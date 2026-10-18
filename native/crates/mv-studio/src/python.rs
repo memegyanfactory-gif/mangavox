@@ -7,6 +7,23 @@ use std::process::Command;
 
 use crate::error::StudioError;
 
+/// `CREATE_NO_WINDOW`: keeps console windows from popping up when the GUI app
+/// starts Python (and helpers such as `taskkill`) on Windows.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// A `std::process::Command` that never opens a console window on Windows.
+pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Minimum accepted Python: the TTS venv bootstrap needs 3.10+, the workers 3.9+.
 const MIN_MINOR: u32 = 9;
 
@@ -90,7 +107,7 @@ pub fn discover_python(configured: Option<&str>) -> Result<PythonInterpreter, St
 
 /// Runs `<program> <prefix> -c "print(version)"` and accepts Python 3.MIN_MINOR+.
 fn probe(program: &str, prefix: &[String]) -> Option<PythonInterpreter> {
-    let out = Command::new(program)
+    let out = quiet_command(program)
         .args(prefix)
         .arg("-c")
         .arg("import sys; v = sys.version_info; print('%d.%d.%d' % (v[0], v[1], v[2]))")
@@ -210,7 +227,7 @@ pub fn check_requirements(
             missing: vec![],
         });
     }
-    let out = Command::new(&interpreter.program)
+    let out = quiet_command(&interpreter.program)
         .args(&interpreter.prefix_args)
         .args(["-m", "pip", "show"])
         .args(&required)

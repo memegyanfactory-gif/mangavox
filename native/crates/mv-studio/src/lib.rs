@@ -12,7 +12,7 @@ pub mod tts;
 #[cfg(test)]
 mod testutil;
 
-pub use bridge::{run_worker, CancelToken, WorkerMessage, WorkerReport, WorkerSpec};
+pub use bridge::{run_worker, run_worker_logged, CancelToken, WorkerMessage, WorkerReport, WorkerSpec};
 pub use error::StudioError;
 pub use jobs::{
     CombineJob, EnhanceJob, JobEvent, JobPayload, JobQueue, JobSnapshot, JobState, NarrateJob,

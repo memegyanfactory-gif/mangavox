@@ -198,10 +198,19 @@ pub fn build_command(
         .args(args)
         .current_dir(cwd)
         .env("PYTHONUNBUFFERED", "1")
+        // Workers open job files and print paths without an explicit encoding;
+        // on Windows the default would be the ANSI code page.
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        // No console window flashing up for every worker in the GUI app.
+        cmd.creation_flags(crate::python::CREATE_NO_WINDOW);
+    }
     #[cfg(unix)]
     {
         // Own process group, so cancel can signal the whole tree.
@@ -231,10 +240,29 @@ fn map_spawn_error(
 pub async fn run_worker<F>(
     spec: &WorkerSpec,
     cancel: &CancelToken,
-    mut on_message: F,
+    on_message: F,
 ) -> Result<WorkerReport, StudioError>
 where
     F: FnMut(&WorkerMessage) + Send,
+{
+    run_worker_logged(spec, cancel, on_message, log_worker_noise).await
+}
+
+/// [`run_worker`] that also forwards every non-protocol line (stderr, and stdout
+/// lines that are not JSON objects) to `on_log` as it arrives.
+///
+/// A worker that reports an `error` and then exits without `done` fails with that
+/// error, even when it was marked recoverable and the exit code is 0 (the pipeline
+/// worker reports stage failures that way).
+pub async fn run_worker_logged<F, L>(
+    spec: &WorkerSpec,
+    cancel: &CancelToken,
+    mut on_message: F,
+    mut on_log: L,
+) -> Result<WorkerReport, StudioError>
+where
+    F: FnMut(&WorkerMessage) + Send,
+    L: FnMut(&str) + Send,
 {
     if cancel.is_cancelled() {
         return Err(StudioError::Cancelled);
@@ -247,11 +275,17 @@ where
         .stdout
         .take()
         .ok_or_else(|| StudioError::Io(std::io::Error::other("stdout not piped")))?;
-    let stderr_task = child.stderr.take().map(|s| tokio::spawn(read_tail(s)));
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|s| tokio::spawn(read_tail(s, Some(log_tx))));
 
     let mut parser = JsonLineParser::default();
     let mut buf = vec![0u8; 8192];
     let mut decided: Option<Result<Option<Value>, StudioError>> = None;
+    // Last non-fatal error, reported if the worker exits without `done`.
+    let mut soft_error: Option<StudioError> = None;
 
     'read: loop {
         tokio::select! {
@@ -261,6 +295,7 @@ where
                 if let Some(task) = stderr_task { task.abort(); }
                 return Err(StudioError::Cancelled);
             }
+            Some(line) = log_rx.recv() => on_log(&line),
             read = stdout.read(&mut buf) => {
                 let n = read?;
                 let lines = if n == 0 {
@@ -275,8 +310,11 @@ where
                             decided = Some(outcome);
                             break 'read;
                         }
+                        if msg.is_error() {
+                            soft_error = Some(worker_error(msg));
+                        }
                     } else if let ParsedLine::Unparsed(text) = &line {
-                        log_worker_noise(text);
+                        on_log(text);
                     }
                 }
                 if n == 0 {
@@ -302,18 +340,22 @@ where
         },
         None => String::new(),
     };
+    while let Ok(line) = log_rx.try_recv() {
+        on_log(&line);
+    }
 
-    match decided {
-        Some(Ok(outputs)) => Ok(WorkerReport {
+    match (decided, soft_error) {
+        (Some(Ok(outputs)), _) => Ok(WorkerReport {
             exit_code: status.code(),
             outputs,
         }),
-        Some(Err(err)) => Err(err),
-        None if status.success() => Ok(WorkerReport {
+        (Some(Err(err)), _) => Err(err),
+        (None, Some(err)) => Err(err),
+        (None, None) if status.success() => Ok(WorkerReport {
             exit_code: status.code(),
             outputs: None,
         }),
-        None => Err(StudioError::Exit {
+        (None, None) => Err(StudioError::Exit {
             code: status.code(),
             stderr,
         }),
@@ -329,15 +371,19 @@ fn classify(
         return Some(Ok(msg.outputs.clone()));
     }
     if msg.is_error() && (strict_errors || !msg.recoverable) {
-        return Some(Err(StudioError::Worker {
-            message: msg
-                .message
-                .clone()
-                .unwrap_or_else(|| "Worker error".to_string()),
-            stage: msg.stage.clone(),
-        }));
+        return Some(Err(worker_error(msg)));
     }
     None
+}
+
+fn worker_error(msg: &WorkerMessage) -> StudioError {
+    StudioError::Worker {
+        message: msg
+            .message
+            .clone()
+            .unwrap_or_else(|| "Worker error".to_string()),
+        stage: msg.stage.clone(),
+    }
 }
 
 /// Non-protocol worker output. This crate has no logger, so it goes to stderr.
@@ -360,11 +406,40 @@ async fn wait_or_cancel(
     }
 }
 
-async fn read_tail<R: AsyncRead + Unpin>(mut reader: R) -> String {
-    let mut all = Vec::new();
-    let _ = reader.read_to_end(&mut all).await;
-    let start = all.len().saturating_sub(STDERR_TAIL_BYTES);
-    String::from_utf8_lossy(&all[start..]).trim().to_string()
+/// Reads a stream to the end, sending each non-blank line to `lines` as it
+/// arrives, and returns the last [`STDERR_TAIL_BYTES`] for error reports.
+async fn read_tail<R: AsyncRead + Unpin>(
+    mut reader: R,
+    lines: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> String {
+    let mut tail = Vec::new();
+    let mut pending = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let send = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        let text = text.trim();
+        if let (Some(tx), false) = (&lines, text.is_empty()) {
+            let _ = tx.send(text.to_string());
+        }
+    };
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        tail.extend_from_slice(&buf[..n]);
+        if tail.len() > STDERR_TAIL_BYTES * 4 {
+            tail.drain(..tail.len() - STDERR_TAIL_BYTES);
+        }
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=pos).collect();
+            send(&line);
+        }
+    }
+    send(&pending);
+    let start = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+    String::from_utf8_lossy(&tail[start..]).trim().to_string()
 }
 
 /// Kills the child and everything it started.
@@ -380,6 +455,7 @@ pub async fn kill_tree(child: &mut Child) {
     {
         let _ = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
+            .creation_flags(crate::python::CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -629,6 +705,37 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn recoverable_error_without_done_fails_and_logs_stderr() {
+        let Some(interp) = testutil::interpreter() else {
+            eprintln!("skipping: no Python 3 on PATH");
+            return;
+        };
+        let dir = testutil::unique_dir("bridge-soft");
+        let script = testutil::write_fake_worker(&dir);
+        let job = dir.join("job.json");
+        std::fs::write(&job, testutil::job_json("soft-3")).unwrap();
+        let spec = WorkerSpec {
+            interpreter: interp,
+            script,
+            args: vec![job.display().to_string()],
+            cwd: dir.clone(),
+            strict_errors: false,
+        };
+        let mut logs = Vec::new();
+        let result =
+            run_worker_logged(&spec, &CancelToken::new(), |_| {}, |l| logs.push(l.to_string())).await;
+        match result {
+            Err(StudioError::Worker { message, stage }) => {
+                assert_eq!(message, "soft 3");
+                assert_eq!(stage.as_deref(), Some("fake"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(logs.iter().any(|l| l == "soft stderr line"), "logs were {logs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

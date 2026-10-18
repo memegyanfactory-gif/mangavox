@@ -6,8 +6,9 @@ use std::time::SystemTime;
 use crate::python::{discover_python, PythonInterpreter};
 
 /// The fake worker. `pages_dir` basename `<mode>-<id>` selects behaviour:
-/// `ok` emits progress and done, `sleep` blocks until killed, `fail` emits a
-/// fatal error, anything else writes to stderr and exits 4.
+/// `ok` emits progress and done, `sleep` blocks until killed, `soft` logs to stderr,
+/// emits a recoverable error and exits 0, `fail` emits a fatal error, anything
+/// else writes to stderr and exits 4.
 const FAKE_WORKER: &str = r#"import json, os, sys, time
 job = json.load(open(sys.argv[1], encoding="utf-8"))
 mode, _, ident = os.path.basename(job["pages_dir"]).partition("-")
@@ -24,6 +25,9 @@ elif mode == "sleep":
     emit({"type": "progress", "stage": "fake", "current": 1, "total": 2, "percent": 50.0})
     time.sleep(120)
     emit({"type": "done", "outputs": {}})
+elif mode == "soft":
+    print("soft stderr line", file=sys.stderr, flush=True)
+    emit({"type": "error", "stage": "fake", "message": "soft " + ident, "recoverable": True})
 elif mode == "fail":
     emit({"type": "error", "stage": "fake", "message": "boom " + ident, "recoverable": False})
     sys.exit(1)

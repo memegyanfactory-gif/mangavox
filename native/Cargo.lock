@@ -5229,6 +5229,7 @@ dependencies = [
  "ui-media",
  "ui-player",
  "ui-settings",
+ "ui-studio",
  "windows-sys 0.60.2",
 ]
 
@@ -9419,6 +9420,21 @@ dependencies = [
  "ui-assistant",
  "ui-manga",
  "ui-media",
+]
+
+[[package]]
+name = "ui-studio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "mv-core",
+ "mv-studio",
+ "mv-ui",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

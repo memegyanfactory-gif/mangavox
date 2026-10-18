@@ -1,73 +1,121 @@
-use std::ops::Range;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_core::repo::chapter::{self, Chapter};
+use mv_core::repo::chapter::Chapter;
 use mv_core::repo::manga::{self, Manga};
-use mv_ui::{button, error_state, size, ButtonKind, CoverSource, Route, Tokens};
+use mv_ui::{button, icon, size, ButtonKind, CoverSource, Route, Tokens};
 
-use crate::backend;
-use crate::logic;
+use crate::backend::{self, ChapterExtra};
+use crate::logic::{self, ChapterView};
 use crate::ops;
-use crate::ui::{muted, Load};
+use crate::store;
+use crate::ui::{action, error_view, icon_tip, note_line, spinner, state_view, tag, tool_button, Load};
+
+/// Fixed list rows before the chapters: the header and the chapter toolbar.
+const LEAD: usize = 2;
+const ROW_H: f32 = 58.0;
 
 pub struct DetailPage {
     manga_id: String,
     state: Load<(Manga, Vec<Chapter>)>,
     cover: Option<PathBuf>,
-    newest_first: bool,
+    source_name: Option<String>,
+    in_library: bool,
+    view: ChapterView,
+    /// Chapter indices (into the ascending list) in display order.
+    rows: Vec<usize>,
+    /// Chapter the Resume / Start button opens.
+    current: Option<usize>,
+    extras: HashMap<String, ChapterExtra>,
+    lang: String,
     expanded: bool,
     refreshing: bool,
-    confirm_remove: bool,
-    note: Option<String>,
-    scroll: UniformListScrollHandle,
+    auto_refreshed: bool,
+    note: Option<(String, bool)>,
+    hovered: Option<String>,
+    list: ListState,
+    seen_version: u64,
 }
 
-fn load(id: String) -> anyhow::Result<(Manga, Vec<Chapter>, Option<PathBuf>)> {
+struct Loaded {
+    manga: Manga,
+    chapters: Vec<Chapter>,
+    cover: Option<PathBuf>,
+}
+
+fn load(id: String, lang: String) -> anyhow::Result<Loaded> {
     backend::with_db(|c| {
-        let m = manga::get(c, &id)?.ok_or_else(|| anyhow::anyhow!("This title is not in your library"))?;
-        let cs = chapter::list(c, &id)?;
+        let m = manga::get(c, &id)?.ok_or_else(|| anyhow::anyhow!("This title is no longer in the database"))?;
+        let cs = store::chapters(c, &id, &lang)?;
         let cover = m.cover_path.as_deref().and_then(mv_core::covers::cached_cover);
-        Ok((m, cs, cover))
+        Ok(Loaded { manga: m, chapters: cs, cover })
     })
 }
 
 impl DetailPage {
     pub fn new(manga_id: String, cx: &mut Context<Self>) -> Self {
         let mut p = Self {
+            in_library: !backend::browse_only().contains(&manga_id),
+            extras: backend::extras(&manga_id).unwrap_or_default(),
             manga_id,
             state: Load::Loading,
             cover: None,
-            newest_first: true,
+            source_name: None,
+            view: ChapterView::default(),
+            rows: vec![],
+            current: None,
+            lang: backend::preferred_language(),
             expanded: false,
             refreshing: false,
-            confirm_remove: false,
+            auto_refreshed: false,
             note: None,
-            scroll: UniformListScrollHandle::new(),
+            hovered: None,
+            list: ListState::new(0, ListAlignment::Top, px(400.)),
+            seen_version: backend::data_version(),
         };
         p.reload(cx);
         p
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let id = self.manga_id.clone();
+        let (id, lang) = (self.manga_id.clone(), self.lang.clone());
         cx.spawn(async move |this, cx| {
-            let res = mv_ui::bg::blocking(move || load(id)).await.and_then(|r| r);
-            let missing = match &res {
-                Ok((m, _, None)) => m.cover_path.clone().filter(|u| u.starts_with("http")).map(|u| (u, m.source_plugin.clone())),
-                _ => None,
+            let res = mv_ui::bg::blocking(move || load(id, lang)).await.and_then(|r| r);
+            let (missing, source) = match &res {
+                Ok(l) => (
+                    if l.cover.is_none() { l.manga.cover_path.clone().filter(|u| u.starts_with("http")).map(|u| (u, l.manga.source_plugin.clone())) } else { None },
+                    Some(l.manga.source_plugin.clone()),
+                ),
+                _ => (None, None),
             };
             let _ = this.update(cx, |this, cx| {
                 match res {
-                    Ok((m, cs, cover)) => {
-                        this.cover = cover;
-                        this.state = Load::Ready((m, cs));
+                    Ok(l) => {
+                        let empty = l.chapters.is_empty();
+                        if l.cover.is_some() {
+                            this.cover = l.cover;
+                        }
+                        this.in_library = !backend::browse_only().contains(&this.manga_id);
+                        this.set_data(l.manga, l.chapters);
+                        // A title without chapters has never been synced: fetch them once.
+                        if empty && !this.auto_refreshed {
+                            this.auto_refreshed = true;
+                            this.refresh(cx);
+                        }
                     }
                     Err(e) => this.state = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();
             });
+            if let Some(src) = source {
+                let name = mv_ui::bg::run(async move { backend::registry().await.get(&src).map(|s| s.info().name) }).await.ok().flatten();
+                let _ = this.update(cx, |this, cx| {
+                    this.source_name = name;
+                    cx.notify();
+                });
+            }
             if let Some((url, src)) = missing {
                 let p = mv_ui::bg::run(backend::ensure_cover(url, Some(src))).await.ok().flatten();
                 let _ = this.update(cx, |this, cx| {
@@ -77,6 +125,28 @@ impl DetailPage {
             }
         })
         .detach();
+    }
+
+    fn set_data(&mut self, m: Manga, cs: Vec<Chapter>) {
+        self.state = Load::Ready((m, cs));
+        self.sync_rows();
+        self.list.remeasure_items(0..LEAD.min(self.list.item_count()));
+    }
+
+    /// Recompute the visible chapters and tell the list how many rows it has.
+    fn sync_rows(&mut self) {
+        (self.rows, self.current) = match &self.state {
+            Load::Ready((_, cs)) => (logic::visible_chapters(cs, self.view), logic::continue_target(cs).map(|(i, _)| i)),
+            _ => (vec![], None),
+        };
+        // header + toolbar + (chapters or one empty-state row) + bottom spacer for the Resume button
+        let want = LEAD + self.rows.len().max(1) + 1;
+        let have = self.list.item_count();
+        if have < LEAD {
+            self.list.reset(want);
+        } else if have != want {
+            self.list.splice(LEAD..have, want - LEAD);
+        }
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -93,10 +163,17 @@ impl DetailPage {
                 this.refreshing = false;
                 match res {
                     Ok((m, cs)) => {
-                        this.note = Some(format!("{} chapters", cs.len()));
-                        this.state = Load::Ready((m, cs));
+                        let before = match &this.state {
+                            Load::Ready((_, old)) => old.len(),
+                            _ => 0,
+                        };
+                        let added = cs.len().saturating_sub(before);
+                        this.note = Some((if added > 0 { format!("{added} new chapters") } else { "Up to date".into() }, false));
+                        this.extras = backend::extras(&this.manga_id).unwrap_or_default();
+                        this.seen_version = backend::data_version();
+                        this.set_data(m, cs);
                     }
-                    Err(e) => this.note = Some(format!("Refresh failed: {e:#}")),
+                    Err(e) => this.note = Some((format!("Refresh failed: {e:#}"), true)),
                 }
                 cx.notify();
             });
@@ -112,182 +189,447 @@ impl DetailPage {
         let id = self.manga_id.clone();
         cx.spawn(async move |_, _| {
             let _ = mv_ui::bg::blocking(move || backend::with_db(|c| manga::toggle_favorite(c, &id))).await;
+            backend::bump_data();
         })
         .detach();
     }
 
-    fn remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_remove {
-            self.confirm_remove = true;
-            cx.notify();
-            return;
+    fn toggle_library(&mut self, cx: &mut Context<Self>) {
+        self.in_library = !self.in_library;
+        backend::set_in_library(&self.manga_id, self.in_library);
+        self.seen_version = backend::data_version();
+        self.note = Some((if self.in_library { "Added to library".into() } else { "Removed from library".into() }, false));
+        cx.notify();
+    }
+
+    /// Mark chapters read / unread, updating the list immediately.
+    fn set_read(&mut self, ids: Vec<String>, read: bool, cx: &mut Context<Self>) {
+        if let Load::Ready((_, cs)) = &mut self.state {
+            for c in cs.iter_mut().filter(|c| ids.contains(&c.id)) {
+                c.is_read = read;
+                if !read {
+                    c.read_progress = 0;
+                }
+            }
         }
-        let id = self.manga_id.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            let _ = mv_ui::bg::blocking(move || backend::with_db(|c| manga::remove(c, &id))).await;
-            let _ = cx.update(|w, cx| mv_ui::navigate(Route::Library, w, cx));
+        self.sync_rows();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let _ = mv_ui::bg::blocking(move || backend::with_db(|c| store::set_read(c, &ids, read))).await;
+            let _ = this.update(cx, |this, _| this.seen_version = backend::data_version());
         })
         .detach();
     }
 
-    fn header(&self, m: &Manga, chapters: &[Chapter], cx: &mut Context<Self>) -> Div {
+    fn set_view(&mut self, view: ChapterView, cx: &mut Context<Self>) {
+        self.view = view;
+        self.sync_rows();
+        cx.notify();
+    }
+
+    fn render_item(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        if !matches!(self.state, Load::Ready(_)) {
+            return div().into_any_element();
+        }
+        // Borrow the data out of `self` for the duration of the row (no per-row clone of the list).
+        let state = std::mem::replace(&mut self.state, Load::Loading);
+        let Load::Ready((m, cs)) = &state else { unreachable!() };
+        let el = match ix {
+            0 => self.header(m, cx).into_any_element(),
+            1 => self.toolbar(cs, cx).into_any_element(),
+            _ => {
+                let r = ix - LEAD;
+                match self.rows.get(r) {
+                    Some(&i) if i < cs.len() => self.chapter_row(m, cs, i, cx).into_any_element(),
+                    None if r == 0 => self.empty_chapters(cs, cx).into_any_element(),
+                    _ => div().h(px(96.)).into_any_element(),
+                }
+            }
+        };
+        self.state = state;
+        el
+    }
+
+    fn header(&self, m: &Manga, cx: &mut Context<Self>) -> Div {
         let cover = self.cover.clone().map(CoverSource::File);
-        let target = logic::continue_target(chapters).map(|(i, _)| chapters[i].id.clone());
-        let mid = m.id.clone();
-        let meta: Vec<String> = [m.author.clone(), m.status.clone()].into_iter().flatten().filter(|s| !s.is_empty()).collect();
-        let desc = m.description.clone().unwrap_or_default();
-        let long = desc.chars().count() > 280;
+        let backdrop = self.cover.clone().map(CoverSource::File);
+        let desc = m.description.clone().unwrap_or_default().trim().to_string();
+        let long = desc.chars().count() > 260 || desc.lines().count() > 3;
+        let web = logic::web_url(&m.source_plugin, &m.source_id);
+        let mut people: Vec<String> = vec![];
+        if let Some(a) = m.author.clone().filter(|s| !s.is_empty()) {
+            people.push(a);
+        }
+        if let Some(a) = m.artist.clone().filter(|s| !s.is_empty() && Some(s) != m.author.as_ref()) {
+            people.push(a);
+        }
+        let status = m.status.clone().filter(|s| !s.is_empty());
+        let source = self.source_name.clone().unwrap_or_else(|| m.source_plugin.clone());
+
+        let top = div()
+            .relative()
+            .w_full()
+            .overflow_hidden()
+            .when_some(backdrop, |d, c| d.child(c.into_img().absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover).opacity(0.22)))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(linear_gradient(180., linear_color_stop(rgba(0x0b0d1066), 0.), linear_color_stop(Tokens::base(), 1.))),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .gap(px(24.))
+                    .px(px(size::PAGE_X))
+                    .pt(px(32.))
+                    .pb(px(16.))
+                    .child(
+                        div()
+                            .w(px(150.))
+                            .h(px(225.))
+                            .flex_none()
+                            .rounded(px(10.))
+                            .overflow_hidden()
+                            .bg(Tokens::surface_2())
+                            .border_1()
+                            .border_color(Tokens::border())
+                            .shadow_lg()
+                            .map(|d| match cover {
+                                Some(c) => d.child(c.into_img().size_full().object_fit(ObjectFit::Cover)),
+                                None => d.flex().items_center().justify_center().child(icon("icons/book-open.svg", rgba(0xffffff1f), 36.)),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .text_size(px(size::XXL))
+                                    .line_height(px(34.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Tokens::text_1())
+                                    .line_clamp(3)
+                                    .child(m.title.clone()),
+                            )
+                            .when(!people.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .text_size(px(size::MD))
+                                        .text_color(Tokens::text_2())
+                                        .child(icon("icons/user.svg", Tokens::text_3(), 14.))
+                                        .child(people.join(", ")),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_size(px(size::SM))
+                                    .text_color(Tokens::text_3())
+                                    .child(icon(status_icon(status.as_deref()), Tokens::text_3(), 14.))
+                                    .child(status.unwrap_or_else(|| "Unknown status".into()))
+                                    .child("·")
+                                    .child(source)
+                                    .when(self.lang != "all", |d| d.child("·").child(self.lang.to_uppercase())),
+                            ),
+                    ),
+            );
+
+        let actions = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .px(px(size::PAGE_X - 10.))
+            .child(
+                action("act-lib", if self.in_library { "icons/bookmark-check.svg" } else { "icons/bookmark-plus.svg" }, if self.in_library { "In library" } else { "Add to library" }, self.in_library)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_library(cx))),
+            )
+            .child(
+                action("act-fav", "icons/heart.svg", "Favorite", m.is_favorite)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_favorite(cx))),
+            )
+            .child(
+                action("act-refresh", "icons/refresh-cw.svg", if self.refreshing { "Refreshing" } else { "Refresh" }, false)
+                    .when(self.refreshing, |d| d.opacity(0.6))
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+            )
+            .when_some(web, |d, url| {
+                d.child(action("act-web", "icons/globe.svg", "Open in browser", false).on_click(move |_, _, cx| cx.open_url(&url)))
+            })
+            .child(div().flex_1())
+            .when_some(self.note.clone(), |d, (n, err)| d.child(div().mr(px(10.)).child(note_line(n, err))));
+
+        let expanded = self.expanded;
+        let about = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .px(px(size::PAGE_X))
+            .pt(px(12.))
+            .pb(px(16.))
+            .when(!desc.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("desc")
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .max_w(px(860.))
+                        .when(long, |d| {
+                            d.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
+                                this.expanded = !this.expanded;
+                                this.list.remeasure_items(0..1);
+                                cx.notify();
+                            }))
+                        })
+                        .child(div().text_size(px(size::MD)).line_height(px(21.)).text_color(Tokens::text_2()).when(!expanded, |d| d.line_clamp(3)).child(desc))
+                        .when(long, |d| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_size(px(size::SM))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(Tokens::accent())
+                                    .child(if expanded { "Show less" } else { "Show more" })
+                                    .child(icon(if expanded { "icons/chevron-up.svg" } else { "icons/chevron-down.svg" }, Tokens::accent(), 14.)),
+                            )
+                        }),
+                )
+            })
+            .when(!m.genres.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(6.)).children(m.genres.iter().take(16).map(|g| tag(g.clone())))));
+
+        div().flex().flex_col().child(top).child(actions).child(about)
+    }
+
+    fn toolbar(&self, cs: &[Chapter], cx: &mut Context<Self>) -> Div {
+        let v = self.view;
+        let all_read = !cs.is_empty() && cs.iter().all(|c| c.is_read);
+        let unread = cs.iter().filter(|c| !c.is_read).count();
+        let count = if unread > 0 && unread < cs.len() { format!("{} chapters, {unread} unread", cs.len()) } else { format!("{} chapters", cs.len()) };
         div()
             .flex()
-            .gap(px(24.))
-            .mb(px(20.))
+            .items_center()
+            .gap(px(4.))
+            .h(px(48.))
+            .mx(px(size::PAGE_X))
+            .border_b_1()
+            .border_color(Tokens::border())
+            .child(div().flex_1().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(count))
+            .when(self.refreshing, |d| d.child(div().mr(px(6.)).child(spinner("refresh-spin", 16.))))
+            .child(tool_button("f-unread", "icons/eye-off.svg", "Unread", v.unread_only).on_click(cx.listener(move |this, _, _, cx| {
+                this.set_view(ChapterView { unread_only: !v.unread_only, ..v }, cx)
+            })))
+            .child(tool_button("f-dl", "icons/folder-down.svg", "Downloaded", v.downloaded_only).on_click(cx.listener(move |this, _, _, cx| {
+                this.set_view(ChapterView { downloaded_only: !v.downloaded_only, ..v }, cx)
+            })))
             .child(
-                div().w(px(170.)).h(px(244.)).flex_none().rounded(px(12.)).overflow_hidden().bg(Tokens::surface_2()).border_1().border_color(Tokens::border()).when_some(cover, |d, c| {
-                    d.child(c.into_img().size_full().object_fit(ObjectFit::Cover))
-                }),
+                tool_button(
+                    "sort",
+                    if v.newest_first { "icons/arrow-down-wide-narrow.svg" } else { "icons/arrow-up-narrow-wide.svg" },
+                    if v.newest_first { "Newest first" } else { "Oldest first" },
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_view(ChapterView { newest_first: !v.newest_first, ..v }, cx))),
             )
+            .when(!cs.is_empty(), |d| {
+                let ids: Vec<String> = cs.iter().map(|c| c.id.clone()).collect();
+                d.child(
+                    tool_button("mark-all", if all_read { "icons/rotate-ccw.svg" } else { "icons/check-check.svg" }, if all_read { "Mark all unread" } else { "Mark all read" }, false)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_read(ids.clone(), !all_read, cx))),
+                )
+            })
+    }
+
+    fn empty_chapters(&self, cs: &[Chapter], cx: &mut Context<Self>) -> Div {
+        if self.refreshing && cs.is_empty() {
+            return div().flex().items_center().justify_center().gap(px(10.)).h(px(160.)).child(spinner("chapters-spin", 18.)).child(note_line("Fetching chapters...", false));
+        }
+        if cs.is_empty() {
+            return div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(state_view("icons/book-open.svg", "No chapters yet", "The source has not listed any readable chapters."))
+                .child(button("refresh-empty", "Check again", ButtonKind::Secondary).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
+        }
+        div().child(state_view("icons/list-filter.svg", "No chapters match", "Turn off the Unread or Downloaded filter to see every chapter."))
+    }
+
+    fn chapter_row(&self, m: &Manga, cs: &[Chapter], i: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let c = &cs[i];
+        let current = self.current == Some(i);
+        let route = Route::Reader { manga_id: m.id.clone(), chapter_id: c.id.clone() };
+        let extra = self.extras.get(&c.source_id).cloned().unwrap_or_default();
+        let mut meta: Vec<String> = vec![];
+        if let Some(d) = extra.date {
+            meta.push(d);
+        }
+        if let Some(g) = extra.group {
+            meta.push(g);
+        }
+        if !logic::lang_matches(&c.language, &self.lang) {
+            meta.push(c.language.to_uppercase());
+        }
+        let progress = (!c.is_read && c.read_progress > 0).then(|| format!("Page {}", c.read_progress + 1));
+        let downloaded = c.download_status == "complete";
+        let hovered = self.hovered.as_deref() == Some(c.id.as_str());
+        let (hid, rid) = (c.id.clone(), c.id.clone());
+        let read = c.is_read;
+        let title_color = if read { Tokens::text_3() } else { Tokens::text_1() };
+        div()
+            .id(SharedString::from(format!("ch-{}", c.id)))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(ROW_H))
+            .mx(px(size::PAGE_X - 10.))
+            .px(px(10.))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .hover(|s| s.bg(Tokens::hover()))
+            .on_hover(cx.listener(move |this, h: &bool, _, cx| {
+                if *h {
+                    this.hovered = Some(hid.clone());
+                } else if this.hovered.as_deref() == Some(hid.as_str()) {
+                    this.hovered = None;
+                }
+                cx.notify();
+            }))
+            .on_click(move |_, w, cx| mv_ui::navigate(route.clone(), w, cx))
+            .child(div().w(px(3.)).h(px(28.)).rounded(px(2.)).flex_none().when(current, |d| d.bg(Tokens::accent())))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(10.))
-                    .child(div().text_size(px(size::XXL)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(m.title.clone()))
-                    .when(!meta.is_empty(), |d| d.child(muted(meta.join("  -  "))))
-                    .when(!m.genres.is_empty(), |d| {
-                        d.child(div().flex().flex_wrap().gap(px(6.)).children(m.genres.iter().take(12).map(|g| {
-                            div().px(px(8.)).py(px(2.)).rounded(px(999.)).border_1().border_color(Tokens::border()).text_size(px(size::XS)).text_color(Tokens::text_2()).child(g.clone())
-                        })))
-                    })
-                    .when(!desc.is_empty(), |d| {
-                        let expanded = self.expanded;
-                        d.child(
-                            div()
-                                .id("desc")
-                                .text_size(px(size::MD))
-                                .text_color(Tokens::text_2())
-                                .when(long, |d| d.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
-                                    this.expanded = !this.expanded;
-                                    cx.notify();
-                                })))
-                                .when(!expanded, |d| d.line_clamp(4))
-                                .child(desc),
-                        )
-                    })
+                    .gap(px(2.))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .mt(px(4.))
-                            .child(
-                                button("read", logic::continue_label(chapters), ButtonKind::Primary).on_click(move |_, w, cx| {
-                                    if let Some(cid) = &target {
-                                        mv_ui::navigate(Route::Reader { manga_id: mid.clone(), chapter_id: cid.clone() }, w, cx);
-                                    }
+                            .truncate()
+                            .text_size(px(size::MD))
+                            .font_weight(if read { FontWeight::NORMAL } else { FontWeight::MEDIUM })
+                            .text_color(title_color)
+                            .child(logic::chapter_label(c)),
+                    )
+                    .when(!meta.is_empty() || progress.is_some(), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(size::XS))
+                                .text_color(if read { rgba(0x7d859099) } else { Tokens::text_3() })
+                                .when(!meta.is_empty(), |d| d.child(div().truncate().child(meta.join("  ·  "))))
+                                .when_some(progress, |d, p| {
+                                    d.when(!meta.is_empty(), |d| d.child("·")).child(div().flex_none().text_color(Tokens::accent()).child(p))
                                 }),
-                            )
-                            .child(
-                                button("fav", if m.is_favorite { "Favorited" } else { "Favorite" }, ButtonKind::Secondary)
-                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_favorite(cx))),
-                            )
-                            .child(
-                                button("refresh", if self.refreshing { "Refreshing..." } else { "Refresh chapters" }, ButtonKind::Ghost)
-                                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                            )
-                            .child(
-                                button("remove", if self.confirm_remove { "Click again to remove" } else { "Remove" }, ButtonKind::Ghost)
-                                    .when(self.confirm_remove, |d| d.text_color(Tokens::danger()))
-                                    .on_click(cx.listener(|this, _, w, cx| this.remove(w, cx))),
-                            )
-                            .when_some(self.note.clone(), |d, n| d.child(muted(n))),
-                    ),
+                        )
+                    }),
             )
+            .when(downloaded, |d| d.child(icon("icons/circle-check.svg", Tokens::text_3(), 16.)))
+            .when(hovered, |d| {
+                d.child(
+                    icon_tip(SharedString::from(format!("mr-{}", c.id)), if read { "icons/rotate-ccw.svg" } else { "icons/check.svg" }, if read { "Mark unread" } else { "Mark read" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_read(vec![rid.clone()], !read, cx);
+                        })),
+                )
+            })
     }
 
-    fn chapter_list(&self, chapters: &[Chapter], cx: &mut Context<Self>) -> impl IntoElement {
-        let n = chapters.len();
-        let newest = self.newest_first;
-        let current = logic::continue_target(chapters).map(|(i, _)| chapters[i].id.clone());
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .mb(px(8.))
-                    .child(div().flex_1().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(format!("Chapters ({n})")))
-                    .child(
-                        button("order", if newest { "Newest first" } else { "Oldest first" }, ButtonKind::Ghost).on_click(cx.listener(|this, _, _, cx| {
-                            this.newest_first = !this.newest_first;
-                            cx.notify();
-                        })),
-                    ),
-            )
-            .child(if n == 0 {
-                muted("No chapters yet. Try Refresh chapters.").into_any_element()
-            } else {
-                uniform_list(
-                    "chapters",
-                    n,
-                    cx.processor(move |this: &mut Self, range: Range<usize>, _w, _cx| {
-                        let Load::Ready((m, cs)) = &this.state else { return vec![] };
-                        range
-                            .map(|row| {
-                                let c = if newest { &cs[cs.len() - 1 - row] } else { &cs[row] };
-                                let route = Route::Reader { manga_id: m.id.clone(), chapter_id: c.id.clone() };
-                                let status = if c.is_read {
-                                    "Read".to_string()
-                                } else if c.read_progress > 0 {
-                                    format!("Page {}", c.read_progress + 1)
-                                } else {
-                                    String::new()
-                                };
-                                let is_cur = current.as_deref() == Some(c.id.as_str());
-                                div()
-                                    .id(SharedString::from(format!("ch-{}", c.id)))
-                                    .flex()
-                                    .items_center()
-                                    .h(px(40.))
-                                    .px(px(12.))
-                                    .rounded(px(8.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(Tokens::hover()))
-                                    .when(is_cur, |d| d.bg(Tokens::accent_soft()))
-                                    .on_click(move |_, w, cx| mv_ui::navigate(route.clone(), w, cx))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .truncate()
-                                            .text_size(px(size::MD))
-                                            .text_color(if c.is_read { Tokens::text_3() } else { Tokens::text_1() })
-                                            .child(logic::chapter_label(c)),
-                                    )
-                                    .child(muted(status))
-                            })
-                            .collect()
-                    }),
-                )
-                .track_scroll(&self.scroll)
-                .h_full()
-                .into_any_element()
-            })
+    /// Floating Resume / Start button (always reachable while scrolling the chapter list).
+    fn fab(&self, m: &Manga, cs: &[Chapter]) -> Option<Stateful<Div>> {
+        let (i, resume) = logic::continue_target(cs)?;
+        let route = Route::Reader { manga_id: m.id.clone(), chapter_id: cs[i].id.clone() };
+        let label = format!("{} {}", if resume { "Resume" } else { "Start" }, logic::chapter_short(&cs[i]));
+        Some(
+            div()
+                .id("fab")
+                .absolute()
+                .bottom(px(24.))
+                .right(px(size::PAGE_X))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(44.))
+                .px(px(18.))
+                .rounded(px(999.))
+                .bg(Tokens::accent())
+                .shadow_lg()
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.92))
+                .text_size(px(size::MD))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(Tokens::base())
+                .child(icon("icons/play.svg", Tokens::base(), 16.))
+                .child(label)
+                .on_click(move |_, w, cx| mv_ui::navigate(route.clone(), w, cx)),
+        )
+    }
+}
+
+fn status_icon(status: Option<&str>) -> &'static str {
+    let s = status.unwrap_or("").to_lowercase();
+    if s.contains("complete") || s.contains("finished") {
+        "icons/circle-check.svg"
+    } else if s.contains("hiatus") || s.contains("cancel") {
+        "icons/circle-pause.svg"
+    } else {
+        "icons/clock.svg"
     }
 }
 
 impl Render for DetailPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let root = div().size_full().flex().flex_col().px(px(size::PAGE_X)).pt(px(size::PAGE_Y));
+        // Read state changed in the reader (or elsewhere) while this page was in history.
+        let v = backend::data_version();
+        if v != self.seen_version {
+            self.seen_version = v;
+            self.lang = backend::preferred_language();
+            self.extras = backend::extras(&self.manga_id).unwrap_or_default();
+            self.reload(cx);
+        }
+        let root = div().size_full().relative();
         match &self.state {
-            Load::Loading => root.child(muted("Loading...")),
-            Load::Failed(e) => root.child(error_state(e.clone())),
+            Load::Loading => root.child(
+                div()
+                    .flex()
+                    .gap(px(24.))
+                    .px(px(size::PAGE_X))
+                    .pt(px(32.))
+                    .child(div().w(px(150.)).h(px(225.)).rounded(px(10.)).bg(Tokens::surface_2()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .justify_end()
+                            .gap(px(10.))
+                            .child(div().w(px(320.)).h(px(24.)).rounded(px(6.)).bg(Tokens::surface_2()))
+                            .child(div().w(px(180.)).h(px(12.)).rounded(px(4.)).bg(Tokens::surface_2())),
+                    ),
+            ),
+            Load::Failed(e) => root.child(error_view(e.clone())),
             Load::Ready((m, cs)) => {
-                let (m, cs) = (m.clone(), cs.clone());
-                root.child(self.header(&m, &cs, cx)).child(self.chapter_list(&cs, cx))
+                let fab = self.fab(m, cs);
+                root.child(list(self.list.clone(), cx.processor(|this: &mut Self, ix: usize, _w, cx| this.render_item(ix, cx))).size_full())
+                    .when_some(fab, |d, f| d.child(f))
             }
         }
     }

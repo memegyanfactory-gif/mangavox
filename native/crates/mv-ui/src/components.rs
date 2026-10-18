@@ -28,6 +28,11 @@ pub fn page(id: impl Into<ElementId>) -> Stateful<Div> {
     div().id(id).size_full().overflow_y_scroll().px(px(size::PAGE_X)).py(px(size::PAGE_Y))
 }
 
+/// Scrollable page whose position lives in `handle`, so it survives leaving and coming back.
+pub fn scroll_page(id: impl Into<ElementId>, handle: &ScrollHandle) -> Stateful<Div> {
+    div().id(id).size_full().overflow_y_scroll().track_scroll(handle)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ButtonKind {
     Primary,

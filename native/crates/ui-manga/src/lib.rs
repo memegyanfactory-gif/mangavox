@@ -21,7 +21,7 @@ pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView>
     match route {
         Route::Library => Some(cx.new(|cx| library::LibraryPage::new(window, cx)).into()),
         Route::Browse => Some(cx.new(|cx| browse::BrowsePage::new(window, cx)).into()),
-        Route::MangaHistory => Some(cx.new(history::HistoryPage::new).into()),
+        Route::MangaHistory => Some(cx.new(|cx| history::HistoryPage::new(window, cx)).into()),
         Route::MangaDetail { manga_id, .. } => {
             let id = manga_id.clone();
             Some(cx.new(|cx| detail::DetailPage::new(id, cx)).into())

@@ -1,5 +1,6 @@
 //! Minimal libmpv binding loaded at runtime (no import library needed). Video renders into a
 //! borderless owned popup positioned over the player area (GPUI composes above child HWNDs).
+//! GPUI controls drawn over the video are made visible by cutting holes in the popup's region.
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 
@@ -146,7 +147,8 @@ impl Mpv {
                 ("input-default-bindings", "no"),
                 ("input-vo-keyboard", "no"),
                 ("input-cursor", "no"),
-                ("cursor-autohide", "no"),
+                ("cursor-autohide", "3000"),
+                ("window-dragging", "no"),
                 ("ytdl", "no"),
                 ("volume-max", "130"),
                 ("cache", "yes"),
@@ -315,6 +317,29 @@ impl Mpv {
     pub fn set_visible(&self, visible: bool) {
         show_surface(self.surface, visible);
     }
+
+    /// Cuts `[x, y, w, h]` rects (popup device pixels) out of the video so GPUI shows through.
+    pub fn set_holes(&self, holes: &[[i32; 4]]) {
+        set_region(self.surface, holes);
+    }
+
+    /// Screen cursor position while it is over the video (for idle detection).
+    pub fn cursor_over(&self) -> Option<(i32, i32)> {
+        cursor_over(self.surface)
+    }
+
+    /// mpv's own video window (made on mpv's thread) would swallow mouse input over the video;
+    /// disabled child windows pass it to the popup, whose HTTRANSPARENT hands it to the app.
+    pub fn pass_mouse_through(&self) {
+        disable_children(self.surface);
+    }
+
+    /// Hides the cursor until it moves, if it is over the video.
+    pub fn hide_cursor(&self) {
+        if self.cursor_over().is_some() {
+            hide_cursor();
+        }
+    }
 }
 
 impl Drop for Mpv {
@@ -384,10 +409,57 @@ mod win {
     pub fn destroy_child(h: isize) {
         unsafe { DestroyWindow(h as HWND) };
     }
+
+    /// Window region = everything minus `holes`; no holes restores the full window.
+    pub fn set_region(h: isize, holes: &[[i32; 4]]) {
+        use windows_sys::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF};
+        unsafe {
+            if holes.is_empty() {
+                SetWindowRgn(h as HWND, std::ptr::null_mut(), 1);
+                return;
+            }
+            let rgn = CreateRectRgn(0, 0, 32767, 32767);
+            for &[x, y, w, hgt] in holes {
+                let cut = CreateRectRgn(x, y, x + w, y + hgt);
+                CombineRgn(rgn, rgn, cut, RGN_DIFF);
+                DeleteObject(cut);
+            }
+            // The system owns `rgn` after this call.
+            SetWindowRgn(h as HWND, rgn, 1);
+        }
+    }
+
+    pub fn cursor_over(h: isize) -> Option<(i32, i32)> {
+        use windows_sys::Win32::Foundation::RECT;
+        unsafe {
+            let (mut pt, mut r) = (POINT { x: 0, y: 0 }, RECT { left: 0, top: 0, right: 0, bottom: 0 });
+            if GetCursorPos(&mut pt) == 0 || IsWindowVisible(h as HWND) == 0 || GetWindowRect(h as HWND, &mut r) == 0 {
+                return None;
+            }
+            (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom).then_some((pt.x, pt.y))
+        }
+    }
+
+    pub fn disable_children(h: isize) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
+        unsafe {
+            let mut c = GetWindow(h as HWND, GW_CHILD);
+            while !c.is_null() {
+                if IsWindowEnabled(c) != 0 {
+                    EnableWindow(c, 0);
+                }
+                c = GetWindow(c, GW_HWNDNEXT);
+            }
+        }
+    }
+
+    pub fn hide_cursor() {
+        unsafe { SetCursor(std::ptr::null_mut()) };
+    }
 }
 
 #[cfg(windows)]
-use win::{create_child, destroy_child, show_surface};
+use win::{create_child, cursor_over, destroy_child, disable_children, hide_cursor, set_region, show_surface};
 #[cfg(windows)]
 pub use win::move_surface;
 
@@ -401,3 +473,13 @@ pub fn move_surface(_: isize, _: (i32, i32, i32, i32)) {}
 fn show_surface(_: isize, _: bool) {}
 #[cfg(not(windows))]
 fn destroy_child(_: isize) {}
+#[cfg(not(windows))]
+fn set_region(_: isize, _: &[[i32; 4]]) {}
+#[cfg(not(windows))]
+fn cursor_over(_: isize) -> Option<(i32, i32)> {
+    None
+}
+#[cfg(not(windows))]
+fn hide_cursor() {}
+#[cfg(not(windows))]
+fn disable_children(_: isize) {}

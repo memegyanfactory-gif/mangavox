@@ -9,6 +9,7 @@ mod anime_home;
 mod common;
 mod discover;
 mod history;
+mod look;
 mod movie_detail;
 mod movies_home;
 mod streams;

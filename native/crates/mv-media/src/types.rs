@@ -75,9 +75,40 @@ pub struct AnimeSearchResult {
     pub catalog_source: Option<CatalogSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_source_name: Option<String>,
+    // ── Optional extras for richer detail pages. None when the source has no such data. ──
+    /// Title logo image (Cinemeta `logo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_url: Option<String>,
+    /// Cast names (Cinemeta `cast`; AniList main-character Japanese voice actors on details).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast: Option<Vec<String>>,
+    /// Directors (Cinemeta `director`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directors: Option<Vec<String>>,
+    /// AniList media id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anilist_id: Option<u64>,
+    /// Dominant cover colour as `#rrggbb`, handy for hero gradients and accents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Full trailer URL (YouTube watch URL when the site is YouTube).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trailer_url: Option<String>,
+    /// Main animation studios.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub studios: Option<Vec<String>>,
+    /// Episode (or movie) length in minutes (AniList `duration`, Cinemeta `runtime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_minutes: Option<u32>,
+    /// Number of the next episode to air (airing shows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_episode: Option<u32>,
+    /// When the next episode airs, unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_episode_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnimeEpisode {
     pub id: String,

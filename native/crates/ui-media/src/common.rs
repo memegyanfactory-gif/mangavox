@@ -3,7 +3,6 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use gpui_kit::component::input::InputState;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::media::{self, MediaEvent, MediaTitle};
 use mv_core::repo::watchlist;
@@ -11,7 +10,7 @@ use mv_media::addons::AddonRegistry;
 use mv_media::jikan::JikanClient;
 use mv_media::types::AnimeSearchResult;
 use mv_ui::{
-    bg, card_grid, cover_card, empty_state, error_state, navigate, section_title, size, skeleton_card, CoverSource, Route, Tokens,
+    bg, card_grid, cover_card, empty_state, error_state, navigate, size, skeleton_card, CoverSource, Route, Tokens,
 };
 
 /// State of one async-loaded block.
@@ -108,31 +107,6 @@ pub fn result_card(id: (&'static str, usize), r: &AnimeSearchResult) -> Stateful
     on_open(cover_card(id, r.title.clone().into(), sub.into(), cover_of(&r.cover_url), badge), result_route(r))
 }
 
-pub fn skeleton_row() -> Div {
-    div().flex().gap(px(16.)).overflow_hidden().children((0..9).map(|_| div().flex_none().child(skeleton_card())))
-}
-
-fn rail_row(id: &'static str, items: &[AnimeSearchResult]) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .gap(px(16.))
-        .pb(px(8.))
-        .overflow_x_scroll()
-        .children(items.iter().take(30).enumerate().map(|(i, r)| div().flex_none().child(result_card((id, i), r))))
-}
-
-/// Titled horizontal rail with loading / error / empty states.
-pub fn rail(id: &'static str, title: &str, load: &Load<Vec<AnimeSearchResult>>) -> Div {
-    let body = match load {
-        Load::Loading => skeleton_row().into_any_element(),
-        Load::Failed(e) => error_state(e.clone()).min_h(px(120.)).into_any_element(),
-        Load::Ready(v) if v.is_empty() => empty_state("Nothing here yet", "").min_h(px(120.)).into_any_element(),
-        Load::Ready(v) => rail_row(id, v).into_any_element(),
-    };
-    div().mb(px(20.)).child(section_title(title.to_string())).child(body)
-}
-
 /// Wrapping grid with loading / error / empty states.
 pub fn grid(id: &'static str, load: &Load<Vec<AnimeSearchResult>>) -> Div {
     match load {
@@ -217,15 +191,4 @@ pub fn set_watchlist(title: MediaTitle, add: bool) -> impl Future<Output = Resul
         }
         Ok(add)
     })
-}
-
-/// Small "Add to list" toggle used by the detail pages.
-pub fn list_button(id: &'static str, in_list: Option<bool>) -> Stateful<Div> {
-    use mv_ui::{button, ButtonKind};
-    let (label, kind) = match in_list {
-        Some(true) => ("In your list", ButtonKind::Secondary),
-        Some(false) => ("Add to list", ButtonKind::Secondary),
-        None => ("Add to list", ButtonKind::Ghost),
-    };
-    button(id, label, kind).when(in_list.is_none(), |d| d.opacity(0.5))
 }

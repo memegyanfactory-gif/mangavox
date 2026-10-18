@@ -5,7 +5,7 @@ use gpui_kit::*;
 use mv_ui::nav::set_navigator;
 use mv_ui::{empty_state, icon, icon_button, size, Route, Tokens};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     Manga,
     Anime,
@@ -80,14 +80,37 @@ fn is_focus(route: &Route) -> bool {
     matches!(route, Route::Reader { .. } | Route::Player { .. })
 }
 
+/// Pages that stay alive once opened, so the sidebar brings back the same scroll position,
+/// source, filters and loaded results instead of starting over.
+fn keep_alive(route: &Route) -> bool {
+    matches!(route, Route::Browse | Route::AnimeHome | Route::MoviesHome | Route::Discover)
+}
+
+/// A history entry. The view is kept so Back restores the page exactly as it was;
+/// the player is never kept (it would keep playing in the background).
+struct Entry {
+    route: Route,
+    view: Option<AnyView>,
+}
+
+/// One section's navigation state, parked while another section is shown.
+struct Parked {
+    route: Route,
+    page: AnyView,
+    history: Vec<Entry>,
+}
+
 pub struct Shell {
     collapsed: bool,
     section: Section,
     route: Route,
-    history: Vec<Route>,
+    history: Vec<Entry>,
     page: AnyView,
+    kept: std::collections::HashMap<String, AnyView>,
+    parked: std::collections::HashMap<Section, Parked>,
     dock: Option<AnyView>,
     dock_open: bool,
+    _keys: Subscription,
 }
 
 impl Shell {
@@ -98,9 +121,42 @@ impl Shell {
                 s.update(cx, |s, cx| s.go(route, window, cx));
             }
         });
+        // Alt+Left goes back from anywhere (Escape is handled by the reader / player themselves).
+        let keys = cx.observe_keystrokes(|this, ev, window, cx| {
+            let k = &ev.keystroke;
+            if k.modifiers.alt && !k.modifiers.control && k.key == "left" {
+                this.back(window, cx);
+            }
+        });
         let route = Route::Library;
         let page = Self::resolve(&route, window, cx);
-        Self { collapsed: false, section: Section::Manga, route, history: vec![], page, dock: None, dock_open: false }
+        Self {
+            collapsed: false,
+            section: Section::Manga,
+            route,
+            history: vec![],
+            page,
+            kept: Default::default(),
+            parked: Default::default(),
+            dock: None,
+            dock_open: false,
+            _keys: keys,
+        }
+    }
+
+    /// Open `route`, reusing the live page for keep-alive routes.
+    fn open(&mut self, route: &Route, window: &mut Window, cx: &mut App) -> AnyView {
+        if !keep_alive(route) {
+            return Self::resolve(route, window, cx);
+        }
+        let key = format!("{route:?}");
+        if let Some(v) = self.kept.get(&key) {
+            ui_assistant::set_page_context(route);
+            return v.clone();
+        }
+        let v = Self::resolve(route, window, cx);
+        self.kept.insert(key, v.clone());
+        v
     }
 
     fn resolve(route: &Route, window: &mut Window, cx: &mut App) -> AnyView {
@@ -111,6 +167,7 @@ impl Shell {
             .or_else(|| ui_player::open(route, window, cx))
             .or_else(|| ui_assistant::open(route, window, cx))
             .or_else(|| ui_settings::open(route, window, cx))
+            .or_else(|| ui_studio::open(route, window, cx))
             .unwrap_or_else(|| {
                 let title = title_for(route);
                 cx.new(|_| Placeholder { title }).into()
@@ -125,29 +182,57 @@ impl Shell {
         if route == self.route {
             return;
         }
-        let prev = std::mem::replace(&mut self.route, route.clone());
-        self.history.push(prev);
+        let page = self.open(&route, window, cx);
+        let prev = std::mem::replace(&mut self.route, route);
+        let prev_view = std::mem::replace(&mut self.page, page);
+        let view = (!matches!(prev, Route::Player { .. })).then_some(prev_view);
+        self.history.push(Entry { route: prev, view });
         if self.history.len() > 50 {
             self.history.remove(0);
         }
-        self.page = Self::resolve(&route, window, cx);
         cx.notify();
     }
 
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::Player { .. }) && window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
         if let Some(prev) = self.history.pop() {
-            self.page = Self::resolve(&prev, window, cx);
-            self.route = prev;
+            self.page = match prev.view {
+                Some(v) => {
+                    ui_assistant::set_page_context(&prev.route);
+                    v
+                }
+                None => self.open(&prev.route, window, cx),
+            };
+            self.route = prev.route;
             cx.notify();
         }
     }
 
+    /// Switching sections parks the current one (page + history) and restores the target's.
     fn set_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        if section == self.section {
+            return;
+        }
+        let route = std::mem::replace(&mut self.route, section.home());
+        let history = std::mem::take(&mut self.history);
+        if !matches!(route, Route::Player { .. } | Route::Settings { .. } | Route::Studio) {
+            self.parked.insert(self.section, Parked { route, page: self.page.clone(), history });
+        }
         self.section = section;
-        self.history.clear();
-        self.route = section.home();
-        let route = self.route.clone();
-        self.page = Self::resolve(&route, window, cx);
+        match self.parked.remove(&section) {
+            Some(p) => {
+                ui_assistant::set_page_context(&p.route);
+                self.route = p.route;
+                self.page = p.page;
+                self.history = p.history;
+            }
+            None => {
+                let home = section.home();
+                self.page = self.open(&home, window, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -324,6 +409,8 @@ impl Render for Shell {
             .flex_col()
             .size_full()
             .bg(Tokens::base())
+            // The mouse's back side button works everywhere.
+            .on_mouse_down(MouseButton::Navigate(NavigationDirection::Back), cx.listener(|this, _, w, cx| this.back(w, cx)))
             .text_color(Tokens::text_1())
             .font_family("Segoe UI")
             .child(self.title_bar(cx))

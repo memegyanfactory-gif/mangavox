@@ -32,7 +32,8 @@ PIPER_EN_DIR = os.path.join(BASE_DIR, "models", "piper", "en_US")
 # Back-compat alias
 PIPER_DIR = PIPER_HI_DIR
 VENV_DIR = os.path.join(BASE_DIR, "tts-venv")
-VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
+# Windows venvs keep the interpreter under Scripts/, everything else under bin/.
+VENV_PYTHON = os.path.join(VENV_DIR, "Scripts", "python.exe") if os.name == "nt" else os.path.join(VENV_DIR, "bin", "python3")
 UV_CACHE_DIR = os.path.join(BASE_DIR, "uv-cache")
 UV_PYTHON_INSTALL_DIR = os.path.join(BASE_DIR, "uv-python")
 

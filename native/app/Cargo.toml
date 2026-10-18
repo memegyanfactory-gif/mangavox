@@ -12,6 +12,7 @@ ui-media = { path = "../crates/ui-media" }
 ui-player = { path = "../crates/ui-player" }
 ui-assistant = { path = "../crates/ui-assistant" }
 ui-settings = { path = "../crates/ui-settings" }
+ui-studio = { path = "../crates/ui-studio" }
 mv-net = { path = "../crates/mv-net" }
 mv-sources = { path = "../crates/mv-sources" }
 mv-webwall = { path = "../crates/mv-webwall" }

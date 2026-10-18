@@ -7,8 +7,11 @@
 //!   While open, calls fail fast with [`MediaError::CircuitOpen`].
 //! - 429 responses are retried after 2 s. Invalid JSON is retried up to 3 times.
 //! - The arm.haglund MAL to IMDB lookup is not Jikan, so it has no breaker and retries network errors.
+//! - The list, details and episode methods fall back to AniList ([`crate::anilist`]) when Jikan fails,
+//!   times out or returns nothing. While the breaker is open they go straight to AniList.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -16,6 +19,7 @@ use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::anilist::AniListClient;
 use crate::error::{MediaError, Result};
 use crate::types::{AnimeEpisode, AnimeSearchResult};
 use crate::util::non_empty;
@@ -26,6 +30,8 @@ const ARM_URL: &str = "https://arm.haglund.dev/api/v2/ids";
 /// Minimum gap between Jikan request starts.
 pub const MIN_INTERVAL: Duration = Duration::from_millis(500);
 const JIKAN_TIMEOUT: Duration = Duration::from_secs(6);
+/// Short connect timeout so an unreachable Jikan fails fast and trips the breaker.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const GENERIC_TIMEOUT: Duration = Duration::from_secs(15);
 const BREAKER_OPEN_FOR: Duration = Duration::from_secs(10 * 60);
 const RATE_LIMIT_RETRY: Duration = Duration::from_secs(2);
@@ -365,20 +371,20 @@ impl Breaker {
 }
 
 /// Reserves start times so consecutive requests are at least `min_interval` apart.
-struct Limiter {
+pub(crate) struct Limiter {
     min_interval: Duration,
     next_start: tokio::sync::Mutex<Instant>,
 }
 
 impl Limiter {
-    fn new(min_interval: Duration) -> Self {
+    pub(crate) fn new(min_interval: Duration) -> Self {
         Self {
             min_interval,
             next_start: tokio::sync::Mutex::new(Instant::now()),
         }
     }
 
-    async fn acquire(&self) {
+    pub(crate) async fn acquire(&self) {
         let start = {
             let mut next = self.next_start.lock().await;
             let now = Instant::now();
@@ -417,6 +423,7 @@ impl JikanClient {
                 env!("CARGO_PKG_VERSION"),
                 " (mv-media)"
             ))
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
         Ok(Self {
             http,
@@ -449,6 +456,10 @@ impl JikanClient {
                 return Err(MediaError::CircuitOpen);
             }
             self.limiter.acquire().await;
+            // The breaker may have tripped while this request waited for its slot.
+            if !self.breaker.is_available() {
+                return Err(MediaError::CircuitOpen);
+            }
         }
         let timeout = if jikan {
             JIKAN_TIMEOUT
@@ -526,20 +537,44 @@ impl JikanClient {
         Ok(env.data.unwrap_or_default().iter().map(map_anime).collect())
     }
 
+    /// Keep the Jikan result unless it failed or was empty; then ask AniList.
+    /// If AniList fails too, an empty Jikan result is kept, otherwise AniList's error is returned.
+    async fn or_anilist<T, Fut>(
+        &self,
+        jikan: Result<Vec<T>>,
+        fallback: impl FnOnce(&'static AniListClient) -> Fut,
+    ) -> Result<Vec<T>>
+    where
+        Fut: Future<Output = Result<Vec<T>>>,
+    {
+        if matches!(&jikan, Ok(items) if !items.is_empty()) {
+            return jikan;
+        }
+        let fallback = match AniListClient::shared() {
+            Ok(anilist) => fallback(anilist).await,
+            Err(e) => Err(e),
+        };
+        fallback.or_else(|e| jikan.or(Err(e)))
+    }
+
     /// Top anime by popularity. `kind`: "tv" | "movie" | None for all.
     pub async fn top_anime(&self, page: u32, kind: Option<&str>) -> Result<Vec<AnimeSearchResult>> {
         let type_param = kind.map(|t| format!("&type={t}")).unwrap_or_default();
-        self.anime_list(&format!(
-            "{}/top/anime?page={page}&limit=25{type_param}",
-            self.base
-        ))
-        .await
+        let jikan = self
+            .anime_list(&format!(
+                "{}/top/anime?page={page}&limit=25{type_param}",
+                self.base
+            ))
+            .await;
+        self.or_anilist(jikan, |a| a.top_anime(page, kind)).await
     }
 
     /// Currently airing anime (`/seasons/now`).
     pub async fn airing_anime(&self, page: u32) -> Result<Vec<AnimeSearchResult>> {
-        self.anime_list(&format!("{}/seasons/now?page={page}&limit=25", self.base))
-            .await
+        let jikan = self
+            .anime_list(&format!("{}/seasons/now?page={page}&limit=25", self.base))
+            .await;
+        self.or_anilist(jikan, |a| a.airing_anime(page)).await
     }
 
     /// Anime for a year and season ("winter" | "spring" | "summer" | "fall").
@@ -554,13 +589,15 @@ impl JikanClient {
             (Some(y), Some(s)) => format!("{y}/{s}"),
             _ => "now".to_string(),
         };
-        let items = self
+        let jikan = self
             .anime_list(&format!(
                 "{}/seasons/{path}?page={page}&limit=25",
                 self.base
             ))
-            .await?;
-        Ok(dedupe_by_id(items, |a| a.id.as_str()))
+            .await
+            .map(|items| dedupe_by_id(items, |a| a.id.as_str()));
+        self.or_anilist(jikan, |a| a.season_anime(year, season, page))
+            .await
     }
 
     /// Airing schedule for one weekday.
@@ -582,11 +619,13 @@ impl JikanClient {
 
     /// Upcoming anime (`/seasons/upcoming`).
     pub async fn upcoming_anime(&self, page: u32) -> Result<Vec<AnimeSearchResult>> {
-        self.anime_list(&format!(
-            "{}/seasons/upcoming?page={page}&limit=25",
-            self.base
-        ))
-        .await
+        let jikan = self
+            .anime_list(&format!(
+                "{}/seasons/upcoming?page={page}&limit=25",
+                self.base
+            ))
+            .await;
+        self.or_anilist(jikan, |a| a.upcoming_anime(page)).await
     }
 
     /// Search by title, sorted by score. `kind`: "tv" | "movie" | None.
@@ -598,11 +637,14 @@ impl JikanClient {
     ) -> Result<Vec<AnimeSearchResult>> {
         let type_param = kind.map(|t| format!("&type={t}")).unwrap_or_default();
         let q = crate::util::encode_uri_component(query);
-        self.anime_list(&format!(
-            "{}/anime?q={q}&page={page}&limit=25&order_by=score&sort=desc{type_param}",
-            self.base
-        ))
-        .await
+        let jikan = self
+            .anime_list(&format!(
+                "{}/anime?q={q}&page={page}&limit=25&order_by=score&sort=desc{type_param}",
+                self.base
+            ))
+            .await;
+        self.or_anilist(jikan, |a| a.search_anime(query, page, kind))
+            .await
     }
 
     /// Anime for one genre id, sorted by score.
@@ -613,11 +655,14 @@ impl JikanClient {
         kind: Option<&str>,
     ) -> Result<Vec<AnimeSearchResult>> {
         let type_param = kind.map(|t| format!("&type={t}")).unwrap_or_default();
-        self.anime_list(&format!(
-            "{}/anime?genres={genre_id}&page={page}&limit=25&order_by=score&sort=desc{type_param}",
-            self.base
-        ))
-        .await
+        let jikan = self
+            .anime_list(&format!(
+                "{}/anime?genres={genre_id}&page={page}&limit=25&order_by=score&sort=desc{type_param}",
+                self.base
+            ))
+            .await;
+        self.or_anilist(jikan, |a| a.anime_by_genre(genre_id, page, kind))
+            .await
     }
 
     /// Full anime genre list.
@@ -643,28 +688,32 @@ impl JikanClient {
 
     /// Full details for one MAL id (`/anime/{id}/full`).
     pub async fn anime_details(&self, mal_id: &str) -> Result<AnimeSearchResult> {
-        let env: Envelope<JikanAnime> = self
-            .fetch_json(&format!("{}/anime/{mal_id}/full", self.base))
-            .await?;
-        env.data
-            .map(|item| map_anime(&item))
-            .ok_or_else(|| MediaError::NotFound(format!("anime {mal_id}")))
+        let jikan = self
+            .fetch_json::<Envelope<JikanAnime>>(&format!("{}/anime/{mal_id}/full", self.base))
+            .await;
+        match jikan {
+            Ok(Envelope { data: Some(item) }) => Ok(map_anime(&item)),
+            _ => AniListClient::shared()?.anime_details(mal_id).await,
+        }
     }
 
     /// Episode list for one MAL id, one page at a time.
     pub async fn anime_episodes(&self, mal_id: &str, page: u32) -> Result<Vec<AnimeEpisode>> {
-        let env: Envelope<Vec<JikanEpisode>> = self
-            .fetch_json(&format!(
+        let jikan = self
+            .fetch_json::<Envelope<Vec<JikanEpisode>>>(&format!(
                 "{}/anime/{mal_id}/episodes?page={page}",
                 self.base
             ))
-            .await?;
-        Ok(env
-            .data
-            .unwrap_or_default()
-            .iter()
-            .map(|ep| map_episode(mal_id, ep))
-            .collect())
+            .await
+            .map(|env| {
+                env.data
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|ep| map_episode(mal_id, ep))
+                    .collect()
+            });
+        self.or_anilist(jikan, |a| a.anime_episodes(mal_id, page))
+            .await
     }
 
     /// Related entries (sequels, prequels, side stories) for one MAL id.
@@ -701,7 +750,7 @@ impl JikanClient {
         {
             return hit.clone();
         }
-        let url = format!("{ARM_URL}?source=myanimelist&id={mal_id}");
+        let url = format!("{ARM_URL}?source=myanimelist&id={mal_id}&include=imdb");
         let imdb = self
             .fetch_json::<ArmIds>(&url)
             .await
@@ -806,6 +855,31 @@ mod tests {
             limiter.acquire().await;
             assert!(start.elapsed() >= Duration::from_millis(100));
         });
+    }
+
+    /// With Jikan unreachable, calls should land on AniList and only the first should pay Jikan's timeout.
+    /// Run: `cargo test -p mv-media --lib -- --ignored jikan_falls_back_live --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn jikan_falls_back_live() {
+        let c = JikanClient::new().unwrap();
+        let start = Instant::now();
+        let top = c.top_anime(1, None).await.unwrap();
+        println!("top: {} items in {:?}", top.len(), start.elapsed());
+        let start = Instant::now();
+        let (airing, season) = tokio::join!(c.airing_anime(1), c.season_anime(None, None, 1));
+        let details = c.anime_details(&top[0].id).await.unwrap();
+        let eps = c.anime_episodes(&top[0].id, 1).await.unwrap();
+        println!(
+            "airing {} season {} details {:?} eps {} in {:?} (breaker available: {})",
+            airing.unwrap().len(),
+            season.unwrap().len(),
+            details.title,
+            eps.len(),
+            start.elapsed(),
+            c.is_available()
+        );
+        assert!(!top.is_empty() && !eps.is_empty());
     }
 
     #[test]

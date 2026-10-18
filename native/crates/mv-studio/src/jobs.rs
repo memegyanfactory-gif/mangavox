@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{broadcast, Notify};
 
-use crate::bridge::{run_worker, CancelToken, WorkerMessage, WorkerSpec};
+use crate::bridge::{run_worker_logged, CancelToken, WorkerMessage, WorkerSpec};
 use crate::error::StudioError;
 use crate::python::{configured_python, discover_python, PythonInterpreter, PythonLayout};
 
@@ -353,6 +353,12 @@ pub enum JobEvent {
         key: String,
         message: WorkerMessage,
     },
+    /// A non-protocol output line from the running worker (stderr, library logging).
+    Log {
+        id: u64,
+        key: String,
+        line: String,
+    },
     Finished {
         id: u64,
         key: String,
@@ -575,19 +581,30 @@ async fn execute(
         cwd: shared.layout.dir.clone(),
         strict_errors: payload.strict_errors(),
     };
-    let report = run_worker(&spec, token, |message| {
-        {
-            let mut st = shared.lock();
-            if let Some(job) = st.jobs.iter_mut().find(|j| j.id == id) {
-                job.last_message = Some(message.clone());
+    let report = run_worker_logged(
+        &spec,
+        token,
+        |message| {
+            {
+                let mut st = shared.lock();
+                if let Some(job) = st.jobs.iter_mut().find(|j| j.id == id) {
+                    job.last_message = Some(message.clone());
+                }
             }
-        }
-        shared.emit(JobEvent::Message {
-            id,
-            key: key.to_string(),
-            message: message.clone(),
-        });
-    })
+            shared.emit(JobEvent::Message {
+                id,
+                key: key.to_string(),
+                message: message.clone(),
+            });
+        },
+        |line| {
+            shared.emit(JobEvent::Log {
+                id,
+                key: key.to_string(),
+                line: line.to_string(),
+            });
+        },
+    )
     .await?;
     Ok(report.outputs)
 }
@@ -797,7 +814,7 @@ mod tests {
                     );
                     finished.push(id);
                 }
-                JobEvent::Message { .. } => {}
+                JobEvent::Message { .. } | JobEvent::Log { .. } => {}
             }
         }
         assert_eq!(started, ids);

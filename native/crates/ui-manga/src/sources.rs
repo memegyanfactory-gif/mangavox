@@ -32,12 +32,25 @@ pub struct SourcesPanel {
     input: Entity<InputState>,
     installing: bool,
     note: Option<(bool, String)>,
+    /// Preferred chapter language (manga pages show only chapters in it, when there are any).
+    lang: String,
 }
+
+const LANGUAGES: [(&str, &str); 8] = [
+    ("en", "English"),
+    ("es", "Spanish"),
+    ("pt", "Portuguese"),
+    ("fr", "French"),
+    ("id", "Indonesian"),
+    ("ru", "Russian"),
+    ("ja", "Japanese"),
+    ("all", "All languages"),
+];
 
 impl SourcesPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Plugin URL (GitHub repo or manifest.json)"));
-        let mut p = Self { rows: None, disabled: backend::disabled_sources(), input, installing: false, note: None };
+        let mut p = Self { rows: None, disabled: backend::disabled_sources(), input, installing: false, note: None, lang: backend::preferred_language() };
         p.reload(false, cx);
         p
     }
@@ -221,6 +234,28 @@ impl Render for SourcesPanel {
             .flex_col()
             .gap(px(16.))
             .child(div().text_size(px(size::XL)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Sources"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .p(px(12.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(Tokens::border())
+                    .bg(Tokens::surface())
+                    .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child("Chapter language"))
+                    .child(muted("Manga pages list chapters in this language. Titles without any fall back to every language."))
+                    .child(div().flex().flex_wrap().gap(px(6.)).children(LANGUAGES.map(|(code, name)| {
+                        let active = crate::logic::lang_matches(&self.lang, code) && (code == "all") == (self.lang == "all");
+                        chip(SharedString::from(format!("lang-{code}")), name, active).on_click(cx.listener(move |this, _, _, cx| {
+                            this.lang = code.to_string();
+                            backend::set_config_str("chapterLanguage", code);
+                            backend::bump_data();
+                            cx.notify();
+                        }))
+                    }))),
+            )
             .child(
                 div()
                     .flex()

@@ -27,16 +27,23 @@ if not os.path.exists(TTS_WORKER):
     if os.path.exists(alt):
         TTS_WORKER = alt
 
+def _venv_python(venv_dir):
+    """Interpreter inside a venv (Scripts/python.exe on Windows, bin/python3 elsewhere)."""
+    if os.name == "nt":
+        return os.path.join(venv_dir, "Scripts", "python.exe")
+    return os.path.join(venv_dir, "bin", "python3")
+
+
 # Find the correct Python with TTS dependencies (kokoro, soundfile, numpy)
 # The AURA VOICE venv has these installed — system Python does NOT
 def _find_tts_python():
     tts_dir = os.path.dirname(TTS_WORKER) if os.path.exists(TTS_WORKER) else os.path.expanduser("~/Documents/VS CODE/TTS software")
     # Check for venv inside aura_voice/
-    venv_python = os.path.join(tts_dir, "aura_voice", "venv", "bin", "python3")
+    venv_python = _venv_python(os.path.join(tts_dir, "aura_voice", "venv"))
     if os.path.exists(venv_python):
         return venv_python
     # Check for venv at TTS software root
-    venv_python2 = os.path.join(tts_dir, "venv", "bin", "python3")
+    venv_python2 = _venv_python(os.path.join(tts_dir, "venv"))
     if os.path.exists(venv_python2):
         return venv_python2
     # Last resort: current Python (likely won't have deps)
@@ -56,7 +63,7 @@ _HINDI_VOICE_IDS = frozenset({
     "hi-lekha", "hi-female", "hi-male", "hi-male-aman", "hi-male-deep",
 })
 
-_TTS_VENV_PYTHON = os.path.join(os.path.expanduser("~"), ".mangavox", "tts-venv", "bin", "python3")
+_TTS_VENV_PYTHON = _venv_python(os.path.join(os.path.expanduser("~"), ".mangavox", "tts-venv"))
 
 
 def _tts_subprocess_python() -> str:

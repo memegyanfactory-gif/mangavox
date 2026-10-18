@@ -1,0 +1,18 @@
+[package]
+name = "ui-studio"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+mv-ui = { path = "../mv-ui" }
+mv-core = { path = "../mv-core" }
+mv-studio = { path = "../mv-studio" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

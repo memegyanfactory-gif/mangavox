@@ -1,10 +1,12 @@
 //! Non-UI IO for the player: torrent engine, resume/progress persistence, skip times, subtitles.
 //! Everything here is `Send` and meant to run through `mv_ui::bg`.
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
 use mv_core::repo::media::{self, MediaEvent, MediaTitle};
+use mv_media::addons::AddonRegistry;
+use mv_media::stream_utils::{has_playable_link, stream_resource_id};
 use mv_media::stremio::StremioClient;
 use mv_media::types::{SkipSegment, StremioSubtitle};
 use mv_torrent::{AddOptions, Engine, EngineConfig};
@@ -157,4 +159,35 @@ pub async fn subtitles(imdb: String, season: Option<u32>, episode: Option<u32>) 
     let mut subs = client.fetch_subtitles(SUBTITLES_ENDPOINT, &id, kind).await?;
     subs.truncate(24);
     Ok(subs)
+}
+
+/// Whether `next_episode` can look anything up for this request.
+pub fn has_next(req: &PlayRequest) -> bool {
+    req.episode.is_some() && (req.imdb_id.as_deref().is_some_and(|s| !s.is_empty()) || req.mal_id.is_some())
+}
+
+/// The following episode's request, using the first playable stream from installed addons.
+pub async fn next_episode(req: PlayRequest) -> Result<PlayRequest> {
+    static REG: OnceLock<AddonRegistry> = OnceLock::new();
+    let ep = req.episode.ok_or_else(|| anyhow!("No episode number"))?;
+    let imdb = match req.imdb_id.clone().filter(|s| !s.is_empty()) {
+        Some(i) => i,
+        None => {
+            let mal = req.mal_id.clone().ok_or_else(|| anyhow!("No title id"))?;
+            mv_media::jikan::JikanClient::shared()?.imdb_id(&mal).await.ok_or_else(|| anyhow!("This title has no IMDb mapping"))?
+        }
+    };
+    let rid = stream_resource_id(&imdb, false, req.season.unwrap_or(1), ep + 1).ok_or_else(|| anyhow!("Invalid title id"))?;
+    let reg = REG.get_or_init(|| AddonRegistry::open(mv_core::paths::root().join("addons")));
+    let streams = reg.find_streams(&rid, "series").await;
+    let s = streams.iter().find(|s| has_playable_link(s)).ok_or_else(|| anyhow!("No sources found for episode {}", ep + 1))?;
+    Ok(PlayRequest {
+        title: logic::next_title(&req.title, ep),
+        source: logic::playable_source(&s.info_hash),
+        file_idx: s.file_idx.map(|i| i as usize),
+        imdb_id: Some(imdb),
+        mal_id: req.mal_id,
+        season: req.season,
+        episode: Some(ep + 1),
+    })
 }

@@ -309,3 +309,91 @@ pub fn resolve_covers(urls: impl IntoIterator<Item = (String, Option<String>)>) 
     }
     (have, missing)
 }
+
+// ---------------------------------------------------------------- reading preferences
+
+const LANG_KEY: &str = "chapterLanguage";
+
+/// Preferred chapter language (ISO code, default "en"; "all" disables the filter).
+pub fn preferred_language() -> String {
+    mv_core::config::Config::open_default()
+        .get(LANG_KEY)
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "en".into())
+}
+
+pub fn config_str(key: &str) -> Option<String> {
+    mv_core::config::Config::open_default().get(key).and_then(|v| v.as_str().map(str::to_string))
+}
+
+pub fn set_config_str(key: &str, value: &str) {
+    let _ = mv_core::config::Config::open_default().set(key, serde_json::json!(value));
+}
+
+// ---------------------------------------------------------------- change tracking
+
+static DATA_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped whenever reading progress, read state or library membership changes, so pages that are
+/// kept alive in history (Library, History, Detail, Browse) can reload when they are shown again.
+pub fn data_version() -> u64 {
+    DATA_VERSION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn bump_data() {
+    DATA_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------- library membership
+
+const BROWSE_ONLY_KEY: &str = "mangaBrowseOnly";
+
+/// Titles that exist in the database only because they were opened from Browse (not added to the
+/// library). Kept in the config so the shared database schema stays untouched.
+pub fn browse_only() -> HashSet<String> {
+    mv_core::config::Config::open_default()
+        .get(BROWSE_ONLY_KEY)
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+pub fn set_in_library(manga_id: &str, in_library: bool) {
+    let mut set = browse_only();
+    let changed = if in_library { set.remove(manga_id) } else { set.insert(manga_id.to_string()) };
+    if changed {
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        let _ = mv_core::config::Config::open_default().set(BROWSE_ONLY_KEY, serde_json::json!(v));
+        bump_data();
+    }
+}
+
+// ---------------------------------------------------------------- chapter extras
+
+/// Scanlation group and upload date per chapter (`source_id` -> extras). The database has no
+/// columns for these, so they live for the session, filled whenever a chapter list is fetched.
+#[derive(Clone, Default, Debug)]
+pub struct ChapterExtra {
+    pub group: Option<String>,
+    pub date: Option<String>,
+}
+
+static EXTRAS: Mutex<Option<std::collections::HashMap<String, std::collections::HashMap<String, ChapterExtra>>>> = Mutex::new(None);
+
+pub fn store_extras(manga_id: &str, chapters: &[ChapterInfo]) {
+    let map = chapters
+        .iter()
+        .map(|c| {
+            let date = c.published_at.as_deref().map(|d| d.chars().take(10).collect::<String>()).filter(|d| !d.is_empty());
+            (c.source_id.clone(), ChapterExtra { group: c.scanlation_group.clone().filter(|g| !g.is_empty()), date })
+        })
+        .collect();
+    EXTRAS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(manga_id.to_string(), map);
+}
+
+pub fn extras(manga_id: &str) -> Option<std::collections::HashMap<String, ChapterExtra>> {
+    EXTRAS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(manga_id).cloned())
+}

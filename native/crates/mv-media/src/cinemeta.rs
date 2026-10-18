@@ -12,7 +12,8 @@ use serde_json::Value;
 use crate::error::{MediaError, Result};
 use crate::types::{AnimeEpisode, AnimeSearchResult};
 use crate::util::{
-    encode_uri_component, first_four_digits, str_field, value_to_f64, value_to_string,
+    encode_uri_component, first_four_digits, parse_leading_int, str_field, value_to_f64,
+    value_to_string,
 };
 
 pub const CINEMETA_BASE: &str = "https://v3-cinemeta.strem.io";
@@ -69,8 +70,25 @@ fn map_meta(m: &Value) -> AnimeSearchResult {
         anime_type: Some(if is_movie { "Movie" } else { "TV" }.to_string()),
         score: value_to_f64(m.get("imdbRating")).filter(|&s| s != 0.0),
         status: str_field(m, "releaseInfo"),
+        logo_url: str_field(m, "logo"),
+        duration_minutes: str_field(m, "runtime").as_deref().and_then(runtime_minutes),
+        cast: Some(string_array(m.get("cast"))).filter(|c| !c.is_empty()),
+        directors: Some(string_array(m.get("director"))).filter(|d| !d.is_empty()),
         ..Default::default()
     }
+}
+
+/// Cinemeta `runtime` ("148 min", "2h 28min", "45") to minutes.
+fn runtime_minutes(s: &str) -> Option<u32> {
+    let s = s.to_ascii_lowercase();
+    let minutes = match s.split_once('h') {
+        Some((h, rest)) => {
+            let hours = parse_leading_int(h)?;
+            hours * 60 + parse_leading_int(rest).unwrap_or(0)
+        }
+        None => parse_leading_int(&s)?,
+    };
+    u32::try_from(minutes).ok().filter(|&m| m > 0)
 }
 
 /// Map an IMDB suggestion entry (`searchMovies`, first source).
@@ -419,6 +437,24 @@ mod tests {
             .genres
             .as_ref()
             .is_some_and(|g| g.contains(&"Sci-Fi".to_string())));
+        assert_eq!(
+            m.logo_url.as_deref(),
+            Some("https://images.metahub.space/logo/medium/tt1375666/img")
+        );
+        assert_eq!(m.duration_minutes, Some(148));
+        assert!(m
+            .cast
+            .as_ref()
+            .is_some_and(|c| c.contains(&"Leonardo DiCaprio".to_string())));
+        assert_eq!(m.directors, Some(vec!["Christopher Nolan".to_string()]));
+    }
+
+    #[test]
+    fn runtime_strings_to_minutes() {
+        assert_eq!(runtime_minutes("148 min"), Some(148));
+        assert_eq!(runtime_minutes("2h 28min"), Some(148));
+        assert_eq!(runtime_minutes("45"), Some(45));
+        assert_eq!(runtime_minutes("N/A"), None);
     }
 
     #[test]
