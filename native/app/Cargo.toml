@@ -1,0 +1,21 @@
+[package]
+name = "mangavox"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+anyhow = { workspace = true }
+mv-ui = { path = "../crates/mv-ui" }
+ui-manga = { path = "../crates/ui-manga" }
+ui-media = { path = "../crates/ui-media" }
+ui-player = { path = "../crates/ui-player" }
+ui-assistant = { path = "../crates/ui-assistant" }
+ui-settings = { path = "../crates/ui-settings" }
+mv-net = { path = "../crates/mv-net" }
+mv-sources = { path = "../crates/mv-sources" }
+mv-webwall = { path = "../crates/mv-webwall" }
+reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.9" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

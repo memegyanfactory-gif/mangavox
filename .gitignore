@@ -1,0 +1,20 @@
+node_modules/
+out/
+dist/
+*.dmg
+*.app
+.DS_Store
+.codex-agent/
+.kodex-agent/
+.continue/
+__pycache__/
+*.pyc
+
+# macOS resource-fork files
+._*
+
+# Local model weights bundled by scripts/bundleDefaultChatModel.js (multi-GB)
+resources/models/
+.playwright-mcp/
+native/target/
+target/

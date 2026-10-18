@@ -1,0 +1,6 @@
+paddlepaddle
+paddleocr
+manga-ocr
+opencv-python-headless
+Pillow
+numpy

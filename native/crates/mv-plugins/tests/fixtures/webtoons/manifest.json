@@ -1,0 +1,8 @@
+{
+  "id": "webtoons",
+  "name": "WEBTOON",
+  "version": "1.0.0",
+  "base_url": "https://www.webtoons.com",
+  "lang": "en",
+  "entry_point": "index.js"
+}

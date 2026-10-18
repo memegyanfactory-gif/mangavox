@@ -1,0 +1,18 @@
+[package]
+name = "ui-player"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+mv-ui = { path = "../mv-ui" }
+mv-torrent = { path = "../mv-torrent" }
+mv-media = { path = "../mv-media" }
+mv-core = { path = "../mv-core" }
+anyhow = { workspace = true }
+libloading = "0.8"
+raw-window-handle = "0.6"
+tokio = { version = "1", features = ["sync"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }

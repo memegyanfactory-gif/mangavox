@@ -1,0 +1,10 @@
+[package]
+name = "mv-ui"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"
+anyhow = { workspace = true }

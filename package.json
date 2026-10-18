@@ -1,0 +1,129 @@
+{
+  "name": "mangavox",
+  "productName": "MangaVox",
+  "version": "7.23.0",
+  "description": "Manga-to-Voice Platform — browse, read, and convert manga to audio/video",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "node scripts/dev.js",
+    "build": "electron-vite build",
+    "bundle:chat-model": "node scripts/bundleDefaultChatModel.js",
+    "preview": "electron-vite preview",
+    "rebuild": "electron-rebuild",
+    "package:mac": "npm run bundle:chat-model && electron-vite build && electron-rebuild && electron-builder --mac",
+    "package:win": "npm run bundle:chat-model && electron-vite build && electron-rebuild && electron-builder --win",
+    "package": "npm run bundle:chat-model && electron-vite build && electron-rebuild && electron-builder --mac --win",
+    "typecheck": "tsc --noEmit",
+    "debug:status": "node scripts/mv.js status",
+    "debug:logs": "node scripts/mv.js logs",
+    "test:sources": "node scripts/test-sources.js",
+    "test": "node --experimental-strip-types --test tests/model-catalog.test.ts tests/media-intelligence.test.ts tests/playback-utils.test.ts tests/player-subtitles.test.ts tests/stream-match.test.ts tests/deep-research-html.test.ts tests/anime-addons.test.ts tests/assistant.test.ts && python3 -m unittest tests/test_scene_narrator.py",
+    "release": "electron-vite build && electron-builder --publish always"
+  },
+  "build": {
+    "appId": "com.mangavox.app",
+    "productName": "MangaVox",
+    "afterPack": "./scripts/afterPack.js",
+    "asar": true,
+    "asarUnpack": [
+      "**/*.node",
+      "**/better-sqlite3/**",
+      "**/node_modules/better-sqlite3/**"
+    ],
+    "npmRebuild": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "resources/**/*",
+      "!resources/models/**/*",
+      "python/**/*",
+      "node_modules/**/*",
+      "!node_modules/*/{CHANGELOG.md,README.md,readme.md,readme}",
+      "!node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
+      "!node_modules/.cache"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "resources"
+      },
+      {
+        "from": "python",
+        "to": "python"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.entertainment",
+      "icon": "resources/icon.icns",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "hardenedRuntime": false,
+      "darkModeSupport": true,
+      "identity": null
+    },
+    "win": {
+      "icon": "resources/icon.png",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "dmg": {
+      "title": "MangaVox",
+      "icon": "resources/icon.icns"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "memegyanfactory-gif",
+        "repo": "mangavox",
+        "releaseType": "draft"
+      }
+    ]
+  },
+  "keywords": [
+    "manga",
+    "tts",
+    "audiobook",
+    "electron"
+  ],
+  "author": "Aayush Datta",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "electron-updater": "^6.8.9",
+    "electron-vite": "^5.0.0",
+    "framer-motion": "^12.38.0",
+    "lucide-react": "^1.0.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "uuid": "^11.1.0",
+    "webtorrent": "^1.9.7",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/uuid": "^10.0.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "^28.3.3",
+    "electron-builder": "^26.8.1",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/memegyanfactory-gif/mangavox.git"
+  }
+}

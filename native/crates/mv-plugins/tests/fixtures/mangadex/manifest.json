@@ -1,0 +1,8 @@
+{
+  "id": "mangadex",
+  "name": "MangaDex",
+  "version": "1.0.0",
+  "base_url": "https://api.mangadex.org",
+  "lang": "en",
+  "entry_point": "index.js"
+}

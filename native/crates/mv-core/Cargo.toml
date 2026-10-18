@@ -1,0 +1,18 @@
+[package]
+name = "mv-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true, features = ["backup"] }
+dirs = { workspace = true }
+md5 = "0.8"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,13 @@
+[package]
+name = "ui-media"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+mv-ui = { path = "../mv-ui" }
+mv-media = { path = "../mv-media" }
+mv-core = { path = "../mv-core" }
+anyhow = { workspace = true }
+rusqlite = { workspace = true }
+futures = "0.3"

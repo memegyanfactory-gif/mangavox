@@ -1,0 +1,24 @@
+# Enhanced local Hindi + English TTS with multiple state-of-the-art engines
+# 1. F5-TTS (Recommended) — State-of-the-art, most natural, ~1.5 GB
+# 2. Parler-TTS — Fast, controllable, excellent quality, ~1 GB
+# 3. XTTS v2 (Optional) — ElevenLabs-class, voice cloning, ~2 GB
+# 4. Kokoro-82M — Small, efficient, ~310 MB
+# 5. Piper — Standard, reliable, Python 3.9+
+
+# State-of-the-art engines
+f5-tts>=0.2.0
+parler-tts>=1.2.0
+
+# Traditional/Fallback engines
+kokoro-onnx>=0.4.0
+piper-tts>=1.3.0
+
+# Common dependencies
+soundfile>=0.12.0
+numpy>=2.0.0
+torch>=2.0.0
+torchaudio>=2.0.0
+onnxruntime>=1.19.0,<2
+transformers>=4.40.0
+librosa>=0.10.0
+einops>=0.8.0

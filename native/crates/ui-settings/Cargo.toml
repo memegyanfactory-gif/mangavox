@@ -1,0 +1,15 @@
+[package]
+name = "ui-settings"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+mv-ui = { path = "../mv-ui" }
+mv-core = { path = "../mv-core" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
+ui-assistant = { path = "../ui-assistant" }
+ui-manga = { path = "../ui-manga" }
+ui-media = { path = "../ui-media" }

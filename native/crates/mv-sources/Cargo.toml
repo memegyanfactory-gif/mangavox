@@ -1,0 +1,19 @@
+[package]
+name = "mv-sources"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mv-net = { path = "../mv-net" }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+scraper = "0.23"
+regex = "1"
+thiserror = "1"
+percent-encoding = "2"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
