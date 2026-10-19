@@ -34,6 +34,8 @@ jobs:
         with:
           workspaces: native -> target
 
+      # Build numbers: Cargo.toml holds the series start (8.0.5001); every push to main releases
+      # the latest tag + 1 (8.0.5002, 8.0.5003, ...). Raise Cargo.toml above the latest tag to start a new series.
       - name: Compute next version
         id: ver
         shell: pwsh
