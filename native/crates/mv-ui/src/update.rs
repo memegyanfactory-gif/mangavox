@@ -123,12 +123,12 @@ impl Updater {
     /// Downloads the release, swaps it in after the app exits and restarts.
     pub fn install(&mut self, cx: &mut Context<Self>) {
         let Status::Available(release) = self.status.clone() else { return };
-        let Some(dir) = mv_update::install_dir() else {
-            self.status = Status::Failed("This is a development build. Install MangaVox with the setup exe to get automatic updates.".into());
-            self.prompt = false;
-            return cx.notify();
+        // A development build (run from `target\`) installs the release into the normal
+        // per-user folder instead, with shortcuts, and starts that copy.
+        let (dir, fresh) = match mv_update::install_dir() {
+            Some(d) => (d, false),
+            None => (mv_update::default_install_dir(), true),
         };
-        self.prompt = false;
         self.progress.store(0, Ordering::Relaxed);
         self.status = Status::Downloading(release.clone());
         cx.notify();
@@ -147,13 +147,24 @@ impl Updater {
         .detach();
         cx.spawn(async move |this, cx| {
             let r = release.clone();
+            let dir2 = dir.clone();
             let res = crate::bg::run(async move {
-                mv_update::prepare(&r, move |done, total| {
+                let staged = mv_update::prepare(&r, move |done, total| {
                     if total > 0 {
                         progress.store(((done as f64 / total as f64) * 1000.0) as u32, Ordering::Relaxed);
                     }
                 })
-                .await
+                .await?;
+                if fresh {
+                    let (d, v) = (dir2, r.version.clone());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = std::fs::create_dir_all(&d);
+                        let _ = mv_update::create_shortcuts(&d);
+                        let _ = mv_update::register_uninstall(&d, &v);
+                    })
+                    .await;
+                }
+                anyhow::Ok(staged)
             })
             .await
             .and_then(|r| r);
@@ -191,6 +202,18 @@ pub fn badge(collapsed: bool, cx: &mut App) -> AnyElement {
         Status::Idle | Status::UpToDate => ("icons/circle-check.svg", format!("MangaVox v{}", version()), Tokens::text_3()),
     };
     let available = matches!(st, Status::Available(_));
+    // Collapsed sidebar: icon only, green while an update is available or downloading.
+    let (ic, color) = match &st {
+        Status::Available(_) if collapsed => ("icons/circle-arrow-up.svg", Tokens::accent()),
+        Status::Failed(_) if collapsed => ("icons/circle-alert.svg", Tokens::danger()),
+        _ => (ic, color),
+    };
+    let tip: SharedString = match &st {
+        Status::Available(r) => format!("MangaVox v{} is available. Click to download and restart.", r.version).into(),
+        Status::Downloading(_) => format!("Downloading update · {}%", (pct * 100.).round() as i32).into(),
+        Status::Failed(e) => e.clone().into(),
+        _ => label.clone().into(),
+    };
     let u2 = u.clone();
     div()
         .id("update-badge")
@@ -203,30 +226,31 @@ pub fn badge(collapsed: bool, cx: &mut App) -> AnyElement {
         .cursor_pointer()
         .text_size(px(size::XS))
         .text_color(color)
-        .when(available, |d| d.bg(Tokens::accent_soft()))
+        .when(available || (collapsed && matches!(st, Status::Downloading(_))), |d| d.bg(Tokens::accent_soft()))
+        .when(collapsed, |d| d.justify_center().size(px(32.)).px_0().rounded(px(8.)).tooltip(move |w, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(w, cx)))
         .hover(|s| s.bg(Tokens::hover()))
-        .child(icon(ic, color, 13.))
+        .child(icon(ic, color, if collapsed { 16. } else { 13. }))
         .when(!collapsed, |d| d.child(label))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
-            u2.update(cx, |u, cx| u.click(cx));
+            // Collapsed there is no room for the prompt card: the icon downloads straight away.
+            u2.update(cx, |u, cx| if collapsed && matches!(u.status, Status::Available(_)) { u.install(cx) } else { u.click(cx) });
         })
         .into_any_element()
 }
 
-/// The "update available" prompt, shown above the sidebar footer while open.
+/// The update card above the sidebar footer: offer, download progress, or what went wrong.
 pub fn prompt(cx: &mut App) -> Option<AnyElement> {
     let u = updater(cx);
-    let (open, st) = {
+    let (open, st, pct) = {
         let r = u.read(cx);
-        (r.prompt, r.status.clone())
+        (r.prompt, r.status.clone(), r.progress())
     };
-    let Status::Available(release) = st else { return None };
     if !open {
         return None;
     }
     let (a, b) = (u.clone(), u.clone());
-    Some(
+    let card = |title: SharedString, ic: &'static str, color: Rgba| {
         div()
             .flex()
             .flex_col()
@@ -235,22 +259,34 @@ pub fn prompt(cx: &mut App) -> Option<AnyElement> {
             .rounded(px(10.))
             .bg(Tokens::surface())
             .border_1()
-            .border_color(Tokens::accent())
-            .child(div().flex().items_center().gap(px(6.)).child(icon("icons/circle-arrow-up.svg", Tokens::accent(), 14.)).child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).child("Update available")))
-            .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!(
-                "MangaVox v{} is out (you have v{}). Download it now? The app restarts by itself when it's done.",
-                release.version,
-                version()
-            )))
+            .border_color(color)
+            .child(div().flex().items_center().gap(px(6.)).child(icon(ic, color, 14.)).child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).child(title)))
+    };
+    let text = |t: String| div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(t);
+    let el = match st {
+        Status::Available(release) => card("Update available".into(), "icons/circle-arrow-up.svg", Tokens::accent())
+            .child(text(format!("MangaVox v{} is out (you have v{}). Download it now? The app restarts by itself when it's done.", release.version, version())))
             .child(
                 div()
                     .flex()
                     .gap(px(6.))
                     .child(small_btn("update-later", "Later", false).on_click(move |_, _, cx| a.update(cx, |u, cx| u.dismiss(cx))))
                     .child(small_btn("update-now", "Download", true).on_click(move |_, _, cx| b.update(cx, |u, cx| u.install(cx)))),
-            )
-            .into_any_element(),
-    )
+            ),
+        Status::Downloading(release) => card(format!("Downloading v{}", release.version).into(), "icons/download.svg", Tokens::accent())
+            .child(div().w_full().h(px(4.)).rounded_full().bg(Tokens::active()).child(div().h_full().rounded_full().bg(Tokens::accent()).w(relative(pct))))
+            .child(text(format!("{}% · MangaVox restarts when it's done.", (pct * 100.).round() as i32))),
+        Status::Installing(release) => card(format!("Installing v{}", release.version).into(), "icons/loader-circle.svg", Tokens::accent()).child(text("Restarting MangaVox…".into())),
+        Status::Failed(e) => card("Update failed".into(), "icons/circle-alert.svg", Tokens::danger()).child(text(e)).child(
+            div()
+                .flex()
+                .gap(px(6.))
+                .child(small_btn("update-close", "Close", false).on_click(move |_, _, cx| a.update(cx, |u, cx| u.dismiss(cx))))
+                .child(small_btn("update-retry", "Try again", true).on_click(move |_, _, cx| b.update(cx, |u, cx| u.check(true, true, cx)))),
+        ),
+        _ => return None,
+    };
+    Some(el.into_any_element())
 }
 
 /// Settings → About: version, author, and the same update flow.

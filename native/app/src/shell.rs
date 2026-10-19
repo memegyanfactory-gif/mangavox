@@ -449,7 +449,8 @@ impl Shell {
             .child(div().flex().flex_col().gap(px(1.)).children(items))
             .children(studio_group)
             .child(div().flex_1())
-            .children(mv_ui::update::prompt(cx))
+            // Collapsed, the footer badge turns into a green update icon instead of the card.
+            .when(!collapsed, |d| d.children(mv_ui::update::prompt(cx)))
             .child(
                 div()
                     .flex()
