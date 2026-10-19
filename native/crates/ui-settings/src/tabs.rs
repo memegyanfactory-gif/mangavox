@@ -291,7 +291,7 @@ impl SettingsView {
                 ),
         ));
 
-        div().flex().flex_col().gap(px(20.)).child(folders).child(cache)
+        div().flex().flex_col().gap(px(20.)).child(self.storage_mgr.clone()).child(folders).child(cache)
     }
 
     pub(crate) fn render_about(&self, cx: &mut Context<Self>) -> Div {

@@ -268,18 +268,13 @@ pub fn save_mode(mode: &str) -> Result<()> {
     config().set("app.mode", json!(mode))
 }
 
-/// Default download folder for a storage kind (mirrors src/main/services/app-paths.ts).
+/// Default download folder for a storage kind: `library/<kind>` in the data folder.
 pub fn storage_default(kind: &str) -> PathBuf {
-    if kind == "manga" {
-        return mv_core::paths::root().join("library");
+    match kind {
+        "manga" => mv_core::paths::manga_downloads(),
+        "anime" | "movies" => mv_core::paths::library().join(kind),
+        _ => mv_core::paths::library().join("subtitles"),
     }
-    let videos = dirs::video_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Videos"));
-    let sub = match kind {
-        "anime" => "Anime",
-        "movies" => "Movies",
-        _ => "Subtitles",
-    };
-    videos.join("MangaVox").join(sub)
 }
 
 /// Sets a custom folder for a kind. An empty path resets to the default. Returns the stored value.

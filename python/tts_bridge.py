@@ -63,7 +63,7 @@ _HINDI_VOICE_IDS = frozenset({
     "hi-lekha", "hi-female", "hi-male", "hi-male-aman", "hi-male-deep",
 })
 
-_TTS_VENV_PYTHON = _venv_python(os.path.join(os.path.expanduser("~"), ".mangavox", "tts-venv"))
+_TTS_VENV_PYTHON = _venv_python(os.path.join(os.environ.get("MANGAVOX_DATA") or os.path.join(os.path.expanduser("~"), ".mangavox"), "tts-venv"))
 
 
 def _tts_subprocess_python() -> str:
@@ -411,7 +411,7 @@ def _generate_audio_kokoro(text, output_path, voice, speed):
     args_file.close()
 
     kokoro_py = sys.executable
-    venv_py = os.path.join(os.path.expanduser("~"), ".mangavox", "tts-venv", "bin", "python3")
+    venv_py = os.path.join(os.environ.get("MANGAVOX_DATA") or os.path.join(os.path.expanduser("~"), ".mangavox"), "tts-venv", "bin", "python3")
     if os.path.isfile(venv_py):
         kokoro_py = venv_py
 

@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+mv-core = { path = "../crates/mv-core" }
 gpui-kit = { workspace = true }
 anyhow = { workspace = true }
 mv-ui = { path = "../crates/mv-ui" }

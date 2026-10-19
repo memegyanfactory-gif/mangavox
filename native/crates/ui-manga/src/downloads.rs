@@ -163,12 +163,33 @@ impl Downloads {
         cx.notify();
     }
 
-    /// Delete downloaded chapters (`(manga_id, chapter_id)`) from disk and mark them online-only.
-    pub fn delete(&mut self, chapters: Vec<(String, String)>, cx: &mut Context<Self>) {
+    /// Delete downloaded chapters (`(manga_id, chapter_id)`) and their Studio work from disk and
+    /// mark them online-only. `whole_manga` also drops the manga's Studio brain (characters, faces).
+    pub fn delete(&mut self, chapters: Vec<(String, String)>, whole_manga: bool, cx: &mut Context<Self>) {
         cx.spawn(async move |_, _| {
             let _ = mv_ui::bg::blocking(move || {
+                // Chapters saved before the manga folder changed live where the database says.
+                let stored: Vec<PathBuf> = backend::with_db(|c| {
+                    let mut out = vec![];
+                    for (_, cid) in &chapters {
+                        let p: Option<String> = c.query_row("SELECT pages_dir FROM chapter WHERE id = ?1", [cid], |r| r.get(0)).ok().flatten();
+                        out.extend(p.map(PathBuf::from).filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == *cid)));
+                    }
+                    Ok(out)
+                })
+                .unwrap_or_default();
+                for p in &stored {
+                    let _ = std::fs::remove_dir_all(p);
+                }
                 for (mid, cid) in &chapters {
                     let _ = std::fs::remove_dir_all(chapter_dir(mid, cid));
+                    let _ = std::fs::remove_dir_all(mv_core::paths::studio_chapter(mid, cid));
+                }
+                if whole_manga {
+                    for mid in chapters.iter().map(|(m, _)| m).collect::<std::collections::BTreeSet<_>>() {
+                        let _ = std::fs::remove_dir_all(mv_core::paths::studio_projects().join(mv_core::paths::safe_name(mid)));
+                        let _ = std::fs::remove_dir_all(mv_core::paths::studio_manga(mid));
+                    }
                 }
                 // Titles left without any downloads lose their (now empty) folder too.
                 for (mid, _) in &chapters {

@@ -31,6 +31,8 @@ const REC_GRID: Grid = Grid { cols: MAX_RECS, card_w: 116.0 };
 
 pub struct DetailPage {
     manga_id: String,
+    /// Downloaded chapter whose delete was clicked once (a second click deletes).
+    confirm_delete: Option<String>,
     state: Load<(Manga, Vec<Chapter>)>,
     cover: Option<PathBuf>,
     source_name: Option<String>,
@@ -79,6 +81,7 @@ impl DetailPage {
         let watch = cx.observe(&queue, |_, _, cx| cx.notify());
         let newest_first = backend::config_str(SORT_KEY).as_deref() == Some("1");
         let mut p = Self {
+            confirm_delete: None,
             in_library: !backend::browse_only().contains(&manga_id),
             extras: backend::extras(&manga_id).unwrap_or_default(),
             manga_id,
@@ -403,6 +406,11 @@ impl DetailPage {
     }
 
     fn delete_download(&mut self, chapter_id: String, cx: &mut Context<Self>) {
+        if self.confirm_delete.as_deref() != Some(chapter_id.as_str()) {
+            self.confirm_delete = Some(chapter_id);
+            return cx.notify();
+        }
+        self.confirm_delete = None;
         if let Load::Ready((_, cs)) = &mut self.state {
             if let Some(c) = cs.iter_mut().find(|c| c.id == chapter_id) {
                 c.download_status = "none".into();
@@ -410,7 +418,7 @@ impl DetailPage {
         }
         self.sync_rows();
         let mid = self.manga_id.clone();
-        self.queue.update(cx, |d, cx| d.delete(vec![(mid, chapter_id)], cx));
+        self.queue.update(cx, |d, cx| d.delete(vec![(mid, chapter_id)], false, cx));
         cx.notify();
     }
 
@@ -905,9 +913,14 @@ impl DetailPage {
                 .into_any_element(),
             None if downloaded => {
                 let cid = c.id.clone();
+                let confirming = self.confirm_delete.as_deref() == Some(c.id.as_str());
                 base(id)
-                    .tooltip(|w, cx| gpui_kit::component::tooltip::Tooltip::new("Downloaded · click to delete").build(w, cx))
-                    .child(icon("icons/circle-check.svg", Tokens::accent(), 16.))
+                    .tooltip(move |w, cx| {
+                        let tip = if confirming { "Click again to delete the pages and this chapter's Studio work" } else { "Downloaded · click to delete" };
+                        gpui_kit::component::tooltip::Tooltip::new(tip).build(w, cx)
+                    })
+                    .when(confirming, |d| d.px(px(8.)).bg(rgba(0xf8717124)).child(icon("icons/trash.svg", Tokens::danger(), 15.)).child(div().text_size(px(size::XS)).text_color(Tokens::danger()).child("Delete?")))
+                    .when(!confirming, |d| d.child(icon("icons/circle-check.svg", Tokens::accent(), 16.)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.delete_download(cid.clone(), cx);

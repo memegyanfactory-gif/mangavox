@@ -129,6 +129,8 @@ pub struct StudioPage {
     pub(crate) usage_meter: AnyView,
     pub(crate) show_setup: bool,
     pub(crate) notice: Option<Notice>,
+    /// Saved place restored (the library loaded); until then nothing overwrites it.
+    restored: bool,
     pub(crate) renaming: Option<(String, Entity<InputState>)>,
     pub(crate) rename_sub: Option<Subscription>,
     _subs: Vec<Subscription>,
@@ -165,12 +167,12 @@ impl StudioPage {
             setup,
             library: Load::Loading,
             statuses: HashMap::new(),
-            open_groups: HashSet::new(),
-            selected: BTreeSet::new(),
+            open_groups: prefs.open_groups.iter().cloned().collect(),
+            selected: prefs.selected.iter().cloned().collect(),
             search,
             focus: None,
             focus_id: None,
-            phase: Phase::Read,
+            phase: Phase::ALL.into_iter().find(|p| prefs.last_phase.as_deref() == Some(p.label())).unwrap_or(Phase::Read),
             list: ListState::new(0, ListAlignment::Top, px(800.)),
             lib_scroll: ScrollHandle::new(),
             side_scroll: ScrollHandle::new(),
@@ -195,6 +197,7 @@ impl StudioPage {
             usage_meter,
             show_setup: false,
             notice: None,
+            restored: false,
             renaming: None,
             rename_sub: None,
             _subs: subs,
@@ -225,6 +228,17 @@ impl StudioPage {
                             }
                         }
                         this.statuses = statuses;
+                        // Reopen the chapter the user had open last time.
+                        if !this.restored {
+                            this.restored = true;
+                            let last = this.prefs.last_chapter.clone();
+                            if let Some(item) = last.and_then(|id| groups.iter().flat_map(|g| g.chapters.iter()).find(|c| c.id == id).cloned()) {
+                                if this.focus_id.is_none() {
+                                    this.open_groups.insert(item.manga_id.clone());
+                                    this.focus_chapter(item, cx);
+                                }
+                            }
+                        }
                         // Keep the focused chapter's status in step with the library.
                         if let Some(f) = this.focus.as_mut() {
                             if let Some(st) = this.statuses.get(&f.item.id) {
@@ -396,6 +410,27 @@ impl StudioPage {
             1 => format!("{verb} 1 chapter"),
             n => format!("{verb} {n} chapters"),
         }
+    }
+
+    /// Saves where the user is (chapter, step, ticks, expanded manga) whenever it changed, so
+    /// Studio reopens right there. Cheap to call every render.
+    fn remember(&mut self) {
+        if !self.restored {
+            return;
+        }
+        let phase = Some(self.phase.label().to_string());
+        let selected: Vec<String> = self.selected.iter().cloned().collect();
+        let mut open: Vec<String> = self.open_groups.iter().cloned().collect();
+        open.sort();
+        let p = &self.prefs;
+        if p.last_chapter == self.focus_id && p.last_phase == phase && p.selected == selected && p.open_groups == open {
+            return;
+        }
+        self.prefs.last_chapter = self.focus_id.clone();
+        self.prefs.last_phase = phase;
+        self.prefs.selected = selected;
+        self.prefs.open_groups = open;
+        self.prefs.save();
     }
 
     pub(crate) fn say(&mut self, error: bool, text: impl Into<String>) {
@@ -1022,6 +1057,7 @@ impl StudioPage {
 
 impl Render for StudioPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.remember();
         let center = self.center(window, cx);
         let side = self.side_open.then(|| self.side_panel(window, cx));
         div()

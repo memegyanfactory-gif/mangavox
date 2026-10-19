@@ -200,10 +200,26 @@ pub struct Prefs {
     pub engine: Option<String>,
     pub speed: f64,
     pub resolution: String,
+    /// Where the user left off: the open chapter and step, ticked chapters, expanded manga.
+    pub last_chapter: Option<String>,
+    pub last_phase: Option<String>,
+    pub selected: Vec<String>,
+    pub open_groups: Vec<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { model: None, styles: vec![], voice: None, engine: None, speed: 1.0, resolution: "1080p".into() }
+        Self {
+            model: None,
+            styles: vec![],
+            voice: None,
+            engine: None,
+            speed: 1.0,
+            resolution: "1080p".into(),
+            last_chapter: None,
+            last_phase: None,
+            selected: vec![],
+            open_groups: vec![],
+        }
     }
 }

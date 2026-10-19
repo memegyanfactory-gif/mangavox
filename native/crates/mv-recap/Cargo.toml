@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 mv-ai = { path = "../mv-ai" }
+mv-core = { path = "../mv-core" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -6,6 +6,7 @@ mod cli_tools;
 pub mod cli_updates;
 mod data;
 pub mod models;
+mod storage;
 mod tabs;
 mod ui;
 
@@ -194,6 +195,7 @@ pub struct SettingsView {
     /// Model Library page requested by the route (`models:<page>`).
     library_page: Option<Page>,
     notice: Option<Notice>,
+    storage_mgr: Entity<storage::StorageManager>,
     _subs: Vec<Subscription>,
 }
 
@@ -284,6 +286,7 @@ impl SettingsView {
             cli: cli_updates::cli_updates(cx),
             library_page,
             notice: None,
+            storage_mgr: storage::create(cx),
             _subs: vec![],
         };
         // The rail's Studio group follows the live mode flag.

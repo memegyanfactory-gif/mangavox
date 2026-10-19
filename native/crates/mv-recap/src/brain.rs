@@ -67,6 +67,14 @@ impl Brain {
     pub fn load_in(dir: PathBuf, manga_id: &str, title: &str) -> Brain {
         let mut b: Brain = std::fs::read(dir.join("brain.json")).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
         b.manga_id = manga_id.to_string();
+        // Face paths are stored absolute; after the data folder moved, find them in this brain's faces/.
+        for f in b.characters.iter_mut().flat_map(|c| c.faces.iter_mut()) {
+            if !f.is_file() {
+                if let Some(p) = f.file_name().map(|n| dir.join("faces").join(n)).filter(|p| p.is_file()) {
+                    *f = p;
+                }
+            }
+        }
         if !title.is_empty() {
             b.manga_title = title.to_string();
         }

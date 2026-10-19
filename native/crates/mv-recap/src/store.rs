@@ -9,9 +9,9 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::types::*;
 
-/// `~/.mangavox/studio` (same root as `mv_core::paths::root()`).
+/// `<data>/studio` (see `mv_core::paths`).
 pub fn studio_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".mangavox").join("studio")
+    mv_core::paths::studio()
 }
 
 /// `<output_dir>/studio`

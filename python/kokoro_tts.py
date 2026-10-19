@@ -25,7 +25,8 @@ import urllib.request
 import wave
 import struct
 
-BASE_DIR = os.path.join(os.path.expanduser("~"), ".mangavox")
+# The app passes its data folder (Settings → Storage can move it).
+BASE_DIR = os.environ.get("MANGAVOX_DATA") or os.path.join(os.path.expanduser("~"), ".mangavox")
 MODEL_DIR = os.environ.get("MANGAVOX_KOKORO_DIR", os.path.join(BASE_DIR, "models", "kokoro"))
 PIPER_HI_DIR = os.path.join(BASE_DIR, "models", "piper", "hi_IN")
 PIPER_EN_DIR = os.path.join(BASE_DIR, "models", "piper", "en_US")

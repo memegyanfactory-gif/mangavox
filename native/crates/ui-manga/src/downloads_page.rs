@@ -124,7 +124,7 @@ impl DownloadsPage {
         let Some(pos) = items.iter().position(|t| t.manga.id == manga_id) else { return };
         let t = items.remove(pos);
         let list = t.chapters.iter().map(|c| (manga_id.clone(), c.id.clone())).collect();
-        self.queue.update(cx, |d, cx| d.delete(list, cx));
+        self.queue.update(cx, |d, cx| d.delete(list, true, cx));
         cx.notify();
     }
 
@@ -289,7 +289,7 @@ impl DownloadsPage {
                     .when(confirming, |d| d.bg(rgba(0xf8717124)))
                     .hover(|s| s.bg(Tokens::hover()))
                     .child(icon("icons/trash.svg", if confirming { Tokens::danger() } else { Tokens::text_2() }, 16.))
-                    .when(confirming, |d| d.child("Delete?"))
+                    .when(confirming, |d| d.child("Delete pages + Studio work?"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.delete(mid.clone(), cx);

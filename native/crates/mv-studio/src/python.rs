@@ -47,11 +47,9 @@ impl PythonInterpreter {
     }
 }
 
-/// `~/.mangavox`, the app data root shared with the Electron build.
+/// The app data folder (`~/.mangavox` unless the user moved it; see `mv_core::paths`).
 pub fn mangavox_home() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mangavox")
+    mv_core::paths::root()
 }
 
 /// `~/.mangavox/config.json`.

@@ -274,9 +274,10 @@ pub async fn download_page(url: String, source_id: Option<String>) -> Result<Pat
     Ok(path)
 }
 
-/// Root of the offline chapter downloads: `~/.mangavox/downloads/<manga_id>/<chapter_id>/`.
+/// Root of the offline chapter downloads: `<data>/library/manga/<manga_id>/<chapter_id>/`.
+/// A custom "Manga library" folder from Settings → Storage wins.
 pub fn downloads_dir() -> PathBuf {
-    mv_core::paths::root().join("downloads")
+    config_str("storage.manga").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(mv_core::paths::manga_downloads)
 }
 
 /// Save page `index` of a chapter into `dir` as `0001.<ext>`, reusing the reader's page cache

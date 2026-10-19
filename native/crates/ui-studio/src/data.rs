@@ -61,15 +61,60 @@ pub fn chapter_label(number: Option<f64>, title: Option<&str>) -> String {
     }
 }
 
-/// Pipeline output folder for a chapter: next to its `pages` folder (library layout), or
-/// `<manga>/pipeline/<chapter folder>` when the images sit straight in the chapter folder
-/// (offline downloads) — every chapter must get its own folder.
-pub fn output_dir_for(pages_dir: &Path) -> PathBuf {
+/// A chapter's Studio folder, `<data>/studio/projects/<manga>/<chapter>`: keyed by ids so it
+/// never depends on where the pages sit. Work older versions saved next to the pages is moved
+/// in the first time the chapter loads.
+pub fn output_dir_for(manga_id: &str, chapter_id: &str, pages_dir: &Path) -> PathBuf {
+    let dir = mv_core::paths::studio_chapter(manga_id, chapter_id);
+    if !dir.exists() {
+        adopt_legacy(&dir, chapter_id, pages_dir);
+    }
+    dir
+}
+
+/// Where older versions kept a chapter's work: `(folder, shared by the manga's chapters)`.
+fn legacy_dirs(pages_dir: &Path) -> Vec<(PathBuf, bool)> {
     let parent = pages_dir.parent().unwrap_or(pages_dir);
     match pages_dir.file_name().and_then(|n| n.to_str()) {
-        Some(n) if n.eq_ignore_ascii_case("pages") => parent.join("pipeline"),
-        Some(n) => parent.join("pipeline").join(n),
-        None => pages_dir.join("pipeline"),
+        Some(n) if n.eq_ignore_ascii_case("pages") => vec![(parent.join("pipeline"), false)],
+        Some(n) => vec![(parent.join("pipeline").join(n), false), (parent.join("pipeline"), true)],
+        None => vec![],
+    }
+}
+
+fn adopt_legacy(dir: &Path, chapter_id: &str, pages_dir: &Path) {
+    for (old, shared) in legacy_dirs(pages_dir) {
+        if !old.is_dir() {
+            continue;
+        }
+        if !shared {
+            if let Err(e) = mv_core::paths::move_dir(&old, dir) {
+                eprintln!("[studio] could not move {} to {}: {e:#}", old.display(), dir.display());
+            }
+            // The old `<manga>/pipeline` goes once its last chapter moved out.
+            if let Some(p) = old.parent().filter(|p| p.file_name().is_some_and(|n| n == "pipeline")) {
+                let _ = std::fs::remove_dir(p);
+            }
+            return;
+        }
+        // Every downloaded chapter of a manga once wrote here: only the chapter the saved read
+        // belongs to takes it, and the per-chapter folders inside stay put.
+        let owner = std::fs::read(old.join("studio").join("read.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("chapter_id").and_then(|s| s.as_str()).map(str::to_string));
+        if owner.as_deref() != Some(chapter_id) {
+            continue;
+        }
+        let siblings: Vec<std::ffi::OsString> = old.parent().and_then(|p| std::fs::read_dir(p).ok()).map(|rd| rd.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+        let _ = std::fs::create_dir_all(dir);
+        for e in std::fs::read_dir(&old).into_iter().flatten().flatten() {
+            if e.path().is_dir() && siblings.contains(&e.file_name()) {
+                continue;
+            }
+            let _ = mv_core::paths::move_dir(&e.path(), &dir.join(e.file_name()));
+        }
+        return;
     }
 }
 
@@ -141,7 +186,7 @@ pub fn query_chapters(conn: &Connection) -> Result<Vec<MangaGroup>> {
             manga_title: r.get(2)?,
             number: r.get(3)?,
             title: r.get(4)?,
-            output_dir: output_dir_for(&pages_dir),
+            output_dir: PathBuf::new(),
             pages_dir,
             page_count: 0,
             has_text: false,
@@ -182,6 +227,7 @@ pub fn load() -> Result<Vec<MangaGroup>> {
     for g in groups.iter_mut() {
         g.cover = resolve_cover(g);
         for ch in g.chapters.iter_mut() {
+            ch.output_dir = output_dir_for(&ch.manga_id, &ch.id, &ch.pages_dir);
             scan(ch);
         }
     }
@@ -212,13 +258,43 @@ mod tests {
         assert_eq!(chapter_label(None, Some("  ")), "Chapter");
     }
 
+    fn put(p: &Path, body: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
     #[test]
-    fn output_dir_sits_next_to_pages() {
-        let p = Path::new("/lib/m/c/pages");
-        assert_eq!(output_dir_for(p), Path::new("/lib/m/c/pipeline"));
-        // Downloads keep images straight in the chapter folder; chapters must not share one.
-        assert_eq!(output_dir_for(Path::new("/dl/manga/ch-1")), Path::new("/dl/manga/pipeline/ch-1"));
-        assert_ne!(output_dir_for(Path::new("/dl/manga/ch-1")), output_dir_for(Path::new("/dl/manga/ch-2")));
+    fn work_next_to_the_pages_moves_into_the_project_folder() {
+        let d = tempfile::tempdir().unwrap();
+        // Library layout: <chapter>/pages + <chapter>/pipeline.
+        let pages = d.path().join("lib/m/c/pages");
+        put(&d.path().join("lib/m/c/pipeline/studio/read.json"), r#"{"chapter_id":"c"}"#);
+        let dir = d.path().join("proj/c");
+        adopt_legacy(&dir, "c", &pages);
+        assert!(dir.join("studio/read.json").is_file());
+        assert!(!d.path().join("lib/m/c/pipeline").exists());
+    }
+
+    #[test]
+    fn the_old_shared_folder_goes_only_to_the_chapter_that_wrote_it() {
+        let d = tempfile::tempdir().unwrap();
+        let manga = d.path().join("dl/m");
+        for c in ["ch-1", "ch-2"] {
+            std::fs::create_dir_all(manga.join(c)).unwrap();
+        }
+        put(&manga.join("pipeline/studio/read.json"), r#"{"chapter_id":"ch-2"}"#);
+        put(&manga.join("pipeline/audio/p1.wav"), "x");
+        // A newer per-chapter folder inside the shared one must stay where it is.
+        put(&manga.join("pipeline/ch-1/studio/read.json"), r#"{"chapter_id":"ch-1"}"#);
+
+        let one = d.path().join("proj/ch-1");
+        adopt_legacy(&one, "ch-1", &manga.join("ch-1"));
+        assert!(one.join("studio/read.json").is_file(), "ch-1 takes its own folder");
+        assert!(manga.join("pipeline/studio/read.json").is_file(), "not ch-1's shared read");
+
+        let two = d.path().join("proj/ch-2");
+        adopt_legacy(&two, "ch-2", &manga.join("ch-2"));
+        assert!(two.join("studio/read.json").is_file() && two.join("audio/p1.wav").is_file());
     }
 
     #[test]
@@ -311,6 +387,7 @@ mod tests {
         let groups = query_chapters(&conn).unwrap();
         assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Alpha", "Beta"]);
         assert_eq!(groups[0].chapters.iter().map(|c| c.number).collect::<Vec<_>>(), vec![Some(1.0), Some(2.0)]);
-        assert_eq!(groups[0].chapters[0].output_dir, PathBuf::from(format!("/lib/{}/pipeline", ids[2])));
+        // The Studio folder is picked (and old work adopted) in `load`, keyed by ids.
+        assert_eq!(groups[0].chapters[0].pages_dir, PathBuf::from(format!("/lib/{}/pages", ids[2])));
     }
 }

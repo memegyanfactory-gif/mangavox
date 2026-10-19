@@ -9,7 +9,8 @@ import os
 import subprocess
 import sys
 
-BASE_DIR = os.path.join(os.path.expanduser("~"), ".mangavox")
+# The app passes its data folder (Settings → Storage can move it).
+BASE_DIR = os.environ.get("MANGAVOX_DATA") or os.path.join(os.path.expanduser("~"), ".mangavox")
 XTTS_DIR = os.path.join(BASE_DIR, "models", "xtts")
 XTTS_VENV_DIR = os.path.join(BASE_DIR, "xtts-venv")
 XTTS_PYTHON = os.path.join(XTTS_VENV_DIR, "bin", "python3")

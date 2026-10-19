@@ -9,7 +9,8 @@ use gpui_kit::*;
 
 /// Shared HTTP client + hidden WebView2 for Cloudflare-walled manga sources.
 fn init_sources() {
-    let wall = match mv_webwall::WebWall::start(mv_webwall::WallConfig::default()) {
+    let cfg = mv_webwall::WallConfig { profile_dir: mv_core::paths::root().join("webview"), ..Default::default() };
+    let wall = match mv_webwall::WebWall::start(cfg) {
         Ok(w) => Some(w),
         Err(e) => {
             eprintln!("[sources] WebView2 unavailable, walled sources disabled: {e}");
@@ -35,6 +36,25 @@ fn init_sources() {
     }
 }
 
+/// Blocks until process `pid` has exited (at most 30 s).
+fn wait_for_exit(pid: u32) {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            WaitForSingleObject(h, 30_000);
+            CloseHandle(h);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 fn main() {
     // Settings → Apps → Uninstall runs `mangavox.exe --uninstall` (user data in ~/.mangavox stays).
     if std::env::args().any(|a| a == "--uninstall") {
@@ -44,6 +64,16 @@ fn main() {
         return;
     }
     perf::mark_start();
+    // Settings restarts the app with `--after-pid <old pid>`: let the old instance let go of the files first.
+    if let Some(pid) = std::env::args().skip_while(|a| a != "--after-pid").nth(1).and_then(|p| p.parse::<u32>().ok()) {
+        wait_for_exit(pid);
+    }
+    // Before anything opens the data folder: finish a queued move or reset, update old layouts.
+    for line in mv_core::paths::prepare() {
+        eprintln!("[data] {line}");
+    }
+    // Child processes (the Python voice and video scripts) save under the same data folder.
+    std::env::set_var("MANGAVOX_DATA", mv_core::paths::root());
     // Files an update moved aside; the previous process may still be exiting, so wait a bit.
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(10));

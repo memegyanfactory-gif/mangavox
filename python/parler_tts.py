@@ -7,7 +7,8 @@ import subprocess
 import sys
 import json
 
-BASE_DIR = os.path.join(os.path.expanduser("~"), ".mangavox")
+# The app passes its data folder (Settings → Storage can move it).
+BASE_DIR = os.environ.get("MANGAVOX_DATA") or os.path.join(os.path.expanduser("~"), ".mangavox")
 PARLER_DIR = os.path.join(BASE_DIR, "models", "indic-parler-tts")
 MODEL_MARKER = os.path.join(PARLER_DIR, ".model_ready")
 SAFE_CWD = BASE_DIR
