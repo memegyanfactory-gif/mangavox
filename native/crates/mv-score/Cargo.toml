@@ -1,0 +1,17 @@
+[package]
+name = "mv-score"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mv-ai = { path = "../mv-ai" }
+mv-recap = { path = "../mv-recap" }
+mv-studio = { path = "../mv-studio" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = "3.5"
+rustysynth = "1.3"
+
+[dev-dependencies]
+tempfile = "3"

@@ -11,8 +11,13 @@ Models download once to ~/.mangavox/models/
 
 Usage:
   python kokoro_tts.py status
+  python kokoro_tts.py voices-ready          readiness of every catalog voice, one process
+  python kokoro_tts.py voice-ready <voice>
+  python kokoro_tts.py install-engine kokoro|piper|chatterbox
   python kokoro_tts.py install
   python kokoro_tts.py synthesize <args.json>
+
+Model files are downloaded by the app (Settings → Audio). Synthesis never downloads.
 """
 from __future__ import annotations
 
@@ -37,6 +42,13 @@ VENV_DIR = os.path.join(BASE_DIR, "tts-venv")
 VENV_PYTHON = os.path.join(VENV_DIR, "Scripts", "python.exe") if os.name == "nt" else os.path.join(VENV_DIR, "bin", "python3")
 UV_CACHE_DIR = os.path.join(BASE_DIR, "uv-cache")
 UV_PYTHON_INSTALL_DIR = os.path.join(BASE_DIR, "uv-python")
+# A uv the app placed in its data folder (preferred over one on PATH).
+UV_BIN = os.path.join(BASE_DIR, "bin", "uv.exe" if os.name == "nt" else "uv")
+# Markers the studio-grade engine installers write once their model is in place.
+F5_MARKER = os.path.join(BASE_DIR, "models", "f5-tts", ".model_ready")
+PARLER_MARKER = os.path.join(BASE_DIR, "models", "indic-parler-tts", ".model_ready")
+XTTS_MARKER = os.path.join(BASE_DIR, "models", "xtts", ".model_ready")
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 KOKORO_FILES = [
     ("kokoro-v1.0.onnx", "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"),
@@ -143,6 +155,10 @@ VOICE_MAP = {
     "en_piper_f2": ("en_piper_f2", "en", "piper"),
     "en_piper_m2": ("en_piper_m2", "en", "piper"),
     "say-default": ("af_heart", "en-us", "kokoro"),
+    # Chatterbox (Resemble AI): expressive narrators in their own engine (chatterbox_tts.py)
+    "cb_narrator_f": ("cb_narrator_f", "en", "chatterbox"),
+    "cb_narrator_m": ("cb_narrator_m", "en", "chatterbox"),
+    "cb_storyteller_m": ("cb_storyteller_m", "en", "chatterbox"),
 }
 
 PIPER_VOICE_MAP = {
@@ -199,12 +215,34 @@ def _python_candidates() -> list[str]:
         "/opt/homebrew/bin/python3",
         "/usr/local/bin/python3.12",
         *_windows_launcher_pythons(),
+        *_uv_pythons(),
         sys.executable,
         shutil.which("python3"),
     ]:
         if cand and cand not in out and os.path.isfile(cand):
             out.append(cand)
     return out
+
+
+def _uv_pythons() -> list[str]:
+    """Interpreters uv installed into the data folder (`uv python install`), newest first."""
+    found: list[str] = []
+    try:
+        names = sorted(os.listdir(UV_PYTHON_INSTALL_DIR), reverse=True)
+    except OSError:
+        return found
+    for name in names:
+        if not name.startswith("cpython-3."):
+            continue
+        home = os.path.join(UV_PYTHON_INSTALL_DIR, name)
+        exe = os.path.join(home, "python.exe") if os.name == "nt" else os.path.join(home, "bin", "python3")
+        if os.path.isfile(exe):
+            found.append(exe)
+    return found
+
+
+def _uv_binary() -> str | None:
+    return UV_BIN if os.path.isfile(UV_BIN) else shutil.which("uv")
 
 
 _LAUNCHER_PYTHONS: list[str] | None = None
@@ -244,15 +282,37 @@ def _python_version_ok(path: str, min_minor: int = 10) -> bool:
         return False
 
 
+_RESOLVED_PYTHON: str | None = None
+
+
 def resolve_python(prefer_venv: bool = True) -> str:
-    if prefer_venv and os.path.isfile(VENV_PYTHON) and _python_version_ok(VENV_PYTHON, 10):
-        return VENV_PYTHON
-    for cand in _python_candidates():
-        if cand == VENV_PYTHON and not _python_version_ok(cand, 10):
-            continue
-        if _python_version_ok(cand, 10):
-            return cand
-    return sys.executable
+    """Interpreter the voice engines run in: the managed venv, else the best Python 3.10+.
+
+    Probing starts processes, so the answer is kept for the life of this process
+    (`_ensure_venv` resets it after creating the venv)."""
+    global _RESOLVED_PYTHON
+    if prefer_venv and _RESOLVED_PYTHON:
+        return _RESOLVED_PYTHON
+    found = sys.executable
+    if prefer_venv and os.path.isfile(VENV_PYTHON) and (_same_python(VENV_PYTHON, sys.executable) or _python_version_ok(VENV_PYTHON, 10)):
+        found = VENV_PYTHON
+    else:
+        for cand in _python_candidates():
+            if _python_version_ok(cand, 10):
+                found = cand
+                break
+    if prefer_venv:
+        _RESOLVED_PYTHON = found
+    return found
+
+
+def _same_python(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def kokoro_model_paths() -> tuple[str, str]:
@@ -305,21 +365,30 @@ def _piper_set_ready(voice_set: dict, dest_dir: str) -> bool:
     return True
 
 
+def piper_any_ready(lang: str) -> bool:
+    """At least one Piper voice of `lang` ("en" or "hi") is downloaded. Each voice is its own pack."""
+    voice_set, dest = (PIPER_EN_VOICES, PIPER_EN_DIR) if lang == "en" else (PIPER_VOICES, PIPER_HI_DIR)
+    return any(_piper_set_ready({key: files}, dest) for key, files in voice_set.items())
+
+
 def piper_models_ready() -> bool:
-    return piper_hi_ready() or piper_en_ready()
+    """At least one Piper voice is downloaded."""
+    return piper_any_ready("hi") or piper_any_ready("en")
 
 
 def piper_hi_ready() -> bool:
+    """Every Hindi Piper voice is downloaded."""
     return _piper_set_ready(PIPER_VOICES, PIPER_HI_DIR)
 
 
 def piper_en_ready() -> bool:
+    """Every English Piper voice is downloaded."""
     return _piper_set_ready(PIPER_EN_VOICES, PIPER_EN_DIR)
 
 
 def _is_english_voice(voice_id: str) -> bool:
     v = (voice_id or "").lower()
-    if v.startswith("xtts_en_") or v.startswith("en_piper"):
+    if v.startswith("xtts_en_") or v.startswith("en_piper") or v.startswith("cb_"):
         return True
     return v.startswith(("af_", "am_", "bf_", "bm_")) or v in ("say-default",)
 
@@ -328,47 +397,91 @@ def _is_xtts_voice(voice_id: str) -> bool:
     return (voice_id or "").startswith("xtts_")
 
 
-# Piper stand-in when XTTS v2 is not installed (~2 GB). Preview + generation still work.
-XTTS_FALLBACK_VOICE: dict[str, str] = {
-    "xtts_hi_female": "hi_piper_f",
-    "xtts_hi_male": "hi_piper_m",
-    "xtts_hi_storyteller": "hi_piper_f",
-    "xtts_hi_narrator": "hi_piper_rohan",
-    "xtts_en_female": "en_piper_f",
-    "xtts_en_male": "en_piper_m",
-    "xtts_en_narrator": "en_piper_f2",
-    "xtts_en_storyteller": "en_piper_m",
-    "xtts_en_warm": "en_piper_f2",
-    "xtts_en_clear": "en_piper_m2",
-}
-
-STUDIO_FALLBACK_VOICE: dict[str, str] = {
-    "f5_hi_female": "hi_piper_f",
-    "f5_hi_male": "hi_piper_m",
-    "f5_hi_storyteller": "hi_piper_rohan",
-    "f5_hi_narrator": "hi_piper_m",
-    "parler_hi_female_clear": "hi_piper_f",
-    "parler_hi_female_warm": "hf_alpha",
-    "parler_hi_male_deep": "hi_piper_m",
-    "parler_hi_male_bright": "hi_piper_rohan",
-    "f5_en_female": "en_piper_f",
-    "f5_en_male": "en_piper_m",
-    "f5_en_narrator": "en_piper_f2",
-    "f5_en_storyteller": "en_piper_m2",
-    "parler_en_female_neutral": "en_piper_f",
-    "parler_en_female_warm": "en_piper_f2",
-    "parler_en_male_narrator": "en_piper_m",
-    "parler_en_male_casual": "en_piper_m2",
-}
-
-
-
 def _is_f5_voice(voice_id: str) -> bool:
     return (voice_id or "").startswith("f5_")
 
 
 def _is_parler_voice(voice_id: str) -> bool:
     return (voice_id or "").startswith("parler_")
+
+
+# Studio-grade voices (F5-TTS, Parler-TTS, XTTS v2) need several GB and a strong GPU. Until their
+# engine is installed each one is voiced by the closest Kokoro voice, then by a Piper voice of the
+# same language and gender (`fallback_candidates`). Mirrored by `stand_in` in mv-studio/src/tts.rs.
+STUDIO_KOKORO_STAND_IN: dict[str, str] = {
+    "f5_hi_female": "hf_alpha",
+    "f5_hi_male": "hm_omega",
+    "f5_hi_storyteller": "hm_psi",
+    "f5_hi_narrator": "hm_omega",
+    "parler_hi_female_clear": "hf_beta",
+    "parler_hi_female_warm": "hf_alpha",
+    "parler_hi_male_deep": "hm_psi",
+    "parler_hi_male_bright": "hm_omega",
+    "xtts_hi_female": "hf_alpha",
+    "xtts_hi_male": "hm_omega",
+    "xtts_hi_storyteller": "hf_beta",
+    "xtts_hi_narrator": "hm_psi",
+    "f5_en_female": "af_heart",
+    "f5_en_male": "am_michael",
+    "f5_en_narrator": "bf_emma",
+    "f5_en_storyteller": "af_nova",
+    "parler_en_female_neutral": "af_nicole",
+    "parler_en_female_warm": "af_heart",
+    "parler_en_male_narrator": "am_adam",
+    "parler_en_male_casual": "am_liam",
+    "xtts_en_female": "af_heart",
+    "xtts_en_male": "am_echo",
+    "xtts_en_narrator": "bf_emma",
+    "xtts_en_storyteller": "am_adam",
+    "xtts_en_warm": "af_jessica",
+    "xtts_en_clear": "bm_george",
+    "cb_narrator_f": "af_heart",
+    "cb_narrator_m": "am_michael",
+    "cb_storyteller_m": "am_adam",
+}
+
+# Old names, kept for callers: the first stand-in of each studio-grade voice.
+XTTS_FALLBACK_VOICE: dict[str, str] = {k: v for k, v in STUDIO_KOKORO_STAND_IN.items() if k.startswith("xtts_")}
+STUDIO_FALLBACK_VOICE: dict[str, str] = {k: v for k, v in STUDIO_KOKORO_STAND_IN.items() if not k.startswith("xtts_")}
+
+# Piper voices by (language, gender), preferred first.
+PIPER_BY_LANG_GENDER: dict[tuple[str, str], list[str]] = {
+    ("en", "f"): ["en_piper_f", "en_piper_f2"],
+    ("en", "m"): ["en_piper_m", "en_piper_m2"],
+    ("hi", "f"): ["hi_piper_f"],
+    ("hi", "m"): ["hi_piper_m", "hi_piper_rohan"],
+}
+
+# Catalog id of each Piper voice file set in PIPER_VOICE_MAP.
+_PIPER_VOICE_ID: dict[tuple[str, str], str] = {
+    ("en", "amy"): "en_piper_f",
+    ("en", "lessac"): "en_piper_m",
+    ("en", "kristin"): "en_piper_f2",
+    ("en", "ryan"): "en_piper_m2",
+    ("hi", "priyamvada"): "hi_piper_f",
+    ("hi", "pratham"): "hi_piper_m",
+    ("hi", "rohan"): "hi_piper_rohan",
+}
+
+# Pack names in Settings → Audio (mv-studio/src/voices.rs PACKS), so messages say what to get.
+KOKORO_PACK_NAME = "Kokoro v1.0"
+PIPER_PACK_NAMES: dict[str, str] = {
+    "en_piper_f": "Piper · Amy (US)",
+    "en_piper_m": "Piper · Lessac (US)",
+    "en_piper_f2": "Piper · Kristin (US)",
+    "en_piper_m2": "Piper · Ryan (US)",
+    "hi_piper_f": "Piper · Priyamvada (Hindi)",
+    "hi_piper_m": "Piper · Pratham (Hindi)",
+    "hi_piper_rohan": "Piper · Rohan (Hindi)",
+}
+ENGINE_NAMES: dict[str, str] = {
+    "kokoro": "Kokoro",
+    "piper": "Piper",
+    "f5-tts": "F5-TTS",
+    "parler-tts": "Parler-TTS",
+    "xtts": "XTTS v2",
+    "chatterbox": "Chatterbox",
+}
 
 
 def xtts_fallback_voice(voice: str) -> str | None:
@@ -381,7 +494,7 @@ def studio_fallback_voice(voice: str) -> str | None:
 
 def _is_hindi_voice_id(voice_id: str) -> bool:
     v = voice_id or ""
-    if v.startswith("xtts_hi_") or v.startswith("hi_piper") or v.startswith(("hf_", "hm_")):
+    if v.startswith(("xtts_hi_", "hi_piper", "f5_hi_", "parler_hi_")) or v.startswith(("hf_", "hm_")):
         return True
     return v in ("hi-lekha", "hi-female", "hi-male", "hi-male-aman", "hi-male-deep")
 
@@ -391,11 +504,29 @@ def _voice_engine_hint(voice_id: str) -> str | None:
         return VOICE_MAP[voice_id][2]
     if _is_xtts_voice(voice_id):
         return "xtts"
+    if _is_f5_voice(voice_id):
+        return "f5-tts"
+    if _is_parler_voice(voice_id):
+        return "parler-tts"
     if (voice_id or "").startswith(("hf_", "hm_")):
         return "kokoro"
-    if (voice_id or "").startswith("hi_piper_"):
+    if (voice_id or "").startswith(("hi_piper_", "en_piper_")):
         return "piper"
+    if (voice_id or "").startswith("cb_"):
+        return "chatterbox"
     return None
+
+
+def own_engine(voice: str) -> str:
+    """The engine a voice is made for (Kokoro for unknown ids, like `resolve_voice`)."""
+    return _voice_engine_hint(voice) or "kokoro"
+
+
+def _voice_gender(voice: str) -> str:
+    v = STUDIO_KOKORO_STAND_IN.get(voice) or VOICE_MAP.get(voice, (voice,))[0]
+    if v.startswith(("am_", "bm_", "hm_")) or v in ("en_piper_m", "en_piper_m2", "hi_piper_m", "hi_piper_rohan"):
+        return "m"
+    return "f"
 
 
 def piper_voice_ready(voice: str) -> bool:
@@ -412,7 +543,8 @@ def piper_voice_ready(voice: str) -> bool:
 
 
 def ensure_piper_models_for_voice(voice: str) -> bool:
-    """Download Piper ONNX files for this voice if missing."""
+    """Download Piper ONNX files for this voice if missing. Explicit use only: synthesis never
+    calls this (the app owns downloads and shows their progress)."""
     lang, key = PIPER_VOICE_MAP.get(voice, ("hi", "pratham"))
     if lang == "en":
         voice_set = {key: PIPER_EN_VOICES[key]} if key in PIPER_EN_VOICES else PIPER_EN_VOICES
@@ -434,133 +566,364 @@ def ensure_piper_models_for_voice(voice: str) -> bool:
     return _piper_set_ready(voice_set, dest)
 
 
+def fallback_candidates(voice: str) -> list[str]:
+    """Voices that stand in, best first, when `voice`'s own engine cannot run.
+
+    Studio-grade voices try their Kokoro stand-in, then Piper voices of the same language
+    (same gender first). Kokoro voices try their matching Piper voice, then the same list.
+    A Piper voice has none: it is its own download."""
+    own = own_engine(voice)
+    if own == "piper":
+        return []
+    lang = "hi" if _is_hindi_voice_id(voice) else "en"
+    kokoro = voice if own == "kokoro" else STUDIO_KOKORO_STAND_IN.get(voice)
+    out: list[str] = []
+    if kokoro and kokoro != voice:
+        out.append(kokoro)
+    mapped = PIPER_VOICE_MAP.get(kokoro or "")
+    if mapped in _PIPER_VOICE_ID:
+        out.append(_PIPER_VOICE_ID[mapped])
+    gender = _voice_gender(voice)
+    other = "m" if gender == "f" else "f"
+    out += PIPER_BY_LANG_GENDER.get((lang, gender), []) + PIPER_BY_LANG_GENDER.get((lang, other), [])
+    seen: set[str] = set()
+    result = []
+    for v in out:
+        if v != voice and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
+
+
+# Checked in the voice interpreter without importing the heavy studio-grade engines.
+_HEAVY_MODULES = (("f5", "f5_tts"), ("parler", "parler_tts"), ("xtts", "TTS"), ("torch", "torch"))
+_DEPS_PROBE = r"""
+import json, importlib.util as u
+out = {}
+try:
+    import kokoro_onnx, soundfile
+    out["kokoro"] = True
+except Exception:
+    out["kokoro"] = False
+try:
+    from piper import PiperVoice
+    out["piper"] = True
+except Exception:
+    out["piper"] = False
+for key, mod in %r:
+    try:
+        out[key] = u.find_spec(mod) is not None
+    except Exception:
+        out[key] = False
+print(json.dumps(out))
+""" % (_HEAVY_MODULES,)
+
+
+def _probe_deps_here() -> dict:
+    """The deps probe in this interpreter (when it is the voice interpreter), no new process."""
+    from importlib.machinery import PathFinder
+
+    out: dict = {}
+    try:
+        import kokoro_onnx, soundfile  # noqa: F401
+        out["kokoro"] = True
+    except Exception:
+        out["kokoro"] = False
+    try:
+        from piper import PiperVoice  # noqa: F401
+        out["piper"] = True
+    except Exception:
+        out["piper"] = False
+    # This folder has f5_tts.py / parler_tts.py helpers that are not the engines.
+    here = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+    search = [p for p in sys.path if p and os.path.normcase(os.path.abspath(p)) != here]
+    for key, mod in _HEAVY_MODULES:
+        try:
+            out[key] = PathFinder.find_spec(mod, search) is not None
+        except Exception:
+            out[key] = False
+    return out
+
+
+def _probe_deps(python: str) -> dict:
+    """Which engine packages `python` can use: {kokoro, piper} import, {f5, parler, xtts, torch} exist."""
+    if _same_python(python, sys.executable):
+        return _probe_deps_here()
+    try:
+        r = subprocess.run(
+            [python, "-c", _DEPS_PROBE], capture_output=True, text=True, timeout=60,
+            cwd=BASE_DIR if os.path.isdir(BASE_DIR) else None, creationflags=_NO_WINDOW,
+        )
+        lines = [l for l in (r.stdout or "").splitlines() if l.strip()]
+        return json.loads(lines[-1]) if r.returncode == 0 and lines else {}
+    except Exception:
+        return {}
+
+
+def _xtts_ready(python: str) -> bool:
+    try:
+        from xtts_tts import xtts_ready
+    except ImportError:
+        return False
+    return xtts_ready(python)
+
+
+def _xtts_ref_ready(voice: str) -> bool:
+    try:
+        from xtts_tts import xtts_voice_ref_ready
+    except ImportError:
+        return False
+    return xtts_voice_ref_ready(voice)
+
+
+class EngineProbe:
+    """What the voice engines have installed, checked once (each check may start Python)."""
+
+    def __init__(self, python: str | None = None):
+        self.python = python or resolve_python()
+        self._deps: dict | None = None
+        self._flags: dict[str, bool] = {}
+
+    def deps(self) -> dict:
+        if self._deps is None:
+            self._deps = _probe_deps(self.python)
+        return self._deps
+
+    def _once(self, key: str, check) -> bool:
+        if key not in self._flags:
+            try:
+                self._flags[key] = bool(check())
+            except Exception:
+                self._flags[key] = False
+        return self._flags[key]
+
+    def kokoro_models(self) -> bool:
+        return self._once("kokoroModels", kokoro_models_ready)
+
+    def kokoro_deps(self) -> bool:
+        return bool(self.deps().get("kokoro"))
+
+    def kokoro(self) -> bool:
+        return self.kokoro_models() and self.kokoro_deps()
+
+    def piper_deps(self) -> bool:
+        return bool(self.deps().get("piper"))
+
+    def f5_installed(self) -> bool:
+        return bool(self.deps().get("f5") and self.deps().get("torch"))
+
+    def parler_installed(self) -> bool:
+        return bool(self.deps().get("parler") and self.deps().get("torch"))
+
+    def xtts_installed(self) -> bool:
+        xtts_venv_python = os.path.join(BASE_DIR, "xtts-venv", "bin", "python3")
+        return bool(self.deps().get("xtts") and self.deps().get("torch")) or os.path.isfile(xtts_venv_python)
+
+    # The full checks import torch, so they only run when the engine's model is in place.
+    def f5(self) -> bool:
+        return self._once("f5", lambda: os.path.isfile(F5_MARKER) and self.f5_installed() and f5_deps_ready(self.python))
+
+    def parler(self) -> bool:
+        return self._once("parler", lambda: os.path.isfile(PARLER_MARKER) and self.parler_installed() and parler_deps_ready(self.python))
+
+    def xtts(self) -> bool:
+        return self._once("xtts", lambda: os.path.isfile(XTTS_MARKER) and self.xtts_installed() and _xtts_ready(self.python))
+
+    # Chatterbox lives in its own venv; its install writes a marker, so no torch import here.
+    def chatterbox_installed(self) -> bool:
+        return self._once("chatterboxEngine", lambda: _chatterbox().engine_installed())
+
+    def chatterbox_models(self) -> bool:
+        return self._once("chatterboxModels", lambda: _chatterbox().weights_ready())
+
+    def chatterbox(self) -> bool:
+        return self.chatterbox_installed() and self.chatterbox_models()
+
+    def active_engine(self) -> str | None:
+        """Best ready engine: F5-TTS > Parler-TTS > Kokoro > XTTS > Piper."""
+        if self.f5():
+            return "f5-tts"
+        if self.parler():
+            return "parler-tts"
+        if self.kokoro():
+            return "kokoro"
+        if self.xtts():
+            return "xtts"
+        if piper_models_ready() and self.piper_deps():
+            return "piper"
+        return None
+
+
+def _native_status(voice: str, probe: EngineProbe) -> tuple[bool, bool, bool]:
+    """(ready, model files present, engine installed) for the voice's own engine."""
+    own = own_engine(voice)
+    if own == "kokoro":
+        models, deps = probe.kokoro_models(), probe.kokoro_deps()
+        return models and deps, models, deps
+    if own == "piper":
+        models, deps = piper_voice_ready(voice), probe.piper_deps()
+        return models and deps, models, deps
+    if own == "f5-tts":
+        return probe.f5(), os.path.isfile(F5_MARKER), probe.f5_installed()
+    if own == "parler-tts":
+        return probe.parler(), os.path.isfile(PARLER_MARKER), probe.parler_installed()
+    if own == "xtts":
+        ref = _xtts_ref_ready(voice)
+        return probe.xtts() and ref, os.path.isfile(XTTS_MARKER) and ref, probe.xtts_installed()
+    if own == "chatterbox":
+        model_ok = probe.chatterbox_models() and _chatterbox().reference_ready(voice)
+        engine_ok = probe.chatterbox_installed()
+        return model_ok and engine_ok, model_ok, engine_ok
+    return False, False, False
+
+
+_CHATTERBOX = None
+
+
+def _chatterbox():
+    """chatterbox_tts (stdlib-only on this side), imported on first use."""
+    global _CHATTERBOX
+    if _CHATTERBOX is None:
+        import chatterbox_tts as _cb
+        _CHATTERBOX = _cb
+    return _CHATTERBOX
+
+
+def _voice_name(voice: str) -> str:
+    if own_engine(voice) == "piper":
+        return PIPER_VOICE_MAP.get(voice, ("", voice))[1].capitalize()
+    return voice
+
+
+def missing_message(voice: str, probe: EngineProbe | None = None) -> str | None:
+    """What `voice` lacks and where to get it, or None when it can be voiced as it is."""
+    probe = probe or EngineProbe()
+    ready, model_ok, engine_ok = _native_status(voice, probe)
+    if ready:
+        return None
+    own = own_engine(voice)
+    eng = ENGINE_NAMES.get(own, own)
+    if own in ("kokoro", "piper"):
+        pack = KOKORO_PACK_NAME if own == "kokoro" else PIPER_PACK_NAMES.get(voice, "its Piper voice pack")
+        name = _voice_name(voice)
+        if not model_ok:
+            also = "" if engine_ok else f" and the {eng} engine is not installed"
+            return f'Voice {name} is not downloaded{also}. In Settings → Audio, download "{pack}"; its engine installs with it.'
+        return f'Voice {name} is downloaded but the {eng} engine is not installed. In Settings → Audio, press Install engine on "{pack}".'
+    if own == "chatterbox":
+        pack = _chatterbox().PACK_NAME
+        if not engine_ok:
+            what = "the Chatterbox engine is not installed"
+        elif not probe.chatterbox_models():
+            what = "its voice files are not downloaded"
+        else:
+            what = "its reference clip is missing"
+        stand_in = STUDIO_KOKORO_STAND_IN.get(voice)
+        tail = f" Until then {stand_in} (Kokoro) can stand in once Kokoro is installed." if stand_in else ""
+        return f'{voice} needs Chatterbox and {what}. In Settings → Audio, press Set up on "{pack}" (about 8 GB, NVIDIA GPU recommended).{tail}'
+    if not engine_ok:
+        why = f"needs {eng}, which is not installed"
+    elif not model_ok:
+        why = f"needs the {eng} model, which is not downloaded"
+    else:
+        why = f"needs {eng}, which is installed but does not load"
+    if probe.kokoro_models() and not probe.kokoro_deps():
+        get = f'install the Kokoro engine on "{KOKORO_PACK_NAME}"'
+    else:
+        get = f'download "{KOKORO_PACK_NAME}" (its engine installs with it)'
+    return f"{voice} {why}, and no stand-in voice is ready. In Settings → Audio, {get} so a Kokoro voice can stand in."
+
+
+def voice_plan(voice: str, probe: EngineProbe | None = None) -> dict:
+    """How `voice` is voiced right now: by its own engine, by a stand-in voice, or not at all.
+
+    ready          it can be synthesized now
+    engine         the engine that runs ("none" when not ready)
+    synthVoice     the voice actually synthesized (the stand-in when there is one)
+    fallbackVoice  the stand-in, when the voice's own engine cannot run
+    fallbackEngine the stand-in's engine
+    missing        what the voice's own engine lacks: "model", "engine" or None
+    message        what to get and where (only when not ready)
+    """
+    probe = probe or EngineProbe()
+    own = own_engine(voice)
+    ready, model_ok, engine_ok = _native_status(voice, probe)
+    if ready:
+        missing = None
+    elif own in ("kokoro", "piper"):
+        # Downloading the pack also installs its engine, so the model is the first thing to get.
+        missing = "model" if not model_ok else "engine"
+    else:
+        # Studio-grade installers set up the engine and then fetch its model.
+        missing = "engine" if not engine_ok else "model" if not model_ok else "engine"
+    plan: dict = {
+        "ready": ready,
+        "engine": own if ready else "none",
+        "ownEngine": own,
+        "synthVoice": voice,
+        "fallbackVoice": None,
+        "fallbackEngine": None,
+        "missing": missing,
+    }
+    if not ready:
+        for cand in fallback_candidates(voice):
+            if _native_status(cand, probe)[0]:
+                eng = own_engine(cand)
+                plan.update(ready=True, engine=eng, synthVoice=cand, fallbackVoice=cand, fallbackEngine=eng)
+                break
+    if not plan["ready"]:
+        plan["message"] = missing_message(voice, probe)
+    return plan
+
+
+def catalog_voices() -> list[str]:
+    return list(VOICE_MAP.keys())
+
+
+def voices_ready_map(probe: EngineProbe | None = None) -> dict:
+    """`voice_plan` for every catalog voice, sharing one probe (one deps check)."""
+    probe = probe or EngineProbe()
+    return {v: voice_plan(v, probe) for v in catalog_voices()}
+
+
 def resolve_engine_for_voice(
     voice: str,
     *,
     allow_download: bool = False,
     allow_fallback: bool = False,
 ) -> str | None:
-    py = resolve_python()
-    hint = _voice_engine_hint(voice)
-    
-    # Priority 1: F5-TTS (state-of-the-art, most natural)
-    if hint == "f5-tts" or _is_f5_voice(voice):
-        if f5_ready(py) and f5_deps_ready(py):
-            return "f5-tts"
-        if allow_fallback:
-            fb = studio_fallback_voice(voice)
-            if fb:
-                return resolve_engine_for_voice(
-                    fb, allow_download=allow_download, allow_fallback=False,
-                )
-    
-    # Priority 2: Parler-TTS (fast, controllable, high quality)
-    if hint == "parler-tts" or _is_parler_voice(voice):
-        if parler_ready(py) and parler_deps_ready(py):
-            return "parler-tts"
-        if allow_fallback:
-            fb = studio_fallback_voice(voice)
-            if fb:
-                return resolve_engine_for_voice(
-                    fb, allow_download=allow_download, allow_fallback=False,
-                )
-
-    # Priority 3: XTTS (ElevenLabs-quality, voice cloning)
-    if hint == "xtts" or _is_xtts_voice(voice):
-        try:
-            from xtts_tts import xtts_ready, xtts_voice_ref_ready
-            if xtts_ready(py) and xtts_voice_ref_ready(voice):
-                return "xtts"
-        except ImportError:
-            pass
-        if allow_fallback:
-            fb = xtts_fallback_voice(voice)
-            if fb:
-                return resolve_engine_for_voice(
-                    fb, allow_download=allow_download, allow_fallback=False,
-                )
+    """Engine that voices `voice` now; with `allow_fallback` a stand-in's engine counts too.
+    Never downloads (`allow_download` is accepted for old callers and ignored)."""
+    del allow_download
+    plan = voice_plan(voice)
+    if not plan["ready"] or (plan["fallbackVoice"] and not allow_fallback):
         return None
-
-    # Priority 4: Piper (standard, reliable)
-    if hint == "piper":
-        if piper_voice_ready(voice) and piper_deps_ready():
-            return "piper"
-        if allow_download and piper_deps_ready() and ensure_piper_models_for_voice(voice):
-            return "piper"
-        return None
-
-    # Priority 5: Kokoro (small, efficient)
-    if hint != "piper" and kokoro_models_ready() and kokoro_deps_ready(py):
-        if hint == "kokoro" or (voice or "").startswith(("hf_", "hm_")) or _is_english_voice(voice):
-            return "kokoro"
-
-    # Fallback chain
-    if piper_voice_ready(voice) and piper_deps_ready():
-        return "piper"
-    if allow_download and piper_deps_ready() and ensure_piper_models_for_voice(voice):
-        return "piper"
-    return None
-
+    return plan["engine"]
 
 
 def voice_ready(voice: str) -> dict:
-    f5_ready_flag = False
-    parler_ready_flag = False
-    xtts_ready_flag = False
-    try:
-        f5_ready_flag = f5_ready(resolve_python()) and f5_deps_ready(resolve_python())
-    except Exception:
-        pass
-    try:
-        parler_ready_flag = parler_ready(resolve_python()) and parler_deps_ready(resolve_python())
-    except Exception:
-        pass
-    try:
-        from xtts_tts import xtts_ready
-        xtts_ready_flag = xtts_ready(resolve_python())
-    except ImportError:
-        pass
-
-    engine = resolve_engine_for_voice(voice, allow_download=False)
-    preview_fallback = False
-    preview_voice = voice
-    if engine is None and _is_xtts_voice(voice):
-        fb = xtts_fallback_voice(voice)
-        if fb:
-            fb_engine = resolve_engine_for_voice(fb, allow_download=False)
-            if fb_engine:
-                engine = fb_engine
-                preview_fallback = True
-                preview_voice = fb
-    if engine is None and (_is_f5_voice(voice) or _is_parler_voice(voice)):
-        fb = studio_fallback_voice(voice)
-        if fb:
-            fb_engine = resolve_engine_for_voice(fb, allow_download=False)
-            if fb_engine:
-                engine = fb_engine
-                preview_fallback = True
-                preview_voice = fb
-
+    probe = EngineProbe()
+    plan = voice_plan(voice, probe)
     return {
         "voice": voice,
-        "ready": engine is not None,
-        "engine": engine or "none",
-        "previewFallback": preview_fallback,
-        "previewVoice": preview_voice,
-        "f5Ready": f5_ready_flag,
-        "parlerReady": parler_ready_flag,
-        "xttsInstalled": xtts_ready_flag,
-        "xttsReady": xtts_ready_flag,
-        "kokoroReady": kokoro_models_ready() and kokoro_deps_ready(resolve_python()),
-        "piperHiReady": piper_hi_ready() and piper_deps_ready(),
-        "piperEnReady": piper_en_ready() and piper_deps_ready(),
+        **plan,
+        "previewFallback": plan["fallbackVoice"] is not None,
+        "previewVoice": plan["synthVoice"],
+        "f5Ready": probe.f5(),
+        "parlerReady": probe.parler(),
+        "xttsInstalled": probe.xtts(),
+        "xttsReady": probe.xtts(),
+        "kokoroReady": probe.kokoro(),
+        "chatterboxReady": probe.chatterbox(),
+        "piperHiReady": piper_any_ready("hi") and probe.piper_deps(),
+        "piperEnReady": piper_any_ready("en") and probe.piper_deps(),
     }
 
 
 def kokoro_deps_ready(python: str | None = None) -> bool:
     py = python or resolve_python()
     try:
-        r = subprocess.run([py, "-c", "import kokoro_onnx, soundfile"], capture_output=True, timeout=20)
+        r = subprocess.run([py, "-c", "import kokoro_onnx, soundfile"], capture_output=True, timeout=60, creationflags=_NO_WINDOW)
         return r.returncode == 0
     except Exception:
         return False
@@ -569,11 +932,10 @@ def kokoro_deps_ready(python: str | None = None) -> bool:
 def piper_deps_ready(python: str | None = None) -> bool:
     py = python or resolve_python()
     try:
-        r = subprocess.run([py, "-c", "from piper import PiperVoice"], capture_output=True, timeout=20)
+        r = subprocess.run([py, "-c", "from piper import PiperVoice"], capture_output=True, timeout=60, creationflags=_NO_WINDOW)
         return r.returncode == 0
     except Exception:
         return False
-
 
 
 def f5_deps_ready(python: str | None = None) -> bool:
@@ -582,7 +944,7 @@ def f5_deps_ready(python: str | None = None) -> bool:
     try:
         r = subprocess.run(
             [py, "-c", "from f5_tts.api import F5TTS; import torch"],
-            capture_output=True, timeout=20, cwd=BASE_DIR,
+            capture_output=True, timeout=60, cwd=BASE_DIR, creationflags=_NO_WINDOW,
         )
         return r.returncode == 0
     except Exception:
@@ -605,7 +967,7 @@ def parler_deps_ready(python: str | None = None) -> bool:
     try:
         r = subprocess.run(
             [py, "-c", "from parler_tts import ParlerTTSForConditionalGeneration; import torch"],
-            capture_output=True, timeout=20, cwd=BASE_DIR,
+            capture_output=True, timeout=60, cwd=BASE_DIR, creationflags=_NO_WINDOW,
         )
         return r.returncode == 0
     except Exception:
@@ -621,36 +983,23 @@ def parler_ready(python: str | None = None) -> bool:
     except Exception:
         return False
 
+
 def active_engine() -> str | None:
-    py = resolve_python()
-    # Priority: F5-TTS > Parler-TTS > XTTS > Kokoro > Piper
-    if f5_ready(py) and f5_deps_ready(py):
-        return "f5-tts"
-    if parler_ready(py) and parler_deps_ready(py):
-        return "parler-tts"
-    if kokoro_models_ready() and kokoro_deps_ready(py):
-        return "kokoro"
-    try:
-        from xtts_tts import xtts_ready
-        if xtts_ready(py):
-            return "xtts"
-    except ImportError:
-        pass
-    if piper_models_ready() and piper_deps_ready():
-        return "piper"
-    return None
+    return EngineProbe().active_engine()
 
 
 def status() -> dict:
-    engine = active_engine()
-    py = resolve_python()
+    probe = EngineProbe()
+    py = probe.python
+    engine = probe.active_engine()
     active_py_version = sys.version.split()[0]
-    try:
-        r = subprocess.run([py, "-c", "import sys; print(sys.version.split()[0])"], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            active_py_version = r.stdout.strip()
-    except Exception:
-        pass
+    if not _same_python(py, sys.executable):
+        try:
+            r = subprocess.run([py, "-c", "import sys; print(sys.version.split()[0])"], capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
+            if r.returncode == 0 and r.stdout.strip():
+                active_py_version = r.stdout.strip()
+        except Exception:
+            pass
     total_mb = 0.0
     extra_dirs = []
     try:
@@ -677,32 +1026,40 @@ def status() -> dict:
                         total_mb += os.path.getsize(os.path.join(dirpath, f)) / (1024 * 1024)
                     except OSError:
                         pass
-    
-    f5_ready_flag = f5_ready(py) and f5_deps_ready(py)
-    parler_ready_flag = parler_ready(py) and parler_deps_ready(py)
-    xtts_ready_flag = False
+
+    f5_ready_flag = probe.f5()
+    parler_ready_flag = probe.parler()
+    xtts_ready_flag = probe.xtts()
+    kokoro_deps_flag = probe.kokoro_deps()
+    piper_deps_flag = probe.piper_deps()
+    kokoro_models = probe.kokoro_models()
+    piper_models = piper_models_ready()
+    chatterbox_engine = probe.chatterbox_installed()
+    chatterbox_ready = probe.chatterbox()
     try:
-        from xtts_tts import xtts_ready
-        xtts_ready_flag = xtts_ready(py)
-    except ImportError:
-        pass
-    kokoro_deps_flag = kokoro_deps_ready(py)
-    piper_deps_flag = piper_deps_ready(py)
+        chatterbox_info = _chatterbox().status()
+    except Exception as e:
+        chatterbox_info = {"error": str(e)}
 
     st = {
-        "installed": engine is not None or kokoro_models_ready() or piper_models_ready() or f5_ready_flag or parler_ready_flag,
+        "installed": engine is not None or kokoro_models or piper_models or f5_ready_flag or parler_ready_flag,
         "kokoroDepsReady": kokoro_deps_flag,
         "piperDepsReady": piper_deps_flag,
         "engine": engine or "none",
         "f5Ready": f5_ready_flag,
         "parlerReady": parler_ready_flag,
-        "kokoroReady": kokoro_models_ready(),
-        "piperReady": piper_models_ready(),
-        "piperHiReady": piper_hi_ready(),
-        "piperEnReady": piper_en_ready(),
+        "kokoroReady": kokoro_models,
+        "piperReady": piper_models,
+        # Any voice of the language downloaded (each Piper voice is its own pack).
+        "piperHiReady": piper_any_ready("hi"),
+        "piperEnReady": piper_any_ready("en"),
         "xttsReady": xtts_ready_flag,
+        # Chatterbox: its own venv (`engines/chatterbox`) and weights (`models/chatterbox`).
+        "chatterboxDepsReady": chatterbox_engine,
+        "chatterboxReady": chatterbox_ready,
+        "chatterbox": chatterbox_info,
         "depsReady": kokoro_deps_flag or piper_deps_flag or f5_ready_flag or parler_ready_flag,
-        "modelsReady": kokoro_models_ready() or piper_models_ready() or f5_ready_flag or parler_ready_flag,
+        "modelsReady": kokoro_models or piper_models or f5_ready_flag or parler_ready_flag,
         "modelDir": MODEL_DIR,
         "piperDir": PIPER_DIR,
         "piperHiDir": PIPER_HI_DIR,
@@ -741,14 +1098,19 @@ def status() -> dict:
             "bf_emma", "bf_isabella", "bm_george",
             # Piper
             "en_piper_f", "en_piper_m", "en_piper_f2", "en_piper_m2",
+            # Chatterbox (expressive)
+            "cb_narrator_f", "cb_narrator_m", "cb_storyteller_m",
         ],
         "engines": {
             "f5-tts": {"ready": f5_ready_flag, "description": "State-of-the-art multilingual TTS"},
             "parler-tts": {"ready": parler_ready_flag, "description": "Fast, controllable high-quality TTS"},
             "xtts": {"ready": xtts_ready_flag, "description": "ElevenLabs-class quality with voice cloning"},
-            "kokoro": {"ready": kokoro_models_ready() and kokoro_deps_ready(py), "description": "Efficient 82M parameter model"},
-            "piper": {"ready": piper_models_ready() and piper_deps_ready(), "description": "Standard open-source TTS"},
+            "kokoro": {"ready": kokoro_models and kokoro_deps_flag, "description": "Efficient 82M parameter model"},
+            "piper": {"ready": piper_models and piper_deps_flag, "description": "Standard open-source TTS"},
+            "chatterbox": {"ready": chatterbox_ready, "description": "Expressive narrator with emotion control (GPU recommended)"},
         },
+        # Per-voice truth (same as `voices-ready`): the app reads readiness from here.
+        "voices": voices_ready_map(probe),
         "python": active_py_version,
     }
     return st
@@ -830,10 +1192,11 @@ def _ensure_venv() -> str | None:
             continue
         emit({"type": "info", "message": f"Creating TTS virtualenv with {cand}…"})
         os.makedirs(BASE_DIR, exist_ok=True)
-        subprocess.run([cand, "-m", "venv", VENV_DIR], check=True, timeout=120)
+        subprocess.run([cand, "-m", "venv", VENV_DIR], check=True, timeout=120, capture_output=True, creationflags=_NO_WINDOW)
         if os.path.isfile(VENV_PYTHON):
+            _forget_resolved_python()
             return VENV_PYTHON
-    uv = shutil.which("uv")
+    uv = _uv_binary()
     if uv:
         try:
             emit({"type": "info", "message": "Creating private Python 3.12 runtime for studio voices…"})
@@ -841,13 +1204,20 @@ def _ensure_venv() -> str | None:
             env = os.environ.copy()
             env["UV_CACHE_DIR"] = UV_CACHE_DIR
             env["UV_PYTHON_INSTALL_DIR"] = UV_PYTHON_INSTALL_DIR
-            subprocess.run([uv, "python", "install", "3.12"], check=True, timeout=900, env=env)
-            subprocess.run([uv, "venv", "--python", "3.12", VENV_DIR], check=True, timeout=300, env=env)
+            subprocess.run([uv, "python", "install", "3.12"], check=True, timeout=900, env=env, capture_output=True, creationflags=_NO_WINDOW)
+            # --seed puts pip in the venv; _pip_install needs it.
+            subprocess.run([uv, "venv", "--seed", "--python", "3.12", VENV_DIR], check=True, timeout=300, env=env, capture_output=True, creationflags=_NO_WINDOW)
             if os.path.isfile(VENV_PYTHON):
+                _forget_resolved_python()
                 return VENV_PYTHON
         except Exception as e:
             emit({"type": "info", "message": f"Private Python setup skipped: {str(e)[:200]}"})
     return None
+
+
+def _forget_resolved_python() -> None:
+    global _RESOLVED_PYTHON
+    _RESOLVED_PYTHON = None
 
 
 def _pip_install(python: str, packages: list[str]) -> None:
@@ -1018,19 +1388,17 @@ def resolve_voice(voice_id: str) -> tuple[str, str, str]:
 
 
 def _write_wav_pcm16(path: str, samples, sample_rate: int) -> None:
+    """16-bit mono WAV at the engine's native rate. No per-page peak normalisation: the
+    narration is loudness-normalised per chapter (tts_bridge / narration_tts). Only a page
+    that would clip is scaled down."""
     import numpy as np
     arr = np.asarray(samples, dtype=np.float64)
     if arr.ndim > 1:
         arr = arr.mean(axis=1)
-    peak = np.max(np.abs(arr)) or 1.0
-    pcm = (arr / peak * 32767).astype(np.int16)
-    target_rate = 22050
-    if sample_rate != target_rate:
-        target_len = max(1, int(len(pcm) * target_rate / sample_rate))
-        x_old = np.linspace(0.0, 1.0, len(pcm), endpoint=False)
-        x_new = np.linspace(0.0, 1.0, target_len, endpoint=False)
-        pcm = np.interp(x_new, x_old, pcm.astype(np.float64)).astype(np.int16)
-        sample_rate = target_rate
+    peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+    if peak > 0.999:
+        arr = arr / peak * 0.999
+    pcm = (arr * 32767).astype(np.int16)
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1)
@@ -1041,24 +1409,31 @@ def _write_wav_pcm16(path: str, samples, sample_rate: int) -> None:
 
 def synthesize_kokoro(text: str, output_path: str, voice: str, speed: float) -> None:
     kokoro_voice, lang, _ = resolve_voice(voice)
-    py = resolve_python()
-    if not kokoro_deps_ready(py):
-        raise RuntimeError("Kokoro deps missing")
-
-    engine = load_kokoro()
+    if not kokoro_models_ready():
+        raise RuntimeError(missing_message(voice) or "The Kokoro voice pack is not downloaded")
+    try:
+        engine = load_kokoro()
+    except ImportError as e:
+        raise RuntimeError(
+            f'The Kokoro engine is not installed in {sys.executable} ({e}). '
+            f'In Settings → Audio, press Install engine on "{KOKORO_PACK_NAME}".'
+        ) from e
     samples, sample_rate = engine.create(text, voice=kokoro_voice, speed=float(speed or 1.0), lang=lang)
     _write_wav_pcm16(output_path, samples, sample_rate)
 
 
 def synthesize_piper(text: str, output_path: str, voice: str, speed: float) -> None:
-    from piper import PiperVoice
-
-    if not ensure_piper_models_for_voice(voice):
-        lang, key = PIPER_VOICE_MAP.get(voice, ("hi", "pratham"))
-        prefix = "en_US" if lang == "en" else "hi_IN"
-        dest = PIPER_EN_DIR if lang == "en" else PIPER_HI_DIR
-        onnx = os.path.join(dest, f"{prefix}-{key}-medium.onnx")
-        raise RuntimeError(f"Piper model missing: {onnx} — click Download AI Voice Models in the Audio tab")
+    # Never downloads here: a job must not fetch 60 MB without the app showing it.
+    if not piper_voice_ready(voice):
+        raise RuntimeError(missing_message(voice) or f"Piper voice {voice} is not downloaded")
+    try:
+        from piper import PiperVoice
+    except ImportError as e:
+        pack = PIPER_PACK_NAMES.get(voice, "its Piper voice pack")
+        raise RuntimeError(
+            f'The Piper engine is not installed in {sys.executable} ({e}). '
+            f'In Settings → Audio, press Install engine on "{pack}".'
+        ) from e
 
     lang, key = PIPER_VOICE_MAP.get(voice, ("hi", "pratham"))
     if lang == "en":
@@ -1069,7 +1444,7 @@ def synthesize_piper(text: str, output_path: str, voice: str, speed: float) -> N
     onnx = os.path.join(dest, f"{prefix}-{key}-medium.onnx")
     cfg = os.path.join(dest, f"{prefix}-{key}-medium.onnx.json")
     if not os.path.isfile(onnx):
-        raise RuntimeError(f"Piper model missing: {onnx} — click Download AI Voice Models in the Audio tab")
+        raise RuntimeError(missing_message(voice) or f"Piper model missing: {onnx}")
 
     piper = PiperVoice.load(onnx, config_path=cfg)
     chunks = list(piper.synthesize(text))
@@ -1106,31 +1481,32 @@ def synthesize_parler(text: str, output_path: str, voice: str, speed: float) -> 
         raise RuntimeError("Parler-TTS not installed")
 
 
-def synthesize_to_file(text: str, output_path: str, voice: str = "hf_alpha", speed: float = 1.0) -> None:
-    engine = resolve_engine_for_voice(voice, allow_download=True, allow_fallback=True)
-    synth_voice = voice
-    if _is_xtts_voice(voice) and engine != "xtts":
-        synth_voice = xtts_fallback_voice(voice) or voice
-    if (_is_f5_voice(voice) and engine != "f5-tts") or (_is_parler_voice(voice) and engine != "parler-tts"):
-        synth_voice = studio_fallback_voice(voice) or voice
-    py = resolve_python()
-    
+def synthesize_to_file(text: str, output_path: str, voice: str = "hf_alpha", speed: float = 1.0) -> str:
+    """Synthesizes `text` with `voice`, or with its stand-in when the voice's own engine is not
+    installed. Returns the engine used. Never downloads anything."""
+    plan = voice_plan(voice)
+    if not plan["ready"]:
+        raise RuntimeError(plan.get("message") or f"No installed engine can voice {voice}")
+    engine, synth_voice = plan["engine"], plan["synthVoice"]
+    if plan["fallbackVoice"]:
+        emit({"type": "info", "message": f"{voice}: {ENGINE_NAMES.get(plan['ownEngine'], plan['ownEngine'])} is not installed; using {synth_voice} ({ENGINE_NAMES.get(engine, engine)})"})
+
     if engine == "f5-tts":
-        synthesize_f5(text, output_path, voice, speed)
+        synthesize_f5(text, output_path, synth_voice, speed)
     elif engine == "parler-tts":
-        synthesize_parler(text, output_path, voice, speed)
+        synthesize_parler(text, output_path, synth_voice, speed)
     elif engine == "xtts":
         from xtts_tts import synthesize_xtts
-        synthesize_xtts(text, output_path, voice, speed, py)
+        synthesize_xtts(text, output_path, synth_voice, speed, resolve_python())
     elif engine == "kokoro":
         synthesize_kokoro(text, output_path, synth_voice, speed)
     elif engine == "piper":
         synthesize_piper(text, output_path, synth_voice, speed)
+    elif engine == "chatterbox":
+        _chatterbox().synthesize_one(text, output_path, synth_voice, speed)
     else:
-        lang = "English" if _is_english_voice(voice) else "Hindi"
-        raise RuntimeError(
-            f"No {lang} AI voice model installed — open Audio tab and click Download AI Voice Models"
-        )
+        raise RuntimeError(f"Unknown voice engine {engine} for {voice}")
+    return engine
 
 
 _loaded_kokoro_model = None
@@ -1219,8 +1595,8 @@ def cmd_synthesize(args_path: str) -> int:
         emit({"type": "error", "message": "Empty text"})
         return 1
     try:
-        synthesize_to_file(text, args["output_path"], args.get("voice", "hf_alpha"), args.get("speed", 1.0))
-        emit({"type": "done", "path": args["output_path"], "engine": active_engine()})
+        engine = synthesize_to_file(text, args["output_path"], args.get("voice", "hf_alpha"), args.get("speed", 1.0))
+        emit({"type": "done", "path": args["output_path"], "engine": engine})
         return 0
     except Exception as e:
         emit({"type": "error", "message": str(e)})
@@ -1239,6 +1615,9 @@ def install_engine(name: str) -> int:
     Model files are downloaded separately (Settings → Audio), so this only runs pip.
     Emits JSON lines: info / progress / done / error.
     """
+    if name == "chatterbox":
+        # Its own Python 3.11 venv, PyTorch and weights: see chatterbox_tts.install.
+        return _chatterbox().install()
     packages = ENGINE_PACKAGES.get(name)
     if not packages:
         emit({"type": "error", "message": f"Unknown engine: {name}"})
@@ -1285,6 +1664,9 @@ def main() -> int:
     if cmd == "serve":
         voice_id = sys.argv[2] if len(sys.argv) > 2 else "hf_alpha"
         run_server(voice_id)
+        return 0
+    if cmd == "voices-ready":
+        emit(voices_ready_map())
         return 0
     if cmd == "voice-ready":
         voice_id = sys.argv[2] if len(sys.argv) > 2 else "hf_alpha"

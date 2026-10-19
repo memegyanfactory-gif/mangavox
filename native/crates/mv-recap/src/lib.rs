@@ -12,6 +12,7 @@ mod llm;
 mod read;
 mod store;
 mod story;
+mod strip;
 mod transcript;
 mod types;
 

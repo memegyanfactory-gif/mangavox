@@ -45,8 +45,8 @@ def get_audio_duration_sec(audio_path):
     except Exception:
         return 5.0
 
-def get_resolution(preset):
-    """Return (width, height) for a resolution preset."""
+def get_resolution(preset, fmt="landscape"):
+    """Return (width, height) for a resolution preset; "reels" is the same size turned upright (9:16)."""
     presets = {
         "720p":  (1280, 720),
         "1080p": (1920, 1080),
@@ -54,18 +54,97 @@ def get_resolution(preset):
         "4k":    (3840, 2160),
         "2160p": (3840, 2160),
     }
-    return presets.get(preset, (1920, 1080))
+    w, h = presets.get(preset, (1920, 1080))
+    return (h, w) if fmt == "reels" else (w, h)
+
+
+REEL_TARGET_SEC = 60.0
+# A reel may end this far from its ideal cut point to land on a narration boundary.
+REEL_SNAP_SEC = 15.0
+
+
+def plan_reel_cuts(boundaries, total, target=REEL_TARGET_SEC, snap=REEL_SNAP_SEC):
+    """Split `total` seconds into consecutive ~`target`-second reels.
+
+    `boundaries` are the times (seconds) where one narration beat ends and the next
+    begins. The reel count is `round(total / target)` so every reel stays close to
+    the target, and each cut moves to the nearest boundary within `snap` seconds of
+    its ideal spot (only a beat longer than that gets cut mid-sentence).
+    Returns [(start, end), ...] covering 0..total.
+    """
+    if total <= 0:
+        return []
+    n = max(1, int(round(total / target)))
+    cuts = []
+    prev = 0.0
+    for k in range(1, n):
+        ideal = total * k / n
+        near = [b for b in boundaries if abs(b - ideal) <= snap and prev + 1.0 < b < total - 1.0]
+        cut = min(near, key=lambda b: abs(b - ideal)) if near else ideal
+        if cut <= prev + 1.0:
+            continue
+        cuts.append(cut)
+        prev = cut
+    edges = [0.0, *cuts, float(total)]
+    return [(round(a, 3), round(b, 3)) for a, b in zip(edges, edges[1:])]
+
+
+def fit_filter(w, h, fill):
+    """Filter that fits any image inside w x h: black bars, or ("blur") a blurred,
+    darkened copy of the same image filling the frame behind it (the usual look
+    for upright reels). Either way it is one chain that more filters can follow."""
+    if fill == "blur":
+        return (
+            "split[mvbg][mvfg];"
+            f"[mvbg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=24:2,eq=brightness=-0.08[mvb];"
+            f"[mvfg]scale={w}:{h}:force_original_aspect_ratio=decrease[mvf];"
+            "[mvb][mvf]overlay=(W-w)/2:(H-h)/2"
+        )
+    return f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
+
+
+def split_reels(final_video, cuts, reels_dir):
+    """Cut `final_video` into reels_dir/reel_01.mp4 ... at `cuts` (re-encoded so every
+    cut is frame-exact). Writes reels.json and returns the reel paths."""
+    if os.path.isdir(reels_dir):
+        shutil.rmtree(reels_dir, ignore_errors=True)
+    os.makedirs(reels_dir, exist_ok=True)
+    out = []
+    manifest = []
+    for i, (start, end) in enumerate(cuts):
+        dur = end - start
+        if dur < 0.2:
+            continue
+        path = os.path.join(reels_dir, f"reel_{i + 1:02d}.mp4")
+        fade = min(0.15, dur / 4)
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{start:.3f}", "-i", final_video, "-t", f"{dur:.3f}",
+            "-af", f"afade=t=in:d=0.03,afade=t=out:st={max(0.0, dur - fade):.3f}:d={fade:.3f}",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "160k",
+            "-movflags", "+faststart",
+            path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0 or not os.path.exists(path):
+            raise RuntimeError(f"Failed to cut reel {i + 1}: {result.stderr[:300]}")
+        out.append(path)
+        manifest.append({"file": os.path.basename(path), "start": start, "end": end})
+    with open(os.path.join(reels_dir, "reels.json"), "w", encoding="utf-8") as f:
+        json.dump({"reels": manifest}, f, indent=2)
+    return out
 
 
 ZOOMPAN_PRESETS = [
     "zoompan=z='min(zoom+0.0003\\,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
     "zoompan=z='max(1.08-0.0003*on\\,1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-    "zoompan=z='1.06':x='(iw-iw/zoom)*(on/d)':y='ih/2-(ih/zoom/2)'",
-    "zoompan=z='1.06':x='(iw-iw/zoom)*(1-on/d)':y='ih/2-(ih/zoom/2)'",
-    "zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(on/d)'",
-    "zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/d)'",
-    "zoompan=z='1.08':x='(iw-iw/zoom)*(on/d)':y='(ih-ih/zoom)*(on/d)'",
-    "zoompan=z='1.08':x='(iw-iw/zoom)*(1-on/d)':y='(ih-ih/zoom)*(1-on/d)'",
+    "zoompan=z='1.06':x='(iw-iw/zoom)*(on/duration)':y='ih/2-(ih/zoom/2)'",
+    "zoompan=z='1.06':x='(iw-iw/zoom)*(1-on/duration)':y='ih/2-(ih/zoom/2)'",
+    "zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(on/duration)'",
+    "zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/duration)'",
+    "zoompan=z='1.08':x='(iw-iw/zoom)*(on/duration)':y='(ih-ih/zoom)*(on/duration)'",
+    "zoompan=z='1.08':x='(iw-iw/zoom)*(1-on/duration)':y='(ih-ih/zoom)*(1-on/duration)'",
     "zoompan=z='1.04+0.04*sin(2*3.14159*on/90)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
     "zoompan=z='1.0+min(0.08\\,0.08*(on/15))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
 ]
@@ -102,6 +181,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             - resolution: '720p' | '1080p' | '1440p' (default: '1080p')
             - transition_duration: float seconds (default: 0.5)
             - effect: 'ken_burns' | 'none' (default: 'ken_burns')
+            - format: 'landscape' (one 16:9 video) | 'reels' (9:16, also cut into
+              ~1 minute reels in output_dir/reels/) (default: 'landscape')
+            - reel_seconds: target reel length (default: 60)
         progress_cb: function(stage, current, total)
 
     Returns:
@@ -125,7 +207,10 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         # as a per-page visual fade instead of overlapping audio/video.
         transition = "fade"
     force_rerender = config.get("force_rerender", False)
-    w, h = get_resolution(resolution)
+    fmt = "reels" if config.get("format") == "reels" else "landscape"
+    w, h = get_resolution(resolution, fmt)
+    fill = config.get("fill") or ("blur" if fmt == "reels" else "black")
+    reels_dir = os.path.join(output_dir, "reels")
 
     video_dir = os.path.join(output_dir, "video_parts")
     os.makedirs(video_dir, exist_ok=True)
@@ -156,11 +241,14 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 os.makedirs(video_dir, exist_ok=True)
             except OSError:
                 pass
-    elif os.path.exists(final_video) and os.path.getsize(final_video) > 1000:
+    elif os.path.exists(final_video) and os.path.getsize(final_video) > 1000 and (fmt == "reels") == os.path.isdir(reels_dir):
         return final_video
 
     # ── Step 1: Create per-panel (or per-page) video segments ──
     segment_paths = []
+    # End time (seconds) of every rendered clip - where reels may be cut.
+    boundaries = []
+    timeline = 0.0
     total = len(render_items)
 
     for idx, seg in enumerate(render_items):
@@ -247,11 +335,6 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
 
         seg_path = os.path.join(video_dir, f"seg_{idx:04d}.mp4")
 
-        # Skip if already rendered
-        if os.path.exists(seg_path) and os.path.getsize(seg_path) > 100:
-            segment_paths.append(seg_path)
-            continue
-
         # For beats, play just this panel's slice of the page audio; for pages,
         # use the whole file.
         audio_offset = 0.0
@@ -264,11 +347,17 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             continue
         duration = round(duration, 3)
 
+        # Skip if already rendered
+        if os.path.exists(seg_path) and os.path.getsize(seg_path) > 100:
+            segment_paths.append(seg_path)
+            timeline += duration
+            boundaries.append(timeline)
+            continue
+
         # Build video filter for this segment
         vf_parts = [
-            # Scale + pad to target resolution, preserving aspect ratio
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease",
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
+            # Fit to the target resolution, preserving aspect ratio
+            fit_filter(w, h, fill),
             "setsar=1",
         ]
 
@@ -279,8 +368,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             frames = max(1, int(duration * 30))
             zoompan_expr = f"{preset_str}:d={frames}:s={w}x{h}:fps=30"
             vf_parts = [
-                f"scale={int(w*1.2)}:{int(h*1.2)}:force_original_aspect_ratio=decrease",
-                f"pad={int(w*1.2)}:{int(h*1.2)}:(ow-iw)/2:(oh-ih)/2:color=black",
+                fit_filter(int(w * 1.2), int(h * 1.2), fill),
                 zoompan_expr
             ]
 
@@ -322,6 +410,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 print(f"[video] FFmpeg error for page {page_num}: {result.stderr[:300]}", file=sys.stderr)
                 continue
             segment_paths.append(seg_path)
+            timeline += duration
+            boundaries.append(timeline)
         except subprocess.TimeoutExpired:
             print(f"[video] Timeout rendering page {page_num}", file=sys.stderr)
             continue
@@ -353,6 +443,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     bg_music_volume = float(config.get("bg_music_volume") or 0.15)
     narration_volume = float(config.get("narration_volume") or 1.0)
     bg_music_loop = bool(config.get("bg_music_loop", True))
+    # MangaVox's own score (mv-score): already timed to the narration, ducked and limited.
+    score = config.get("score")
     
     subtitle_theme = config.get("subtitle_theme", "Classic White")
     subtitle_anim = config.get("subtitle_anim", "Karaoke Sweep")
@@ -367,7 +459,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 output_dir,
                 theme_name=subtitle_theme,
                 anim_style=subtitle_anim,
-                filename="captions.ass"
+                filename="captions.ass",
+                width=w,
+                height=h,
             )
         except Exception as e:
             print(f"[video] Failed to generate ASS captions: {e}", file=sys.stderr)
@@ -381,7 +475,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         bg_music_volume,
         bg_music_loop,
         w,
-        h
+        h,
+        score=score,
     )
 
     if success:
@@ -404,12 +499,20 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     except Exception:
         pass
 
+    if fmt == "reels":
+        total_sec = get_audio_duration_sec(final_video) if os.path.exists(final_video) else timeline
+        target = float(config.get("reel_seconds") or REEL_TARGET_SEC)
+        split_reels(final_video, plan_reel_cuts(boundaries[:-1], total_sec, target=target), reels_dir)
+    elif os.path.isdir(reels_dir):
+        # Reels from an earlier upright render no longer match this video.
+        shutil.rmtree(reels_dir, ignore_errors=True)
+
     return final_video
 
 
 def _finalize_video_with_audio_mix_and_captions(
     input_video, output_video, ass_path, bg_music,
-    narration_vol, bg_vol, bg_loop, w, h
+    narration_vol, bg_vol, bg_loop, w, h, score=None
 ):
     """
     Adjusts narration volume, mixes background music, loops it, and burns subtitles
@@ -420,8 +523,12 @@ def _finalize_video_with_audio_mix_and_captions(
     # Input 0: Concatenated video
     cmd += ["-i", input_video]
     
-    # Input 1: Background music (if present)
-    has_bg = bg_music and os.path.exists(bg_music)
+    # Input 1: the chapter's own score, which replaces any looped background track,
+    # else background music (if present)
+    has_score = bool(score) and os.path.exists(score)
+    has_bg = bool(bg_music) and os.path.exists(bg_music) and not has_score
+    if has_score:
+        cmd += ["-i", score]
     if has_bg:
         if bg_loop:
             cmd += ["-stream_loop", "-1"]
@@ -430,7 +537,16 @@ def _finalize_video_with_audio_mix_and_captions(
     filter_complex = []
     
     # 1. Audio processing
-    if has_bg:
+    if has_score:
+        # Mix at unity (the score is mastered against this narration), bring the whole mix to
+        # streaming loudness and keep true peaks under -1.5 dBFS.
+        filter_complex.append(
+            f"[0:a]volume={narration_vol},aresample=48000,aformat=channel_layouts=stereo[a0];"
+            f"[1:a]aresample=48000,aformat=channel_layouts=stereo[a1];"
+            f"[a0][a1]amix=inputs=2:duration=first:normalize=0,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,alimiter=limit=0.84:level=0[a]"
+        )
+    elif has_bg:
         filter_complex.append(
             f"[0:a]volume={narration_vol}[a0];"
             f"[1:a]volume={bg_vol}[a1];"
@@ -461,7 +577,7 @@ def _finalize_video_with_audio_mix_and_captions(
         cmd += ["-c:v", "copy"]
         
     cmd += [
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
         output_video
     ]
@@ -485,7 +601,7 @@ def _simple_concat(concat_list, output):
         "-f", "concat", "-safe", "0",
         "-i", concat_list,
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:a", "aac", "-b:a", "192k",
         "-af", "aresample=async=1:first_pts=0",
         "-r", "30",
         "-pix_fmt", "yuv420p",

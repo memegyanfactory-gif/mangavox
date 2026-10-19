@@ -7,6 +7,7 @@ use mv_ui::Route;
 
 pub mod audio;
 pub mod data;
+mod music;
 mod page;
 mod phases;
 mod run;

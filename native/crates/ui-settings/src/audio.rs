@@ -210,7 +210,7 @@ impl SettingsView {
             this.update(cx, |v, cx| {
                 v.audio.installing = None;
                 v.audio.install_cancel = None;
-                let label = if engine == "kokoro" { "Kokoro" } else { "Piper" };
+                let label = tts::engine_label(engine);
                 match res {
                     Ok(Ok(())) => v.report(&format!("{label} engine installed"), Ok(()), cx),
                     Ok(Err(mv_studio::StudioError::Cancelled)) => cx.notify(),
@@ -286,7 +286,14 @@ impl SettingsView {
         c = c
             .child(python)
             .child(divided(self.engine_row("kokoro", "Kokoro", env.engines.kokoro_deps, "Recommended. Natural voices, fast on CPU. About 60 MB of Python packages.", cx)))
-            .child(divided(self.engine_row("piper", "Piper", env.engines.piper_deps, "Lightest and fastest; sounds more synthetic. About 40 MB.", cx)));
+            .child(divided(self.engine_row("piper", "Piper", env.engines.piper_deps, "Lightest and fastest; sounds more synthetic. About 40 MB.", cx)))
+            .child(divided(self.engine_row(
+                "chatterbox",
+                "Chatterbox (expressive)",
+                env.engines.chatterbox_deps,
+                "Acts out each scene from the story: soft for calm pages, intense for fights. Its own Python and PyTorch (about 5 GB, plus 3.2 GB of voice files); an NVIDIA graphics card makes it fast.",
+                cx,
+            )));
         let studio_grade: Vec<&str> = [(env.engines.f5, "F5-TTS"), (env.engines.xtts, "XTTS v2"), (env.engines.parler, "Parler-TTS")].into_iter().filter(|(on, _)| *on).map(|(_, n)| n).collect();
         let note = if studio_grade.is_empty() {
             "F5-TTS, XTTS v2 and Parler-TTS voices sound closest to a studio narrator but need a strong GPU and several GB. Without them those voices fall back to Kokoro or Piper.".to_string()

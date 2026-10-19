@@ -1,27 +1,77 @@
 //! Environment check for Studio: Python, the pipeline scripts, FFmpeg, installed
-//! voice engines and a text-extraction provider. Every gap comes with the exact
-//! command that fixes it; nothing is installed from here.
+//! voice engines (with each voice's readiness, as `kokoro_tts.py` reports it) and a
+//! text-extraction provider. Every gap comes with the exact command that fixes it.
+//!
+//! The last finished check is shared ([`latest`]): Studio and Settings → Audio both show
+//! it, and both check again when [`mv_studio::voices::version`] moves (a pack downloaded or
+//! removed, an engine installed, "Check again"), so neither shows a stale answer.
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use mv_studio::python::{config_path, configured_python, discover_python, quiet_command, PythonInterpreter, PythonLayout};
 use mv_studio::tts::{self, VoiceInfo};
+use mv_studio::voices;
 use mv_studio::ProviderConfig;
 use serde_json::Value;
 
 /// Python modules probed with `importlib.util.find_spec` (nothing is imported).
 const MODULES: &[&str] = &["kokoro_onnx", "soundfile", "numpy", "piper", "onnxruntime", "paddleocr", "manga_ocr", "PIL"];
 
-/// What `kokoro_tts.py install` pip-installs for each engine.
-pub const KOKORO_PACKAGES: &[&str] = &["kokoro-onnx>=0.4.0", "soundfile>=0.12.0", "numpy>=2.0.0", "misaki[en]>=0.9.0"];
+/// What `kokoro_tts.py install-engine` pip-installs for each engine (`ENGINE_PACKAGES`).
+pub const KOKORO_PACKAGES: &[&str] = &["kokoro-onnx>=0.4.0", "soundfile>=0.12.0", "numpy>=1.26"];
 pub const PIPER_PACKAGES: &[&str] = &["piper-tts>=1.3.0", "onnxruntime>=1.19.0,<2"];
 
 /// Ollama models that can read images (`python-bridge.ts`).
 const VISION_KEYWORDS: &[&str] = &["llava", "vision", "bakllava", "moondream", "cogvlm", "minicpm-v", "llama3.2-vision", "gemma3"];
 const VISION_PREFERENCE: &[&str] = &["minicpm-v", "llava-llama3", "llava", "gemma3", "moondream", "bakllava", "cogvlm", "llama3.2-vision"];
+
+/// What a voice's own engine lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Missing {
+    /// The model files (the voice pack) are not downloaded.
+    Model,
+    /// The engine's Python packages are not installed (or do not load).
+    Engine,
+}
+
+/// One voice as `kokoro_tts.py` reports it (`voices` in `status`, same as `voices-ready`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceStatus {
+    /// It can be synthesized now, by its own engine or by a stand-in voice.
+    pub ready: bool,
+    /// Engine that runs (`none` when not ready).
+    pub engine: String,
+    /// The stand-in voice, when the voice's own engine cannot run.
+    pub fallback_voice: Option<String>,
+    pub fallback_engine: Option<String>,
+    /// What the voice's own engine lacks (`None` when it runs natively).
+    pub missing: Option<Missing>,
+    /// What to get and where, when it is not ready.
+    pub message: Option<String>,
+}
+
+impl VoiceStatus {
+    fn from_json(v: &Value) -> Option<Self> {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            ready: v.get("ready")?.as_bool()?,
+            engine: s("engine").unwrap_or_else(|| "none".into()),
+            fallback_voice: s("fallbackVoice"),
+            fallback_engine: s("fallbackEngine"),
+            missing: match v.get("missing").and_then(Value::as_str) {
+                Some("model") => Some(Missing::Model),
+                Some("engine") => Some(Missing::Engine),
+                _ => None,
+            },
+            message: s("message"),
+        })
+    }
+}
 
 /// Installed voice engines as reported by `kokoro_tts.py status`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -30,32 +80,33 @@ pub struct Engines {
     pub kokoro_models: bool,
     pub kokoro_deps: bool,
     pub piper_deps: bool,
+    /// At least one Hindi / English Piper voice can speak (packages and that voice's files).
     pub piper_hi: bool,
     pub piper_en: bool,
     pub f5: bool,
     pub parler: bool,
     pub xtts: bool,
+    /// Chatterbox (expressive narrator) runs: its own engine venv and its weights.
+    pub chatterbox: bool,
+    /// Chatterbox's engine (its own Python 3.11 + PyTorch venv) is installed and verified.
+    pub chatterbox_deps: bool,
     /// Interpreter the voice scripts use (`activePython`).
     pub python: Option<String>,
+    /// Per-voice truth from `kokoro_tts.py`. Empty when the script did not report it.
+    pub voices: HashMap<String, VoiceStatus>,
+    /// Piper voices whose files are downloaded; used only when `voices` is empty.
+    pub piper_voices: Vec<String>,
 }
 
 impl Engines {
     pub fn any(&self) -> bool {
-        self.kokoro || self.piper_hi || self.piper_en || self.f5 || self.parler || self.xtts
-    }
-
-    fn piper(&self, lang: &str) -> bool {
-        if lang == "hi" {
-            self.piper_hi
-        } else {
-            self.piper_en
-        }
+        self.kokoro || self.piper_hi || self.piper_en || self.f5 || self.parler || self.xtts || self.chatterbox
     }
 
     /// Ready engine names, best first.
     pub fn names(&self) -> Vec<&'static str> {
         let mut out = vec![];
-        for (on, name) in [(self.f5, "F5-TTS"), (self.parler, "Parler-TTS"), (self.xtts, "XTTS"), (self.kokoro, "Kokoro")] {
+        for (on, name) in [(self.chatterbox, "Chatterbox"), (self.f5, "F5-TTS"), (self.parler, "Parler-TTS"), (self.xtts, "XTTS"), (self.kokoro, "Kokoro")] {
             if on {
                 out.push(name);
             }
@@ -66,21 +117,63 @@ impl Engines {
         out
     }
 
-    /// Parses the JSON printed by `kokoro_tts.py status`.
+    /// What `kokoro_tts.py` reported for one voice.
+    pub fn voice_status(&self, id: &str) -> Option<&VoiceStatus> {
+        self.voices.get(id)
+    }
+
+    /// Parses the JSON printed by `kokoro_tts.py status` (its `voices` map included).
     pub fn from_status(v: &Value) -> Self {
         let b = |p: &str| v.pointer(p).and_then(Value::as_bool).unwrap_or(false);
-        let piper_engine = b("/engines/piper/ready");
-        Self {
+        let voices: HashMap<String, VoiceStatus> = v
+            .get("voices")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().filter_map(|(id, s)| Some((id.clone(), VoiceStatus::from_json(s)?))).collect())
+            .unwrap_or_default();
+        let piper_deps = b("/piperDepsReady") || b("/engines/piper/ready");
+        let mut e = Self {
             kokoro: b("/engines/kokoro/ready"),
             kokoro_models: b("/kokoroReady"),
             kokoro_deps: b("/kokoroDepsReady"),
-            piper_deps: piper_engine || b("/piperDepsReady"),
-            piper_hi: piper_engine && b("/piperHiReady"),
-            piper_en: piper_engine && b("/piperEnReady"),
+            piper_deps,
+            piper_hi: false,
+            piper_en: false,
             f5: b("/f5Ready"),
             parler: b("/parlerReady"),
             xtts: b("/xttsReady"),
+            chatterbox: b("/chatterboxReady"),
+            chatterbox_deps: b("/chatterboxDepsReady"),
             python: v.get("activePython").and_then(Value::as_str).map(str::to_string),
+            piper_voices: voices.iter().filter(|(id, s)| tts::engine_hint(id) == "piper" && s.missing != Some(Missing::Model)).map(|(id, _)| id.clone()).collect(),
+            voices,
+        };
+        e.piper_voices.sort();
+        if e.voices.is_empty() {
+            // An older script: only per-language flags (any voice of the language downloaded).
+            e.piper_hi = piper_deps && b("/piperHiReady");
+            e.piper_en = piper_deps && b("/piperEnReady");
+        } else {
+            e.refresh_piper_flags();
+        }
+        e
+    }
+
+    /// Recomputes `piper_hi` / `piper_en` from `piper_voices`.
+    pub fn refresh_piper_flags(&mut self) {
+        let any = |lang: &str| self.piper_deps && self.piper_voices.iter().any(|v| tts::voice_lang(v) == lang);
+        (self.piper_hi, self.piper_en) = (any("hi"), any("en"));
+    }
+
+    /// The voice runs on its own engine (estimate from the engine flags).
+    fn native(&self, id: &str) -> bool {
+        match tts::engine_hint(id) {
+            "kokoro" => self.kokoro,
+            "piper" => self.piper_deps && self.piper_voices.iter().any(|v| v == id),
+            "f5-tts" => self.f5,
+            "parler-tts" => self.parler,
+            "xtts" => self.xtts,
+            "chatterbox" => self.chatterbox,
+            _ => false,
         }
     }
 }
@@ -100,30 +193,40 @@ impl VoiceReady {
     }
 }
 
-/// Mirrors `resolve_engine_for_voice` / `voice_ready` in `kokoro_tts.py`.
+/// How a voice is synthesized right now. `kokoro_tts.py`'s per-voice report is the truth
+/// (the same `voice_plan` the pipeline uses); without one, it is estimated from the engine
+/// flags with the same stand-ins ([`tts::fallback_candidates`]).
 pub fn voice_ready(e: &Engines, v: &VoiceInfo) -> VoiceReady {
-    let lighter = || {
-        if e.kokoro {
-            VoiceReady::Fallback("Kokoro")
-        } else if e.piper(v.lang) {
-            VoiceReady::Fallback("Piper")
-        } else {
-            VoiceReady::Missing
-        }
-    };
     match tts::engine_hint(v.id) {
-        "say" if cfg!(target_os = "macos") => VoiceReady::Ready("macOS"),
-        "say" => VoiceReady::Missing,
-        "f5-tts" if e.f5 => VoiceReady::Ready("F5-TTS"),
-        "parler-tts" if e.parler => VoiceReady::Ready("Parler-TTS"),
-        "xtts" if e.xtts => VoiceReady::Ready("XTTS"),
-        "f5-tts" | "parler-tts" | "xtts" => lighter(),
-        "piper" if e.piper(v.lang) => VoiceReady::Ready("Piper"),
-        "piper" => VoiceReady::Missing,
-        _ if e.kokoro => VoiceReady::Ready("Kokoro"),
-        _ if e.piper(v.lang) => VoiceReady::Fallback("Piper"),
-        _ => VoiceReady::Missing,
+        "say" if cfg!(target_os = "macos") => return VoiceReady::Ready("macOS"),
+        "say" => return VoiceReady::Missing,
+        _ => {}
     }
+    if let Some(s) = e.voice_status(v.id) {
+        return match (s.ready, &s.fallback_voice) {
+            (false, _) => VoiceReady::Missing,
+            (true, None) => VoiceReady::Ready(tts::engine_label(&s.engine)),
+            (true, Some(_)) => VoiceReady::Fallback(tts::engine_label(s.fallback_engine.as_deref().unwrap_or(&s.engine))),
+        };
+    }
+    if e.native(v.id) {
+        return VoiceReady::Ready(tts::engine_label(tts::engine_hint(v.id)));
+    }
+    match tts::fallback_candidates(v.id).into_iter().find(|c| e.native(c)) {
+        Some(c) => VoiceReady::Fallback(tts::engine_label(tts::engine_hint(c))),
+        None => VoiceReady::Missing,
+    }
+}
+
+/// The stand-in voice that speaks for `v` now, when its own engine cannot.
+pub fn stand_in_voice(e: &Engines, v: &VoiceInfo) -> Option<String> {
+    if let Some(s) = e.voice_status(v.id) {
+        return s.fallback_voice.clone().filter(|_| s.ready);
+    }
+    if e.native(v.id) {
+        return None;
+    }
+    tts::fallback_candidates(v.id).into_iter().find(|c| e.native(c)).map(str::to_string)
 }
 
 /// Voices offered on this platform (macOS system voices only on macOS).
@@ -341,8 +444,102 @@ pub fn saved_speed() -> Option<f64> {
     pipeline_setting("tts_speed").and_then(|v| v.as_f64())
 }
 
-/// Runs every check. Spawns a few short Python processes; call from the background runtime.
+/// A finished check, shared by every view that shows voice readiness.
+#[derive(Clone, Debug)]
+pub struct Checked {
+    /// Increases with every finished check.
+    pub seq: u64,
+    /// [`voices::version`] when the check started.
+    pub version: u64,
+    pub env: Env,
+}
+
+static LATEST: Mutex<Option<Checked>> = Mutex::new(None);
+static SEQ: AtomicU64 = AtomicU64::new(0);
+/// Versions of the checks running now.
+static RUNNING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The newest finished check.
+pub fn latest() -> Option<Checked> {
+    LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// A check that started at the current voices version is running.
+pub fn checking_current() -> bool {
+    let v = voices::version();
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner()).contains(&v)
+}
+
+/// Marks voice readiness out of date: Studio and Settings → Audio check again.
+pub fn invalidate() {
+    voices::invalidate();
+}
+
+/// Keeps a view's environment in step with [`latest`] and [`voices::version`].
+#[derive(Clone, Debug, Default)]
+pub struct EnvSync {
+    seen_seq: u64,
+    env_version: u64,
+    tried_version: u64,
+}
+
+impl EnvSync {
+    /// A check finished since this view last looked: the env to show now.
+    pub fn take_newer(&mut self) -> Option<Env> {
+        let c = latest()?;
+        if c.seq <= self.seen_seq {
+            return None;
+        }
+        self.seen_seq = c.seq;
+        self.env_version = c.version;
+        Some(c.env)
+    }
+
+    /// The shown env predates the last voice change and no check for it has started.
+    pub fn should_check(&self, checking: bool) -> bool {
+        let v = voices::version();
+        self.env_version != v && self.tried_version != v && !checking && !checking_current()
+    }
+
+    /// Call when this view starts a check.
+    pub fn started(&mut self) {
+        self.tried_version = voices::version();
+    }
+
+    /// Something changed that this view has not started (or adopted) a check for yet.
+    pub fn behind(&self) -> bool {
+        let v = voices::version();
+        self.tried_version != v && self.env_version != v
+    }
+}
+
+struct Running(u64);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let mut r = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = r.iter().position(|v| *v == self.0) {
+            r.remove(i);
+        }
+    }
+}
+
+/// Runs every check and shares the result ([`latest`]). Spawns a few short Python
+/// processes; call from the background runtime.
 pub async fn check() -> Env {
+    let version = voices::version();
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner()).push(version);
+    let _running = Running(version);
+    let env = check_now().await;
+    let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+    if latest.as_ref().is_none_or(|c| c.version <= version) {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        *latest = Some(Checked { seq, version, env: env.clone() });
+    }
+    env
+}
+
+async fn check_now() -> Env {
     let base = tokio::task::spawn_blocking(|| {
         let python = discover_python(configured_python(&config_path()).as_deref()).map_err(|e| e.to_string());
         let scripts = PythonLayout::resolve(None).map_err(|e| e.to_string());
@@ -362,6 +559,14 @@ pub async fn check() -> Env {
         },
         _ => (Engines::default(), None),
     };
+    if engines.voices.is_empty() {
+        // No per-voice report: which Piper voices are downloaded, from the files.
+        engines.piper_voices = tts::voice_catalog()
+            .iter()
+            .filter(|v| tts::engine_hint(v.id) == "piper" && voices::pack_for_voice(v.id).is_some_and(voices::installed))
+            .map(|v| v.id.to_string())
+            .collect();
+    }
     let has = |m: &str| modules.get(m).copied().unwrap_or(false);
     // `activePython` may differ from the worker interpreter; only trust our probe when it is the same one.
     let same_python = match (&python, &engines.python) {
@@ -370,6 +575,7 @@ pub async fn check() -> Env {
     };
     engines.kokoro_deps = engines.kokoro_deps || engines.kokoro || same_python && has("kokoro_onnx") && has("soundfile");
     engines.piper_deps = engines.piper_deps || same_python && has("piper");
+    engines.refresh_piper_flags();
 
     let mut providers = ProviderConfig::load(&config_path());
     let ocr_engine = pipeline_setting("ocr_engine").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "vision".into());
@@ -414,21 +620,58 @@ mod tests {
         tts::find_voice(id).unwrap()
     }
 
-    #[test]
-    fn status_json_maps_to_engines() {
-        let v = json!({
+    /// `kokoro_tts.py status` on a PC with the Kokoro pack and engine, the Piper engine and
+    /// only the Amy Piper pack (the per-voice part trimmed to the voices under test).
+    fn amy_only_status() -> Value {
+        json!({
             "engines": {"kokoro": {"ready": true}, "piper": {"ready": true}},
-            "kokoroReady": true, "piperHiReady": false, "piperEnReady": true,
+            "kokoroReady": true, "kokoroDepsReady": true, "piperDepsReady": true,
+            "piperHiReady": false, "piperEnReady": true,
             "f5Ready": false, "parlerReady": false, "xttsReady": false,
-            "activePython": "C:\\Py\\python.exe"
-        });
-        let e = Engines::from_status(&v);
-        assert!(e.kokoro && e.piper_en && !e.piper_hi && e.any());
-        assert_eq!(e.names(), vec!["Kokoro", "Piper"]);
-        assert_eq!(e.python.as_deref(), Some("C:\\Py\\python.exe"));
-        assert!(!Engines::from_status(&json!({"installed": false})).any());
+            "activePython": "C:\\Py\\python.exe",
+            "voices": {
+                "en_piper_f": {"ready": true, "engine": "piper", "fallbackVoice": null, "fallbackEngine": null, "missing": null},
+                "en_piper_m": {"ready": false, "engine": "none", "fallbackVoice": null, "fallbackEngine": null, "missing": "model",
+                               "message": "Voice Lessac is not downloaded."},
+                "en_piper_m2": {"ready": false, "engine": "none", "fallbackVoice": null, "fallbackEngine": null, "missing": "model"},
+                "af_heart": {"ready": true, "engine": "kokoro", "fallbackVoice": null, "fallbackEngine": null, "missing": null},
+                "f5_en_storyteller": {"ready": true, "engine": "kokoro", "fallbackVoice": "af_nova", "fallbackEngine": "kokoro", "missing": "engine"},
+                "hi_piper_f": {"ready": false, "engine": "none", "fallbackVoice": null, "fallbackEngine": null, "missing": "model"}
+            }
+        })
     }
 
+    #[test]
+    fn status_json_maps_to_engines() {
+        let e = Engines::from_status(&amy_only_status());
+        assert!(e.kokoro && e.piper_deps && e.piper_en && !e.piper_hi && e.any());
+        assert_eq!(e.names(), vec!["Kokoro", "Piper"]);
+        assert_eq!(e.python.as_deref(), Some("C:\\Py\\python.exe"));
+        assert_eq!(e.piper_voices, vec!["en_piper_f"]);
+        let lessac = e.voice_status("en_piper_m").unwrap();
+        assert_eq!((lessac.ready, lessac.missing), (false, Some(Missing::Model)));
+        assert_eq!(lessac.message.as_deref(), Some("Voice Lessac is not downloaded."));
+        assert!(!Engines::from_status(&json!({"installed": false})).any());
+        // An older script without the per-voice map: the per-language flags still count.
+        let old = Engines::from_status(&json!({"piperDepsReady": true, "piperEnReady": true}));
+        assert!(old.piper_en && !old.piper_hi && old.voices.is_empty());
+    }
+
+    /// The reported bug: only the Amy pack is downloaded, so Amy is ready and Lessac/Ryan are not.
+    #[test]
+    fn piper_readiness_is_per_voice() {
+        let e = Engines::from_status(&amy_only_status());
+        assert_eq!(voice_ready(&e, voice("en_piper_f")), VoiceReady::Ready("Piper"));
+        assert_eq!(voice_ready(&e, voice("en_piper_m")), VoiceReady::Missing);
+        assert_eq!(voice_ready(&e, voice("en_piper_m2")), VoiceReady::Missing);
+        assert_eq!(voice_ready(&e, voice("hi_piper_f")), VoiceReady::Missing);
+        assert_eq!(voice_ready(&e, voice("af_heart")), VoiceReady::Ready("Kokoro"));
+        assert_eq!(voice_ready(&e, voice("f5_en_storyteller")), VoiceReady::Fallback("Kokoro"));
+        assert_eq!(stand_in_voice(&e, voice("f5_en_storyteller")).as_deref(), Some("af_nova"));
+        assert_eq!(stand_in_voice(&e, voice("en_piper_f")), None);
+    }
+
+    /// Without a per-voice report the same rules are estimated from the engine flags.
     #[test]
     fn voice_readiness_follows_engine_fallbacks() {
         let none = Engines::default();
@@ -438,15 +681,55 @@ mod tests {
         assert_eq!(voice_ready(&kokoro, voice("af_heart")), VoiceReady::Ready("Kokoro"));
         assert_eq!(voice_ready(&kokoro, voice("xtts_en_male")), VoiceReady::Fallback("Kokoro"));
         assert_eq!(voice_ready(&kokoro, voice("f5_hi_female")), VoiceReady::Fallback("Kokoro"));
+        assert_eq!(stand_in_voice(&kokoro, voice("f5_hi_female")).as_deref(), Some("hf_alpha"));
         assert_eq!(voice_ready(&kokoro, voice("en_piper_m")), VoiceReady::Missing);
 
-        let piper_en = Engines { piper_en: true, ..Default::default() };
-        assert_eq!(voice_ready(&piper_en, voice("en_piper_m")), VoiceReady::Ready("Piper"));
-        assert_eq!(voice_ready(&piper_en, voice("am_adam")), VoiceReady::Fallback("Piper"));
-        assert_eq!(voice_ready(&piper_en, voice("hi_piper_f")), VoiceReady::Missing);
+        let amy = Engines { piper_deps: true, piper_voices: vec!["en_piper_f".into()], ..Default::default() };
+        assert_eq!(voice_ready(&amy, voice("en_piper_f")), VoiceReady::Ready("Piper"));
+        assert_eq!(voice_ready(&amy, voice("en_piper_m2")), VoiceReady::Missing);
+        assert_eq!(voice_ready(&amy, voice("am_adam")), VoiceReady::Fallback("Piper"));
+        assert_eq!(voice_ready(&amy, voice("f5_en_storyteller")), VoiceReady::Fallback("Piper"));
+        assert_eq!(voice_ready(&amy, voice("hi_piper_f")), VoiceReady::Missing);
+        assert_eq!(voice_ready(&amy, voice("f5_hi_female")), VoiceReady::Missing);
+        // Files without the engine are not a voice.
+        let files_only = Engines { piper_voices: vec!["en_piper_f".into()], ..Default::default() };
+        assert_eq!(voice_ready(&files_only, voice("en_piper_f")), VoiceReady::Missing);
 
         let f5 = Engines { f5: true, ..Default::default() };
         assert_eq!(voice_ready(&f5, voice("f5_en_male")), VoiceReady::Ready("F5-TTS"));
+
+        // Chatterbox voices speak through Kokoro until Chatterbox is set up.
+        assert_eq!(voice_ready(&kokoro, voice("cb_narrator_m")), VoiceReady::Fallback("Kokoro"));
+        assert_eq!(stand_in_voice(&kokoro, voice("cb_narrator_m")).as_deref(), Some("am_michael"));
+        let cb = Engines { chatterbox: true, kokoro: true, ..Default::default() };
+        assert_eq!(voice_ready(&cb, voice("cb_narrator_f")), VoiceReady::Ready("Chatterbox"));
+        assert_eq!(cb.names()[0], "Chatterbox");
+        assert!(Engines::from_status(&json!({"chatterboxReady": true})).chatterbox);
+    }
+
+    #[test]
+    fn env_sync_adopts_newer_checks_and_rechecks_after_changes() {
+        let mut sync = EnvSync::default();
+        let env = Env {
+            python: Err("x".into()),
+            scripts: Err("x".into()),
+            ffmpeg: false,
+            modules: HashMap::new(),
+            engines: Engines::default(),
+            tts_error: None,
+            ocr: OcrProvider::Gemini,
+            providers: ProviderConfig::default(),
+            ocr_engine: "vision".into(),
+        };
+        let v = voices::version();
+        *LATEST.lock().unwrap() = Some(Checked { seq: SEQ.fetch_add(1, Ordering::SeqCst) + 1, version: v, env });
+        assert!(sync.take_newer().is_some());
+        assert!(sync.take_newer().is_none(), "the same check is adopted once");
+        invalidate();
+        assert!(sync.behind() && sync.should_check(false));
+        assert!(!sync.should_check(true));
+        sync.started();
+        assert!(!sync.behind() && !sync.should_check(false), "one check per change");
     }
 
     #[test]

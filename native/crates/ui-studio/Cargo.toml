@@ -14,6 +14,8 @@ rusqlite = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync"] }
 rodio = { version = "0.20", default-features = false, features = ["wav", "mp3"] }
 mv-recap = { path = "../mv-recap" }
+mv-score = { path = "../mv-score" }
+hound = "3.5"
 mv-ai = { path = "../mv-ai" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 ui-assistant = { path = "../ui-assistant" }

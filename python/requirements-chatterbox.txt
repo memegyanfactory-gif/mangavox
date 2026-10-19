@@ -1,0 +1,30 @@
+# Chatterbox (Resemble AI, MIT): the expressive narrator. It needs its OWN environment
+# (Python 3.11): its pins (torch 2.6, transformers 5.2, numpy<2) clash with Kokoro's.
+# `python chatterbox_tts.py install` (or `kokoro_tts.py install-engine chatterbox`) builds it
+# in <data>/engines/chatterbox with uv; this file mirrors what it installs (DEPS in
+# chatterbox_tts.py), for a manual setup:
+#
+#   uv venv --seed --python 3.11 <data>/engines/chatterbox
+#   uv pip install --python <venv python> torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#       (CPU only: --index-url https://download.pytorch.org/whl/cpu)
+#   uv pip install --python <venv python> -r requirements-chatterbox.txt
+#   uv pip install --python <venv python> chatterbox-tts==0.1.7 --no-deps
+#
+# Weights (3.2 GB) go to <data>/models/chatterbox (see WEIGHTS in chatterbox_tts.py).
+torch==2.6.0
+torchaudio==2.6.0
+numpy>=1.24.0,<2.0.0
+librosa==0.11.0
+s3tokenizer
+transformers==5.2.0
+diffusers==0.29.0
+resemble-perth>=1.0.0
+conformer==0.3.2
+safetensors==0.5.3
+spacy-pkuseg
+pykakasi==2.3.0
+pyloudnorm
+omegaconf
+soundfile
+# resemble-perth imports pkg_resources, which setuptools 81+ removed.
+setuptools<81

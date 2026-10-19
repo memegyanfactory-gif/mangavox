@@ -6,7 +6,7 @@ use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_recap::{PageRead, STYLES};
+use mv_recap::{PageRead, Prefs, STYLES};
 use mv_ui::nav::PlayRequest;
 use mv_ui::{button, chip, empty_state, icon, progress_bar, scan_overlay, spinner, size, ButtonKind, Route, Tokens};
 
@@ -18,6 +18,7 @@ use crate::{audio, run};
 
 const SPEEDS: [f64; 4] = [0.9, 1.0, 1.1, 1.25];
 const RESOLUTIONS: [&str; 2] = ["720p", "1080p"];
+const FORMATS: [(&str, &str); 2] = [(mv_recap::FORMAT_LANDSCAPE, "Landscape 16:9"), (mv_recap::FORMAT_REELS, "Reels 9:16")];
 const PAGE_MAX_W: f32 = 760.;
 
 impl StudioPage {
@@ -30,7 +31,7 @@ impl StudioPage {
             Phase::Read | Phase::Transcript => f.pages.len(),
             Phase::Story => f.story.as_ref().map(|s| s.segments.len()).unwrap_or(0),
             Phase::Audio => 1 + audio_pages(f).len(),
-            Phase::Video => 1,
+            Phase::Music | Phase::Video => 1,
         };
         self.sync_list(count);
         let header = self.phase_header(window, cx);
@@ -68,6 +69,7 @@ impl StudioPage {
             Phase::Story => self.story_row(ix, window, cx),
             Phase::Audio if ix == 0 => self.voice_card(cx),
             Phase::Audio => self.audio_row(ix - 1, cx),
+            Phase::Music => self.music_card(cx),
             Phase::Video => self.video_card(cx),
         };
         div().px(px(20.)).pt(px(14.)).child(el).into_any_element()
@@ -90,6 +92,10 @@ impl StudioPage {
                 f.story.as_ref().map(|s| format!("{} · {} segments", if s.title.is_empty() { "Story" } else { s.title.as_str() }, s.segments.len())).unwrap_or_default(),
             ),
             Phase::Audio => ("Narrate the script with a local voice. Listen to each page and regenerate any that sound off.", format!("{} page clips", f.status.audio_files)),
+            Phase::Music => (
+                "Your own score, composed for this chapter: it follows each scene, builds into fights, drops before reveals and ducks under the narrator.",
+                self.music.score.as_ref().map(|s| format!("{} cues", s.cues.len())).unwrap_or_default(),
+            ),
             Phase::Video => ("Pages and panels follow the voice-over, in sync, as a recap video.", if f.status.video.is_some() { "Rendered".into() } else { String::new() }),
         };
         let title = div()
@@ -149,7 +155,7 @@ impl StudioPage {
                     ),
                 }
             }
-            Phase::Video => actions,
+            Phase::Music | Phase::Video => actions,
         };
         let mut head = div()
             .flex()
@@ -190,7 +196,8 @@ impl StudioPage {
                     } else {
                         this.prefs.styles.push(s.to_string());
                     }
-                    this.prefs.save();
+                    let styles = this.prefs.styles.clone();
+                    Prefs::update(|p| p.styles = styles);
                     cx.notify();
                 }))
             }))
@@ -388,7 +395,7 @@ impl StudioPage {
         let speeds = div().flex().gap(px(6.)).children(SPEEDS.map(|s| {
             chip(SharedString::from(format!("speed-{s}")), format!("{s}x"), self.prefs.speed == s).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.prefs.speed = s;
-                this.prefs.save();
+                Prefs::update(|p| p.speed = s);
                 cx.notify();
             }))
         }));
@@ -573,10 +580,18 @@ impl StudioPage {
         let res = div().flex().gap(px(6.)).children(RESOLUTIONS.map(|r| {
             chip(SharedString::from(format!("res-{r}")), r, self.prefs.resolution == r).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.prefs.resolution = r.to_string();
-                this.prefs.save();
+                Prefs::update(|p| p.resolution = r.to_string());
                 cx.notify();
             }))
         }));
+        let formats = div().flex().gap(px(6.)).children(FORMATS.map(|(id, label)| {
+            chip(SharedString::from(format!("fmt-{id}")), label, self.prefs.format == id).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.prefs.format = id.to_string();
+                Prefs::update(|p| p.format = id.to_string());
+                cx.notify();
+            }))
+        }));
+        let reels = f.status.reels.clone();
         let blocker = if !has_audio {
             Some("Generate the audio first (Audio step).")
         } else if env.is_some() && !ffmpeg {
@@ -592,7 +607,7 @@ impl StudioPage {
                 }
             }),
             None => primary("render-video", "icons/clapperboard.svg", if video.is_some() { "Render again".to_string() } else { "Render video".to_string() }, blocker.is_none())
-                .when(blocker.is_none(), |b| b.on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.run_pipeline(&["sync_map", "video"], false, cx)))),
+                .when(blocker.is_none(), |b| b.on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.render_video(cx)))),
         };
         let bhippi = find_bhippi();
         div()
@@ -610,12 +625,69 @@ impl StudioPage {
                     .bg(Tokens::surface())
                     .border_1()
                     .border_color(Tokens::border())
+                    .flex_wrap()
+                    .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("Format"))
+                    .child(formats)
                     .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("Resolution"))
                     .child(res)
-                    .child(div().flex_1().text_size(px(size::XS)).text_color(Tokens::text_3()).children(blocker))
+                    .child(div().flex_1().min_w(px(120.)).text_size(px(size::XS)).text_color(Tokens::text_3()).children(blocker))
                     .child(render_btn),
             )
+            .when(self.prefs.format == mv_recap::FORMAT_REELS && reels.is_empty(), |d| {
+                d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(
+                    "Reels renders upright (9:16) and cuts the recap into ~1 minute parts, ending each at a pause in the narration.",
+                ))
+            })
             .map(|d| match video {
+                Some(v) if !reels.is_empty() => {
+                    let count = reels.len();
+                    let thumb = f.pages.first().map(|p| p.0.clone());
+                    let dir = reels[0].parent().map(Path::to_path_buf);
+                    d.child(
+                        div().flex().flex_wrap().gap(px(12.)).children(reels.into_iter().enumerate().map(|(i, reel)| {
+                            let name = format!("{title} · Reel {} of {count}", i + 1);
+                            div()
+                                .id(SharedString::from(format!("reel-{i}")))
+                                .relative()
+                                .w(px(150.))
+                                .aspect_ratio(9. / 16.)
+                                .rounded(px(12.))
+                                .overflow_hidden()
+                                .bg(rgb(0x000000))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.92))
+                                .children(thumb.clone().map(|p| img(p).size_full().object_fit(ObjectFit::Cover).opacity(0.45)))
+                                .child(
+                                    div().absolute().inset_0().flex().items_center().justify_center().child(
+                                        div().size(px(44.)).rounded_full().bg(Tokens::accent()).flex().items_center().justify_center().child(icon("icons/play.svg", Tokens::base(), 18.)),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .bottom(px(8.))
+                                        .left(px(10.))
+                                        .text_size(px(size::XS))
+                                        .text_color(rgb(0xffffff))
+                                        .child(format!("Reel {} / {count}", i + 1)),
+                                )
+                                .on_click(move |_, w, cx| play_video(&name, &reel, w, cx))
+                        })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .when_some(dir, |d, dir| {
+                                d.child(button("reels-folder", "Show reels in folder", ButtonKind::Secondary).on_click(move |_, _, cx| cx.open_with_system(&dir)))
+                            })
+                            .when_some(bhippi, |d, exe| {
+                                d.child(button("video-bhippi", "Edit full video in Bhippi", ButtonKind::Secondary).on_click(move |_, _, _| {
+                                    let _ = std::process::Command::new(&exe).arg(&v).spawn();
+                                }))
+                            }),
+                    )
+                }
                 Some(v) => {
                     let (v1, v2, v3) = (v.clone(), v.clone(), v.clone());
                     let thumb = f.pages.first().map(|p| p.0.clone());
@@ -703,6 +775,7 @@ impl StudioPage {
                 speed: self.prefs.speed,
                 video: stages.contains(&"video"),
                 resolution: self.prefs.resolution.clone(),
+                format: self.prefs.format.clone(),
                 stages: Some(stages.iter().map(|s| s.to_string()).collect()),
                 force_regen,
             };

@@ -523,7 +523,18 @@ impl Render for Shell {
                     .min_h_0()
                     .when(!focus && !in_settings, |d| d.child(self.sidebar(cx)))
                     .when_some(dock, |d, dock| d.child(div().flex_none().w(px(400.)).h_full().border_r_1().border_color(Tokens::border()).child(dock)))
-                    .child(div().relative().flex_1().min_w_0().h_full().overflow_hidden().child(self.page.clone()).when(!focus, |d| d.children(ui_manga::download_toast(cx)))),
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(self.page.clone())
+                            .when(!focus, |d| d.children(ui_manga::download_toast(cx)))
+                            // App-wide toasts (mv_ui::toast::show), bottom centre of the page area.
+                            .child(mv_ui::toast::host(cx)),
+                    ),
             )
     }
 }

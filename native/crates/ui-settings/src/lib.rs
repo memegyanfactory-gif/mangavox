@@ -494,12 +494,14 @@ impl SettingsView {
             return;
         }
         self.preset = preset.to_string();
+        mv_ui::theme::set_palette(preset, cx);
         cx.notify();
         self.background(cx, move || data::save_preset(preset), |v, r, cx| v.report_result(r, cx));
     }
 
     fn set_reduce_motion(&mut self, on: bool, cx: &mut Context<Self>) {
         self.reduce_motion = on;
+        mv_ui::motion::set_reduced(on, cx);
         cx.notify();
         self.background(cx, move || data::save_reduce_motion(on), |v, r, cx| v.report_result(r, cx));
     }

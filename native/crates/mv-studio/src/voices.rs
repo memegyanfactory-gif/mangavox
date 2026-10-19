@@ -3,11 +3,13 @@
 //! progress, and the narration voice defaults (app-wide and per chapter).
 //!
 //! Files land where `kokoro_tts.py` looks for them (`~/.mangavox/models/kokoro`,
-//! `.../piper/en_US`, `.../piper/hi_IN`). Downloads write `<file>.part` and resume from it
+//! `.../piper/en_US`, `.../piper/hi_IN`, `.../chatterbox`; `chatterbox_tts.py` downloads the
+//! same Chatterbox files to the same place, so either side resumes the other's `.part`). Downloads write `<file>.part` and resume from it
 //! with an HTTP Range request, so an interrupted download continues where it stopped.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -83,6 +85,14 @@ macro_rules! piper {
     };
 }
 
+/// Chatterbox weights (Hugging Face `ResembleAI/chatterbox`, pinned revision): the same list
+/// as `WEIGHTS` in `chatterbox_tts.py`.
+macro_rules! chatterbox_file {
+    ($name:literal, $size:literal) => {
+        PackFile { dir: "chatterbox", name: $name, url: concat!("https://huggingface.co/ResembleAI/chatterbox/resolve/5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18/", $name), size: $size }
+    };
+}
+
 /// Every pack, best first.
 pub const PACKS: &[VoicePack] = &[
     VoicePack {
@@ -109,6 +119,24 @@ pub const PACKS: &[VoicePack] = &[
         files: &[PackFile { dir: "kokoro", name: "kokoro-v1.0.int8.onnx", url: concat!("https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/", "kokoro-v1.0.int8.onnx"), size: 92_361_271 }, KOKORO_VOICES],
         voices: &[],
     },
+    VoicePack {
+        id: "chatterbox",
+        name: "Chatterbox · Expressive narrator",
+        engine: "Chatterbox",
+        summary: "Acts out the story: calm pages stay soft, fights and reveals get real intensity. Resemble AI's open model (MIT). About 8 GB on disk with its engine; an NVIDIA graphics card makes it fast.",
+        languages: "English",
+        quality: 5,
+        speed: 1,
+        recommended: false,
+        files: &[
+            chatterbox_file!("ve.safetensors", 5_695_784),
+            chatterbox_file!("t3_cfg.safetensors", 2_129_653_744),
+            chatterbox_file!("s3gen.safetensors", 1_056_484_620),
+            chatterbox_file!("tokenizer.json", 25_470),
+            chatterbox_file!("conds.pt", 107_374),
+        ],
+        voices: &["cb_narrator_f", "cb_narrator_m", "cb_storyteller_m"],
+    },
     piper!("piper-en-amy", "Piper · Amy (US)", "Clear US female. Very fast and light, more robotic than Kokoro.", "English", "piper/en_US", "en_US-amy-medium", "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/", 63_201_294, "en_piper_f"),
     piper!("piper-en-lessac", "Piper · Lessac (US)", "Steady US male. Very fast and light.", "English", "piper/en_US", "en_US-lessac-medium", "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/", 63_201_294, "en_piper_m"),
     piper!("piper-en-kristin", "Piper · Kristin (US)", "Smooth US female. Very fast and light.", "English", "piper/en_US", "en_US-kristin-medium", "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/kristin/medium/", 63_531_379, "en_piper_f2"),
@@ -121,6 +149,57 @@ pub const PACKS: &[VoicePack] = &[
 
 pub fn find_pack(id: &str) -> Option<&'static VoicePack> {
     PACKS.iter().find(|p| p.id == id)
+}
+
+/// The pack that provides a catalog voice (a Piper voice's own pack, the full Kokoro pack for
+/// Kokoro voices). `None` for voices no pack provides (studio-grade and system voices).
+pub fn pack_for_voice(voice: &str) -> Option<&'static VoicePack> {
+    match tts::engine_hint(voice) {
+        "kokoro" => find_pack("kokoro"),
+        "piper" | "chatterbox" => PACKS.iter().find(|p| p.voices.contains(&voice)),
+        _ => None,
+    }
+}
+
+/// `kokoro_tts.py install-engine` name of the engine a pack runs on.
+pub fn engine_of(pack: &VoicePack) -> &'static str {
+    match pack.engine {
+        "Kokoro" => "kokoro",
+        "Chatterbox" => "chatterbox",
+        _ => "piper",
+    }
+}
+
+/// The pack runs well only on a graphics card (NVIDIA, CUDA); on a CPU it works, slowly.
+pub fn needs_gpu(pack: &VoicePack) -> bool {
+    engine_of(pack) == "chatterbox"
+}
+
+/// Rough bytes its engine installs (Python packages and, for Chatterbox, its own Python and
+/// PyTorch with CUDA), to show next to [`VoicePack::size`].
+pub fn engine_size(pack: &VoicePack) -> u64 {
+    match engine_of(pack) {
+        "chatterbox" => 5_000_000_000,
+        "kokoro" => 60_000_000,
+        _ => 40_000_000,
+    }
+}
+
+// ---------------------------------------------------------------- change counter
+
+static VERSION: AtomicU64 = AtomicU64::new(1);
+
+/// Bumped whenever what is installed for voices may have changed: a pack downloaded or
+/// removed, an engine installed, or the user asking to check again. Views that show voice
+/// readiness remember the version they checked at and check again when it moves, so
+/// Studio and Settings never show a stale "not installed".
+pub fn version() -> u64 {
+    VERSION.load(Ordering::SeqCst)
+}
+
+/// Marks every voice readiness check as out of date. Returns the new version.
+pub fn invalidate() -> u64 {
+    VERSION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// `~/.mangavox/models`.
@@ -182,7 +261,9 @@ pub fn remove_in(root: &Path, pack: &VoicePack) -> Result<(), StudioError> {
 }
 
 pub fn remove(pack: &VoicePack) -> Result<(), StudioError> {
-    remove_in(&models_root(), pack)
+    let res = remove_in(&models_root(), pack);
+    invalidate();
+    res
 }
 
 /// Download progress for one pack.
@@ -420,6 +501,9 @@ pub async fn run_download(id: &'static str) -> Result<(), StudioError> {
             m.insert(id, (DownloadState::Failed(e.to_string()), CancelToken::new()));
         }
     });
+    if res.is_ok() {
+        invalidate();
+    }
     res
 }
 
@@ -523,6 +607,38 @@ pub fn voice_for_chapter(chapter_id: &str) -> String {
     chapter_voice(chapter_id).unwrap_or_else(default_voice)
 }
 
+// ---------------------------------------------------------------- emotion strength
+
+/// How strongly a chapter's narration follows the story's emotion: 0 = flat, 1 = as read
+/// (the default), 2 = twice as dramatic. Scales the scene intensity that drives Chatterbox
+/// (and the speed of Kokoro/Piper).
+pub const EMOTION_STRENGTH_DEFAULT: f32 = 1.0;
+pub const EMOTION_STRENGTH_RANGE: (f32, f32) = (0.0, 2.0);
+
+/// `<chapter output dir>/narration_style.json`, read by `tts_bridge.run_tts` when the job's
+/// `tts_config` has no `emotion_strength`.
+pub fn narration_style_path(output_dir: &Path) -> PathBuf {
+    output_dir.join("narration_style.json")
+}
+
+/// The chapter's emotion strength (the default when unset or unreadable).
+pub fn emotion_strength(output_dir: &Path) -> f32 {
+    read_json(&narration_style_path(output_dir))
+        .get("emotion_strength")
+        .and_then(Value::as_f64)
+        .map(|v| (v as f32).clamp(EMOTION_STRENGTH_RANGE.0, EMOTION_STRENGTH_RANGE.1))
+        .unwrap_or(EMOTION_STRENGTH_DEFAULT)
+}
+
+/// Saves the chapter's emotion strength (other keys of the file are kept).
+pub fn set_emotion_strength(output_dir: &Path, strength: f32) -> Result<(), StudioError> {
+    let path = narration_style_path(output_dir);
+    let mut m = read_json(&path);
+    let v = strength.clamp(EMOTION_STRENGTH_RANGE.0, EMOTION_STRENGTH_RANGE.1);
+    m.insert("emotion_strength".into(), json!((v * 100.0).round() / 100.0));
+    write_json(&path, m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +663,45 @@ mod tests {
     }
 
     #[test]
+    fn every_downloadable_voice_has_its_pack() {
+        assert_eq!(pack_for_voice("en_piper_f").map(|p| p.id), Some("piper-en-amy"));
+        assert_eq!(pack_for_voice("hi_piper_rohan").map(|p| p.id), Some("piper-hi-rohan"));
+        assert_eq!(pack_for_voice("af_heart").map(|p| p.id), Some("kokoro"));
+        assert_eq!(pack_for_voice("f5_en_male"), None);
+        assert_eq!(engine_of(find_pack("kokoro-lite").unwrap()), "kokoro");
+        assert_eq!(engine_of(find_pack("piper-en-ryan").unwrap()), "piper");
+        assert_eq!(pack_for_voice("cb_narrator_m").map(|p| p.id), Some("chatterbox"));
+        let cb = find_pack("chatterbox").unwrap();
+        assert_eq!(engine_of(cb), "chatterbox");
+        assert!(needs_gpu(cb) && cb.size() > 3_000_000_000 && engine_size(cb) > cb.size());
+        assert!(!needs_gpu(find_pack("kokoro").unwrap()));
+        assert!(cb.files.iter().all(|f| f.dir == "chatterbox" && f.url.ends_with(f.name)));
+    }
+
+    /// The pack's files must match `WEIGHTS` in python/chatterbox_tts.py (names, sizes, revision).
+    #[test]
+    fn chatterbox_files_match_chatterbox_tts_py() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../python/chatterbox_tts.py");
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let cb = find_pack("chatterbox").unwrap();
+        for f in cb.files {
+            let digits = f.size.to_string();
+            let groups: Vec<&str> = digits.as_bytes().rchunks(3).rev().map(|c| std::str::from_utf8(c).unwrap()).collect();
+            let py_size = groups.join("_");
+            assert!(text.contains(&format!("(\"{}\", {py_size})", f.name)), "{} {py_size} not in chatterbox_tts.py", f.name);
+            let rev = f.url.split("/resolve/").nth(1).unwrap().split('/').next().unwrap();
+            assert!(text.contains(&format!("HF_REVISION = \"{rev}\"")), "revision {rev}");
+        }
+    }
+
+    #[test]
+    fn invalidate_moves_the_version() {
+        let before = version();
+        let after = invalidate();
+        assert!(after > before && version() >= after);
+    }
+
+    #[test]
     fn remove_keeps_files_shared_with_an_installed_pack() {
         let dir = tempdir();
         let root = dir.as_path();
@@ -564,6 +719,17 @@ mod tests {
         remove_in(root, lite).unwrap();
         assert!(!root.join("kokoro").join("voices-v1.0.bin").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn emotion_strength_round_trips_and_clamps() {
+        let dir = tempdir();
+        assert_eq!(emotion_strength(&dir), EMOTION_STRENGTH_DEFAULT);
+        set_emotion_strength(&dir, 1.5).unwrap();
+        assert_eq!(emotion_strength(&dir), 1.5);
+        set_emotion_strength(&dir, 9.0).unwrap();
+        assert_eq!(emotion_strength(&dir), 2.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -174,7 +174,7 @@ pub enum Part {
     Studio,
     /// AI chats.
     Chats,
-    /// Local AI models, voice previews and the voice engine.
+    /// Local AI models, voice previews and the voice engines (tts-venv, engines/).
     Models,
     /// Library, reading and watch history (the database), with its downloads and Studio work.
     Library,
@@ -194,7 +194,7 @@ impl Part {
             Part::VideoDownloads => &["library/anime", "library/movies", "library/subtitles"],
             Part::Studio => &[],
             Part::Chats => &["assistant", "assistant-workspace"],
-            Part::Models => &["models", "voice-samples", "tts-venv"],
+            Part::Models => &["models", "voice-samples", "tts-venv", "engines"],
             Part::Library => &["library/manga", "downloads", "studio/projects"],
             Part::Settings => &[],
             Part::Everything => &[],

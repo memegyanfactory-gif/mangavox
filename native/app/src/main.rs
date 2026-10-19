@@ -88,6 +88,8 @@ fn main() {
         .run(|cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
+        // Saved Appearance preset and reduce-motion, mapped onto Tokens and the component theme.
+        mv_ui::theme::init(cx);
         ui_media::warm_up();
         ui_settings::start_cli_update_checks(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);

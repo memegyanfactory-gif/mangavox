@@ -103,6 +103,8 @@ pub struct NarrationRequest {
     pub speed: f64,
     pub video: bool,
     pub resolution: String,
+    /// `mv_recap::FORMAT_LANDSCAPE` or `FORMAT_REELS`.
+    pub format: String,
     /// Explicit pipeline stages (Studio's Audio / Video phases); `None` = full run.
     pub stages: Option<Vec<String>>,
     /// Re-synthesize pages whose audio already exists.
@@ -132,10 +134,19 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
     });
     job.video_config = json!({
         "resolution": req.resolution,
+        "format": req.format,
+        // Asking for the video stage means "render it now", not "reuse the last file".
+        "force_rerender": true,
         "transition": "fade",
         "transition_duration": 0.5,
         "effect": "ken_burns",
     });
+    // The chapter's own score (Music step), when it is on and matches the narration.
+    let r = crate::page::chref(ch);
+    let music = mv_score::load_settings(&r);
+    if req.video && music.enabled && mv_score::is_fresh(&r, &music) {
+        job.video_config["score"] = json!(mv_score::score_wav(&r).to_string_lossy());
+    }
     job.ocr_engine = env.ocr_engine.clone();
     if matches!(env.ocr, OcrProvider::Local | OcrProvider::Unavailable { .. }) {
         // Without an Ollama model the worker falls through to the local OCR engines.
@@ -380,7 +391,15 @@ mod tests {
     }
 
     fn req(video: bool) -> NarrationRequest {
-        NarrationRequest { voice: "af_heart".into(), speed: 1.1, video, resolution: "720p".into(), stages: None, force_regen: true }
+        NarrationRequest {
+            voice: "af_heart".into(),
+            speed: 1.1,
+            video,
+            resolution: "720p".into(),
+            format: mv_recap::FORMAT_REELS.into(),
+            stages: None,
+            force_regen: true,
+        }
     }
 
     #[test]
@@ -391,6 +410,7 @@ mod tests {
         assert_eq!(job.tts_config["voice"], "af_heart");
         assert_eq!(job.tts_config["speed"], 1.1);
         assert_eq!(job.video_config["resolution"], "720p");
+        assert_eq!(job.video_config["format"], "reels");
         assert_eq!(job.output_dir, PathBuf::from("/lib/m/c1/pipeline"));
         assert!(!job.ollama_url.is_empty());
 

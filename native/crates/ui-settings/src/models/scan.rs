@@ -683,6 +683,31 @@ pub fn scan_kokoro(dir: &Path) -> Option<LocalModel> {
     })
 }
 
+/// Chatterbox weights in `models/chatterbox` (`WEIGHTS` in `python/chatterbox_tts.py`).
+pub const CHATTERBOX_FILES: [&str; 5] = ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"];
+
+/// The Chatterbox expressive narrator: its weights plus the reference clips in `voices/`.
+/// Its engine (Python 3.11 + PyTorch) lives in `engines/chatterbox`, not here.
+pub fn scan_chatterbox(dir: &Path) -> Option<LocalModel> {
+    let t3 = std::fs::metadata(dir.join(CHATTERBOX_FILES[1])).ok()?.len();
+    if t3 <= 1_000_000 || !CHATTERBOX_FILES.iter().all(|f| dir.join(f).is_file()) {
+        return None;
+    }
+    Some(LocalModel {
+        id: "chatterbox:en".into(),
+        key: dir.to_string_lossy().into_owned(),
+        name: "Chatterbox expressive narrator".into(),
+        family: "Chatterbox 0.5B (Resemble AI)".into(),
+        category: Category::Voice,
+        source: Source::MangaVox,
+        size: dir_size(dir),
+        path: dir.to_path_buf(),
+        vision: false,
+        quant: None,
+        thumbnail: None,
+    })
+}
+
 /// Piper voices: `<name>.onnx` next to `<name>.onnx.json`.
 pub fn scan_piper(dir: &Path) -> Vec<LocalModel> {
     let mut files = vec![];
@@ -1038,6 +1063,7 @@ pub fn scan_models(roots: &Roots, ollama_live: Option<&[(String, u64)]>) -> Vec<
     for r in &roots.piper {
         all.extend(scan_piper(r));
     }
+    all.extend(scan_chatterbox(&roots.app_models.join("chatterbox")));
     for r in &roots.whisper {
         all.extend(scan_whisper(r));
     }
@@ -1181,6 +1207,14 @@ mod tests {
         let piper = scan_piper(&d.join("piper"));
         assert_eq!(piper.len(), 1);
         assert_eq!(piper[0].key, "en_US-amy-medium");
+
+        for f in CHATTERBOX_FILES {
+            write(&d.join("chatterbox").join(f), if f == "t3_cfg.safetensors" { &mb } else { b"x" });
+        }
+        let cb = scan_chatterbox(&d.join("chatterbox")).unwrap();
+        assert_eq!((cb.category, cb.source), (Category::Voice, Source::MangaVox));
+        std::fs::remove_file(d.join("chatterbox/conds.pt")).unwrap();
+        assert!(scan_chatterbox(&d.join("chatterbox")).is_none());
 
         let big = vec![0u8; 10 * 1024 * 1024 + 1];
         write(&d.join("comfy/checkpoints/sdxl.safetensors"), &big);

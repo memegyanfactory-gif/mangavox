@@ -52,6 +52,27 @@ fn main() -> anyhow::Result<()> {
     }
     println!("  ... {} Hindi voices", setup::voices("hi").len());
 
+    // `--lab [voice] [kind]`: the voice lab (one sentence at intensity 2/5/8).
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--lab") {
+        let voice = args.get(i + 1).filter(|a| !a.starts_with("--")).cloned().unwrap_or_else(|| "cb_narrator_f".into());
+        let kind = args.get(i + 2).filter(|a| !a.starts_with("--")).cloned().unwrap_or_else(|| "fight".into());
+        println!("\n== Voice lab: {voice}, {kind}");
+        if let (Ok(py), Ok(layout)) = (&env.python, &env.scripts) {
+            let req = mv_studio::tts::LabRequest::new(&voice, &kind);
+            let dir = mv_studio::tts::default_lab_dir();
+            match rt.block_on(mv_studio::tts::voice_lab(py, layout, &dir, &std::env::temp_dir(), &req)) {
+                Ok(r) => {
+                    println!("  engine {} (voice {}): {}", r.engine, r.synth_voice, r.text);
+                    for s in &r.samples {
+                        println!("  intensity {:>2}: {:.2}s rtf {:?} {} -> {}", s.intensity, s.duration, s.rtf, s.params, s.path.display());
+                    }
+                }
+                Err(e) => println!("  failed: {e}"),
+            }
+        }
+    }
+
     println!("\n== Downloaded chapters");
     let groups = data::load()?;
     for g in &groups {
@@ -91,7 +112,7 @@ fn main() -> anyhow::Result<()> {
     copy.pages_dir = pages;
     copy.output_dir = tmp.join("pipeline");
     copy.has_text = false;
-    let req = NarrationRequest { voice: "af_heart".into(), speed: 1.0, video: false, resolution: "720p".into(), stages: None, force_regen: true };
+    let req = NarrationRequest { voice: "af_heart".into(), speed: 1.0, video: false, resolution: "720p".into(), format: mv_recap::FORMAT_LANDSCAPE.into(), stages: None, force_regen: true };
     let job = build_job(&req, &env, &copy);
     println!("\n== Running job on a 3-page copy in {}\nstages: {:?}", tmp.display(), job.stages);
 

@@ -42,11 +42,12 @@ pub(crate) enum Phase {
     Transcript,
     Story,
     Audio,
+    Music,
     Video,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 5] = [Phase::Read, Phase::Transcript, Phase::Story, Phase::Audio, Phase::Video];
+    pub const ALL: [Phase; 6] = [Phase::Read, Phase::Transcript, Phase::Story, Phase::Audio, Phase::Music, Phase::Video];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -54,6 +55,7 @@ impl Phase {
             Phase::Transcript => "Transcript",
             Phase::Story => "Story",
             Phase::Audio => "Audio",
+            Phase::Music => "Music",
             Phase::Video => "Video",
         }
     }
@@ -65,6 +67,7 @@ impl Phase {
             Phase::Transcript => st.transcript,
             Phase::Story => st.story,
             Phase::Audio => st.audio_files > 0,
+            Phase::Music => st.music,
             Phase::Video => st.video.is_some(),
         }
     }
@@ -133,6 +136,7 @@ pub struct StudioPage {
     restored: bool,
     pub(crate) renaming: Option<(String, Entity<InputState>)>,
     pub(crate) rename_sub: Option<Subscription>,
+    pub(crate) music: crate::music::MusicState,
     _subs: Vec<Subscription>,
 }
 
@@ -201,6 +205,7 @@ impl StudioPage {
             restored: false,
             renaming: None,
             rename_sub: None,
+            music: Default::default(),
             _subs: subs,
         };
         page.reload_library(cx);
@@ -701,7 +706,7 @@ impl StudioPage {
         // Room left for the steps once the side columns are drawn; narrow windows show only
         // the active step's name so the usage meter and setup stay visible.
         let center = f32::from(window.viewport_size().width) - 60. - LIBRARY_W - if self.side_open { SIDE_W } else { 0. };
-        let compact = center < 820.;
+        let compact = center < 900.;
         let status = self.focus.as_ref().map(|f| f.status.clone()).unwrap_or_default();
         let steps = div().flex().items_center().gap(px(2.)).children(Phase::ALL.iter().enumerate().map(|(i, &p)| {
             let active = self.phase == p;
