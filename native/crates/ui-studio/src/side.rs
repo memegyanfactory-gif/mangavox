@@ -121,11 +121,7 @@ impl StudioPage {
                         )
                         .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("Model: {}", r.model)))
                         .when(r.running(), |d| {
-                            let label = match (&r.chapter, r.total) {
-                                (Some(c), t) if t > 0 => format!("{c} · page {}/{t}", r.done.min(t)),
-                                (Some(c), _) => c.clone(),
-                                _ => "Starting…".into(),
-                            };
+                            let label = r.status_line();
                             d.child(progress_line(r.progress(), label))
                         })
                         .when(!r.new_characters.is_empty(), |d| {

@@ -352,7 +352,9 @@ impl StudioPage {
                     this.jobs = jobs;
                     changed = true;
                 }
-                if changed {
+                // Keep the "0:42" timer of a running read ticking.
+                let ticking = this.run.as_ref().is_some_and(|r| r.running() && !r.reading.is_empty());
+                if changed || ticking {
                     cx.notify();
                 }
             });

@@ -243,7 +243,7 @@ async fn read_chapter_end_to_end_and_resume() {
     let prompt = &seen[1].messages.last().unwrap().content;
     assert!(prompt.contains("Image 2 = reference face of"));
     assert!(prompt.contains("Silver-haired swordsman"));
-    assert_eq!(seen[1].workspace.as_ref().unwrap(), &chapter_dir(&ch).join("work"));
+    assert_eq!(seen[1].workspace.as_ref().unwrap(), &chapter_dir(&ch).join("work").join("p0001"));
     drop(seen);
     // placeholder renamed; speaker canonicalised
     let b = brain.lock().unwrap();

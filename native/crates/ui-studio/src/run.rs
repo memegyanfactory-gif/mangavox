@@ -36,6 +36,9 @@ pub struct RunInfo {
     pub done: usize,
     pub total: usize,
     pub page: Option<usize>,
+    /// Pages the model is working on right now, and since when.
+    pub reading: Vec<usize>,
+    pub since: Option<std::time::Instant>,
     pub logs: VecDeque<String>,
     pub new_characters: Vec<String>,
 }
@@ -43,6 +46,31 @@ pub struct RunInfo {
 impl RunInfo {
     pub fn running(&self) -> bool {
         self.state == RunState::Running
+    }
+
+    /// "Chapter 1 · reading pages 5–7 · 4/38 done · 0:42".
+    pub fn status_line(&self) -> String {
+        let mut parts: Vec<String> = vec![];
+        if let Some(c) = &self.chapter {
+            parts.push(c.clone());
+        }
+        match (self.reading.first(), self.reading.last()) {
+            (Some(a), Some(b)) if a != b => parts.push(format!("reading pages {}–{}", a + 1, b + 1)),
+            (Some(a), _) => parts.push(format!("reading page {}", a + 1)),
+            _ => {}
+        }
+        if self.total > 0 {
+            parts.push(format!("{}/{} done", self.done.min(self.total), self.total));
+        }
+        if let Some(t) = self.since.filter(|_| !self.reading.is_empty()) {
+            let s = t.elapsed().as_secs();
+            parts.push(format!("{}:{:02}", s / 60, s % 60));
+        }
+        if parts.is_empty() {
+            "Starting…".into()
+        } else {
+            parts.join(" · ")
+        }
     }
 
     /// 0..=1 across the whole batch.
@@ -128,6 +156,8 @@ fn begin(kind: RunKind, model: String, chapters: usize) -> Option<CancellationTo
         done: 0,
         total: 0,
         page: None,
+        reading: vec![],
+        since: None,
         logs: VecDeque::new(),
         new_characters: vec![],
     });
@@ -157,10 +187,22 @@ fn finish(res: anyhow::Result<()>, cancel: &CancellationToken) {
 fn progress_fn() -> mv_recap::ProgressFn {
     Arc::new(|p: Progress| {
         update(|r| match p {
+            Progress::Reading { pages, done, total } => {
+                r.done = done;
+                r.total = total;
+                r.since = Some(std::time::Instant::now());
+                r.log(match (pages.first(), pages.last()) {
+                    (Some(a), Some(b)) if a != b => format!("Reading pages {}–{}…", a + 1, b + 1),
+                    (Some(a), _) => format!("Reading page {}…", a + 1),
+                    _ => "Reading…".into(),
+                });
+                r.reading = pages;
+            }
             Progress::Page { done, total, page } => {
                 r.done = done;
                 r.total = total;
                 r.page = Some(page);
+                r.reading.retain(|p| *p != page);
             }
             Progress::Log(l) => r.log(l),
             Progress::Character { name, new } => {

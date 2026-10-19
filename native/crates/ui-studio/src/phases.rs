@@ -158,11 +158,7 @@ impl StudioPage {
             head = head.child(self.style_chips(cx));
         }
         if let Some(r) = run.filter(|r| matches!((r.kind, self.phase), (RunKind::Read, Phase::Read) | (RunKind::Story, Phase::Story))) {
-            let label = match (&r.chapter, r.total) {
-                (Some(c), t) if t > 0 => format!("{c} · page {}/{t} · {}", r.done.min(t), r.model),
-                (Some(c), _) => format!("{c} · {}", r.model),
-                _ => r.model.clone(),
-            };
+            let label = format!("{} · {}", r.status_line(), r.model);
             head = head.child(progress_line(r.progress(), label));
         }
         if let Some(j) = self.jobs.iter().find(|j| j.chapter_id == f.item.id && !j.state.finished()).filter(|_| matches!(self.phase, Phase::Audio | Phase::Video)) {
@@ -199,12 +195,7 @@ impl StudioPage {
         let f = self.focus.as_ref().expect("focus");
         let Some((path, ratio)) = f.pages.get(ix).cloned() else { return div().into_any_element() };
         let read = f.read.as_ref().and_then(|r| r.pages.iter().find(|p| p.index == ix)).cloned();
-        let reading_now = self.run.as_ref().filter(|r| r.running() && r.kind == RunKind::Read && r.chapter_id.as_deref() == Some(f.item.id.as_str())).is_some_and(|r| {
-            // Progress names the page just finished; the one being read is the next unread page.
-            let is_read = |p: usize| f.read.as_ref().is_some_and(|rd| rd.pages.iter().any(|x| x.index == p));
-            let from = r.page.map(|p| p + 1).unwrap_or(0);
-            (from..f.pages.len()).find(|&p| !is_read(p)) == Some(ix)
-        });
+        let reading_now = self.run.as_ref().is_some_and(|r| r.running() && r.kind == RunKind::Read && r.chapter_id.as_deref() == Some(f.item.id.as_str()) && r.reading.contains(&ix));
         let faces = run::brain_snapshot(&f.item.manga_id, &f.item.manga_title);
         div()
             .flex()

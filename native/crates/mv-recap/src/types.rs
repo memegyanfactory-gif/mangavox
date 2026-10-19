@@ -160,6 +160,8 @@ pub struct ChapterRef {
 
 #[derive(Debug, Clone)]
 pub enum Progress {
+    /// These pages are being read now; `done` of `total` are finished.
+    Reading { pages: Vec<usize>, done: usize, total: usize },
     Page { done: usize, total: usize, page: usize },
     Log(String),
     Character { name: String, new: bool },

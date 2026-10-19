@@ -61,9 +61,16 @@ pub fn chapter_label(number: Option<f64>, title: Option<&str>) -> String {
     }
 }
 
-/// Pipeline output folder for a chapter: next to its `pages` folder.
+/// Pipeline output folder for a chapter: next to its `pages` folder (library layout), or
+/// `<manga>/pipeline/<chapter folder>` when the images sit straight in the chapter folder
+/// (offline downloads) — every chapter must get its own folder.
 pub fn output_dir_for(pages_dir: &Path) -> PathBuf {
-    pages_dir.parent().unwrap_or(pages_dir).join("pipeline")
+    let parent = pages_dir.parent().unwrap_or(pages_dir);
+    match pages_dir.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n.eq_ignore_ascii_case("pages") => parent.join("pipeline"),
+        Some(n) => parent.join("pipeline").join(n),
+        None => pages_dir.join("pipeline"),
+    }
 }
 
 fn count_files(dir: &Path, exts: &[&str], min_bytes: u64) -> usize {
@@ -209,6 +216,9 @@ mod tests {
     fn output_dir_sits_next_to_pages() {
         let p = Path::new("/lib/m/c/pages");
         assert_eq!(output_dir_for(p), Path::new("/lib/m/c/pipeline"));
+        // Downloads keep images straight in the chapter folder; chapters must not share one.
+        assert_eq!(output_dir_for(Path::new("/dl/manga/ch-1")), Path::new("/dl/manga/pipeline/ch-1"));
+        assert_ne!(output_dir_for(Path::new("/dl/manga/ch-1")), output_dir_for(Path::new("/dl/manga/ch-2")));
     }
 
     #[test]

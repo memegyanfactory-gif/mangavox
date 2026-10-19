@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use image::{imageops::FilterType, DynamicImage};
-use mv_ai::{AiMessage, CancellationToken, Registry};
+use mv_ai::{AiMessage, AiStepRequest, CancellationToken, Registry};
 use serde_json::Value;
 
 use crate::brain::Brain;
@@ -62,6 +62,9 @@ Rules
 5. SCENE. Judge the depth of the page, not just the surface: fights, tension, grief, comedy beats, reveals, flashbacks. Pick the single best "kind", set intensity honestly (a quiet conversation is 1-3, a decisive blow or tearful goodbye is 8-10), and add 2-5 tags.
 6. SUMMARY continues the story: use the previous page's summary for continuity and write what is new here. If the page is only a title, credits or an ad, say so in the summary and return an empty "panels" list.
 7. Never wrap the JSON in code fences. Never output anything but the JSON object."##;
+
+/// Pages read at the same time.
+const PARALLEL: usize = 3;
 
 // ── parsing ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -406,88 +409,122 @@ pub(crate) async fn read_chapter_with(
         return Ok(read);
     }
     let total = targets.len();
+    let mut finished = 0;
 
-    for (k, &i) in targets.iter().enumerate() {
+    // Pages are read a few at a time: each model call is slow (tens of seconds), and a batch
+    // still sees the brain and the summaries of everything read before it.
+    // The first page goes alone so the brain has faces before pages are read side by side.
+    let (first, rest) = targets.split_at(1);
+    for batch in std::iter::once(first).chain(rest.chunks(PARALLEL)) {
         if cancel.is_cancelled() {
             progress(Progress::Failed("Cancelled".into()));
             return Err(anyhow!("cancelled"));
         }
-        let page_path = pages[i].clone();
-        let file = page_path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        progress(Progress::Reading { pages: batch.to_vec(), done: finished, total });
 
-        let (wp, wk) = (page_path.clone(), work.clone());
-        let prepped = tokio::task::spawn_blocking(move || prep_page(&wp, &wk, i)).await.map_err(|e| anyhow!(e))?;
-        let (send_path, w, h) = match prepped {
-            Ok(x) => x,
-            Err(e) => {
-                progress(Progress::Log(format!("Page {}: {e}", i + 1)));
-                upsert(&mut read, PageRead { index: i, file, summary: format!("(unreadable image: {e})"), ..Default::default() });
-                save_read(ch, &read)?;
-                progress(Progress::Page { done: k + 1, total, page: i });
-                continue;
-            }
-        };
-
-        let prev_summary = i.checked_sub(1).and_then(|p| read.pages.iter().find(|x| x.index == p)).map(|p| p.summary.clone()).unwrap_or_default();
-        let recent = recent_names(&read, i);
-        let (prompt, faces) = {
-            let b = brain.lock().unwrap();
-            let faces = pick_faces(&b, &recent);
-            let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces });
-            (prompt, faces)
-        };
-        let mut images = vec![send_path];
-        images.extend(faces.iter().map(|(_, p)| p.clone()));
-        let req = request(model, vec![AiMessage::system(READ_SYSTEM), AiMessage::user(prompt)], images, Some(work.clone()));
-
-        let answer = match ask_json(llm, req, cancel).await {
-            Ok(a) => a,
-            Err(e) if is_cancelled(&e) => {
-                progress(Progress::Failed("Cancelled".into()));
-                return Err(e);
-            }
-            Err(e) => return Err(fail(format!("Page {}: {e}", i + 1))),
-        };
-        let mut parsed = match answer {
-            Ok(v) => parse_page(&v, i, &file),
-            Err(raw) => {
-                progress(Progress::Log(format!("Page {}: the model did not return valid JSON; stored its raw text instead.", i + 1)));
-                Parsed { page: PageRead { index: i, file: file.clone(), summary: truncate(&raw, 600), ..Default::default() }, extras: vec![], memory: None }
-            }
-        };
-
-        let (events, jobs) = {
-            let mut b = brain.lock().unwrap();
-            apply_to_brain(&mut b, &mut parsed, &ch.chapter_id, &ch.label)
-        };
-        for (name, new) in events {
-            progress(Progress::Character { name, new });
+        // 1. Prepare images and prompts.
+        let mut jobs: Vec<(usize, PathBuf, String, Option<AiStepRequest>)> = vec![];
+        for &i in batch {
+            let page_path = pages[i].clone();
+            let file = page_path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+            // Each page gets its own workspace: CLI agents clear their attachments when done.
+            let ws = work.join(format!("p{i:04}"));
+            std::fs::create_dir_all(&ws).context("create page workspace")?;
+            let (wp, wk) = (page_path.clone(), ws.clone());
+            let prepped = tokio::task::spawn_blocking(move || prep_page(&wp, &wk, i)).await.map_err(|e| anyhow!(e))?;
+            let (send_path, w, h) = match prepped {
+                Ok(x) => x,
+                Err(e) => {
+                    progress(Progress::Log(format!("Page {}: {e}", i + 1)));
+                    upsert(&mut read, PageRead { index: i, file, summary: format!("(unreadable image: {e})"), ..Default::default() });
+                    jobs.push((i, page_path, String::new(), None));
+                    continue;
+                }
+            };
+            let prev_summary = (0..i).rev().find_map(|p| read.pages.iter().find(|x| x.index == p)).map(|p| p.summary.clone()).unwrap_or_default();
+            let recent = recent_names(&read, i);
+            let (prompt, faces) = {
+                let b = brain.lock().unwrap();
+                let faces = pick_faces(&b, &recent);
+                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces });
+                (prompt, faces)
+            };
+            let mut images = vec![send_path];
+            images.extend(faces.iter().map(|(_, p)| p.clone()));
+            let req = request(model, vec![AiMessage::system(READ_SYSTEM), AiMessage::user(prompt)], images, Some(ws));
+            jobs.push((i, page_path, file, Some(req)));
         }
-        let assets = Assets {
-            page: page_path,
-            page_index: i,
-            panels: parsed.page.panels.iter().enumerate().filter_map(|(n, p)| p.bbox.map(|b| (n, b))).collect(),
-            faces: jobs,
-            panels_dir: panels_dir(ch),
-        };
-        match tokio::task::spawn_blocking(move || write_assets(assets)).await.map_err(|e| anyhow!(e))? {
-            Ok(faces) => {
+
+        // 2. Ask the model about every page of the batch at once.
+        let answers = futures::future::join_all(jobs.iter().map(|(_, _, _, req)| async move {
+            match req {
+                Some(r) => Some(ask_json(llm, r.clone(), cancel).await),
+                None => None,
+            }
+        }))
+        .await;
+
+        // 3. Fold the answers in, in page order.
+        for ((i, page_path, file, _), answer) in jobs.into_iter().zip(answers) {
+            finished += 1;
+            let Some(answer) = answer else {
+                save_read(ch, &read)?;
+                progress(Progress::Page { done: finished, total, page: i });
+                continue;
+            };
+            let answer = match answer {
+                Ok(a) => a,
+                Err(e) if is_cancelled(&e) => {
+                    save_read(ch, &read)?;
+                    progress(Progress::Failed("Cancelled".into()));
+                    return Err(e);
+                }
+                Err(e) => {
+                    save_read(ch, &read)?;
+                    return Err(fail(format!("Page {}: {e}", i + 1)));
+                }
+            };
+            let mut parsed = match answer {
+                Ok(v) => parse_page(&v, i, &file),
+                Err(raw) => {
+                    progress(Progress::Log(format!("Page {}: the model did not return valid JSON; stored its raw text instead.", i + 1)));
+                    Parsed { page: PageRead { index: i, file: file.clone(), summary: truncate(&raw, 600), ..Default::default() }, extras: vec![], memory: None }
+                }
+            };
+
+            let (events, face_jobs) = {
                 let mut b = brain.lock().unwrap();
-                for (id, p) in faces {
-                    b.add_face(&id, p);
+                apply_to_brain(&mut b, &mut parsed, &ch.chapter_id, &ch.label)
+            };
+            for (name, new) in events {
+                progress(Progress::Character { name, new });
+            }
+            let assets = Assets {
+                page: page_path,
+                page_index: i,
+                panels: parsed.page.panels.iter().enumerate().filter_map(|(n, p)| p.bbox.map(|b| (n, b))).collect(),
+                faces: face_jobs,
+                panels_dir: panels_dir(ch),
+            };
+            match tokio::task::spawn_blocking(move || write_assets(assets)).await.map_err(|e| anyhow!(e))? {
+                Ok(faces) => {
+                    let mut b = brain.lock().unwrap();
+                    for (id, p) in faces {
+                        b.add_face(&id, p);
+                    }
+                }
+                Err(e) => progress(Progress::Log(format!("Page {}: crops failed: {e}", i + 1))),
+            }
+            {
+                let b = brain.lock().unwrap().clone();
+                if let Err(e) = b.save() {
+                    progress(Progress::Log(format!("Could not save the brain: {e}")));
                 }
             }
-            Err(e) => progress(Progress::Log(format!("Page {}: crops failed: {e}", i + 1))),
+            upsert(&mut read, parsed.page);
+            save_read(ch, &read)?;
+            progress(Progress::Page { done: finished, total, page: i });
         }
-        {
-            let b = brain.lock().unwrap().clone();
-            if let Err(e) = b.save() {
-                progress(Progress::Log(format!("Could not save the brain: {e}")));
-            }
-        }
-        upsert(&mut read, parsed.page);
-        save_read(ch, &read)?;
-        progress(Progress::Page { done: k + 1, total, page: i });
     }
     progress(Progress::Done);
     Ok(read)
