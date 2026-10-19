@@ -1,7 +1,7 @@
 {
   "name": "mangavox",
   "productName": "MangaVox",
-  "version": "7.23.2",
+  "version": "7.23.3",
   "description": "Manga-to-Voice Platform — browse, read, and convert manga to audio/video",
   "main": "./out/main/index.js",
   "scripts": {
