@@ -198,12 +198,38 @@ def _python_candidates() -> list[str]:
         "/opt/homebrew/bin/python3.11",
         "/opt/homebrew/bin/python3",
         "/usr/local/bin/python3.12",
+        *_windows_launcher_pythons(),
         sys.executable,
         shutil.which("python3"),
     ]:
         if cand and cand not in out and os.path.isfile(cand):
             out.append(cand)
     return out
+
+
+_LAUNCHER_PYTHONS: list[str] | None = None
+
+
+def _windows_launcher_pythons() -> list[str]:
+    """Interpreters the Windows `py` launcher knows, best versions for the TTS wheels first."""
+    global _LAUNCHER_PYTHONS
+    if _LAUNCHER_PYTHONS is not None:
+        return _LAUNCHER_PYTHONS
+    found: list[str] = []
+    py = shutil.which("py") if os.name == "nt" else None
+    if py:
+        for ver in ("3.12", "3.11", "3.13", "3.10"):
+            try:
+                r = subprocess.run([py, f"-{ver}", "-c", "import sys; print(sys.executable)"],
+                                   capture_output=True, text=True, timeout=10,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                exe = r.stdout.strip()
+                if r.returncode == 0 and exe and exe not in found:
+                    found.append(exe)
+            except Exception:
+                pass
+    _LAUNCHER_PYTHONS = found
+    return found
 
 
 def _python_version_ok(path: str, min_minor: int = 10) -> bool:
@@ -230,10 +256,40 @@ def resolve_python(prefer_venv: bool = True) -> str:
 
 
 def kokoro_model_paths() -> tuple[str, str]:
-    return (
-        os.path.join(MODEL_DIR, "kokoro-v1.0.onnx"),
-        os.path.join(MODEL_DIR, "voices-v1.0.bin"),
-    )
+    """Full-precision model when downloaded, else the int8 "Lite" pack from Settings → Audio."""
+    full = os.path.join(MODEL_DIR, "kokoro-v1.0.onnx")
+    lite = os.path.join(MODEL_DIR, "kokoro-v1.0.int8.onnx")
+    onnx = lite if not os.path.isfile(full) and os.path.isfile(lite) else full
+    return (onnx, os.path.join(MODEL_DIR, "voices-v1.0.bin"))
+
+
+def _thread_cap() -> int | None:
+    """Worker threads allowed by MangaVox's system resource limit (Settings → System)."""
+    try:
+        n = int(os.environ.get("MANGAVOX_THREADS", "0"))
+        return n if n > 0 else None
+    except ValueError:
+        return None
+
+
+def load_kokoro():
+    """Kokoro with ONNX Runtime capped to the allowed thread count."""
+    from kokoro_onnx import Kokoro
+
+    onnx_path, voices_path = kokoro_model_paths()
+    cap = _thread_cap()
+    if cap:
+        try:
+            import onnxruntime as ort
+
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = cap
+            opts.inter_op_num_threads = 1
+            session = ort.InferenceSession(onnx_path, sess_options=opts, providers=["CPUExecutionProvider"])
+            return Kokoro.from_session(session, voices_path)
+        except Exception:
+            pass
+    return Kokoro(onnx_path, voices_path)
 
 
 def kokoro_models_ready() -> bool:
@@ -630,9 +686,13 @@ def status() -> dict:
         xtts_ready_flag = xtts_ready(py)
     except ImportError:
         pass
-    
+    kokoro_deps_flag = kokoro_deps_ready(py)
+    piper_deps_flag = piper_deps_ready(py)
+
     st = {
         "installed": engine is not None or kokoro_models_ready() or piper_models_ready() or f5_ready_flag or parler_ready_flag,
+        "kokoroDepsReady": kokoro_deps_flag,
+        "piperDepsReady": piper_deps_flag,
         "engine": engine or "none",
         "f5Ready": f5_ready_flag,
         "parlerReady": parler_ready_flag,
@@ -641,7 +701,7 @@ def status() -> dict:
         "piperHiReady": piper_hi_ready(),
         "piperEnReady": piper_en_ready(),
         "xttsReady": xtts_ready_flag,
-        "depsReady": kokoro_deps_ready() or piper_deps_ready() or f5_ready_flag or parler_ready_flag,
+        "depsReady": kokoro_deps_flag or piper_deps_flag or f5_ready_flag or parler_ready_flag,
         "modelsReady": kokoro_models_ready() or piper_models_ready() or f5_ready_flag or parler_ready_flag,
         "modelDir": MODEL_DIR,
         "piperDir": PIPER_DIR,
@@ -980,16 +1040,12 @@ def _write_wav_pcm16(path: str, samples, sample_rate: int) -> None:
 
 
 def synthesize_kokoro(text: str, output_path: str, voice: str, speed: float) -> None:
-    import soundfile as sf
-    from kokoro_onnx import Kokoro
-
     kokoro_voice, lang, _ = resolve_voice(voice)
-    onnx_path, voices_path = kokoro_model_paths()
     py = resolve_python()
     if not kokoro_deps_ready(py):
         raise RuntimeError("Kokoro deps missing")
 
-    engine = Kokoro(onnx_path, voices_path)
+    engine = load_kokoro()
     samples, sample_rate = engine.create(text, voice=kokoro_voice, speed=float(speed or 1.0), lang=lang)
     _write_wav_pcm16(output_path, samples, sample_rate)
 
@@ -1082,9 +1138,7 @@ _loaded_kokoro_model = None
 def get_kokoro_model():
     global _loaded_kokoro_model
     if _loaded_kokoro_model is None:
-        from kokoro_onnx import Kokoro
-        onnx_path, voices_path = kokoro_model_paths()
-        _loaded_kokoro_model = Kokoro(onnx_path, voices_path)
+        _loaded_kokoro_model = load_kokoro()
     return _loaded_kokoro_model
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -1173,6 +1227,49 @@ def cmd_synthesize(args_path: str) -> int:
         return 1
 
 
+ENGINE_PACKAGES = {
+    "kokoro": ["kokoro-onnx>=0.4.0", "soundfile>=0.12.0", "numpy>=1.26"],
+    "piper": ["piper-tts>=1.3.0", "onnxruntime>=1.19.0,<2"],
+}
+
+
+def install_engine(name: str) -> int:
+    """Install one engine's Python packages into the managed voice environment.
+
+    Model files are downloaded separately (Settings → Audio), so this only runs pip.
+    Emits JSON lines: info / progress / done / error.
+    """
+    packages = ENGINE_PACKAGES.get(name)
+    if not packages:
+        emit({"type": "error", "message": f"Unknown engine: {name}"})
+        return 2
+    check = kokoro_deps_ready if name == "kokoro" else piper_deps_ready
+    emit({"type": "progress", "stage": "venv", "current": 1, "total": 3, "message": "Preparing the voice environment…"})
+    try:
+        py = _ensure_venv()
+    except Exception as e:
+        emit({"type": "error", "message": f"Could not create the voice environment: {str(e)[:300]}"})
+        return 1
+    if not py:
+        emit({"type": "error", "message": "Python 3.10 or newer is needed for voices. Install it (winget install -e --id Python.Python.3.12) and try again."})
+        return 1
+    if check(py):
+        emit({"type": "done", "message": f"{name} is already installed", "python": py})
+        return 0
+    emit({"type": "progress", "stage": "pip", "current": 2, "total": 3, "message": f"Installing {', '.join(packages)}…"})
+    try:
+        _pip_install(py, packages)
+    except Exception as e:
+        emit({"type": "error", "message": str(e)[-600:]})
+        return 1
+    emit({"type": "progress", "stage": "verify", "current": 3, "total": 3, "message": "Checking the install…"})
+    if not check(py):
+        emit({"type": "error", "message": f"{name} installed but cannot be imported with {py}"})
+        return 1
+    emit({"type": "done", "message": f"{name} installed", "python": py})
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print(__doc__, file=sys.stderr)
@@ -1183,6 +1280,8 @@ def main() -> int:
         return 0
     if cmd in ("install", "install-all"):
         return install()
+    if cmd == "install-engine":
+        return install_engine(sys.argv[2] if len(sys.argv) > 2 else "kokoro")
     if cmd == "serve":
         voice_id = sys.argv[2] if len(sys.argv) > 2 else "hf_alpha"
         run_server(voice_id)

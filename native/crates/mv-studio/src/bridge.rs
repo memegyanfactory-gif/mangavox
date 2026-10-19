@@ -208,9 +208,12 @@ pub fn build_command(
         .kill_on_drop(true);
     #[cfg(windows)]
     {
-        // No console window flashing up for every worker in the GUI app.
-        cmd.creation_flags(crate::python::CREATE_NO_WINDOW);
+        // No console window flashing up for every worker in the GUI app; below normal
+        // priority so the UI and the rest of the PC stay responsive.
+        cmd.creation_flags(crate::python::CREATE_NO_WINDOW | mv_core::limits::BELOW_NORMAL_PRIORITY);
     }
+    // Thread pools (OpenMP, BLAS, ONNX Runtime) sized to the system resource limit.
+    cmd.envs(mv_core::limits::child_env());
     #[cfg(unix)]
     {
         // Own process group, so cancel can signal the whole tree.
@@ -270,6 +273,7 @@ where
     let mut child = build_command(&spec.interpreter, &spec.script, &spec.args, &spec.cwd)
         .spawn()
         .map_err(|e| map_spawn_error(&spec.interpreter, &spec.script, e))?;
+    adopt(&child);
 
     let mut stdout = child
         .stdout
@@ -484,6 +488,13 @@ pub async fn kill_tree(child: &mut Child) {
     let _ = child.wait().await;
 }
 
+/// Puts a worker under the system resource limit (CPU cap, memory limit, priority).
+fn adopt(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        mv_core::limits::adopt(pid);
+    }
+}
+
 /// Runs a script to completion and returns `(exit code, stdout, stderr)`.
 /// Used for one-shot helpers (voice preview, Kokoro status) that print a JSON line.
 pub async fn run_capture(
@@ -492,10 +503,11 @@ pub async fn run_capture(
     args: &[String],
     cwd: &Path,
 ) -> Result<(Option<i32>, String, String), StudioError> {
-    let out = build_command(interpreter, script, args, cwd)
-        .output()
-        .await
+    let child = build_command(interpreter, script, args, cwd)
+        .spawn()
         .map_err(|e| map_spawn_error(interpreter, script, e))?;
+    adopt(&child);
+    let out = child.wait_with_output().await?;
     Ok((
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

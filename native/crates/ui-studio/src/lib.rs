@@ -5,7 +5,7 @@
 use gpui_kit::*;
 use mv_ui::Route;
 
-mod audio;
+pub mod audio;
 pub mod data;
 mod page;
 mod phases;

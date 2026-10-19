@@ -374,7 +374,11 @@ impl StudioPage {
     fn voice_card(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let env = self.setup.read(cx).env.clone();
         let engines = env.as_ref().map(|e| e.engines.clone()).unwrap_or_default();
-        let voice = self.prefs.voice.clone().unwrap_or_default();
+        // The default comes from Settings → Audio; a chapter may have its own voice.
+        let default = self.prefs.voice.clone().unwrap_or_default();
+        let own = self.focus_id.as_deref().and_then(mv_studio::voices::chapter_voice);
+        let voice = own.clone().unwrap_or_else(|| default.clone());
+        let default_label = mv_studio::tts::find_voice(&default).map(|v| v.label).unwrap_or("none");
         let langs = div().flex().gap(px(6.)).children([("en", "English"), ("hi", "Hindi")].map(|(code, label)| {
             chip(SharedString::from(format!("lang-{code}")), label, self.lang == code).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.lang = code;
@@ -449,8 +453,20 @@ impl StudioPage {
                 )
                 .when(on, |d| d.child(icon("icons/star.svg", Tokens::accent(), 13.)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.prefs.voice = Some(id.to_string());
-                    this.prefs.save();
+                    let chapters: Vec<String> = this.targets().into_iter().map(|c| c.id).collect();
+                    let default = this.prefs.voice.clone().unwrap_or_default();
+                    if chapters.is_empty() {
+                        this.prefs.voice = Some(id.to_string());
+                        if let Err(e) = mv_studio::voices::set_default_voice(id) {
+                            this.say(true, format!("Could not save the voice: {e}"));
+                        }
+                    }
+                    for ch in chapters {
+                        // Picking the default again clears the chapter's own choice.
+                        if let Err(e) = mv_studio::voices::set_chapter_voice(&ch, (id != default).then_some(id)) {
+                            this.say(true, format!("Could not save the voice: {e}"));
+                        }
+                    }
                     cx.notify();
                 }))
         }));
@@ -469,7 +485,19 @@ impl StudioPage {
                     .items_center()
                     .gap(px(12.))
                     .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).child("Narrator"))
-                    .child(div().flex_1().text_size(px(size::XS)).text_color(Tokens::text_3()).child("Press ▶ to hear a sample. The voice you pick is remembered as the default."))
+                    .child(div().flex_1().text_size(px(size::XS)).text_color(Tokens::text_3()).child(if own.is_some() {
+                        format!("Own voice for this chapter. Default: {default_label}.")
+                    } else {
+                        format!("Default: {default_label}. A voice picked here is for this chapter only.")
+                    }))
+                    .when(own.is_some(), |d| {
+                        d.child(chip("voice-use-default", "Use default", false).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            for ch in this.targets() {
+                                let _ = mv_studio::voices::set_chapter_voice(&ch.id, None);
+                            }
+                            cx.notify();
+                        })))
+                    })
                     .child(langs),
             )
             .child(tiles)
@@ -644,30 +672,46 @@ impl StudioPage {
             self.say(true, "Studio needs Python and the pipeline scripts. See Setup.");
             return cx.notify();
         }
-        let voice = self.prefs.voice.clone().unwrap_or_else(|| "af_heart".into());
+        let targets = self.targets();
+        // Each chapter is narrated with its own voice, else the default (Settings → Audio).
+        let mut by_voice: Vec<(String, Vec<crate::data::ChapterItem>)> = vec![];
+        for c in &targets {
+            let v = mv_studio::voices::voice_for_chapter(&c.id);
+            match by_voice.iter_mut().find(|(g, _)| *g == v) {
+                Some((_, list)) => list.push(c.clone()),
+                None => by_voice.push((v, vec![c.clone()])),
+            }
+        }
         if stages.contains(&"tts") {
-            let ok = mv_studio::tts::find_voice(&voice).is_some_and(|v| setup::voice_ready(&env.engines, v).usable());
-            if !ok {
+            let missing_voice = by_voice.iter().map(|(v, _)| v).find(|v| !mv_studio::tts::find_voice(v).is_some_and(|v| setup::voice_ready(&env.engines, v).usable()));
+            if let Some(v) = missing_voice {
+                let label = mv_studio::tts::find_voice(v).map(|v| v.label).unwrap_or(v.as_str());
                 self.show_setup = true;
-                self.say(true, "The selected voice isn't installed yet. See Setup, or pick a ready voice.");
+                self.say(true, format!("{label} isn't installed yet. Download it in Settings → Audio, or pick a ready voice."));
                 return cx.notify();
             }
         }
-        let targets = self.targets();
         let missing: Vec<String> = targets.iter().filter(|c| !self.statuses.get(&c.id).is_some_and(|s| s.story)).map(|c| c.label()).collect();
         if stages.contains(&"tts") && !missing.is_empty() {
             self.say(true, format!("Write the story first for: {}", missing.join(", ")));
             return cx.notify();
         }
-        let req = NarrationRequest {
-            voice,
-            speed: self.prefs.speed,
-            video: stages.contains(&"video"),
-            resolution: self.prefs.resolution.clone(),
-            stages: Some(stages.iter().map(|s| s.to_string()).collect()),
-            force_regen,
-        };
-        match service::enqueue(&env, &req, &targets) {
+        let mut queued: anyhow::Result<usize> = Ok(0);
+        for (voice, chapters) in by_voice {
+            let req = NarrationRequest {
+                voice,
+                speed: self.prefs.speed,
+                video: stages.contains(&"video"),
+                resolution: self.prefs.resolution.clone(),
+                stages: Some(stages.iter().map(|s| s.to_string()).collect()),
+                force_regen,
+            };
+            queued = match (queued, service::enqueue(&env, &req, &chapters)) {
+                (Ok(a), Ok(b)) => Ok(a + b),
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            };
+        }
+        match queued {
             Ok(0) => self.say(false, "Already in progress."),
             Ok(n) => {
                 self.notice = None;

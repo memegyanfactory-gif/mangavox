@@ -73,8 +73,8 @@ impl Engines {
         Self {
             kokoro: b("/engines/kokoro/ready"),
             kokoro_models: b("/kokoroReady"),
-            kokoro_deps: false,
-            piper_deps: piper_engine,
+            kokoro_deps: b("/kokoroDepsReady"),
+            piper_deps: piper_engine || b("/piperDepsReady"),
             piper_hi: piper_engine && b("/piperHiReady"),
             piper_en: piper_engine && b("/piperEnReady"),
             f5: b("/f5Ready"),
@@ -368,7 +368,7 @@ pub async fn check() -> Env {
         (Ok(py), Some(active)) => paths_match(&py.program, active),
         _ => engines.python.is_none(),
     };
-    engines.kokoro_deps = engines.kokoro || same_python && has("kokoro_onnx") && has("soundfile");
+    engines.kokoro_deps = engines.kokoro_deps || engines.kokoro || same_python && has("kokoro_onnx") && has("soundfile");
     engines.piper_deps = engines.piper_deps || same_python && has("piper");
 
     let mut providers = ProviderConfig::load(&config_path());

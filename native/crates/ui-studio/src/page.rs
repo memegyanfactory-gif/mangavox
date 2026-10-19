@@ -155,7 +155,8 @@ impl StudioPage {
             }
         }));
         let prefs = Prefs::load();
-        let voice = prefs.voice.clone().filter(|v| mv_studio::tts::find_voice(v).is_some()).unwrap_or_else(|| "af_heart".into());
+        // Default narrator chosen in Settings → Audio (same file, plus config.json fallback).
+        let voice = mv_studio::voices::default_voice();
         let mut prefs = prefs;
         prefs.voice = Some(voice.clone());
         if !(0.5..=2.0).contains(&prefs.speed) {
@@ -430,7 +431,13 @@ impl StudioPage {
         self.prefs.last_phase = phase;
         self.prefs.selected = selected;
         self.prefs.open_groups = open;
-        self.prefs.save();
+        // Only these keys: Settings may have changed others (e.g. the default voice) meanwhile.
+        let mut on_disk = Prefs::load();
+        on_disk.last_chapter = self.prefs.last_chapter.clone();
+        on_disk.last_phase = self.prefs.last_phase.clone();
+        on_disk.selected = self.prefs.selected.clone();
+        on_disk.open_groups = self.prefs.open_groups.clone();
+        on_disk.save();
     }
 
     pub(crate) fn say(&mut self, error: bool, text: impl Into<String>) {
