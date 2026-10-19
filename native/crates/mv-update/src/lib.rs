@@ -3,8 +3,8 @@
 //! Every push to `main` publishes a release (`.github/workflows/release.yml`) with
 //! `MangaVox-<ver>-win64.zip` (the whole app folder) and `MangaVox-Setup-<ver>.exe`.
 //! The app checks `releases/latest`; updating downloads the zip, unpacks it next to the
-//! install, and a small hidden script swaps the files in once the app has exited and
-//! starts it again. No installer is shown for updates.
+//! install, swaps the files in (moving locked ones aside) and starts the new copy before
+//! quitting. No installer is shown for updates.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -212,36 +212,75 @@ pub async fn prepare(release: &Release, progress: impl Fn(u64, u64)) -> Result<P
     Ok(staged)
 }
 
-/// Starts a hidden script that waits for this process to exit, copies `staged` over
-/// `install`, records the new version and starts the app again. The caller then quits.
+/// Copies `staged` over `install` while this app is still running, then starts the new
+/// copy; the caller then quits. Windows lets a running exe or loaded DLL be renamed but
+/// not overwritten, so locked files are moved aside to `*.old` (removed by [`cleanup`] on
+/// the next start). The swap happens before quitting, so even if the restart fails the
+/// next launch is the new version.
 pub fn apply_and_restart(staged: &Path, install: &Path, version: &str) -> Result<()> {
-    let pid = std::process::id();
-    let script = updates_dir().join("apply.cmd");
-    std::fs::create_dir_all(updates_dir())?;
-    let body = format!(
-        "@echo off\r\n\
-         :wait\r\n\
-         tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n\
-         robocopy \"{src}\" \"{dst}\" /E /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >nul\r\n\
-         if %ERRORLEVEL% GEQ 8 goto start\r\n\
-         reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{PRODUCT}\" /v DisplayVersion /d \"{version}\" /f >nul 2>nul\r\n\
-         rmdir /s /q \"{src}\"\r\n\
-         :start\r\n\
-         start \"\" \"{dst}\\{EXE}\"\r\n\
-         del \"%~f0\"\r\n",
-        src = staged.display(),
-        dst = install.display(),
-    );
-    std::fs::write(&script, body)?;
-    let mut cmd = Command::new("cmd");
-    cmd.arg("/c").arg(&script);
+    std::fs::create_dir_all(install)?;
+    copy_over(staged, install).context("Could not replace the app files")?;
+    let _ = reg_add("DisplayVersion", "REG_SZ", version);
+    let _ = std::fs::remove_dir_all(staged);
+    restart(install)
+}
+
+fn copy_over(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_over(&entry.path(), &to)?;
+            continue;
+        }
+        if to.exists() && std::fs::remove_file(&to).is_err() {
+            // In use: move it aside under a fresh name.
+            let mut aside = to.as_os_str().to_owned();
+            aside.push(format!(".{}.old", std::process::id()));
+            std::fs::rename(&to, &aside).with_context(|| format!("{} is in use", to.display()))?;
+        }
+        std::fs::copy(entry.path(), &to).with_context(|| format!("Could not write {}", to.display()))?;
+    }
+    Ok(())
+}
+
+/// Starts the installed exe, outside any job object this process runs in so it survives our exit.
+fn restart(install: &Path) -> Result<()> {
+    let exe = install.join(EXE);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        let spawn = |flags: u32| Command::new(&exe).current_dir(install).creation_flags(flags).spawn();
+        if spawn(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB).is_ok() {
+            return Ok(());
+        }
+        spawn(DETACHED_PROCESS).context("Could not restart MangaVox")?;
     }
-    cmd.spawn().context("Could not start the updater")?;
+    #[cfg(not(windows))]
+    Command::new(&exe).current_dir(install).spawn().context("Could not restart MangaVox")?;
     Ok(())
+}
+
+/// Deletes the `*.old` files an earlier update moved aside. Call once at startup.
+pub fn cleanup() {
+    fn walk(dir: &Path) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p);
+            } else if p.extension().is_some_and(|x| x == "old") {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    if let Some(dir) = install_dir() {
+        walk(&dir);
+    }
+    // Left over from the old script-based updater.
+    let _ = std::fs::remove_file(updates_dir().join("apply.cmd"));
 }
 
 // ---------------------------------------------------------------- install integration (setup exe)

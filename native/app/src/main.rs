@@ -44,6 +44,11 @@ fn main() {
         return;
     }
     perf::mark_start();
+    // Files an update moved aside; the previous process may still be exiting, so wait a bit.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        mv_update::cleanup();
+    });
     init_sources();
     // Remote posters/avatars load through GPUI's image cache, which needs an HTTP client.
     let http = reqwest_client::ReqwestClient::user_agent(mv_net::BROWSER_UA).expect("http client");

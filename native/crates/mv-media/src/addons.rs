@@ -20,7 +20,7 @@ use crate::types::{AnimeAddonManifest, AnimeTorrentStream};
 
 const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 /// After the first startable source arrives, wait this long for better ones.
-const GRACE: Duration = Duration::from_millis(1500);
+const GRACE: Duration = Duration::from_millis(3000);
 /// Answer with whatever we have after this, even if addons are still running.
 const DEADLINE: Duration = Duration::from_secs(9);
 
@@ -169,17 +169,28 @@ impl AddonRegistry {
     }
 
     /// Query every stream addon for `resource_id` (`tt…` for movies, `tt…:S:E` for episodes) and
-    /// return the ranked, de-duplicated playable streams. Answers shortly after a startable source
-    /// shows up, or after a hard deadline. Non-empty complete results are cached for 30 minutes.
+    /// return the ranked, de-duplicated playable streams. See [`Self::find_streams_any`].
     pub async fn find_streams(&self, resource_id: &str, kind: &str) -> Vec<AnimeTorrentStream> {
-        let key = format!("{kind}:{resource_id}");
+        self.find_streams_any(&[resource_id.to_string()], kind).await
+    }
+
+    /// Like [`Self::find_streams`] for several ids of the same item (e.g. `tt…:2:5` and
+    /// `kitsu:…:30`): each addon is asked for every id it declares support for, and the results
+    /// are merged. Answers shortly after a startable source shows up, or after a hard deadline.
+    /// Non-empty complete results are cached for 30 minutes.
+    pub async fn find_streams_any(&self, ids: &[String], kind: &str) -> Vec<AnimeTorrentStream> {
+        let key = format!("{kind}:{}", ids.join("|"));
         if let Some((at, s)) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             if at.elapsed() < CACHE_TTL {
                 return s.clone();
             }
         }
-        let providers = self.stream_addons(kind);
-        let (ranked, complete) = search_streams(providers, resource_id, kind).await;
+        let jobs: Vec<(AnimeAddonManifest, String)> = self
+            .stream_addons(kind)
+            .into_iter()
+            .flat_map(|a| ids.iter().filter(|id| accepts(&a, id)).map(|id| (a.clone(), id.clone())).collect::<Vec<_>>())
+            .collect();
+        let (ranked, complete) = search_streams(jobs, kind).await;
         if complete && !ranked.is_empty() {
             self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (Instant::now(), ranked.clone()));
         }
@@ -187,13 +198,19 @@ impl AddonRegistry {
     }
 }
 
+/// Whether `addon` may serve streams for `id`: its `idPrefixes` match, or it declares none
+/// (Torrentio lists them per resource; an unsupported id just comes back empty).
+fn accepts(addon: &AnimeAddonManifest, id: &str) -> bool {
+    addon.id_prefixes.is_empty() || addon.id_prefixes.iter().any(|p| id.starts_with(p.as_str()))
+}
+
 /// Returns (ranked streams, whether every addon answered).
-async fn search_streams(providers: Vec<AnimeAddonManifest>, resource_id: &str, kind: &str) -> (Vec<AnimeTorrentStream>, bool) {
+async fn search_streams(jobs: Vec<(AnimeAddonManifest, String)>, kind: &str) -> (Vec<AnimeTorrentStream>, bool) {
     let Ok(client) = StremioClient::new() else { return (Vec::new(), true) };
     let client = Arc::new(client);
     let mut set = JoinSet::new();
-    for addon in providers {
-        let (client, id, kind) = (client.clone(), resource_id.to_string(), kind.to_string());
+    for (addon, id) in jobs {
+        let (client, kind) = (client.clone(), kind.to_string());
         set.spawn(async move {
             let streams = client.fetch_streams(&addon.endpoint, &id, &kind).await?;
             Ok::<_, MediaError>(
@@ -287,6 +304,19 @@ mod tests {
         assert_eq!(AddonRegistry::open(&dir).list().len(), 1);
         assert!(again.insert(manifest("../x", &[], &[]), String::new()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addons_get_only_ids_they_declare() {
+        let mut torrentio = manifest("t", &["stream"], &["series"]);
+        torrentio.id_prefixes = vec!["tt".into(), "kitsu".into()];
+        let mut imdb_only = manifest("p", &["stream"], &["series"]);
+        imdb_only.id_prefixes = vec!["tt".into()];
+        assert!(accepts(&torrentio, "kitsu:7442:30"));
+        assert!(accepts(&torrentio, "tt4644488:2:16"));
+        assert!(accepts(&imdb_only, "tt4644488:2:16"));
+        assert!(!accepts(&imdb_only, "kitsu:7442:30"));
+        assert!(accepts(&manifest("n", &["stream"], &[]), "kitsu:7442:30"));
     }
 
     #[test]

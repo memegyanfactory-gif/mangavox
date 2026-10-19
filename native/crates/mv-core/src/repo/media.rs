@@ -255,6 +255,17 @@ pub fn watched_ids(conn: &Connection, kind: Option<&str>) -> Result<HashSet<Stri
     Ok(ids)
 }
 
+/// Episode numbers of `media_id` the user finished (a `complete` event or progress past 90 %).
+pub fn watched_episodes(conn: &Connection, media_id: &str) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT episode_number FROM media_event
+         WHERE media_id = ?1 AND episode_number IS NOT NULL
+           AND (event_type = 'complete' OR (duration_secs > 0 AND position_secs >= duration_secs * 0.9))",
+    )?;
+    let eps = stmt.query_map([media_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(eps)
+}
+
 pub fn reset_personalization(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM media_event", [])?;
     conn.execute("DELETE FROM media_playback", [])?;
@@ -273,6 +284,17 @@ mod tests {
 
     fn ev(id: &str, ty: &str) -> MediaEvent {
         MediaEvent { media_id: Some(id.into()), kind: "anime".into(), event_type: ty.into(), position_secs: Some(10.0), duration_secs: Some(1400.0), episode_number: Some(1), ..Default::default() }
+    }
+
+    #[test]
+    fn watched_episodes_counts_complete_and_nearly_done() {
+        let (_d, conn) = temp_db();
+        upsert_title(&conn, &title("a")).unwrap();
+        record_event(&conn, &ev("a", "progress")).unwrap();
+        record_event(&conn, &MediaEvent { episode_number: Some(2), ..ev("a", "complete") }).unwrap();
+        record_event(&conn, &MediaEvent { episode_number: Some(3), position_secs: Some(1300.0), ..ev("a", "progress") }).unwrap();
+        let w = watched_episodes(&conn, "a").unwrap();
+        assert_eq!(w, HashSet::from([2, 3]));
     }
 
     #[test]

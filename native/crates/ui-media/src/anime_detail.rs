@@ -2,7 +2,8 @@
 //! show facts, then an episode grid with thumbnails. Plays via addons.
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use mv_media::episode_art;
 use mv_media::types::{AnimeEpisode, AnimeSearchResult};
@@ -10,7 +11,7 @@ use mv_ui::{bg, button, empty_state, error_state, icon, navigate, size, ButtonKi
 
 use mv_core::cache::DataCache;
 
-use crate::common::{cached, fetch, fetch_cached, in_watchlist, jikan, media_id, media_title, muted, record_open, set_watchlist, Load, DAY, EPISODES_TTL};
+use crate::common::{cached, db, fetch, fetch_cached, in_watchlist, jikan, media_id, media_title, muted, record_open, set_watchlist, Load, DAY, EPISODES_TTL};
 use crate::look::{self, crunchy, EDGE};
 use crate::streams::{self, PlayBase, StreamState};
 
@@ -27,11 +28,24 @@ pub struct AnimeDetail {
     auto: bool,
     /// Episode whose links are shown.
     sel: Option<u32>,
-    /// Addon chip selected in the sources panel.
+    /// The links open under the clicked episode instead of in the hero.
+    inline: bool,
+    /// Addon / language chip selected in the sources panel.
     addon_filter: Option<String>,
+    /// Episodes finished, drawn dimmed.
+    watched: HashSet<u32>,
+    /// `ui_player::watch_epoch()` when `watched` was loaded.
+    watch_epoch: Option<u64>,
     /// Full synopsis shown under the hero.
     synopsis_open: bool,
     scroll: ScrollHandle,
+}
+
+/// Episode whose links were last open per title (and whether inline), so reopening the page
+/// comes back to the same selection.
+fn last_selection() -> &'static Mutex<HashMap<String, (u32, bool)>> {
+    static M: OnceLock<Mutex<HashMap<String, (u32, bool)>>> = OnceLock::new();
+    M.get_or_init(Default::default)
 }
 
 /// "in 3 days" / "in 5 hours" until a unix timestamp.
@@ -79,7 +93,10 @@ impl AnimeDetail {
             streams: StreamState::Idle,
             auto: false,
             sel: None,
+            inline: false,
             addon_filter: None,
+            watched: HashSet::new(),
+            watch_epoch: None,
             synopsis_open: false,
             scroll: ScrollHandle::new(),
         };
@@ -179,11 +196,27 @@ impl AnimeDetail {
         self.lookup(episode, true, window, cx);
     }
 
+    /// Reload which episodes are finished when the player has saved progress since.
+    fn refresh_watched(&mut self, cx: &mut Context<Self>) {
+        let epoch = ui_player::watch_epoch();
+        if self.watch_epoch == Some(epoch) {
+            return;
+        }
+        self.watch_epoch = Some(epoch);
+        let id = media_id("anime", &self.mal_id);
+        fetch(cx, db(move |c| mv_core::repo::media::watched_episodes(c, &id)), |v: &mut Self, l| {
+            if let Load::Ready(eps) = l {
+                v.watched = eps.into_iter().filter_map(|n| u32::try_from(n).ok()).collect();
+            }
+        });
+    }
+
     /// Find links for an episode and list them on the page.
     fn lookup(&mut self, episode: u32, autoplay: bool, window: &mut Window, cx: &mut Context<Self>) {
         let movie = self.is_movie();
         self.sel = Some(episode);
         self.addon_filter = None;
+        last_selection().lock().unwrap_or_else(|e| e.into_inner()).insert(self.mal_id.clone(), (episode, self.inline));
         let name = self.display_title();
         let label = if movie { name.clone() } else { format!("{name}, episode {episode}") };
         self.streams = StreamState::Searching(label.clone());
@@ -236,19 +269,12 @@ impl AnimeDetail {
             Some(true) => ("icons/bookmark-check.svg", "IN WATCHLIST"),
             _ => ("icons/bookmark-plus.svg", "ADD TO WATCHLIST"),
         };
-        let heading = match (movie, self.sel) {
-            (false, Some(e)) => {
-                let name = self.episodes.ready().and_then(|v| v.iter().find(|x| x.number == e)).and_then(|x| x.title.clone()).filter(|t| !t.is_empty());
-                format!("Episode {e}{}", name.map(|n| format!("  {n}")).unwrap_or_default())
-            }
-            _ => "Sources".to_string(),
-        };
-        let panel = streams::sources_panel(&self.streams, crunchy(), heading, self.addon_filter.as_deref(), cx, |v: &mut Self, f| v.addon_filter = f);
+        let panel = if self.inline { None } else { self.panel(cx) };
         look::billboard("anime-detail-hero", height, d.banner_url.clone().or_else(|| d.cover_url.clone()))
             .child(
                 look::hero_copy(56.)
                     .w(px(640.))
-                    .when(!matches!(self.streams, StreamState::Idle), |d| d.max_w(relative(0.5)))
+                    .when(!self.inline && !matches!(self.streams, StreamState::Idle), |d| d.max_w(relative(0.5)))
                     .child(div().text_size(px(40.)).line_height(px(46.)).font_weight(FontWeight::BLACK).text_color(Tokens::text_1()).line_clamp(2).child(SharedString::from(d.title.clone())))
                     .child(
                         div()
@@ -331,6 +357,18 @@ impl AnimeDetail {
             })
     }
 
+    /// Links for the selected episode (`None` when nothing is selected).
+    fn panel(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let heading = match (self.is_movie(), self.sel) {
+            (false, Some(e)) => {
+                let name = self.episodes.ready().and_then(|v| v.iter().find(|x| x.number == e)).and_then(|x| x.title.clone()).filter(|t| !t.is_empty());
+                format!("Episode {e}{}", name.map(|n| format!("  {n}")).unwrap_or_default())
+            }
+            _ => "Sources".to_string(),
+        };
+        streams::sources_panel(&self.streams, crunchy(), heading, self.addon_filter.as_deref(), cx, |v: &mut Self, f| v.addon_filter = f)
+    }
+
     /// The whole synopsis, when "More details" is open.
     fn synopsis(&self) -> Option<Div> {
         let text = self.details.ready()?.description.clone().filter(|_| self.synopsis_open)?;
@@ -366,6 +404,97 @@ impl AnimeDetail {
         })))
     }
 
+    /// One episode card; finished episodes are dimmed with a "Watched" mark.
+    fn episode_card(&self, ep: &AnimeEpisode, w: f32, h: f32, fallback_img: Option<String>, cx: &mut Context<Self>) -> Stateful<Div> {
+        let n = ep.number;
+        let group: SharedString = format!("aep-{n}").into();
+        let title = ep.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| format!("Episode {n}"));
+        let watched = self.watched.contains(&n);
+        let selected = self.sel == Some(n);
+        div()
+            .id(("ep", n as usize))
+            .group(group.clone())
+            .w(px(w))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .cursor_pointer()
+            .child(
+                div()
+                    .relative()
+                    .w(px(w))
+                    .when(selected, |d| d.border_2().border_color(crunchy()))
+                    .h(px(h))
+                    .rounded(px(4.))
+                    .overflow_hidden()
+                    .bg(Tokens::surface_2())
+                    .when_some(ep.thumbnail.clone().or(fallback_img), |d, u| d.child(look::pic(u)))
+                    .when(watched, |d| d.child(div().absolute().inset_0().bg(rgba(0x000000a6))))
+                    .when(watched, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left(px(6.))
+                                .top(px(6.))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(3.))
+                                .bg(rgba(0x000000c0))
+                                .text_size(px(size::XS))
+                                .text_color(Tokens::text_2())
+                                .child(icon("icons/check.svg", Tokens::text_2(), 12.))
+                                .child("Watched"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgba(0x00000080))
+                            .opacity(0.)
+                            .group_hover(group.clone(), |s| s.opacity(1.))
+                            .child(icon("icons/play.svg", crunchy(), 40.)),
+                    )
+                    .when(watched, |d| d.child(div().absolute().left_0().bottom_0().w_full().h(px(3.)).bg(crunchy())))
+                    .child(div().absolute().right(px(6.)).bottom(px(6.)).px(px(5.)).rounded(px(3.)).bg(rgba(0x000000c0)).text_size(px(size::XS)).text_color(Tokens::text_1()).child(SharedString::from(format!("E{n}")))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(SharedString::from(format!("Episode {n}"))))
+                    .child(
+                        div()
+                            .text_size(px(size::MD))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if watched { Tokens::text_3() } else { Tokens::text_1() })
+                            .line_clamp(2)
+                            .group_hover(group, |s| s.text_color(crunchy()))
+                            .child(SharedString::from(title)),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, w, cx| {
+                // Links open right under the episode's row; clicking it again closes them.
+                if this.inline && this.sel == Some(n) {
+                    this.inline = false;
+                    this.sel = None;
+                    this.streams = StreamState::Idle;
+                    last_selection().lock().unwrap_or_else(|e| e.into_inner()).remove(&this.mal_id);
+                    cx.notify();
+                    return;
+                }
+                this.inline = true;
+                this.lookup(n, false, w, cx);
+            }))
+    }
+
     fn episodes(&self, width: f32, cx: &mut Context<Self>) -> Div {
         let per = look::per_row(width, 260., 16.);
         let w = ((width - EDGE * 2.0 - 16.0 * (per as f32 - 1.0)) / per as f32).clamp(220., 340.);
@@ -376,56 +505,20 @@ impl AnimeDetail {
             Load::Loading => div().flex().flex_wrap().gap(px(16.)).children((0..8).map(|_| div().w(px(w)).h(px(h)).rounded(px(4.)).bg(Tokens::surface_2()))),
             Load::Failed(e) => error_state(e.clone()).min_h(px(100.)),
             Load::Ready(v) if v.is_empty() => empty_state("No episode list", "Use the watch button above to look for sources.").min_h(px(100.)),
-            Load::Ready(v) => div().flex().flex_wrap().gap_x(px(16.)).gap_y(px(24.)).children(v.iter().map(|ep| {
-                let n = ep.number;
-                let group: SharedString = format!("aep-{n}").into();
-                let title = ep.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| format!("Episode {n}"));
-                div()
-                    .id(("ep", n as usize))
-                    .group(group.clone())
-                    .w(px(w))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .relative()
-                            .w(px(w))
-                            .when(self.sel == Some(n), |d| d.border_2().border_color(crunchy()))
-                            .h(px(h))
-                            .rounded(px(4.))
-                            .overflow_hidden()
-                            .bg(Tokens::surface_2())
-                            .when_some(ep.thumbnail.clone().or_else(|| fallback_img.clone()), |d, u| d.child(look::pic(u)))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(rgba(0x00000080))
-                                    .opacity(0.)
-                                    .group_hover(group.clone(), |s| s.opacity(1.))
-                                    .child(icon("icons/play.svg", crunchy(), 40.)),
-                            )
-                            .child(div().absolute().right(px(6.)).bottom(px(6.)).px(px(5.)).rounded(px(3.)).bg(rgba(0x000000c0)).text_size(px(size::XS)).text_color(Tokens::text_1()).child(SharedString::from(format!("E{n}")))),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(SharedString::from(format!("Episode {n}"))))
-                            .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).line_clamp(2).group_hover(group, |s| s.text_color(crunchy())).child(SharedString::from(title))),
-                    )
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        // Links show in the panel at the top, like Stremio.
-                        this.lookup(n, false, w, cx);
-                        this.scroll.set_offset(point(px(0.), px(0.)));
-                    }))
-            })),
+            Load::Ready(v) => {
+                // The links open right under the row holding the selected episode.
+                let open_after = self.sel.filter(|_| self.inline).and_then(|n| v.iter().position(|e| e.number == n)).map(|i| ((i / per + 1) * per).min(v.len()) - 1);
+                let mut grid = div().flex().flex_wrap().gap_x(px(16.)).gap_y(px(24.));
+                for (i, ep) in v.iter().enumerate() {
+                    grid = grid.child(self.episode_card(ep, w, h, fallback_img.clone(), cx));
+                    if open_after == Some(i) {
+                        if let Some(p) = self.panel(cx) {
+                            grid = grid.child(div().w(px((width - EDGE * 2.0).max(320.))).h(px(440.)).child(p));
+                        }
+                    }
+                }
+                grid
+            }
         };
         div()
             .px(px(EDGE))
@@ -453,11 +546,22 @@ impl Render for AnimeDetail {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let width = look::page_width(&self.scroll, window);
         let movie = self.is_movie();
-        // Links load by themselves once we know the first episode (or that it is a movie).
+        self.refresh_watched(cx);
+        // Links load by themselves once we know the first episode (or that it is a movie);
+        // a title opened before comes back to the episode that was selected then.
         if !self.auto && self.details.ready().is_some() {
-            let first = if movie { Some(1) } else { self.episodes.ready().map(|e| e.first().map(|e| e.number).unwrap_or(1)) };
-            if let Some(ep) = first {
+            let saved = last_selection().lock().unwrap_or_else(|e| e.into_inner()).get(&self.mal_id).copied();
+            let start = if movie {
+                Some((1, false))
+            } else {
+                self.episodes.ready().map(|eps| match saved {
+                    Some((n, inline)) => (n, inline && eps.iter().any(|e| e.number == n)),
+                    None => (eps.first().map(|e| e.number).unwrap_or(1), false),
+                })
+            };
+            if let Some((ep, inline)) = start {
                 self.auto = true;
+                self.inline = inline;
                 self.lookup(ep, false, window, cx);
             }
         }

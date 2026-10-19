@@ -34,6 +34,7 @@ const FLASH: Duration = Duration::from_millis(700);
 const SCRUB_SEEK_EVERY: Duration = Duration::from_millis(90);
 const TRACKS_W: f32 = 580.0;
 const SPEED_W: f32 = 240.0;
+const AUDIO_W: f32 = 320.0;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Phase {
@@ -47,6 +48,7 @@ enum Phase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
+    Audio,
     Tracks,
     Speed,
 }
@@ -945,6 +947,7 @@ impl PlayerView {
 
     fn menu_size(&self, menu: Menu) -> (f32, f32) {
         match menu {
+            Menu::Audio => (AUDIO_W, logic::menu_height(self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count().max(1))),
             Menu::Tracks => {
                 let count = |k| self.tracks.iter().filter(|t| t.kind == k).count();
                 (TRACKS_W, logic::menu_height(count(TrackKind::Audio).max(count(TrackKind::Sub) + 1).max(2)))
@@ -1338,6 +1341,11 @@ impl PlayerView {
                 )
             })
             .child(
+                ctl("audio", "icons/audio-lines.svg", 24.)
+                    .when(menu == Some(Menu::Audio), |d| d.bg(rgba(0xffffff26)))
+                    .on_click(cx.listener(|this, _, _w, cx| this.toggle_menu(Menu::Audio, cx))),
+            )
+            .child(
                 ctl("tracks", "icons/captions.svg", 24.)
                     .when(menu == Some(Menu::Tracks), |d| d.bg(rgba(0xffffff26)))
                     .on_click(cx.listener(|this, _, _w, cx| this.toggle_menu(Menu::Tracks, cx))),
@@ -1541,6 +1549,21 @@ impl PlayerView {
                 .child(title)
         };
         let body = match menu {
+            Menu::Audio => {
+                let mut list = div().id("audio-only-list").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).flex().flex_col();
+                let tracks: Vec<&Track> = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).collect();
+                if tracks.is_empty() {
+                    list = list.child(div().px(px(10.)).py(px(8.)).text_size(px(size::SM)).text_color(Tokens::text_3()).child("No audio tracks yet"));
+                }
+                for t in tracks {
+                    let id = t.id;
+                    list = list.child(
+                        row(format!("ao{id}"), Some(flag(logic::flag_country(&t.lang, &t.title))), logic::track_label(t), t.selected)
+                            .on_click(cx.listener(move |this, _, _w, cx| this.select_track(TrackKind::Audio, Some(id), cx))),
+                    );
+                }
+                div().size_full().flex().flex_col().child(head("Audio language", "icons/audio-lines.svg")).child(list)
+            }
             Menu::Tracks => {
                 let mut audio = div().id("audio-list").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).flex().flex_col();
                 let tracks: Vec<&Track> = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).collect();

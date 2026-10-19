@@ -120,7 +120,7 @@ impl Updater {
         self.progress.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
-    /// Downloads the release, swaps it in after the app exits and restarts.
+    /// Downloads the release, swaps the files in, starts the new copy and quits.
     pub fn install(&mut self, cx: &mut Context<Self>) {
         let Status::Available(release) = self.status.clone() else { return };
         // A development build (run from `target\`) installs the release into the normal
@@ -147,7 +147,6 @@ impl Updater {
         .detach();
         cx.spawn(async move |this, cx| {
             let r = release.clone();
-            let dir2 = dir.clone();
             let res = crate::bg::run(async move {
                 let staged = mv_update::prepare(&r, move |done, total| {
                     if total > 0 {
@@ -155,21 +154,22 @@ impl Updater {
                     }
                 })
                 .await?;
-                if fresh {
-                    let (d, v) = (dir2, r.version.clone());
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = std::fs::create_dir_all(&d);
-                        let _ = mv_update::create_shortcuts(&d);
-                        let _ = mv_update::register_uninstall(&d, &v);
-                    })
-                    .await;
-                }
-                anyhow::Ok(staged)
+                // Copying ~200 MB of app files stays off the UI thread.
+                tokio::task::spawn_blocking(move || {
+                    if fresh {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = mv_update::create_shortcuts(&dir);
+                        let _ = mv_update::register_uninstall(&dir, &r.version);
+                    }
+                    mv_update::apply_and_restart(&staged, &dir, &r.version)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
             })
             .await
             .and_then(|r| r);
             let _ = this.update(cx, |u, cx| {
-                match res.and_then(|staged| mv_update::apply_and_restart(&staged, &dir, &release.version)) {
+                match res {
                     Ok(()) => {
                         u.status = Status::Installing(release.clone());
                         cx.notify();

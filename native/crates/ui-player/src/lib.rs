@@ -9,6 +9,17 @@ pub mod mpv;
 mod overlay;
 mod view;
 
+static WATCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped whenever playback progress is saved, so pages can refresh their "watched" marks.
+pub fn watch_epoch() -> u64 {
+    WATCH_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn bump_watch_epoch() {
+    WATCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Warm the torrent behind `request` while the user is still choosing (detail pages).
 pub fn prefetch(request: &mv_ui::nav::PlayRequest) {
     backend::prefetch(request);

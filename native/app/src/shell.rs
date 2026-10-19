@@ -359,7 +359,7 @@ impl Shell {
                     .justify_center()
                     .gap_1()
                     .h(px(28.))
-                    .px(px(6.))
+                    .when(!collapsed, |d| d.px(px(6.)))
                     .rounded(px(7.))
                     .text_size(px(12.))
                     .text_color(fg)
@@ -383,24 +383,20 @@ impl Shell {
         let studio_group = studio_on.then(|| {
             let assistant = self.side_button("Assistant", "icons/sparkles.svg", self.dock_open).on_click(cx.listener(|this, _, w, cx| this.toggle_dock(w, cx)));
             let studio = self.side_item("Studio", "icons/wand-sparkles.svg", self.route == Route::Studio, Route::Studio, cx);
+            // Same look as the nav above; a quiet label (a divider when collapsed) sets it apart.
             div()
                 .flex()
                 .flex_col()
                 .gap(px(1.))
-                .p(px(4.))
-                .rounded(px(10.))
-                .bg(Tokens::accent_soft())
-                .border_1()
-                .border_color(Tokens::border())
+                .when(collapsed, |d| d.pt(px(10.)).border_t_1().border_color(Tokens::border()))
                 .when(!collapsed, |d| {
                     d.child(
                         div()
-                            .px(px(6.))
-                            .pt(px(2.))
+                            .px(px(10.))
                             .pb(px(4.))
                             .text_size(px(size::XS))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(Tokens::accent())
+                            .text_color(Tokens::text_3())
                             .child("STUDIO"),
                     )
                 })
@@ -428,7 +424,8 @@ impl Shell {
                     .items_center()
                     .gap(px(9.))
                     .h(px(30.))
-                    .px(px(6.))
+                    .when(collapsed, |d| d.justify_center())
+                    .when(!collapsed, |d| d.px(px(6.)))
                     .child(
                         div()
                             .size(px(22.))

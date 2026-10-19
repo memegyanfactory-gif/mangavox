@@ -265,7 +265,19 @@ fn parse_manifest(raw: &Value, endpoint: String) -> Result<AnimeAddonManifest> {
         endpoint,
         resources,
         types: string_array(raw.get("types")),
-        id_prefixes: string_array(raw.get("idPrefixes")),
+        id_prefixes: {
+            // Top-level `idPrefixes`, plus those on the stream resource object (Torrentio).
+            let mut p = string_array(raw.get("idPrefixes"));
+            let streams = raw.get("resources").and_then(Value::as_array).into_iter().flatten().filter(|r| str_field(r, "name").as_deref() == Some("stream"));
+            for r in streams {
+                for x in string_array(r.get("idPrefixes")) {
+                    if !p.contains(&x) {
+                        p.push(x);
+                    }
+                }
+            }
+            p
+        },
     })
 }
 

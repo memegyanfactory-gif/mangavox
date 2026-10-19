@@ -155,6 +155,7 @@ pub fn save_event(ident: &Ident, kind: &str, pos: f64, duration: f64) -> Result<
             ..Default::default()
         },
     )?;
+    crate::bump_watch_epoch();
     Ok(())
 }
 

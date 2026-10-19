@@ -55,7 +55,8 @@ fn verdicts() -> &'static Cache<bool> {
     C.get_or_init(Default::default)
 }
 
-async fn kitsu_id(mal_id: &str) -> Option<String> {
+/// Kitsu id for a MAL anime (cached; `None` when Kitsu has no mapping).
+pub async fn kitsu_id(mal_id: &str) -> Option<String> {
     if let Some(hit) = kitsu_ids().lock().unwrap_or_else(|e| e.into_inner()).get(mal_id) {
         return hit.clone();
     }
@@ -161,6 +162,44 @@ async fn imdb_stills(mal_id: &str) -> Option<Stills> {
     fetched
 }
 
+fn imdb_order() -> &'static Cache<Arc<Vec<(u32, u32)>>> {
+    static C: OnceLock<Cache<Arc<Vec<(u32, u32)>>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// IMDb `(season, episode)` for episode `n` of an anime numbered from 1 (MAL / Kitsu style).
+/// IMDb often splits one long MAL entry into seasons, so `S1E30` would not exist: when season
+/// 1 is shorter than `n`, the episode is found by absolute air order instead. `None` when the
+/// series has no episode list or `n` is past its end.
+pub async fn imdb_episode(imdb: &str, n: u32) -> Option<(u32, u32)> {
+    let cached = imdb_order().lock().unwrap_or_else(|e| e.into_inner()).get(imdb).cloned();
+    let order = match cached {
+        Some(o) => o,
+        None => {
+            let mut eps = CinemetaClient::new().ok()?.series_episodes(imdb).await.ok()?;
+            eps.retain(|e| season_of(e) > 0);
+            eps.sort_by_key(|e| (season_of(e), e.number));
+            let o = Arc::new(eps.iter().map(|e| (season_of(e), e.number)).collect::<Vec<_>>());
+            if !o.is_empty() {
+                imdb_order().lock().unwrap_or_else(|e| e.into_inner()).insert(imdb.to_string(), o.clone());
+            }
+            o
+        }
+    };
+    absolute_to_season(&order, n)
+}
+
+fn absolute_to_season(order: &[(u32, u32)], n: u32) -> Option<(u32, u32)> {
+    if n == 0 || order.is_empty() {
+        return None;
+    }
+    let first_season = order.iter().filter(|(s, _)| *s == 1).count() as u32;
+    if n <= first_season {
+        return Some((1, n));
+    }
+    order.get(n as usize - 1).copied()
+}
+
 /// Give every episode without a thumbnail its own still where one can be found.
 /// `expected_total` is the MAL episode count (`None` while airing). Never fails.
 pub async fn fill_thumbnails(mal_id: &str, episodes: &mut [AnimeEpisode], expected_total: Option<u32>) {
@@ -216,6 +255,15 @@ mod tests {
         // A later season numbered from 1 against the whole series: titles disagree.
         let s2 = [ep(1, Some("Beast Titan")), ep(2, Some("I'm Home")), ep(3, Some("Southwestward"))];
         assert!(!lines_up(&s2, &series, Some(12)));
+    }
+
+    #[test]
+    fn absolute_episode_maps_into_later_seasons() {
+        let order = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)];
+        assert_eq!(absolute_to_season(&order, 2), Some((1, 2)));
+        assert_eq!(absolute_to_season(&order, 4), Some((2, 1)));
+        assert_eq!(absolute_to_season(&order, 9), None);
+        assert_eq!(absolute_to_season(&[], 1), None);
     }
 
     #[test]

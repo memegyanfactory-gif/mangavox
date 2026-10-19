@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::cache::DataCache;
+use mv_media::episode_art;
 use mv_media::stream_utils::stream_resource_id;
 use mv_media::types::AnimeTorrentStream;
 use mv_ui::nav::PlayRequest;
@@ -63,14 +64,32 @@ async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) -> Result<(
     if reg.stream_addons(kind).is_empty() {
         return Err(NO_ADDONS.into());
     }
+    let mal = base.mal_id.clone();
     if base.imdb_id.is_none() {
-        if let Some(mal) = base.mal_id.clone() {
-            base.imdb_id = jikan()?.imdb_id(&mal).await;
+        if let Some(mal) = &mal {
+            base.imdb_id = jikan()?.imdb_id(mal).await;
         }
     }
-    let imdb = base.imdb_id.clone().ok_or("This title has no IMDb mapping, so sources cannot be looked up.")?;
-    let rid = stream_resource_id(&imdb, movie, base.season.unwrap_or(1), base.episode.unwrap_or(1)).ok_or("Invalid title id.")?;
-    let streams = reg.find_streams(&rid, kind).await;
+    let (season, episode) = (base.season.unwrap_or(1), base.episode.unwrap_or(1));
+    let mut ids = vec![];
+    if let Some(imdb) = &base.imdb_id {
+        // Anime count episodes from 1 across the show; IMDb may split them into seasons.
+        let (s, e) = match &mal {
+            Some(_) if !movie => episode_art::imdb_episode(imdb, episode).await.unwrap_or((season, episode)),
+            _ => (season, episode),
+        };
+        ids.extend(stream_resource_id(imdb, movie, s, e));
+    }
+    // Kitsu ids number anime episodes like MAL, and anime addons index far more releases by them.
+    if let Some(mal) = &mal {
+        if let Some(k) = episode_art::kitsu_id(mal).await {
+            ids.push(if movie { format!("kitsu:{k}") } else { format!("kitsu:{k}:{episode}") });
+        }
+    }
+    if ids.is_empty() {
+        return Err("This title has no IMDb or Kitsu mapping, so sources cannot be looked up.".into());
+    }
+    let streams = reg.find_streams_any(&ids, kind).await;
     Ok((base, streams))
 }
 
@@ -78,7 +97,7 @@ async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) -> Result<(
 fn stream_key(base: &PlayBase, kind: &str) -> String {
     let addons: Vec<String> = registry().stream_addons(kind).into_iter().map(|m| format!("{}@{}", m.id, m.version)).collect();
     let id = base.imdb_id.clone().or_else(|| base.mal_id.as_ref().map(|m| format!("mal{m}"))).unwrap_or_default();
-    format!("streams:{kind}:{id}:{}:{}:{}", base.season.unwrap_or(0), base.episode.unwrap_or(0), addons.join(","))
+    format!("streams2:{kind}:{id}:{}:{}:{}", base.season.unwrap_or(0), base.episode.unwrap_or(0), addons.join(","))
 }
 
 /// Bumped by every lookup, so a background refresh never replaces a newer request's links.
@@ -296,7 +315,65 @@ fn describe(title: &str) -> Described {
             names.push(rest);
         }
     }
+    if flags.is_empty() {
+        flags = name_langs(title);
+    }
     Described { names, tags: tags.join(" / "), flags }
+}
+
+/// Language tag in release names, its flag's country code and display name.
+const LANG_TAGS: &[(&[&str], &str, &str)] = &[
+    (&["eng", "english"], "gb", "English"),
+    (&["jap", "jpn", "japanese"], "jp", "Japanese"),
+    (&["ita", "italian"], "it", "Italian"),
+    (&["spa", "esp", "spanish", "castellano"], "es", "Spanish"),
+    (&["lat", "latino"], "mx", "Latino"),
+    (&["fre", "fra", "french", "vf", "vff", "vostfr", "truefrench"], "fr", "French"),
+    (&["ger", "deu", "german"], "de", "German"),
+    (&["hin", "hindi"], "in", "Hindi"),
+    (&["tam", "tamil"], "in", "Tamil"),
+    (&["rus", "russian"], "ru", "Russian"),
+    (&["por", "portuguese", "ptbr"], "pt", "Portuguese"),
+    (&["kor", "korean"], "kr", "Korean"),
+    (&["chi", "chs", "cht", "chinese"], "cn", "Chinese"),
+    (&["ara", "arabic"], "sa", "Arabic"),
+    (&["tur", "turkish"], "tr", "Turkish"),
+    (&["pol", "polish"], "pl", "Polish"),
+];
+
+/// Country codes for language tags in a release name ("Show.ITA.ENG.1080p"), for addons
+/// that give no flag emoji.
+fn name_langs(title: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for word in title.split(|c: char| !c.is_ascii_alphanumeric()).map(str::to_ascii_lowercase) {
+        if let Some((_, cc, _)) = LANG_TAGS.iter().find(|(tags, _, _)| tags.contains(&word.as_str())) {
+            if !out.iter().any(|c| c == cc) {
+                out.push(cc.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Language name for a flag country code (flag emoji use countries, not languages).
+fn lang_name(cc: &str) -> String {
+    match cc {
+        "gb" | "us" => "English".into(),
+        "es" => "Spanish".into(),
+        "br" => "Portuguese (BR)".into(),
+        "cz" => "Czech".into(),
+        "ua" => "Ukrainian".into(),
+        "nl" => "Dutch".into(),
+        "se" => "Swedish".into(),
+        "gr" => "Greek".into(),
+        "il" => "Hebrew".into(),
+        "vn" => "Vietnamese".into(),
+        "th" => "Thai".into(),
+        "id" => "Indonesian".into(),
+        "hu" => "Hungarian".into(),
+        "ro" => "Romanian".into(),
+        _ => LANG_TAGS.iter().find(|(_, c, _)| *c == cc).map(|(_, _, n)| n.to_string()).unwrap_or_else(|| cc.to_uppercase()),
+    }
 }
 
 fn flag(cc: &str) -> Img {
@@ -341,35 +418,65 @@ pub fn sources_panel<V: 'static>(
         }
         StreamState::Picking { base, streams, .. } => {
             let mut addons: Vec<String> = streams.iter().filter_map(|s| s.addon.clone()).collect();
-            addons.dedup();
             addons.sort();
             addons.dedup();
-            let chips = (addons.len() > 1).then(|| {
-                let chip = |id: usize, label: String, active: bool, value: Option<String>, cx: &mut Context<V>| {
+            // Languages by how many links carry them, most first.
+            let described: Vec<Vec<String>> = streams.iter().map(|s| describe(&s.title).flags).collect();
+            let mut langs: Vec<(String, usize)> = vec![];
+            for cc in described.iter().flatten() {
+                match langs.iter_mut().find(|(c, _)| c == cc) {
+                    Some((_, n)) => *n += 1,
+                    None => langs.push((cc.clone(), 1)),
+                }
+            }
+            langs.sort_by(|a, b| b.1.cmp(&a.1));
+            let chips = (addons.len() > 1 || langs.len() > 1).then(|| {
+                let chip = |id: usize, label: String, cc: Option<String>, active: bool, value: Option<String>, cx: &mut Context<V>| {
                     div()
-                        .id(("addon", id))
+                        .id(("source-chip", id))
                         .px(px(10.))
                         .h(px(26.))
                         .flex()
                         .items_center()
+                        .gap(px(6.))
                         .rounded(px(999.))
                         .text_size(px(size::XS))
                         .cursor_pointer()
                         .map(|d| if active { d.bg(Tokens::text_1()).text_color(rgb(0x000000)) } else { d.bg(Tokens::surface_2()).text_color(Tokens::text_2()).hover(|s| s.text_color(Tokens::text_1())) })
+                        .children(cc.map(|c| flag(&c).w(px(16.)).h(px(11.))))
                         .child(SharedString::from(label))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             set_filter(this, value.clone());
                             cx.notify();
                         }))
                 };
-                let mut row = div().flex().flex_wrap().gap(px(6.)).mb(px(12.)).child(chip(0, "All".into(), filter.is_none(), None, cx));
-                for (i, a) in addons.iter().enumerate() {
-                    row = row.child(chip(i + 1, a.clone(), filter == Some(a.as_str()), Some(a.clone()), cx));
+                let mut row = div().flex().flex_wrap().gap(px(6.)).mb(px(12.)).child(chip(0, "All".into(), None, filter.is_none(), None, cx));
+                if addons.len() > 1 {
+                    for (i, a) in addons.iter().enumerate() {
+                        row = row.child(chip(1 + i, a.clone(), None, filter == Some(a.as_str()), Some(a.clone()), cx));
+                    }
+                }
+                if langs.len() > 1 {
+                    for (i, (cc, _)) in langs.iter().take(12).enumerate() {
+                        let value = format!("lang:{cc}");
+                        row = row.child(chip(100 + i, lang_name(cc), Some(cc.clone()), filter == Some(value.as_str()), Some(value), cx));
+                    }
                 }
                 row
             });
-            let shown: Vec<&AnimeTorrentStream> = streams.iter().filter(|s| filter.is_none() || s.addon.as_deref() == filter).collect();
-            let rows = shown.iter().take(40).enumerate().map(|(i, s)| {
+            let shown: Vec<&AnimeTorrentStream> = streams
+                .iter()
+                .zip(&described)
+                .filter(|(s, langs)| match filter {
+                    None => true,
+                    Some(f) => match f.strip_prefix("lang:") {
+                        Some(cc) => langs.iter().any(|l| l == cc),
+                        None => s.addon.as_deref() == Some(f),
+                    },
+                })
+                .map(|(s, _)| s)
+                .collect();
+            let rows = shown.iter().take(80).enumerate().map(|(i, s)| {
                 let req = request_for(base, s);
                 let d = describe(&s.title);
                 let quality = s.quality.clone().filter(|q| !q.is_empty()).unwrap_or_else(|| "Auto".into());
