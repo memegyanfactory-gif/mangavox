@@ -970,7 +970,7 @@ impl SettingsView {
             .border_1()
             .border_color(Tokens::border())
             .child(div().flex().items_center().gap(px(8.)).child(fact(ph::MONITOR, "This PC")).child(gpu))
-            .child(div().flex().items_start().gap(px(6.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(div().pt(px(2.)).child(ph_icon(ph::TIMER, Weight::Bold, Tokens::text_3(), icon_px::XS))).child(speed))
+            .child(div().flex().items_start().gap(px(6.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(div().pt(px(2.)).child(ph_icon(ph::TIMER, Weight::Bold, Tokens::text_3(), icon_px::XS))).child(div().flex_1().min_w_0().child(speed)))
             .child(div().text_size(px(size::SM)).text_color(if weak { Tokens::warning() } else { Tokens::text_3() }).child(if weak {
                 "Without an NVIDIA card with about 4 GB of memory, Chatterbox runs on the CPU and is many times slower than real time."
             } else {

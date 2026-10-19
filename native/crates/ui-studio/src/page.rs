@@ -414,6 +414,8 @@ impl StudioPage {
                                 f.status = st.clone();
                             }
                         }
+                        // Ticks saved in prefs can point at chapters that were deleted since.
+                        this.selected.retain(|id| groups.iter().flat_map(|g| g.chapters.iter()).any(|c| &c.id == id));
                         this.library = Load::Ready(groups);
                     }
                     Err(e) => this.library = Load::Failed(format!("{e:#}")),

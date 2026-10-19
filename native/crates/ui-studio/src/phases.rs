@@ -243,7 +243,7 @@ impl StudioPage {
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(true, cx))),
                         )
                     })
-                    .child(primary("read-it", glyphs::READ, self.target_label("Read it")).when_some(blocker, |b, r| b.disabled(r)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(false, cx)))),
+                    .child(primary("read-it", glyphs::READ, self.target_label("Read")).when_some(blocker, |b, r| b.disabled(r)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(false, cx)))),
             },
             Phase::Transcript => actions.child(
                 btn("to-story", "Continue to Story", ButtonKind::Secondary).trailing_icon(ph::ARROW_RIGHT).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.set_phase(Phase::Story, cx))),
