@@ -50,10 +50,12 @@ impl StudioPage {
             })
             .when(!empty, |d| {
                 d.child(
-                    list(self.list.clone(), cx.processor(|this: &mut Self, ix: usize, window, cx| this.row(ix, window, cx)))
+                    div()
+                        .relative()
                         .flex_1()
-                        .size_full()
-                        .pb(px(24.)),
+                        .min_h_0()
+                        .child(list(self.list.clone(), cx.processor(|this: &mut Self, ix: usize, window, cx| this.row(ix, window, cx))).size_full().pr(px(8.)).pb(px(24.)))
+                        .child(crate::page::vbar("studio-center-bar", &self.list)),
                 )
             })
             .into_any_element()

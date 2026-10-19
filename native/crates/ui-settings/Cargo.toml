@@ -16,6 +16,8 @@ ui-media = { path = "../ui-media" }
 mv-ai = { path = "../mv-ai" }
 mv-studio = { path = "../mv-studio" }
 sysinfo = "0.31"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["process", "time", "rt"] }
 
 [dev-dependencies]
 tempfile = "3"

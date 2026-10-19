@@ -9,23 +9,36 @@ pub fn muted(text: impl Into<SharedString>) -> Div {
     div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(text.into())
 }
 
-/// Brand logo for a provider, tinted with its brand colour (`brand/*.svg`, served by `mv_ui::Assets`).
-pub fn provider_logo(id: AiProviderId, size: f32) -> impl IntoElement {
-    let (path, color): (&'static str, u32) = match id {
-        AiProviderId::Anthropic | AiProviderId::ClaudeCode => ("brand/claude.svg", 0xD97757),
-        AiProviderId::Openai | AiProviderId::Codex => ("brand/openai.svg", 0xE6E8EB),
-        AiProviderId::Gemini | AiProviderId::GeminiCli => ("brand/gemini.svg", 0x8E75FF),
-        AiProviderId::Opencode => ("brand/opencode.svg", 0xE6E8EB),
-        AiProviderId::Ollama | AiProviderId::Llamacpp => ("brand/ollama.svg", 0xE6E8EB),
-        AiProviderId::Lmstudio => ("brand/lmstudio.svg", 0x8B7CF6),
-        AiProviderId::Openrouter => ("brand/openrouter.svg", 0x94A3B8),
-        AiProviderId::Groq => ("brand/groq.svg", 0xF55036),
-        AiProviderId::Deepseek => ("brand/deepseek.svg", 0x4D6BFE),
-        AiProviderId::Mistral => ("brand/mistral.svg", 0xFA520F),
-        AiProviderId::Xai => ("brand/xai.svg", 0xE6E8EB),
-        AiProviderId::Custom => ("brand/generic.svg", 0x9AA3AE),
+/// Official brand logo for a provider (`brand/*.svg`, served by `mv_ui::Assets`). Marks that
+/// have colours of their own render as images; single-colour marks are tinted.
+pub fn provider_logo(id: AiProviderId, size: f32) -> AnyElement {
+    enum Mark {
+        Color(&'static str),
+        Mono(&'static str, u32),
+    }
+    let mark = match id {
+        AiProviderId::Anthropic => Mark::Color("brand/claude.svg"),
+        AiProviderId::ClaudeCode => Mark::Color("brand/claudecode.svg"),
+        AiProviderId::Codex => Mark::Color("brand/codex.svg"),
+        AiProviderId::Openai => Mark::Mono("brand/openai.svg", 0xE6E8EB),
+        AiProviderId::Gemini => Mark::Color("brand/gemini.svg"),
+        AiProviderId::GeminiCli => Mark::Color("brand/geminicli.svg"),
+        AiProviderId::Antigravity => Mark::Color("brand/antigravity.svg"),
+        AiProviderId::Opencode => Mark::Mono("brand/opencode.svg", 0xE6E8EB),
+        AiProviderId::GrokCli => Mark::Mono("brand/grok.svg", 0xE6E8EB),
+        AiProviderId::Xai => Mark::Mono("brand/xai.svg", 0xE6E8EB),
+        AiProviderId::Ollama | AiProviderId::Llamacpp => Mark::Mono("brand/ollama.svg", 0xE6E8EB),
+        AiProviderId::Lmstudio => Mark::Mono("brand/lmstudio.svg", 0xE6E8EB),
+        AiProviderId::Openrouter => Mark::Color("brand/openrouter.svg"),
+        AiProviderId::Groq => Mark::Mono("brand/groq.svg", 0xF55036),
+        AiProviderId::Deepseek => Mark::Color("brand/deepseek.svg"),
+        AiProviderId::Mistral => Mark::Color("brand/mistral.svg"),
+        AiProviderId::Custom => Mark::Mono("brand/generic.svg", 0x9AA3AE),
     };
-    svg().path(path).size(px(size)).flex_none().text_color(rgb(color))
+    match mark {
+        Mark::Color(path) => img(path).size(px(size)).flex_none().into_any_element(),
+        Mark::Mono(path, color) => svg().path(path).size(px(size)).flex_none().text_color(rgb(color)).into_any_element(),
+    }
 }
 
 pub fn state_text(s: AiProviderState) -> &'static str {

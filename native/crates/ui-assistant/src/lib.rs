@@ -13,6 +13,7 @@ mod shared;
 pub mod store;
 pub mod tools;
 mod ui;
+mod usage_meter;
 
 pub use agent::set_studio_context;
 pub use picker::ModelPicker;
@@ -88,4 +89,10 @@ pub fn model_picker(window: &mut Window, cx: &mut App) -> AnyView {
 /// Same as [`model_picker`] but the popover opens *above* the button (bottom composers).
 pub fn model_picker_above(window: &mut Window, cx: &mut App) -> AnyView {
     picker::create(true, window, cx)
+}
+
+/// Usage pill for the current assistant provider: session tokens plus 5h / weekly limit bars
+/// (Claude Code, Codex). Hover for "% left" and reset countdown. Renders nothing until there is data.
+pub fn usage_meter(window: &mut Window, cx: &mut App) -> AnyView {
+    usage_meter::create(window, cx)
 }

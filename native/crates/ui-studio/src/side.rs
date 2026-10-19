@@ -6,7 +6,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::{empty_state, icon, icon_button, size, Tokens};
 
-use crate::page::{plural, Side, StudioPage, MONO, SIDE_W};
+use crate::page::{plural, vbar, Side, StudioPage, MONO, SIDE_W};
 use crate::phases::{face_avatar, progress_line, tag};
 use crate::run::{self, RunKind, RunState};
 use crate::service::{self, JobView};
@@ -43,8 +43,14 @@ impl StudioPage {
             }),
         );
         let body: AnyElement = match self.side {
-            Side::Activity => self.activity(cx).into_any_element(),
-            Side::Brain => self.brain_view(window, cx).into_any_element(),
+            Side::Activity => {
+                let body = self.activity(cx).size_full().track_scroll(&self.side_scroll);
+                div().relative().flex_1().min_h_0().child(body).child(vbar("side-bar", &self.side_scroll)).into_any_element()
+            }
+            Side::Brain => {
+                let body = self.brain_view(window, cx).size_full().track_scroll(&self.side_scroll);
+                div().relative().flex_1().min_h_0().child(body).child(vbar("side-bar", &self.side_scroll)).into_any_element()
+            }
             Side::Chat => match self.dock.clone() {
                 Some(d) => div().flex_1().min_h_0().child(d).into_any_element(),
                 None => div().p(px(16.)).child(empty_state("Chat unavailable", "The assistant could not start.")).into_any_element(),
@@ -56,9 +62,7 @@ impl StudioPage {
             .flex_none()
             .w(px(SIDE_W))
             .h_full()
-            .bg(Tokens::sidebar())
-            .border_l_1()
-            .border_color(Tokens::border())
+            .map(crate::page::panel)
             .child(div().flex_none().h(px(52.)).flex().items_center().px(px(12.)).border_b_1().border_color(Tokens::border()).child(div().flex_1().child(tabs)))
             .child(body)
             .into_any_element()

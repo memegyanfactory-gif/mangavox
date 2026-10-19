@@ -2,6 +2,8 @@
 //! Left: grouped category rail. Right: the selected page — a title, a one-line description
 //! and flat sections — or, for Model Library, its own sub-navigation and pages.
 //! Config is read and written off the UI thread through `mv_ui::bg::blocking`.
+mod cli_tools;
+pub mod cli_updates;
 mod data;
 pub mod models;
 mod tabs;
@@ -25,6 +27,8 @@ pub fn studio_saved() -> bool {
     data::studio_saved()
 }
 
+pub use cli_updates::{cli_updates_available, start_cli_update_checks};
+
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {
         Route::Settings { tab } => {
@@ -45,6 +49,7 @@ pub enum Tab {
     Addons,
     Providers,
     Models,
+    CliTools,
     Storage,
     Studio,
     About,
@@ -55,7 +60,7 @@ const GROUPS: &[(&str, &[Tab])] = &[
     ("", &[Tab::Profile, Tab::Mode]),
     ("Look and feel", &[Tab::Appearance, Tab::Playback]),
     ("Content", &[Tab::Sources, Tab::Addons]),
-    ("AI", &[Tab::Providers, Tab::Models]),
+    ("AI", &[Tab::Providers, Tab::Models, Tab::CliTools]),
     ("Projects and media", &[Tab::Storage]),
 ];
 
@@ -79,6 +84,7 @@ impl Tab {
             "storage" => Tab::Storage,
             "providers" => Tab::Providers,
             "models" | "model-library" => Tab::Models,
+            "cli-tools" | "cli" => Tab::CliTools,
             "studio" => Tab::Studio,
             "about" => Tab::About,
             _ => return None,
@@ -96,6 +102,7 @@ impl Tab {
             Tab::Storage => "storage",
             Tab::Providers => "providers",
             Tab::Models => "models",
+            Tab::CliTools => "cli-tools",
             Tab::Studio => "studio",
             Tab::About => "about",
         }
@@ -112,6 +119,7 @@ impl Tab {
             Tab::Storage => "Storage",
             Tab::Providers => "AI providers",
             Tab::Models => "Model Library",
+            Tab::CliTools => "CLI tools",
             Tab::Studio => "Studio",
             Tab::About => "About",
         }
@@ -128,6 +136,7 @@ impl Tab {
             Tab::Storage => "Download folders and cached data.",
             Tab::Providers => "Local and cloud AI services for the assistant, with keys and default models.",
             Tab::Models => "Models on this PC and what MangaVox uses them for.",
+            Tab::CliTools => "Installed coding-agent CLIs, their versions and updates.",
             Tab::Studio => "Defaults for narration and video output in Studio projects.",
             Tab::About => "Version, data folder and links.",
         }
@@ -144,6 +153,7 @@ impl Tab {
             Tab::Storage => "icons/hard-drive.svg",
             Tab::Providers => "icons/sparkles.svg",
             Tab::Models => "icons/boxes.svg",
+            Tab::CliTools => "icons/terminal.svg",
             Tab::Studio => "icons/wand-sparkles.svg",
             Tab::About => "icons/info.svg",
         }
@@ -180,6 +190,7 @@ pub struct SettingsView {
     cache_bytes: Option<u64>,
     panels: HashMap<Tab, AnyView>,
     library: Option<Entity<ModelLibrary>>,
+    cli: Entity<cli_updates::CliUpdates>,
     /// Model Library page requested by the route (`models:<page>`).
     library_page: Option<Page>,
     notice: Option<Notice>,
@@ -270,6 +281,7 @@ impl SettingsView {
             cache_bytes: None,
             panels: HashMap::new(),
             library: None,
+            cli: cli_updates::cli_updates(cx),
             library_page,
             notice: None,
             _subs: vec![],
@@ -285,6 +297,9 @@ impl SettingsView {
         this._subs.push(obs);
         let updater = mv_ui::update::updater(cx);
         this._subs.push(cx.observe(&updater, |_, _, cx| cx.notify()));
+        let cli = this.cli.clone();
+        this._subs.push(cx.observe(&cli, |_, _, cx| cx.notify()));
+        cli_updates::start_cli_update_checks(cx);
         let initial = this.tab;
         this.ensure_panel(initial, window, cx);
 
@@ -554,8 +569,10 @@ impl SettingsView {
                 group = group.child(div().px(px(10.)).pb(px(6.)).child(ui::section_label(title)));
             }
             for tab in tabs.iter().copied() {
+                let dot = tab == Tab::CliTools && self.cli.read(cx).banners().iter().any(|(k, _)| k.contains('@'));
                 group = group.child(
                     self.rail_item(tab.id(), tab.icon(), tab.label(), self.tab == tab)
+                        .when(dot, |d| d.child(div().ml_auto().flex_none().size(px(7.)).rounded_full().bg(Tokens::accent())))
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.select_tab(tab, window, cx))),
                 );
             }
@@ -601,6 +618,7 @@ impl SettingsView {
             Tab::Storage => self.render_storage(cx).into_any_element(),
             Tab::Studio => self.render_studio(cx).into_any_element(),
             Tab::About => self.render_about(cx).into_any_element(),
+            Tab::CliTools => self.render_cli_tools(cx).into_any_element(),
             tab => match self.panels.get(&tab) {
                 Some(view) => div().w_full().child(view.clone()).into_any_element(),
                 None => mv_ui::empty_state(tab.label(), "Loading…").into_any_element(),
@@ -625,6 +643,7 @@ impl Render for SettingsView {
                     .gap(px(22.))
                     .child(ui::page_title(self.tab.label(), self.tab.description()))
                     .when_some(self.notice.as_ref(), |d, n| d.child(tabs::notice_bar(n)))
+                    .children(self.render_cli_banners(cx))
                     .child(body);
                 div().id("settings-content").flex_1().h_full().min_w_0().overflow_y_scroll().child(column).into_any_element()
             }

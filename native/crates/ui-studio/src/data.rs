@@ -44,6 +44,8 @@ impl ChapterItem {
 pub struct MangaGroup {
     pub id: String,
     pub title: String,
+    /// Cached cover image (or the first downloaded page when there is none).
+    pub cover: Option<PathBuf>,
     pub chapters: Vec<ChapterItem>,
 }
 
@@ -117,15 +119,16 @@ fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
 /// Downloaded chapters grouped by manga, in title / chapter order.
 pub fn query_chapters(conn: &Connection) -> Result<Vec<MangaGroup>> {
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.manga_id, m.title, c.number, c.title, c.pages_dir
+        "SELECT c.id, c.manga_id, m.title, c.number, c.title, c.pages_dir, m.cover_path
          FROM chapter c JOIN manga m ON m.id = c.manga_id
          WHERE c.download_status = 'complete' AND c.pages_dir IS NOT NULL AND c.pages_dir != ''
          ORDER BY m.title COLLATE NOCASE, m.id, c.number, c.added_at",
     )?;
     let rows = stmt.query_map([], |r| {
         let pages: String = r.get(5)?;
+        let cover: Option<String> = r.get(6)?;
         let pages_dir = PathBuf::from(pages);
-        Ok(ChapterItem {
+        let ch = ChapterItem {
             id: r.get(0)?,
             manga_id: r.get(1)?,
             manga_title: r.get(2)?,
@@ -137,24 +140,43 @@ pub fn query_chapters(conn: &Connection) -> Result<Vec<MangaGroup>> {
             has_text: false,
             video: None,
             audio_files: 0,
-        })
+        };
+        Ok((ch, cover))
     })?;
     let mut groups: Vec<MangaGroup> = vec![];
     for row in rows {
-        let ch = row?;
+        let (ch, cover) = row?;
         match groups.last_mut() {
             Some(g) if g.id == ch.manga_id => g.chapters.push(ch),
-            _ => groups.push(MangaGroup { id: ch.manga_id.clone(), title: ch.manga_title.clone(), chapters: vec![ch] }),
+            _ => groups.push(MangaGroup { id: ch.manga_id.clone(), title: ch.manga_title.clone(), cover: cover.map(PathBuf::from), chapters: vec![ch] }),
         }
     }
     Ok(groups)
 }
 
+/// The cover to show for a manga: the library's cached cover, a local cover file, or the
+/// first page of its first downloaded chapter.
+fn resolve_cover(g: &MangaGroup) -> Option<PathBuf> {
+    let raw = g.cover.as_ref().map(|p| p.to_string_lossy().to_string()).filter(|s| !s.is_empty());
+    raw.as_deref()
+        .and_then(mv_core::covers::cached_cover)
+        .or_else(|| raw.map(PathBuf::from).filter(|p| p.is_file()))
+        .or_else(|| {
+            let ch = g.chapters.first()?;
+            let mut pages: Vec<PathBuf> = std::fs::read_dir(&ch.pages_dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+            pages.sort();
+            pages.into_iter().next()
+        })
+}
+
 /// Loads the library and scans every chapter's pipeline folder.
 pub fn load() -> Result<Vec<MangaGroup>> {
     let mut groups = with_db(query_chapters)?;
-    for ch in groups.iter_mut().flat_map(|g| g.chapters.iter_mut()) {
-        scan(ch);
+    for g in groups.iter_mut() {
+        g.cover = resolve_cover(g);
+        for ch in g.chapters.iter_mut() {
+            scan(ch);
+        }
     }
     Ok(groups)
 }

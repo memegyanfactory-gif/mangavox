@@ -42,6 +42,7 @@ pub struct Dock {
     input: Entity<TextareaState>,
     search: Entity<InputState>,
     picker: AnyView,
+    meter: AnyView,
     attachments: Vec<std::path::PathBuf>,
     rename: Option<Rename>,
     confirm_delete: Option<String>,
@@ -63,6 +64,7 @@ impl Dock {
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder("Ask for changes, send follow-ups, or attach images"));
         let search = text_state("Search chats", window, cx);
         let picker = crate::picker::create(true, window, cx);
+        let meter = crate::usage_meter::create(window, cx);
         let mut subs = vec![];
         subs.push(cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = ev {
@@ -85,6 +87,7 @@ impl Dock {
             input,
             search,
             picker,
+            meter,
             attachments: vec![],
             rename: None,
             confirm_delete: None,
@@ -360,6 +363,7 @@ impl Dock {
                 cx.notify();
             })))
             .child(div().flex_1().min_w_0().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(title))
+            .child(self.meter.clone())
             .child(icon_button("dock-new", "icons/plus.svg", self.run.is_none()).on_click(cx.listener(|this, _, w, cx| this.new_chat(w, cx))))
     }
 

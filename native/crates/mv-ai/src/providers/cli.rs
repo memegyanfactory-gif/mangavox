@@ -1,4 +1,4 @@
-//! Coding-agent CLIs (Claude Code, Codex, Gemini CLI, OpenCode) driven headless.
+//! Coding-agent CLIs (Claude Code, Codex, Gemini CLI, OpenCode, Grok, Antigravity) driven headless.
 //! Prompts always go over stdin; argv only ever carries allow-listed flag values, because
 //! Windows npm shims (`.cmd`) need a shell (`cmd /C`) to start.
 
@@ -23,6 +23,8 @@ pub fn cli_binary(id: AiProviderId) -> Option<&'static str> {
         AiProviderId::Codex => Some("codex"),
         AiProviderId::GeminiCli => Some("gemini"),
         AiProviderId::Opencode => Some("opencode"),
+        AiProviderId::GrokCli => Some("grok"),
+        AiProviderId::Antigravity => Some("agy"),
         _ => None,
     }
 }
@@ -118,6 +120,50 @@ pub async fn opencode_models(workspace: &Path) -> Vec<String> {
         .await
         .map(|o| o.lines().map(str::trim).filter(|l| re.is_match(l)).map(String::from).collect())
         .unwrap_or_default()
+}
+
+/// `grok models` prints `  * grok-4.7 (default)` / `  grok-x` lines under "Available models:".
+pub fn parse_grok_models(out: &str) -> Vec<String> {
+    let mut on = false;
+    let mut v = Vec::new();
+    for l in out.lines() {
+        if l.trim_start().starts_with("Available models") {
+            on = true;
+        } else if on {
+            let id = l.trim().trim_start_matches('*').trim().split_whitespace().next().unwrap_or("");
+            if !id.is_empty() && safe_arg(id) {
+                v.push(id.to_string());
+            }
+        }
+    }
+    v
+}
+
+pub async fn grok_models(workspace: &Path) -> Vec<String> {
+    run_capture("grok", &["models"], workspace, Duration::from_secs(20)).await.map(|o| parse_grok_models(&o)).unwrap_or_default()
+}
+
+/// `agy models` prints `<id>\t<label>` lines after a "Fetching available models..." line.
+pub fn parse_agy_models(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|l| {
+            let (id, label) = l.split_once('\t')?;
+            let id = id.trim();
+            safe_arg(id).then(|| (id.to_string(), label.trim().to_string()))
+        })
+        .collect()
+}
+
+pub async fn agy_models(workspace: &Path) -> Vec<(String, String)> {
+    run_capture("agy", &["models"], workspace, Duration::from_secs(20)).await.map(|o| parse_agy_models(&o)).unwrap_or_default()
+}
+
+/// What goes on stdin: the plain prompt, except Antigravity which wants one NDJSON `user` event.
+pub fn stdin_payload(id: AiProviderId, prompt: &str) -> String {
+    match id {
+        AiProviderId::Antigravity => format!("{}\n", serde_json::json!({ "event": "user", "message": { "content": prompt } })),
+        _ => prompt.to_string(),
+    }
 }
 
 // ── Per-CLI command lines ────────────────────────────────────────────────────
@@ -249,6 +295,25 @@ pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
                 add(&["-f", r]);
             }
         }
+        AiProviderId::GrokCli => {
+            add(&["--output-format", "streaming-json", "-p", "-"]);
+            if has_model(req) {
+                add(&["-m", &req.model]);
+            }
+            add(&["--permission-mode", if full(req) { "acceptEdits" } else { "default" }]);
+        }
+        AiProviderId::Antigravity => {
+            add(&["--input-format", "stream-json", "--output-format", "stream-json"]);
+            if has_model(req) {
+                add(&["--model", &req.model]);
+            }
+            if let Some(e) = req.effort {
+                add(&["--effort", e.as_str()]);
+            }
+            if full(req) {
+                add(&["--mode", "accept-edits"]);
+            }
+        }
         _ => {}
     }
     a
@@ -301,6 +366,8 @@ impl CliAcc {
             AiProviderId::Codex => self.codex(ev, emit),
             AiProviderId::GeminiCli => self.gemini(ev, emit),
             AiProviderId::Opencode => self.opencode(ev, emit),
+            AiProviderId::GrokCli => self.grok(ev, emit),
+            AiProviderId::Antigravity => self.antigravity(ev, emit),
             _ => false,
         }
     }
@@ -491,6 +558,79 @@ impl CliAcc {
         }
     }
 
+    /// Grok Build `--output-format streaming-json`: `text` / `thought` deltas in `data`, `tool_call`, `usage`, `end`, `error`.
+    fn grok(&mut self, ev: &Value, emit: &Emit) -> bool {
+        match ev.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let t = js_str(ev.get("data"));
+                self.emit_text(emit, &t);
+                true
+            }
+            Some("thought") => {
+                let t = js_str(ev.get("data"));
+                self.reasoning.push_str(&t);
+                emit_reasoning(emit, &t);
+                true
+            }
+            Some("tool_call") => {
+                let name = ev.get("toolName").and_then(Value::as_str).unwrap_or("tool");
+                emit(StreamEvent::Activity { label: format!("Grok: {name}"), detail: None });
+                true
+            }
+            Some("usage") | Some("end") => {
+                if let Some(u) = ev.get("usage") {
+                    self.input_tokens = u.get("input_tokens").and_then(Value::as_u64);
+                    self.output_tokens = u.get("output_tokens").and_then(Value::as_u64);
+                }
+                true
+            }
+            Some("error") => {
+                self.error = Some(ev.get("message").and_then(Value::as_str).unwrap_or("Grok failed").to_string());
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Antigravity (`agy`) `--output-format stream-json`: `step_update` events carry `text_delta` (agent_response)
+    /// and tool steps; a final `result` has status, full response and usage.
+    fn antigravity(&mut self, ev: &Value, emit: &Emit) -> bool {
+        match ev.get("event").and_then(Value::as_str) {
+            Some("step_update") => {
+                let su = ev.get("step_update").unwrap_or(&Value::Null);
+                match su.get("step_type").and_then(Value::as_str) {
+                    Some("agent_response") => {
+                        if let Some(d) = su.get("text_delta").and_then(Value::as_str) {
+                            self.emit_text(emit, d);
+                        }
+                    }
+                    Some("tool") if su.get("state").and_then(Value::as_str) == Some("ACTIVE") => {
+                        let name = su.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
+                        emit(StreamEvent::Activity { label: format!("Antigravity: {name}"), detail: None });
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Some("result") => {
+                let r = ev.get("result").unwrap_or(&Value::Null);
+                self.input_tokens = r.pointer("/usage/input_tokens").and_then(Value::as_u64);
+                self.output_tokens = r.pointer("/usage/output_tokens").and_then(Value::as_u64);
+                if r.get("status").and_then(Value::as_str).is_some_and(|s| s != "SUCCESS") {
+                    self.error = Some(r.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()).unwrap_or("Antigravity failed").to_string());
+                } else if self.text.trim().is_empty() {
+                    if let Some(t) = r.get("response").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+                        self.emit_text(emit, t);
+                    }
+                }
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     /// Final result once the process has exited. `code` is the exit code (None if killed by a signal).
     pub fn finish(mut self, bin: &str, code: Option<i32>, aborted: bool, stderr: &str, emit: &Emit) -> Result<AiStepResult> {
         if aborted {
@@ -545,7 +685,7 @@ pub async fn cli_step(ctx: &StepContext) -> Result<AiStepResult> {
     let args = cli_args_with(&ctx.req, &rels);
     let mut prompt = build_transcript(&ctx.req.messages);
     prompt.push_str(&attachment_prompt(id, &rels));
-    let res = run_cli(ctx, id, bin, &args, prompt).await;
+    let res = run_cli(ctx, id, bin, &args, stdin_payload(id, &prompt)).await;
     if !ctx.req.images.is_empty() {
         let _ = std::fs::remove_dir_all(ctx.workspace.join(ATTACH_DIR));
     }
@@ -746,6 +886,93 @@ mod tests {
         let (acc, ev) = feed_all(AiProviderId::GeminiCli, fixture);
         assert_eq!(acc.text, "Hi friend");
         assert!(ev.contains(&StreamEvent::Activity { label: "Gemini: read_file".into(), detail: None }));
+    }
+
+    // Captured from grok 1.0.62 (`grok --output-format streaming-json -p -`), long fields trimmed.
+    const GROK: &str = r#"{"type":"available_commands","tools":["read_file"],"commands":["compact"]}
+{"type":"thought","data":"The"}
+{"type":"thought","data":" user wants OK."}
+{"type":"tool_call","toolCallId":"c0","title":"list_dir","kind":"list","status":"pending","toolName":"list_dir","rawInput":{},"content":[],"locations":[]}
+{"type":"tool_call_update","toolCallId":"c0","status":"completed","content":[],"rawOutput":null,"locations":[]}
+{"type":"text","data":"O"}
+{"type":"text","data":"K"}
+{"type":"usage","usage":{"input_tokens":17321,"output_tokens":24,"reasoning_tokens":23},"signature":"x"}
+{"type":"end","stopReason":"end_turn","sessionId":"s","usage":{"input_tokens":23577,"output_tokens":132},"num_turns":2}
+"#;
+
+    #[test]
+    fn grok_streaming_json() {
+        let (acc, ev) = feed_all(AiProviderId::GrokCli, GROK);
+        assert_eq!(acc.text, "OK");
+        assert_eq!(acc.reasoning, "The user wants OK.");
+        assert!(acc.plain.is_empty());
+        assert!(ev.contains(&StreamEvent::Activity { label: "Grok: list_dir".into(), detail: None }));
+        let (emit, _) = recorder();
+        let r = acc.finish("grok", Some(0), false, "", &emit).unwrap();
+        let u = r.usage.unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (Some(23577), Some(132)));
+        let (acc, _) = feed_all(AiProviderId::GrokCli, "{\"type\":\"error\",\"message\":\"unknown model id\"}\n");
+        assert_eq!(acc.finish("grok", Some(1), false, "", &emit).unwrap_err().to_string(), "unknown model id");
+    }
+
+    // Captured from agy 1.4.2 (`agy --input-format stream-json --output-format stream-json`), trimmed.
+    const AGY: &str = r#"{"event":"init","conversation_id":"c","init":{"cwd":"x","tools":["view_file"]}}
+{"event":"step_update","step_update":{"conversation_id":"c","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"c","step_index":2,"state":"ACTIVE","step_type":"agent_response","text_delta":"OK"}}
+{"event":"step_update","step_update":{"conversation_id":"c","step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"view_file","tool_info":{"name":"view_file"}}}
+{"event":"step_update","step_update":{"conversation_id":"c","step_index":3,"state":"DONE","step_type":"tool","tool_name":"view_file"}}
+{"event":"step_update","step_update":{"conversation_id":"c","step_index":2,"state":"DONE","step_type":"agent_response","text_delta":"\n","usage":{"input_tokens":2051}}}
+{"event":"result","result":{"conversation_id":"c","status":"SUCCESS","response":"OK\n","num_turns":1,"usage":{"input_tokens":2051,"output_tokens":501,"thinking_tokens":500}}}
+"#;
+
+    #[test]
+    fn antigravity_stream_json() {
+        let (acc, ev) = feed_all(AiProviderId::Antigravity, AGY);
+        assert_eq!(acc.text, "OK\n"); // deltas are not duplicated by the final `response`
+        assert!(acc.plain.is_empty());
+        assert_eq!(ev.iter().filter(|e| matches!(e, StreamEvent::Activity { .. })).count(), 1);
+        let (emit, _) = recorder();
+        let r = acc.finish("agy", Some(0), false, "", &emit).unwrap();
+        assert_eq!(r.usage.unwrap().output_tokens, Some(501));
+        // no deltas: the result's response is the reply; failures surface the error
+        let (acc, _) = feed_all(AiProviderId::Antigravity, "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"Hi\"}}\n");
+        assert_eq!(acc.text, "Hi");
+        let (acc, _) = feed_all(AiProviderId::Antigravity, "{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"stream input message is missing the event field\"}}\n");
+        assert!(acc.finish("agy", Some(0), false, "", &emit).unwrap_err().to_string().contains("missing the event"));
+    }
+
+    #[test]
+    fn grok_and_antigravity_commands_and_models() {
+        let mut req = AiStepRequest {
+            request_id: "r".into(),
+            provider_id: AiProviderId::GrokCli,
+            model: "grok-4.7".into(),
+            messages: vec![AiMessage::user("x")],
+            tools: None,
+            effort: Some(AiEffort::Low),
+            access: Some(AiAccessMode::Full),
+            images: vec![],
+            workspace: None,
+        };
+        let a = cli_args(&req);
+        assert_eq!(&a[..4], ["--output-format", "streaming-json", "-p", "-"]);
+        assert!(a.windows(2).any(|w| w == ["-m", "grok-4.7"]) && a.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
+        assert!(a.iter().all(|x| safe_arg(x)));
+        req.provider_id = AiProviderId::Antigravity;
+        req.model = "gemini-3.8-flash-high".into();
+        let a = cli_args(&req);
+        assert!(a.windows(2).any(|w| w == ["--input-format", "stream-json"]) && a.windows(2).any(|w| w == ["--mode", "accept-edits"]));
+        assert!(a.windows(2).any(|w| w == ["--model", "gemini-3.8-flash-high"]) && a.windows(2).any(|w| w == ["--effort", "low"]));
+        assert!(a.iter().all(|x| safe_arg(x)));
+        assert_eq!((cli_binary(AiProviderId::GrokCli), cli_binary(AiProviderId::Antigravity)), (Some("grok"), Some("agy")));
+        assert_eq!(stdin_payload(AiProviderId::Codex, "a\nb"), "a\nb");
+        let p = stdin_payload(AiProviderId::Antigravity, "a \"b\"\nc");
+        assert!(p.ends_with('\n') && p.matches('\n').count() == 1);
+        assert_eq!(serde_json::from_str::<Value>(&p).unwrap().pointer("/message/content").and_then(Value::as_str), Some("a \"b\"\nc"));
+        assert_eq!(parse_grok_models("You are logged in.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  grok-5\n"), ["grok-4.7", "grok-5"]);
+        let m = parse_agy_models("Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n");
+        assert_eq!(m[0], ("gemini-3.8-flash-high".to_string(), "Gemini 3.8 Flash (High)".to_string()));
+        assert_eq!(m.len(), 2);
     }
 
     #[test]

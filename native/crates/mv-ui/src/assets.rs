@@ -9,7 +9,7 @@ macro_rules! brand {
         const BRAND: &[(&str, &[u8])] = &[$((concat!("brand/", $name, ".svg"), include_bytes!(concat!("../assets/brand/", $name, ".svg")))),*];
     };
 }
-brand!("claude", "openai", "gemini", "opencode", "ollama", "lmstudio", "openrouter", "groq", "deepseek", "mistral", "xai", "generic", "star");
+brand!("claude", "claudecode", "codex", "openai", "gemini", "geminicli", "opencode", "ollama", "lmstudio", "openrouter", "groq", "deepseek", "mistral", "xai", "grok", "antigravity", "generic", "star");
 
 /// Use as `.with_assets(mv_ui::Assets)`.
 pub struct Assets;

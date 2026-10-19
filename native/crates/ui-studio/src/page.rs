@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarHandle, ScrollbarMode};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -104,6 +105,8 @@ pub struct StudioPage {
     pub(crate) focus_id: Option<String>,
     pub(crate) phase: Phase,
     pub(crate) list: ListState,
+    pub(crate) lib_scroll: ScrollHandle,
+    pub(crate) side_scroll: ScrollHandle,
     list_key: (Option<String>, Phase, usize),
     // Editors for transcript pages / story segments, created as rows render.
     pub(crate) editors: HashMap<(Phase, usize), Entity<TextareaState>>,
@@ -123,6 +126,7 @@ pub struct StudioPage {
     pub(crate) side: Side,
     pub(crate) dock: Option<AnyView>,
     pub(crate) model_button: AnyView,
+    pub(crate) usage_meter: AnyView,
     pub(crate) show_setup: bool,
     pub(crate) notice: Option<Notice>,
     pub(crate) renaming: Option<(String, Entity<InputState>)>,
@@ -156,6 +160,7 @@ impl StudioPage {
             prefs.speed = 1.0;
         }
         let model_button = ui_assistant::model_picker(window, cx);
+        let usage_meter = ui_assistant::usage_meter(window, cx);
         let mut page = Self {
             setup,
             library: Load::Loading,
@@ -167,6 +172,8 @@ impl StudioPage {
             focus_id: None,
             phase: Phase::Read,
             list: ListState::new(0, ListAlignment::Top, px(800.)),
+            lib_scroll: ScrollHandle::new(),
+            side_scroll: ScrollHandle::new(),
             list_key: (None, Phase::Read, 0),
             editors: HashMap::new(),
             editor_subs: vec![],
@@ -185,6 +192,7 @@ impl StudioPage {
             side: Side::Activity,
             dock: None,
             model_button,
+            usage_meter,
             show_setup: false,
             notice: None,
             renaming: None,
@@ -394,11 +402,15 @@ impl StudioPage {
             self.say(true, "Pick an AI model first (model button at the top).");
             return cx.notify();
         };
-        let chapters: Vec<ChapterRef> = self.targets().iter().map(chref).collect();
+        let targets = self.targets();
+        let chapters: Vec<ChapterRef> = targets.iter().map(chref).collect();
         if chapters.is_empty() {
             self.say(true, "Pick a chapter on the left first.");
             return cx.notify();
         }
+        // Reading chapters that are already fully read means "read them again".
+        let all_read = targets.iter().all(|c| self.statuses.get(&c.id).is_some_and(|s| s.total_pages > 0 && s.read_pages >= s.total_pages));
+        let force = force || all_read;
         if run::start_read(ui_assistant::registry(cx), model, label, chapters, force) {
             self.side_open = true;
             self.side = Side::Activity;
@@ -636,7 +648,11 @@ impl StudioPage {
 
     // ------------------------------------------------------------ layout pieces
 
-    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Room left for the steps once the side columns are drawn; narrow windows show only
+        // the active step's name so the usage meter and setup stay visible.
+        let center = f32::from(window.viewport_size().width) - 60. - LIBRARY_W - if self.side_open { SIDE_W } else { 0. };
+        let compact = center < 820.;
         let status = self.focus.as_ref().map(|f| f.status.clone()).unwrap_or_default();
         let steps = div().flex().items_center().gap(px(2.)).children(Phase::ALL.iter().enumerate().map(|(i, &p)| {
             let active = self.phase == p;
@@ -680,7 +696,7 @@ impl StudioPage {
                                     }
                                 }),
                         )
-                        .child(p.label())
+                        .when(!compact || active, |d| d.child(p.label()))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_phase(p, cx))),
                 )
         }));
@@ -719,6 +735,7 @@ impl StudioPage {
             .border_b_1()
             .border_color(Tokens::border())
             .child(div().flex_1().min_w_0().overflow_hidden().child(steps))
+            .child(self.usage_meter.clone())
             .child(setup_pill)
             .child(
                 icon_button("studio-side-toggle", if self.side_open { "icons/panel-right-close.svg" } else { "icons/panel-right.svg" }, true).on_click(cx.listener(
@@ -756,15 +773,25 @@ impl StudioPage {
                 .child(button("studio-open-library", "Open Library", ButtonKind::Primary).on_click(|_, w, cx| mv_ui::navigate(Route::Library, w, cx)))
                 .into_any_element(),
             Load::Ready(groups) => div()
-                .id("studio-lib-list")
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .px(px(8.))
-                .pb(px(8.))
-                .children(groups.iter().filter(|g| filter.is_empty() || g.title.to_lowercase().contains(&filter)).map(|g| self.group_view(g, cx)))
+                .child(
+                    div()
+                        .id("studio-lib-list")
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.lib_scroll)
+                        .pl(px(8.))
+                        .pr(px(14.))
+                        .pb(px(8.))
+                        .children(groups.iter().filter(|g| filter.is_empty() || g.title.to_lowercase().contains(&filter)).map(|g| self.group_view(g, cx))),
+                )
+                .child(vbar("studio-lib-bar", &self.lib_scroll))
                 .into_any_element(),
         };
         let total: usize = match &self.library {
@@ -778,9 +805,7 @@ impl StudioPage {
             .flex_none()
             .w(px(LIBRARY_W))
             .h_full()
-            .bg(Tokens::sidebar())
-            .border_r_1()
-            .border_color(Tokens::border())
+            .map(panel)
             .child(
                 div()
                     .flex()
@@ -833,14 +858,40 @@ impl StudioPage {
                     .group("grp")
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .h(px(32.))
+                    .gap(px(8.))
+                    .h(px(56.))
                     .px(px(6.))
-                    .rounded(px(7.))
+                    .rounded(px(8.))
                     .cursor_pointer()
+                    .when(open, |d| d.bg(Tokens::hover()))
                     .hover(|s| s.bg(Tokens::hover()))
+                    .child(
+                        div()
+                            .w(px(34.))
+                            .h(px(46.))
+                            .flex_none()
+                            .rounded(px(5.))
+                            .overflow_hidden()
+                            .bg(Tokens::surface_2())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .map(|d| match &g.cover {
+                                Some(p) => d.child(img(p.clone()).size_full().rounded(px(5.)).object_fit(ObjectFit::Cover)),
+                                None => d.child(icon("icons/book-open.svg", Tokens::text_3(), 14.)),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(2.))
+                            .child(div().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(g.title.clone()))
+                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{} chapter{}", g.chapters.len(), plural(g.chapters.len())))),
+                    )
                     .child(icon(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }, Tokens::text_3(), 13.))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(g.title.clone()))
                     .child(
                         div()
                             .id(SharedString::from(format!("grp-all-{}", g.id)))
@@ -864,7 +915,6 @@ impl StudioPage {
                                 cx.notify();
                             })),
                     )
-                    .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{}", g.chapters.len())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         if !this.open_groups.remove(&gid) {
                             this.open_groups.insert(gid.clone());
@@ -889,7 +939,7 @@ impl StudioPage {
             .items_center()
             .gap(px(8.))
             .h(px(32.))
-            .pl(px(22.))
+            .pl(px(48.))
             .pr(px(6.))
             .rounded(px(7.))
             .cursor_pointer()
@@ -973,7 +1023,9 @@ impl Render for StudioPage {
         div()
             .flex()
             .size_full()
-            .bg(Tokens::base())
+            .gap(px(6.))
+            .p(px(6.))
+            .bg(rgb(0x07080a))
             .child(self.library_panel(cx))
             .child(
                 div()
@@ -982,7 +1034,8 @@ impl Render for StudioPage {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(self.toolbar(cx))
+                    .map(panel)
+                    .child(self.toolbar(window, cx))
                     .children(self.notice_bar(cx))
                     .when(self.show_setup, |d| {
                         d.child(
@@ -1008,6 +1061,23 @@ impl Render for StudioPage {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// A Studio column: rounded card with a soft light sheen along its top edge.
+pub(crate) fn panel(d: Div) -> Div {
+    d.relative()
+        .rounded(px(12.))
+        .overflow_hidden()
+        .bg(Tokens::sidebar())
+        .border_1()
+        .border_color(Tokens::border())
+        .child(div().absolute().top_0().left(px(14.)).right(px(14.)).h(px(1.)).bg(rgba(0xffffff1f)))
+}
+
+/// An always-visible vertical scrollbar laid over a `relative` scroll area, so long lists
+/// can be dragged from top to bottom.
+pub(crate) fn vbar<H: ScrollbarHandle + Clone>(id: &'static str, h: &H) -> Div {
+    div().absolute().inset_0().child(Scrollbar::new(h).id(id).axis(ScrollbarAxis::Vertical).mode(ScrollbarMode::Always).viewport_from_layout())
+}
 
 pub(crate) fn chref(c: &ChapterItem) -> ChapterRef {
     ChapterRef {

@@ -83,6 +83,13 @@ fn static_label(id: AiProviderId, m: &str) -> String {
         (AiProviderId::ClaudeCode, "claude-fable-5-1") => "Fable 5.1".into(),
         (AiProviderId::ClaudeCode, "claude-sonnet-5-5") => "Sonnet 5.5".into(),
         (AiProviderId::ClaudeCode, "claude-opus-5-5") => "Opus 5.5".into(),
+        (AiProviderId::GrokCli, "grok-4.7") => "Grok 4.7".into(),
+        (AiProviderId::Antigravity, "gemini-3.8-flash-high") => "Gemini 3.8 Flash (High)".into(),
+        (AiProviderId::Antigravity, "gemini-3.8-flash-medium") => "Gemini 3.8 Flash (Medium)".into(),
+        (AiProviderId::Antigravity, "gemini-3.8-flash-low") => "Gemini 3.8 Flash (Low)".into(),
+        (AiProviderId::Antigravity, "claude-sonnet-4-6") => "Claude Sonnet 4.6 (Thinking)".into(),
+        (AiProviderId::Antigravity, "claude-opus-4-6-thinking") => "Claude Opus 4.6 (Thinking)".into(),
+        (AiProviderId::Antigravity, "gpt-oss-120b-medium") => "GPT-OSS 120B (Medium)".into(),
         _ => m.to_string(),
     }
 }
@@ -97,8 +104,8 @@ const fn with_base(mut d: ProviderDef, base: &'static str) -> ProviderDef {
     d
 }
 
-/// The 16-provider catalog (order matters: it is the UI order).
-pub static PROVIDERS: [ProviderDef; 16] = [
+/// The 18-provider catalog (order matters: it is the UI order).
+pub static PROVIDERS: [ProviderDef; 18] = [
     with_hint(
         with_base(def(AiProviderId::Ollama, "Ollama", AiProviderKind::Local, "Local models on this PC", StepKind::Ollama), "http://127.0.0.1:11434"),
         "Install from ollama.com, then start Ollama.",
@@ -163,6 +170,17 @@ pub static PROVIDERS: [ProviderDef; 16] = [
     with_hint(
         with_models(def(AiProviderId::Opencode, "OpenCode", AiProviderKind::Cli, "Any model configured in OpenCode", StepKind::Cli), &["default"]),
         "npm i -g opencode-ai, then `opencode auth login`.",
+    ),
+    with_hint(
+        with_models(def(AiProviderId::GrokCli, "Grok", AiProviderKind::Cli, "Uses your Grok sign-in (Grok Build CLI)", StepKind::Cli), &["default", "grok-4.7"]),
+        "Install the Grok Build CLI (`grok`), then run `grok login`.",
+    ),
+    with_hint(
+        with_models(
+            def(AiProviderId::Antigravity, "Antigravity", AiProviderKind::Cli, "Uses your Google Antigravity sign-in", StepKind::Cli),
+            &["default", "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"],
+        ),
+        "Install Google Antigravity CLI (`agy`), then run `agy` once to sign in.",
     ),
 ];
 
@@ -415,6 +433,16 @@ impl Registry {
                 .into_iter()
                 .map(|id| AiModel::new(AiProviderId::Opencode, id.clone(), id))
                 .collect()),
+            AiProviderId::GrokCli => Ok(providers::cli::grok_models(&self.workspace)
+                .await
+                .into_iter()
+                .map(|id| AiModel::new(AiProviderId::GrokCli, id.clone(), id))
+                .collect()),
+            AiProviderId::Antigravity => Ok(providers::cli::agy_models(&self.workspace)
+                .await
+                .into_iter()
+                .map(|(id, label)| AiModel::new(AiProviderId::Antigravity, id, label))
+                .collect()),
             _ => {
                 if def.kind == AiProviderKind::Cli || (def.needs_key && api_key.is_none()) || base_url.is_empty() {
                     return Ok(vec![]);
@@ -459,6 +487,7 @@ impl Registry {
         let def = provider_def(req.provider_id);
         let s = self.read_settings(def.id);
         let request_id = req.request_id.clone();
+        let usage_model = req.model.clone();
         let workspace_override = req.workspace.clone();
         self.active.lock().unwrap().insert(request_id.clone(), cancel.clone());
         let ctx = StepContext {
@@ -488,7 +517,12 @@ impl Registry {
         .await;
         self.active.lock().unwrap().remove(&request_id);
         match out {
-            Ok(r) => r,
+            Ok(r) => {
+                if let Some(u) = &r.usage {
+                    crate::usage::record(def.id, &usage_model, u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0));
+                }
+                r
+            }
             Err(_) if cancel.is_cancelled() => AiStepResult { stopped: true, ..Default::default() },
             Err(e) => AiStepResult { error: Some(friendly_error(def, &e.to_string())), ..Default::default() },
         }
@@ -567,14 +601,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_16_unique_providers() {
-        assert_eq!(PROVIDERS.len(), 16);
+    fn catalog_has_18_unique_providers() {
+        assert_eq!(PROVIDERS.len(), 18);
         let ids: HashSet<_> = PROVIDERS.iter().map(|p| p.id).collect();
-        assert_eq!(ids.len(), 16);
+        assert_eq!(ids.len(), 18);
         assert!(!provider_def(AiProviderId::Codex).supports_tools);
         assert!(provider_def(AiProviderId::Ollama).supports_tools);
         assert_eq!(provider_def(AiProviderId::Gemini).key_env, &["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
         assert_eq!(serde_json::to_string(&AiProviderId::GeminiCli).unwrap(), "\"gemini-cli\"");
+        assert_eq!(serde_json::to_string(&AiProviderId::GrokCli).unwrap(), "\"grok-cli\"");
+        assert_eq!(serde_json::to_string(&AiProviderId::Antigravity).unwrap(), "\"antigravity\"");
+        assert_eq!(provider_def(AiProviderId::Antigravity).label, "Antigravity");
     }
 
     #[test]
@@ -636,7 +673,7 @@ mod tests {
         r.update_provider_settings(AiProviderId::Xai, &AiProviderSettings { enabled: Some(false), ..Default::default() }).unwrap();
         let by = |v: &[AiProviderStatus], id| v.iter().find(|s| s.id == id).unwrap().clone();
         let all = r.list_providers(true).await;
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 18);
         assert_eq!(by(&all, AiProviderId::Anthropic).state, AiProviderState::Ready);
         assert!(by(&all, AiProviderId::Anthropic).has_key);
         assert_eq!(by(&all, AiProviderId::Openai).state, AiProviderState::NeedsKey);

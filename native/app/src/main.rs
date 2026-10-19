@@ -54,6 +54,7 @@ fn main() {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         ui_media::warm_up();
+        ui_settings::start_cli_update_checks(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         let main = gpui_kit::open_window(
             WindowOptions {

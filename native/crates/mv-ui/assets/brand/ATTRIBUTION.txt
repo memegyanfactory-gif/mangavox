@@ -1,0 +1,2 @@
+Provider logos (all except generic.svg and star.svg) come from @lobehub/icons-static-svg 1.95.1
+(https://github.com/lobehub/lobe-icons), MIT License. Trademarks belong to their owners.

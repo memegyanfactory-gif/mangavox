@@ -31,6 +31,8 @@ pub enum AiProviderId {
     Codex,
     GeminiCli,
     Opencode,
+    GrokCli,
+    Antigravity,
 }
 
 impl AiProviderId {
@@ -52,6 +54,8 @@ impl AiProviderId {
             Self::Codex => "codex",
             Self::GeminiCli => "gemini-cli",
             Self::Opencode => "opencode",
+            Self::GrokCli => "grok-cli",
+            Self::Antigravity => "antigravity",
         }
     }
 }

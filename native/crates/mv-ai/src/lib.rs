@@ -12,6 +12,7 @@ pub mod registry;
 pub mod stream;
 pub mod transcript;
 pub mod types;
+pub mod usage;
 
 pub use gguf::{group_gguf_files, parse_quant, QuantInfo};
 pub use hub::{HubConfigPatch, HubConfigPublic, HubSort, ImportResult, ModelHub, ProgressFn, SearchOpts};
