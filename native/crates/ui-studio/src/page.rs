@@ -153,7 +153,8 @@ impl StudioPage {
             }
         }));
         let prefs = Prefs::load();
-        let voice = prefs.voice.clone().filter(|v| mv_studio::tts::find_voice(v).is_some()).unwrap_or_else(|| "af_heart".into());
+        // Default narrator chosen in Settings → Audio (same file, plus config.json fallback).
+        let voice = mv_studio::voices::default_voice();
         let mut prefs = prefs;
         prefs.voice = Some(voice.clone());
         if !(0.5..=2.0).contains(&prefs.speed) {

@@ -5690,6 +5690,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5767,6 +5768,8 @@ name = "mv-studio"
 version = "8.0.4"
 dependencies = [
  "dirs 6.0.0",
+ "mv-core",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -5782,6 +5785,7 @@ dependencies = [
  "bytes",
  "futures",
  "librqbit",
+ "mv-core",
  "reqwest 0.12.28",
  "serde",
  "tempfile",
@@ -5798,6 +5802,7 @@ dependencies = [
  "anyhow",
  "futures",
  "gpui-kit",
+ "mv-core",
  "mv-update",
  "tokio",
 ]
@@ -9820,6 +9825,7 @@ dependencies = [
  "ui-assistant",
  "ui-manga",
  "ui-media",
+ "ui-studio",
 ]
 
 [[package]]

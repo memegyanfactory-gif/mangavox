@@ -2,10 +2,12 @@
 //! Left: grouped category rail. Right: the selected page — a title, a one-line description
 //! and flat sections — or, for Model Library, its own sub-navigation and pages.
 //! Config is read and written off the UI thread through `mv_ui::bg::blocking`.
+mod audio;
 mod cli_tools;
 pub mod cli_updates;
 mod data;
 pub mod models;
+mod system;
 mod tabs;
 mod ui;
 
@@ -45,12 +47,14 @@ pub enum Tab {
     Mode,
     Appearance,
     Playback,
+    Audio,
     Sources,
     Addons,
     Providers,
     Models,
     CliTools,
     Storage,
+    System,
     Studio,
     About,
 }
@@ -58,10 +62,10 @@ pub enum Tab {
 /// Rail groups, in order. An empty title draws no label.
 const GROUPS: &[(&str, &[Tab])] = &[
     ("", &[Tab::Profile, Tab::Mode]),
-    ("Look and feel", &[Tab::Appearance, Tab::Playback]),
+    ("Look and feel", &[Tab::Appearance, Tab::Playback, Tab::Audio]),
     ("Content", &[Tab::Sources, Tab::Addons]),
     ("AI", &[Tab::Providers, Tab::Models, Tab::CliTools]),
-    ("Projects and media", &[Tab::Storage]),
+    ("Projects and media", &[Tab::Storage, Tab::System]),
 ];
 
 /// Shown only while Studio mode is on.
@@ -77,6 +81,8 @@ impl Tab {
         Some(match id {
             "profile" | "general" => Tab::Profile,
             "playback" => Tab::Playback,
+            "audio" | "voices" => Tab::Audio,
+            "system" | "performance" => Tab::System,
             "themes" | "appearance" => Tab::Appearance,
             "mode" => Tab::Mode,
             "sources" | "extensions" => Tab::Sources,
@@ -95,6 +101,8 @@ impl Tab {
         match self {
             Tab::Profile => "profile",
             Tab::Playback => "playback",
+            Tab::Audio => "audio",
+            Tab::System => "system",
             Tab::Appearance => "themes",
             Tab::Mode => "mode",
             Tab::Sources => "sources",
@@ -112,6 +120,8 @@ impl Tab {
         match self {
             Tab::Profile => "General",
             Tab::Playback => "Playback",
+            Tab::Audio => "Audio",
+            Tab::System => "System",
             Tab::Appearance => "Appearance",
             Tab::Mode => "App mode",
             Tab::Sources => "Manga sources",
@@ -129,6 +139,8 @@ impl Tab {
         match self {
             Tab::Profile => "Your name and email. Stored only in your local config file.",
             Tab::Playback => "How episodes and movies play, and which streams and subtitles are picked first.",
+            Tab::Audio => "Narration voices that run on this PC: download them, hear a sample and pick the default narrator.",
+            Tab::System => "Keep the PC responsive while MangaVox narrates, renders or runs local models.",
             Tab::Appearance => "Colour theme and motion. Changes apply immediately.",
             Tab::Mode => "Turn the Studio workspace and Assistant on or off.",
             Tab::Sources => "Where manga comes from: installed sources, plugins and repositories.",
@@ -146,6 +158,8 @@ impl Tab {
         match self {
             Tab::Profile => "icons/user.svg",
             Tab::Playback => "icons/play.svg",
+            Tab::Audio => "icons/audio-lines.svg",
+            Tab::System => "icons/cpu.svg",
             Tab::Appearance => "icons/palette.svg",
             Tab::Mode => "icons/toggle-left.svg",
             Tab::Sources => "icons/book-open.svg",
@@ -182,8 +196,13 @@ pub struct SettingsView {
     reduce_motion: bool,
     mode: String,
     studio: data::StudioPrefs,
-    studio_voice: Entity<InputState>,
     studio_speed: Entity<InputState>,
+    audio: audio::AudioState,
+    /// Resource limit percentage shown next to the slider.
+    limit: u8,
+    limit_slider: Entity<gpui_kit::component::slider::SliderState>,
+    meter: Option<system::Meter>,
+    sampling: bool,
     /// Custom folder per `data::STORAGE_KINDS` entry ("" = default).
     storage: Vec<String>,
     /// `None` while the cache size is still being measured.
@@ -223,7 +242,7 @@ impl SettingsView {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Display name"));
         let email = cx.new(|cx| InputState::new(window, cx).placeholder("you@example.com"));
 
-        let studio_voice = cx.new(|cx| InputState::new(window, cx).placeholder("Default"));
+        let limit_slider = system::limit_slider(window, cx);
         let studio_speed = cx.new(|cx| InputState::new(window, cx).placeholder("1.0"));
         let defaults = Playback::default();
         let timers: Vec<SharedString> = data::TIMERS.iter().map(|t| timer_label(*t)).collect();
@@ -275,8 +294,12 @@ impl SettingsView {
             reduce_motion: false,
             mode: if mv_ui::mode::studio_enabled(cx) { "studio" } else { "entertainment" }.into(),
             studio: data::StudioPrefs::default(),
-            studio_voice,
             studio_speed,
+            audio: audio::AudioState::default(),
+            limit: mv_core::limits::percent(),
+            limit_slider,
+            meter: None,
+            sampling: false,
             storage: vec![String::new(); data::STORAGE_KINDS.len()],
             cache_bytes: None,
             panels: HashMap::new(),
@@ -302,6 +325,24 @@ impl SettingsView {
         cli_updates::start_cli_update_checks(cx);
         let initial = this.tab;
         this.ensure_panel(initial, window, cx);
+        this.on_tab_shown(cx);
+        // Live parts: the System meter, download and install progress on Audio.
+        cx.spawn(async move |this, cx| {
+            let mut n: u32 = 0;
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                n = n.wrapping_add(1);
+                let alive = this.update(cx, |v, cx| match v.tab {
+                    Tab::System if n % 2 == 0 => v.sample_meter(cx),
+                    Tab::Audio if v.audio.busy() => v.audio_tick(cx),
+                    _ => {}
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
 
         cx.spawn_in(window, async move |this, cx| {
             if let Ok((snap, studio)) = mv_ui::bg::blocking(|| (data::load_snapshot(), data::load_studio_prefs())).await {
@@ -341,8 +382,7 @@ impl SettingsView {
     }
 
     fn apply_studio(&mut self, prefs: data::StudioPrefs, window: &mut Window, cx: &mut Context<Self>) {
-        let (voice, speed) = (prefs.voice.clone(), format!("{}", prefs.speed));
-        self.studio_voice.update(cx, |s, cx| s.set_value(voice, window, cx));
+        let speed = format!("{}", prefs.speed);
         self.studio_speed.update(cx, |s, cx| s.set_value(speed, window, cx));
         self.studio = prefs;
         cx.notify();
@@ -359,7 +399,6 @@ impl SettingsView {
             self.report("", Err(anyhow::anyhow!("Speed must be a number between 0.5 and 2.0")), cx);
             return;
         };
-        self.studio.voice = self.studio_voice.read(cx).value().trim().to_string();
         self.studio.speed = speed;
         let p = self.studio.clone();
         self.background(cx, move || data::save_studio_prefs(&p), |v, r, cx| v.report("Studio defaults saved", r, cx));
@@ -395,7 +434,17 @@ impl SettingsView {
         self.tab = tab;
         self.notice = None;
         self.ensure_panel(tab, window, cx);
+        self.on_tab_shown(cx);
         cx.notify();
+    }
+
+    /// Loads what a page needs the first time it is shown.
+    fn on_tab_shown(&mut self, cx: &mut Context<Self>) {
+        match self.tab {
+            Tab::Audio => self.audio_open(cx),
+            Tab::System => self.sample_meter(cx),
+            _ => {}
+        }
     }
 
     /// Runs blocking work off the UI thread, then applies the result on the view.
@@ -613,6 +662,8 @@ impl SettingsView {
         match self.tab {
             Tab::Profile => self.render_profile(cx).into_any_element(),
             Tab::Playback => self.render_playback(cx).into_any_element(),
+            Tab::Audio => self.render_audio(cx).into_any_element(),
+            Tab::System => self.render_system(cx).into_any_element(),
             Tab::Appearance => self.render_appearance(cx).into_any_element(),
             Tab::Mode => self.render_mode(cx).into_any_element(),
             Tab::Storage => self.render_storage(cx).into_any_element(),

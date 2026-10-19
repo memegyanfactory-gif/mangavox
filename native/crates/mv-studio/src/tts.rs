@@ -567,6 +567,36 @@ pub async fn voice_preview(
     }
 }
 
+/// Installs one engine's Python packages (`kokoro` or `piper`) into the managed voice
+/// environment with `kokoro_tts.py install-engine`, reporting each step's message.
+pub async fn install_engine(
+    interpreter: &PythonInterpreter,
+    layout: &PythonLayout,
+    engine: &str,
+    cancel: &crate::bridge::CancelToken,
+    mut on_step: impl FnMut(&str) + Send,
+) -> Result<(), StudioError> {
+    let spec = crate::bridge::WorkerSpec {
+        interpreter: interpreter.clone(),
+        script: layout.script("kokoro_tts.py")?,
+        args: vec!["install-engine".into(), engine.into()],
+        cwd: layout.dir.clone(),
+        strict_errors: true,
+    };
+    crate::bridge::run_worker_logged(
+        &spec,
+        cancel,
+        |m| {
+            if let Some(text) = m.message.as_deref() {
+                on_step(text);
+            }
+        },
+        |_| {},
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Runs `kokoro_tts.py status` and returns its JSON object.
 pub async fn kokoro_status(
     interpreter: &PythonInterpreter,

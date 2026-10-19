@@ -410,15 +410,14 @@ def _generate_audio_kokoro(text, output_path, voice, speed):
     json.dump(args, args_file)
     args_file.close()
 
-    kokoro_py = sys.executable
-    venv_py = os.path.join(os.path.expanduser("~"), ".mangavox", "tts-venv", "bin", "python3")
-    if os.path.isfile(venv_py):
-        kokoro_py = venv_py
+    # The managed voice venv (Scripts\python.exe on Windows, bin/python3 elsewhere).
+    kokoro_py = _tts_subprocess_python()
 
     try:
         result = subprocess.run(
             [kokoro_py, KOKORO_SCRIPT, "synthesize", args_file.name],
             capture_output=True, text=True, timeout=600,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if result.returncode != 0:
             err = result.stderr or result.stdout or "Kokoro synthesis failed"

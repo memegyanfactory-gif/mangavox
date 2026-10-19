@@ -404,8 +404,9 @@ impl Engine {
             }),
             trackers,
             peer_limit: cfg.peer_limit,
-            // Upstream default 8 is shared by disk IO and torrent adds.
-            runtime_worker_threads: Some(32),
+            // Upstream default 8 is shared by disk IO and torrent adds; scaled down (not below 8)
+            // by the system resource limit since piece hashing runs on these threads.
+            runtime_worker_threads: Some((32 * mv_core::limits::percent() as usize / 100).max(8)),
             ratelimits: librqbit::limits::LimitsConfig {
                 upload_bps: cfg.upload_limit_bps.and_then(std::num::NonZeroU32::new),
                 download_bps: None,

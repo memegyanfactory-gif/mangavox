@@ -317,9 +317,8 @@ pub fn save_choice(job: Job, value: &str) -> Result<()> {
         Job::Vision => crate::data::update_object("ollama", |m| {
             m.insert("vision_model".into(), json!(value));
         })?,
-        Job::Voice => crate::data::update_object("pipeline", |m| {
-            m.insert("tts_voice".into(), json!(value));
-        })?,
+        // The default narrator (also shown in Settings → Audio and used by Studio).
+        Job::Voice => mv_studio::voices::set_default_voice(value)?,
         _ => {}
     }
     crate::data::update_object(STORE_KEY, |m| {

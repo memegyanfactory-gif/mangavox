@@ -194,7 +194,12 @@ impl SettingsView {
             .gap(px(16.))
             .child(
                 card("Narration", Some("Defaults for new Studio projects."))
-                    .child(row("Default voice", "Voice name used for narration", div().w(px(280.)).child(Input::new(&self.studio_voice))))
+                    .child(row(
+                        "Default voice",
+                        &mv_studio::tts::find_voice(&p.voice).map(|v| v.label.to_string()).unwrap_or_else(|| "Not chosen yet".into()),
+                        button("studio-voice", "Choose in Audio", ButtonKind::Secondary)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.select_tab(crate::Tab::Audio, window, cx))),
+                    ))
                     .child(divided(row("Speed", "Speaking rate, 1.0 is normal", div().w(px(120.)).child(Input::new(&self.studio_speed))))),
             )
             .child(

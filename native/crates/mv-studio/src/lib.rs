@@ -1,13 +1,14 @@
 //! Backend for Studio, the narration pipeline: Python discovery, the JSON-lines
 //! worker bridge (`python-bridge.ts` port), a sequential job queue for OCR, text
 //! enhancement, narration and TTS/video pipeline jobs, and the TTS voice catalog
-//! with preview helpers. No UI.
+//! with preview helpers, downloadable voice packs and the narration voice defaults. No UI.
 
 pub mod bridge;
 pub mod error;
 pub mod jobs;
 pub mod python;
 pub mod tts;
+pub mod voices;
 
 #[cfg(test)]
 mod testutil;

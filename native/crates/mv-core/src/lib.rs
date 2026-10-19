@@ -5,6 +5,7 @@ pub mod covers;
 pub mod db;
 pub mod events;
 pub mod library;
+pub mod limits;
 pub mod logging;
 pub mod paths;
 pub mod repo;

@@ -12,6 +12,8 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
             .worker_threads(4)
             .enable_all()
             .thread_name("mv-bg")
+            // Below normal priority under the system resource limit, so the UI thread wins.
+            .on_thread_start(mv_core::limits::lower_current_thread)
             .build()
             .expect("tokio runtime")
     })

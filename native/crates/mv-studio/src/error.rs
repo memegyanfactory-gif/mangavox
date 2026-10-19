@@ -33,6 +33,10 @@ pub enum StudioError {
     #[error("{0}")]
     Preview(String),
 
+    /// A voice pack download failed (message is shown to the user).
+    #[error("{0}")]
+    Download(String),
+
     #[error("requirements check failed: {0}")]
     Requirements(String),
 
