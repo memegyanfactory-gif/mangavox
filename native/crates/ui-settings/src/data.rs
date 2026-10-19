@@ -211,6 +211,59 @@ pub fn save_reduce_motion(on: bool) -> Result<()> {
     })
 }
 
+/// Whether the saved `app.mode` is Studio (read once at startup by the shell).
+pub fn studio_saved() -> bool {
+    config().get("app.mode").and_then(|v| v.as_str().map(|s| s == "studio")).unwrap_or(false)
+}
+
+/// Studio defaults kept in `~/.mangavox/studio/prefs.json` (shared with mv-recap, which owns the
+/// rest of the file; only these keys are touched).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StudioPrefs {
+    pub voice: String,
+    pub speed: f64,
+    pub resolution: String,
+}
+
+impl Default for StudioPrefs {
+    fn default() -> Self {
+        Self { voice: String::new(), speed: 1.0, resolution: "1080p".into() }
+    }
+}
+
+fn studio_prefs_path() -> PathBuf {
+    mv_core::paths::root().join("studio").join("prefs.json")
+}
+
+pub fn load_studio_prefs() -> StudioPrefs {
+    let v: Value = std::fs::read_to_string(studio_prefs_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+    let d = StudioPrefs::default();
+    StudioPrefs {
+        voice: v.get("voice").and_then(Value::as_str).unwrap_or(&d.voice).to_string(),
+        speed: v.get("speed").and_then(Value::as_f64).unwrap_or(d.speed),
+        resolution: v.get("resolution").and_then(Value::as_str).filter(|r| *r == "720p" || *r == "1080p").unwrap_or(&d.resolution).to_string(),
+    }
+}
+
+pub fn save_studio_prefs(p: &StudioPrefs) -> Result<()> {
+    save_studio_prefs_at(&studio_prefs_path(), p)
+}
+
+fn save_studio_prefs_at(path: &Path, p: &StudioPrefs) -> Result<()> {
+    let mut root = match std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+        Some(Value::Object(m)) => m,
+        _ => Map::new(),
+    };
+    root.insert("voice".into(), json!(p.voice));
+    root.insert("speed".into(), json!(p.speed));
+    root.insert("resolution".into(), json!(p.resolution));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&Value::Object(root))?)?;
+    Ok(())
+}
+
 pub fn save_mode(mode: &str) -> Result<()> {
     config().set("app.mode", json!(mode))
 }
@@ -290,4 +343,23 @@ pub fn clear_cache() -> Result<()> {
     }
     std::fs::create_dir_all(&dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod studio_tests {
+    use super::*;
+
+    #[test]
+    fn studio_prefs_preserve_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("studio").join("prefs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"keep":{"a":1},"voice":"old"}"#).unwrap();
+        save_studio_prefs_at(&path, &StudioPrefs { voice: "Aria".into(), speed: 1.25, resolution: "720p".into() }).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["keep"]["a"], 1);
+        assert_eq!(v["voice"], "Aria");
+        assert_eq!(v["speed"], 1.25);
+        assert_eq!(v["resolution"], "720p");
+    }
 }

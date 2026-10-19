@@ -9,7 +9,7 @@ use mv_ai::{AiProviderId, AiProviderKind, AiProviderSettings, AiProviderState, A
 use mv_ui::{button, size, ButtonKind, Tokens};
 
 use crate::shared::{shared, Shared};
-use crate::ui::{field, monogram, muted, password_state, set_value, status_pill, tag, text_state, value_of};
+use crate::ui::{field, provider_logo, muted, password_state, set_value, status_pill, tag, text_state, value_of};
 
 struct Fields {
     key: Entity<InputState>,
@@ -161,7 +161,7 @@ impl ProvidersPanel {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(monogram(id, st.state == AiProviderState::Disabled))
+                    .child(div().flex().items_center().justify_center().size(px(34.)).rounded(px(9.)).bg(Tokens::surface_2()).opacity(if st.state == AiProviderState::Disabled { 0.4 } else { 1. }).child(provider_logo(id, 20.)))
                     .child(
                         div()
                             .flex_1()

@@ -1,6 +1,6 @@
 //! Settings page (native counterpart of src/renderer/pages/Settings.tsx).
 //! Left: grouped category rail. Right: the selected page — a title, a one-line description
-//! and section cards — or, for Model Library, its own sub-navigation and pages.
+//! and flat sections — or, for Model Library, its own sub-navigation and pages.
 //! Config is read and written off the UI thread through `mv_ui::bg::blocking`.
 mod data;
 pub mod models;
@@ -19,6 +19,11 @@ use mv_ui::{icon, size, Route, Tokens};
 
 use data::{Playback, Snapshot};
 use models::{LibraryEvent, ModelLibrary, Page};
+
+/// Saved Studio-mode flag, for the shell's startup.
+pub fn studio_saved() -> bool {
+    data::studio_saved()
+}
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {
@@ -41,6 +46,7 @@ pub enum Tab {
     Providers,
     Models,
     Storage,
+    Studio,
     About,
 }
 
@@ -52,6 +58,9 @@ const GROUPS: &[(&str, &[Tab])] = &[
     ("AI", &[Tab::Providers, Tab::Models]),
     ("Projects and media", &[Tab::Storage]),
 ];
+
+/// Shown only while Studio mode is on.
+const STUDIO_GROUP: (&str, &[Tab]) = ("Studio", &[Tab::Studio]);
 
 const HELP_URL: &str = "https://github.com/memegyanfactory-gif/mangavox/issues";
 
@@ -70,6 +79,7 @@ impl Tab {
             "storage" => Tab::Storage,
             "providers" => Tab::Providers,
             "models" | "model-library" => Tab::Models,
+            "studio" => Tab::Studio,
             "about" => Tab::About,
             _ => return None,
         })
@@ -86,6 +96,7 @@ impl Tab {
             Tab::Storage => "storage",
             Tab::Providers => "providers",
             Tab::Models => "models",
+            Tab::Studio => "studio",
             Tab::About => "about",
         }
     }
@@ -101,6 +112,7 @@ impl Tab {
             Tab::Storage => "Storage",
             Tab::Providers => "AI providers",
             Tab::Models => "Model Library",
+            Tab::Studio => "Studio",
             Tab::About => "About",
         }
     }
@@ -110,12 +122,13 @@ impl Tab {
             Tab::Profile => "Your name and email. Stored only in your local config file.",
             Tab::Playback => "How episodes and movies play, and which streams and subtitles are picked first.",
             Tab::Appearance => "Colour theme and motion. Changes apply immediately.",
-            Tab::Mode => "Switch between the entertainment app and the full Manga Studio workspace.",
+            Tab::Mode => "Turn the Studio workspace and Assistant on or off.",
             Tab::Sources => "Where manga comes from: installed sources, plugins and repositories.",
             Tab::Addons => "Stremio-compatible addons that find streams for movies, series and anime.",
             Tab::Storage => "Download folders and cached data.",
             Tab::Providers => "Local and cloud AI services for the assistant, with keys and default models.",
             Tab::Models => "Models on this PC and what MangaVox uses them for.",
+            Tab::Studio => "Defaults for narration and video output in Studio projects.",
             Tab::About => "Version, data folder and links.",
         }
     }
@@ -131,6 +144,7 @@ impl Tab {
             Tab::Storage => "icons/hard-drive.svg",
             Tab::Providers => "icons/sparkles.svg",
             Tab::Models => "icons/boxes.svg",
+            Tab::Studio => "icons/wand-sparkles.svg",
             Tab::About => "icons/info.svg",
         }
     }
@@ -157,6 +171,9 @@ pub struct SettingsView {
     preset: String,
     reduce_motion: bool,
     mode: String,
+    studio: data::StudioPrefs,
+    studio_voice: Entity<InputState>,
+    studio_speed: Entity<InputState>,
     /// Custom folder per `data::STORAGE_KINDS` entry ("" = default).
     storage: Vec<String>,
     /// `None` while the cache size is still being measured.
@@ -195,6 +212,8 @@ impl SettingsView {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Display name"));
         let email = cx.new(|cx| InputState::new(window, cx).placeholder("you@example.com"));
 
+        let studio_voice = cx.new(|cx| InputState::new(window, cx).placeholder("Default"));
+        let studio_speed = cx.new(|cx| InputState::new(window, cx).placeholder("1.0"));
         let defaults = Playback::default();
         let timers: Vec<SharedString> = data::TIMERS.iter().map(|t| timer_label(*t)).collect();
         let timer_idx = data::TIMERS.iter().position(|t| *t == defaults.auto_play_timer).unwrap_or(2);
@@ -243,7 +262,10 @@ impl SettingsView {
             playback: defaults,
             preset: data::DEFAULT_PRESET.into(),
             reduce_motion: false,
-            mode: "entertainment".into(),
+            mode: if mv_ui::mode::studio_enabled(cx) { "studio" } else { "entertainment" }.into(),
+            studio: data::StudioPrefs::default(),
+            studio_voice,
+            studio_speed,
             storage: vec![String::new(); data::STORAGE_KINDS.len()],
             cache_bytes: None,
             panels: HashMap::new(),
@@ -252,12 +274,27 @@ impl SettingsView {
             notice: None,
             _subs: vec![],
         };
+        // The rail's Studio group follows the live mode flag.
+        let obs = cx.observe_global::<mv_ui::mode::StudioMode>(|this, cx| {
+            this.mode = if mv_ui::mode::studio_enabled(cx) { "studio" } else { "entertainment" }.into();
+            if this.mode != "studio" && this.tab == Tab::Studio {
+                this.tab = Tab::Mode;
+            }
+            cx.notify();
+        });
+        this._subs.push(obs);
+        let updater = mv_ui::update::updater(cx);
+        this._subs.push(cx.observe(&updater, |_, _, cx| cx.notify()));
         let initial = this.tab;
         this.ensure_panel(initial, window, cx);
 
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(snap) = mv_ui::bg::blocking(data::load_snapshot).await {
-                this.update_in(cx, |v, window, cx| v.apply(snap, window, cx)).ok();
+            if let Ok((snap, studio)) = mv_ui::bg::blocking(|| (data::load_snapshot(), data::load_studio_prefs())).await {
+                this.update_in(cx, |v, window, cx| {
+                    v.apply(snap, window, cx);
+                    v.apply_studio(studio, window, cx);
+                })
+                .ok();
             }
         })
         .detach();
@@ -286,6 +323,31 @@ impl SettingsView {
         self.storage = storage;
         self.cache_bytes = Some(cache_bytes);
         cx.notify();
+    }
+
+    fn apply_studio(&mut self, prefs: data::StudioPrefs, window: &mut Window, cx: &mut Context<Self>) {
+        let (voice, speed) = (prefs.voice.clone(), format!("{}", prefs.speed));
+        self.studio_voice.update(cx, |s, cx| s.set_value(voice, window, cx));
+        self.studio_speed.update(cx, |s, cx| s.set_value(speed, window, cx));
+        self.studio = prefs;
+        cx.notify();
+    }
+
+    fn set_resolution(&mut self, res: &'static str, cx: &mut Context<Self>) {
+        self.studio.resolution = res.to_string();
+        cx.notify();
+    }
+
+    fn save_studio(&mut self, cx: &mut Context<Self>) {
+        let speed = self.studio_speed.read(cx).value().trim().parse::<f64>().ok().filter(|s| (0.5..=2.0).contains(s));
+        let Some(speed) = speed else {
+            self.report("", Err(anyhow::anyhow!("Speed must be a number between 0.5 and 2.0")), cx);
+            return;
+        };
+        self.studio.voice = self.studio_voice.read(cx).value().trim().to_string();
+        self.studio.speed = speed;
+        let p = self.studio.clone();
+        self.background(cx, move || data::save_studio_prefs(&p), |v, r, cx| v.report("Studio defaults saved", r, cx));
     }
 
     fn ensure_panel(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
@@ -380,9 +442,10 @@ impl SettingsView {
             return;
         }
         self.mode = mode.to_string();
+        mv_ui::mode::set_studio(cx, mode == "studio");
         cx.notify();
         self.background(cx, move || data::save_mode(mode), |v, r, cx| {
-            let text = if v.mode == "studio" { "Manga Studio is unlocked" } else { "Entertainment mode is active" };
+            let text = if v.mode == "studio" { "Studio mode is on" } else { "Studio mode is off" };
             v.report(text, r, cx);
         });
     }
@@ -484,7 +547,8 @@ impl SettingsView {
 
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut groups = div().flex().flex_col().gap(px(18.));
-        for (title, tabs) in GROUPS {
+        let studio_on = mv_ui::mode::studio_enabled(cx);
+        for (title, tabs) in GROUPS.iter().chain(studio_on.then_some(&STUDIO_GROUP)) {
             let mut group = div().flex().flex_col().gap(px(2.));
             if !title.is_empty() {
                 group = group.child(div().px(px(10.)).pb(px(6.)).child(ui::section_label(title)));
@@ -535,6 +599,7 @@ impl SettingsView {
             Tab::Appearance => self.render_appearance(cx).into_any_element(),
             Tab::Mode => self.render_mode(cx).into_any_element(),
             Tab::Storage => self.render_storage(cx).into_any_element(),
+            Tab::Studio => self.render_studio(cx).into_any_element(),
             Tab::About => self.render_about(cx).into_any_element(),
             tab => match self.panels.get(&tab) {
                 Some(view) => div().w_full().child(view.clone()).into_any_element(),
@@ -552,7 +617,7 @@ impl Render for SettingsView {
                 let body = self.render_body(cx);
                 let column = div()
                     .w_full()
-                    .max_w(px(820.))
+                    .max_w(px(760.))
                     .px(px(40.))
                     .py(px(32.))
                     .flex()

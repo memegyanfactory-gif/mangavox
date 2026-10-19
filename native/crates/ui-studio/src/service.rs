@@ -103,24 +103,32 @@ pub struct NarrationRequest {
     pub speed: f64,
     pub video: bool,
     pub resolution: String,
+    /// Explicit pipeline stages (Studio's Audio / Video phases); `None` = full run.
+    pub stages: Option<Vec<String>>,
+    /// Re-synthesize pages whose audio already exists.
+    pub force_regen: bool,
 }
 
 /// The pipeline job for one chapter. Text extraction is skipped when the chapter
 /// already has a script or OCR result (the worker then reuses it).
 pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> PipelineJob {
-    let mut stages = vec![];
-    if !ch.has_text {
-        stages.push("ocr".to_string());
-    }
-    stages.extend(["tts".to_string(), "sync_map".to_string()]);
-    if req.video {
-        stages.push("video".to_string());
-    }
+    let stages = req.stages.clone().unwrap_or_else(|| {
+        let mut stages = vec![];
+        if !ch.has_text {
+            stages.push("ocr".to_string());
+        }
+        stages.extend(["tts".to_string(), "sync_map".to_string()]);
+        if req.video {
+            stages.push("video".to_string());
+        }
+        stages
+    });
     let mut job = PipelineJob::new(&ch.pages_dir, &ch.output_dir, Some(stages), &env.providers);
     job.tts_config = json!({
         "engine": mv_studio::tts::engine_hint(&req.voice),
         "voice": req.voice,
         "speed": req.speed,
+        "force_regen": req.force_regen,
     });
     job.video_config = json!({
         "resolution": req.resolution,
@@ -372,7 +380,7 @@ mod tests {
     }
 
     fn req(video: bool) -> NarrationRequest {
-        NarrationRequest { voice: "af_heart".into(), speed: 1.1, video, resolution: "720p".into() }
+        NarrationRequest { voice: "af_heart".into(), speed: 1.1, video, resolution: "720p".into(), stages: None, force_regen: true }
     }
 
     #[test]

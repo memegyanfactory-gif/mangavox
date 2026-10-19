@@ -1,0 +1,12 @@
+[package]
+name = "mv-update"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["fs", "io-util"] }

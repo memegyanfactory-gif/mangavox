@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui_kit::*;
-use mv_ai::{AiModel, AiProviderId, AiProviderStatus, ModelHub, Registry};
+use mv_ai::{AiModel, AiProviderId, AiProviderState, AiProviderStatus, ModelHub, Registry};
 use mv_ui::bg;
 
 use crate::store::Store;
@@ -95,6 +95,22 @@ impl Shared {
             });
         })
         .detach();
+    }
+
+    /// First launch: choose a ready provider and its default model.
+    pub fn autopick(&mut self, cx: &mut Context<Self>) {
+        if !self.store.prefs.model.is_empty() || !self.providers_loaded {
+            return;
+        }
+        let ready = |p: &&AiProviderStatus| p.state == AiProviderState::Ready;
+        let cand = self.providers.iter().filter(ready).find(|p| p.id == self.store.prefs.provider).or_else(|| self.providers.iter().find(ready)).map(|p| (p.id, p.default_model.clone()));
+        if let Some((id, default)) = cand {
+            let first = self.models.get(&id).and_then(|m| m.first()).map(|m| m.id.clone());
+            match default.or(first) {
+                Some(m) => self.use_in_assistant(id, &m, cx),
+                None => self.load_models(id, false, cx),
+            }
+        }
     }
 
     /// Make `provider`/`model` the assistant's current choice.

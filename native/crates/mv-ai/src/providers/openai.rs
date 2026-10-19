@@ -1,7 +1,7 @@
 //! OpenAI-compatible `/chat/completions` (OpenAI, OpenRouter, Groq, DeepSeek, Mistral, xAI,
 //! LM Studio, llama.cpp, custom endpoints) over SSE.
 
-use super::{emit_reasoning, emit_text, non_empty, StepContext};
+use super::{emit_reasoning, emit_text, non_empty, ImageData, StepContext};
 use crate::stream::{for_each_line, get_json, hdr, new_call_id, post_json, safe_json_parse, sse_data, AiError, Result};
 use crate::types::{AiMessage, AiModel, AiProviderId, AiRole, AiStepResult, AiToolCall, AiUsage, Emit};
 use regex::Regex;
@@ -148,11 +148,26 @@ impl OpenAiAcc {
     }
 }
 
+/// Turn the last user message's content into `[image_url..., text]` parts.
+pub fn attach_images(messages: &mut [Value], images: &[ImageData]) {
+    if images.is_empty() {
+        return;
+    }
+    let Some(m) = super::last_user_mut(messages) else { return };
+    let text = m.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut parts: Vec<Value> =
+        images.iter().map(|i| json!({ "type": "image_url", "image_url": { "url": format!("data:{};base64,{}", i.mime, i.b64) } })).collect();
+    parts.push(json!({ "type": "text", "text": text }));
+    m["content"] = Value::Array(parts);
+}
+
 async fn run(ctx: &StepContext, with_tools: bool) -> Result<AiStepResult> {
     let req = &ctx.req;
+    let mut messages = to_openai_messages(&req.messages);
+    attach_images(&mut messages, &super::load_images(&req.images, &ctx.emit));
     let mut body = json!({
         "model": req.model,
-        "messages": to_openai_messages(&req.messages),
+        "messages": messages,
         "stream": true,
     });
     if let Some((k, v)) = effort_field(ctx) {
@@ -300,5 +315,14 @@ data: [DONE]
     fn model_filter_excludes_non_chat() {
         assert!(chat_model_exclude("text-embedding-3-small"));
         assert!(!chat_model_exclude("gpt-5"));
+    }
+
+    #[test]
+    fn images_become_content_parts_on_last_user_message() {
+        let mut m = to_openai_messages(&[AiMessage::user("a"), AiMessage::user("b")]);
+        attach_images(&mut m, &[ImageData { mime: "image/webp", b64: "QUJD".into() }]);
+        assert_eq!(m[0]["content"], "a");
+        assert_eq!(m[1]["content"][0], json!({"type":"image_url","image_url":{"url":"data:image/webp;base64,QUJD"}}));
+        assert_eq!(m[1]["content"][1], json!({"type":"text","text":"b"}));
     }
 }

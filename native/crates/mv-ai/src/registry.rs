@@ -75,6 +75,18 @@ const fn with_hint(mut d: ProviderDef, hint: &'static str) -> ProviderDef {
     d
 }
 
+/// Display label for a built-in model id.
+fn static_label(id: AiProviderId, m: &str) -> String {
+    match (id, m) {
+        (_, "default") => "Default model".into(),
+        (AiProviderId::ClaudeCode, "claude-haiku-5-5") => "Haiku 5.5".into(),
+        (AiProviderId::ClaudeCode, "claude-fable-5-1") => "Fable 5.1".into(),
+        (AiProviderId::ClaudeCode, "claude-sonnet-5-5") => "Sonnet 5.5".into(),
+        (AiProviderId::ClaudeCode, "claude-opus-5-5") => "Opus 5.5".into(),
+        _ => m.to_string(),
+    }
+}
+
 const fn with_models(mut d: ProviderDef, models: &'static [&'static str]) -> ProviderDef {
     d.static_models = models;
     d
@@ -133,7 +145,7 @@ pub static PROVIDERS: [ProviderDef; 16] = [
     with_hint(
         with_models(
             def(AiProviderId::ClaudeCode, "Claude Code", AiProviderKind::Cli, "Uses your Claude Code sign-in", StepKind::Cli),
-            &["default", "opus", "sonnet", "haiku", "fable"],
+            &["default", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"],
         ),
         "npm i -g @anthropic-ai/claude-code, then run `claude` once to sign in.",
     ),
@@ -423,7 +435,7 @@ impl Registry {
         let def = provider_def(id);
         // Fall back to static + user models when the live list is unavailable.
         let live = self.fetch_models(def).await.unwrap_or_default();
-        let statics = def.static_models.iter().map(|m| AiModel::new(id, *m, if *m == "default" { "Default model" } else { m }));
+        let statics = def.static_models.iter().map(|m| AiModel::new(id, *m, static_label(id, m)));
         let extra = self.read_settings(id).extra_models.unwrap_or_default().into_iter().map(|m| {
             let mut model = AiModel::new(id, m.clone(), m);
             model.tags = Some(vec!["added".into()]);
@@ -447,6 +459,7 @@ impl Registry {
         let def = provider_def(req.provider_id);
         let s = self.read_settings(def.id);
         let request_id = req.request_id.clone();
+        let workspace_override = req.workspace.clone();
         self.active.lock().unwrap().insert(request_id.clone(), cancel.clone());
         let ctx = StepContext {
             req: if def.supports_tools { req } else { AiStepRequest { tools: None, ..req } },
@@ -455,7 +468,7 @@ impl Registry {
             base_url: self.resolve_base_url(def, &s),
             emit,
             client: self.client.clone(),
-            workspace: self.workspace.clone(),
+            workspace: workspace_override.unwrap_or_else(|| self.workspace.clone()),
         };
         let out = async {
             if def.needs_key && ctx.api_key.is_none() {
@@ -513,6 +526,8 @@ impl Registry {
                     tools: None,
                     effort: None,
                     access: None,
+                    images: vec![],
+                    workspace: None,
                 },
                 emit_noop(),
             )
@@ -645,6 +660,8 @@ mod tests {
                     tools: None,
                     effort: None,
                     access: None,
+                    images: vec![],
+                    workspace: None,
                 },
                 emit_noop(),
             )

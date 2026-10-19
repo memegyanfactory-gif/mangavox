@@ -14,6 +14,7 @@ ui-assistant = { path = "../crates/ui-assistant" }
 ui-settings = { path = "../crates/ui-settings" }
 ui-studio = { path = "../crates/ui-studio" }
 mv-net = { path = "../crates/mv-net" }
+mv-update = { path = "../crates/mv-update" }
 mv-sources = { path = "../crates/mv-sources" }
 mv-webwall = { path = "../crates/mv-webwall" }
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.9" }

@@ -228,6 +228,12 @@ pub struct AiStepRequest {
     pub effort: Option<AiEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<AiAccessMode>,
+    /// Absolute paths of images (jpg/png/webp/gif) attached to the LAST user message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<std::path::PathBuf>,
+    /// Overrides the registry workspace (cwd) for CLI providers for this step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -403,4 +409,32 @@ pub struct LocalModelFile {
     pub repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_as: Option<String>,
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn images_and_workspace_roundtrip_and_default_away() {
+        let mut r = AiStepRequest {
+            request_id: "r".into(),
+            provider_id: AiProviderId::ClaudeCode,
+            model: "m".into(),
+            messages: vec![],
+            tools: None,
+            effort: None,
+            access: None,
+            images: vec![],
+            workspace: None,
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(!j.contains("images") && !j.contains("workspace"));
+        assert_eq!(serde_json::from_str::<AiStepRequest>(&j).unwrap(), r);
+        r.images = vec!["/a/b.jpg".into()];
+        r.workspace = Some("/w".into());
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains("\"images\"") && j.contains("\"workspace\""));
+        assert_eq!(serde_json::from_str::<AiStepRequest>(&j).unwrap(), r);
+    }
 }

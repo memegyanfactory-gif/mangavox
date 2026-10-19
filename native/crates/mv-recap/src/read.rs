@@ -1,0 +1,500 @@
+//! READ phase: a vision model reads every page, captures characters into the brain, tags scenes and
+//! writes `read.json` after each page (so a crash or cancel never loses work).
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, Context, Result};
+use image::{imageops::FilterType, DynamicImage};
+use mv_ai::{AiMessage, CancellationToken, Registry};
+use serde_json::Value;
+
+use crate::brain::Brain;
+use crate::json::{bbox_of, num_of, opt_str, str_list, str_of};
+use crate::llm::{ask_json, is_cancelled, request, truncate, Llm};
+use crate::store::*;
+use crate::types::*;
+
+const MAX_FACES_PER_CHARACTER: usize = 4;
+const MAX_FACE_ATTACHMENTS: usize = 6;
+const FACE_PX: u32 = 192;
+const MIN_PANEL_AREA: f32 = 0.02;
+const SCENE_KINDS: &[&str] = &["fight", "dialogue", "emotional", "comedy", "action", "reveal", "calm", "flashback", "romance", "horror", "other"];
+
+const READ_SYSTEM: &str = r##"You are an expert manga reader and script supervisor. You look at one manga page (plus reference face crops of known characters) and produce an exact, structured transcript. A narrator will later retell the story from your output as an anime-style recap video, so accuracy and consistent character names matter more than anything else. You never invent dialogue and never skip a speech balloon. Do not run commands, open other files or write files: use only the attached images and answer directly.
+
+Reply with STRICT JSON only: one JSON object, no markdown fences, no commentary before or after it. Schema (every key present; use "" / [] / null when empty):
+
+{
+  "summary": "1-2 sentences: what happens on this page, in plain English, using character names",
+  "scene": {
+    "kind": "fight|dialogue|emotional|comedy|action|reveal|calm|flashback|romance|horror|other",
+    "mood": "one or two words, e.g. tense, heartbroken, playful",
+    "intensity": 0-10 (0 = quiet, 10 = climax),
+    "tags": ["short tags such as 'sword duel', 'rain', 'confession', 'betrayal', 'training'"]
+  },
+  "memory": "ONE short sentence if a key plot event, reveal, relationship change or world fact happens on this page, else null",
+  "panels": [
+    {
+      "bbox": [x0, y0, x1, y1],
+      "description": "what is drawn: setting, action, expressions, camera angle (1-2 sentences)",
+      "characters": [
+        {
+          "name": "Ruko",
+          "was": null,
+          "face": [x0, y0, x1, y1],
+          "description": "only when first seen: age, hair, eyes, outfit, build, role",
+          "traits": ["only when first seen or newly revealed: personality words"]
+        }
+      ],
+      "lines": [
+        {"speaker": "Ruko", "kind": "speech", "text": "verbatim text of the balloon"}
+      ]
+    }
+  ]
+}
+
+Rules
+1. READING ORDER. Japanese manga reads right-to-left, top-to-bottom: the top-right panel is first, and within a row go right to left. If the page is a webtoon / vertical strip (the prompt says so) read strictly top-to-bottom. List panels in that order. Balloons inside a panel are also ordered by reading order.
+2. COORDINATES. All boxes are NORMALISED to the WHOLE page image: [x0, y0, x1, y1] with values between 0 and 1, origin at the top-left, x to the right, y downward. Panel bbox = the panel frame. Face box = the character's face only, tight (forehead to chin), also relative to the whole page, never to the panel. Omit "face" (null) when the face is hidden, tiny or turned away.
+3. LINES. Transcribe EVERY speech balloon, thought bubble, narration box and meaningful sound effect. kind is one of "speech", "thought", "narration", "sfx". Keep the original meaning; if the text is not English, translate it into natural English. Do not add stage directions. Merge a balloon that is split across several bubbles into one line. Narration boxes and sfx have speaker null. If you cannot tell who speaks, use null rather than guessing wildly; use the tail of the balloon, the facing direction and the roster to decide.
+4. CHARACTERS. A roster of known characters (the "character bank") is given with reference face crops attached after the page. Identify people by face, hair, eyes and outfit, matching them to the roster, and ALWAYS reuse the roster name exactly. Use a real name when it is written or spoken on the page. If someone is not in the roster and has no name yet, give a stable descriptive placeholder such as "Silver-haired swordsman" or "Girl with red ribbon" and reuse exactly the same placeholder next time you see them. If a character that is listed under a placeholder name is named on this page, return the real name in "name" and the old placeholder in "was" (otherwise "was" is null). Do not list background crowds. Only fill "description" and "traits" for a character who is new or whose details were missing; leave them empty for known characters.
+5. SCENE. Judge the depth of the page, not just the surface: fights, tension, grief, comedy beats, reveals, flashbacks. Pick the single best "kind", set intensity honestly (a quiet conversation is 1-3, a decisive blow or tearful goodbye is 8-10), and add 2-5 tags.
+6. SUMMARY continues the story: use the previous page's summary for continuity and write what is new here. If the page is only a title, credits or an ad, say so in the summary and return an empty "panels" list.
+7. Never wrap the JSON in code fences. Never output anything but the JSON object."##;
+
+// ── parsing ──────────────────────────────────────────────────────────────────────────────────────
+
+pub(crate) struct Extra {
+    pub panel: usize,
+    pub seen: usize,
+    pub was: Option<String>,
+    pub description: String,
+    pub traits: Vec<String>,
+}
+
+pub(crate) struct Parsed {
+    pub page: PageRead,
+    pub extras: Vec<Extra>,
+    pub memory: Option<String>,
+}
+
+fn norm_kind(k: &str) -> &'static str {
+    match k.trim().to_lowercase().as_str() {
+        "thought" | "thinking" | "monologue" | "inner" => "thought",
+        "narration" | "narrator" | "caption" | "box" => "narration",
+        "sfx" | "sound" | "sound effect" | "onomatopoeia" => "sfx",
+        _ => "speech",
+    }
+}
+
+/// Lenient conversion of the model's JSON into a [`PageRead`]; missing or odd fields never fail.
+pub(crate) fn parse_page(v: &Value, index: usize, file: &str) -> Parsed {
+    let scene_v = v.get("scene").cloned().unwrap_or(Value::Null);
+    let kind = str_of(&scene_v, "kind").to_lowercase();
+    let scene = Scene {
+        kind: if SCENE_KINDS.contains(&kind.as_str()) { kind } else { "other".into() },
+        mood: str_of(&scene_v, "mood"),
+        intensity: num_of(&scene_v, "intensity").map(|n| n.round().clamp(0.0, 10.0) as u8).unwrap_or(0),
+        tags: str_list(&scene_v, "tags"),
+    };
+    let mut panels = vec![];
+    let mut extras = vec![];
+    for pv in v.get("panels").and_then(Value::as_array).into_iter().flatten() {
+        let pi = panels.len();
+        let mut panel = Panel { bbox: bbox_of(pv, "bbox"), description: str_of(pv, "description"), ..Default::default() };
+        for cv in pv.get("characters").and_then(Value::as_array).into_iter().flatten() {
+            let name = str_of(cv, "name");
+            if name.is_empty() || name.eq_ignore_ascii_case("unknown") {
+                continue;
+            }
+            extras.push(Extra { panel: pi, seen: panel.characters.len(), was: opt_str(cv, "was"), description: str_of(cv, "description"), traits: str_list(cv, "traits") });
+            panel.characters.push(CharacterSeen { name, face: bbox_of(cv, "face").or_else(|| bbox_of(cv, "face_bbox")), is_new: false });
+        }
+        for lv in pv.get("lines").and_then(Value::as_array).into_iter().flatten() {
+            let text = str_of(lv, "text");
+            if text.is_empty() {
+                continue;
+            }
+            let kind = norm_kind(&str_of(lv, "kind"));
+            let speaker = if matches!(kind, "narration" | "sfx") { None } else { opt_str(lv, "speaker") };
+            panel.lines.push(Line { speaker, text, kind: kind.into() });
+        }
+        panels.push(panel);
+    }
+    Parsed { page: PageRead { index, file: file.into(), summary: str_of(v, "summary"), scene, panels }, extras, memory: opt_str(v, "memory") }
+}
+
+// ── brain update ─────────────────────────────────────────────────────────────────────────────────
+
+pub(crate) struct FaceJob {
+    pub id: String,
+    pub bbox: Bbox,
+    pub path: PathBuf,
+}
+
+/// Fold one parsed page into the brain: names are canonicalised in place, new characters created,
+/// placeholders renamed, and face crops scheduled. Returns `(name, is_new)` events and face jobs.
+pub(crate) fn apply_to_brain(brain: &mut Brain, parsed: &mut Parsed, chapter_id: &str, label: &str) -> (Vec<(String, bool)>, Vec<FaceJob>) {
+    let page = parsed.page.index;
+    let mut events: Vec<(String, bool)> = vec![];
+    let mut seen_ids: Vec<String> = vec![];
+    let mut jobs: Vec<FaceJob> = vec![];
+    for e in &parsed.extras {
+        let cs = &mut parsed.page.panels[e.panel].characters[e.seen];
+        let (id, created) = brain.observe(&cs.name, e.was.as_deref(), &e.description, &e.traits);
+        let name = brain.character(&id).map(|c| c.name.clone()).unwrap_or_else(|| cs.name.clone());
+        cs.name = name.clone();
+        cs.is_new = created;
+        if !seen_ids.contains(&id) {
+            seen_ids.push(id.clone());
+            brain.mark_seen(&id, chapter_id, page);
+            events.push((name, created));
+            let have = brain.character(&id).map(|c| c.faces.len()).unwrap_or(0);
+            if let (Some(bbox), true) = (cs.face, have < MAX_FACES_PER_CHARACTER) {
+                let reserved: Vec<PathBuf> = jobs.iter().map(|j| j.path.clone()).collect();
+                let path = brain.next_face_path(&id, &reserved);
+                jobs.push(FaceJob { id, bbox, path });
+            }
+        }
+    }
+    for panel in &mut parsed.page.panels {
+        for l in &mut panel.lines {
+            if let Some(s) = &l.speaker {
+                l.speaker = Some(brain.canonical(s));
+            }
+        }
+    }
+    if let Some(m) = &parsed.memory {
+        brain.add_note(&format!("[{label} p{}] {m}", page + 1));
+    }
+    (events, jobs)
+}
+
+// ── image helpers (blocking) ─────────────────────────────────────────────────────────────────────
+
+fn save_jpeg(img: &DynamicImage, out: &Path) -> Result<()> {
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    img.to_rgb8().save_with_format(out, image::ImageFormat::Jpeg).with_context(|| format!("write {}", out.display()))
+}
+
+/// Square-ish face thumbnail: bbox + 15% padding, squared up, at most 192px.
+pub(crate) fn crop_face(img: &DynamicImage, b: Bbox, out: &Path) -> Result<()> {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let [x0, y0, x1, y1] = b.0;
+    let (cx, cy) = ((x0 + x1) / 2.0 * w, (y0 + y1) / 2.0 * h);
+    let side = ((x1 - x0) * w * 1.3).max((y1 - y0) * h * 1.3).max(8.0).min(w).min(h);
+    let left = (cx - side / 2.0).clamp(0.0, w - side);
+    let top = (cy - side / 2.0).clamp(0.0, h - side);
+    let mut c = img.crop_imm(left as u32, top as u32, side.max(1.0) as u32, side.max(1.0) as u32);
+    if c.width() > FACE_PX {
+        c = c.resize(FACE_PX, FACE_PX, FilterType::Triangle);
+    }
+    save_jpeg(&c, out)
+}
+
+/// Full-resolution panel crop with a hair of padding.
+pub(crate) fn crop_panel(img: &DynamicImage, b: Bbox, out: &Path) -> Result<()> {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let [x0, y0, x1, y1] = b.0;
+    let (px, py) = (((x1 - x0) * 0.01).max(0.0), ((y1 - y0) * 0.01).max(0.0));
+    let (l, t) = ((x0 - px).max(0.0) * w, (y0 - py).max(0.0) * h);
+    let (r, bt) = ((x1 + px).min(1.0) * w, (y1 + py).min(1.0) * h);
+    let c = img.crop_imm(l as u32, t as u32, ((r - l) as u32).max(1), ((bt - t) as u32).max(1));
+    save_jpeg(&c, out)
+}
+
+/// Page image to send to the model: downscaled copy in `work` when huge, else the original.
+/// Returns `(path, width, height)` of the ORIGINAL image dimensions.
+pub(crate) fn prep_page(path: &Path, work: &Path, index: usize) -> Result<(PathBuf, u32, u32)> {
+    let (w, h) = image::image_dimensions(path).with_context(|| format!("cannot read image {}", path.display()))?;
+    let webtoon = is_webtoon(w, h);
+    let factor = if webtoon { (1600.0 / w as f32).min(7000.0 / h as f32) } else { 2000.0 / w.max(h) as f32 };
+    if factor >= 1.0 {
+        return Ok((path.to_path_buf(), w, h));
+    }
+    let img = image::open(path)?;
+    let small = img.resize(((w as f32 * factor) as u32).max(1), ((h as f32 * factor) as u32).max(1), FilterType::Triangle);
+    let out = work.join(format!("page_{index:04}.jpg"));
+    save_jpeg(&small, &out)?;
+    Ok((out, w, h))
+}
+
+pub(crate) fn is_webtoon(w: u32, h: u32) -> bool {
+    h as f32 / w.max(1) as f32 >= 2.2
+}
+
+struct Assets {
+    page: PathBuf,
+    page_index: usize,
+    panels: Vec<(usize, Bbox)>,
+    faces: Vec<FaceJob>,
+    panels_dir: PathBuf,
+}
+
+/// Write panel crops (replacing stale ones for this page) and face thumbnails. Returns written faces.
+fn write_assets(a: Assets) -> Result<Vec<(String, PathBuf)>> {
+    let prefix = format!("p{:04}_", a.page_index);
+    if let Ok(rd) = std::fs::read_dir(&a.panels_dir) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    if a.panels.is_empty() && a.faces.is_empty() {
+        return Ok(vec![]);
+    }
+    let img = image::open(&a.page).with_context(|| format!("open {}", a.page.display()))?;
+    for (n, b) in &a.panels {
+        if b.area() >= MIN_PANEL_AREA {
+            let _ = crop_panel(&img, *b, &a.panels_dir.join(format!("{prefix}{n:02}.jpg")));
+        }
+    }
+    let mut out = vec![];
+    for j in a.faces {
+        if crop_face(&img, j.bbox, &j.path).is_ok() {
+            out.push((j.id, j.path));
+        }
+    }
+    Ok(out)
+}
+
+// ── prompts ──────────────────────────────────────────────────────────────────────────────────────
+
+/// Known characters with reference faces: recently-seen first, then by appearances. At most 6.
+pub(crate) fn pick_faces(brain: &Brain, recent: &[String]) -> Vec<(String, PathBuf)> {
+    let mut cs: Vec<_> = brain.characters.iter().filter_map(|c| c.faces.iter().find(|p| p.is_file()).map(|p| (c, p))).collect();
+    cs.sort_by_key(|(c, _)| (!recent.iter().any(|r| r.eq_ignore_ascii_case(&c.name)), std::cmp::Reverse(c.appearances)));
+    cs.into_iter().take(MAX_FACE_ATTACHMENTS).map(|(c, p)| (c.name.clone(), p.clone())).collect()
+}
+
+pub(crate) fn roster_text(brain: &Brain, limit: usize) -> String {
+    let mut cs: Vec<_> = brain.characters.iter().collect();
+    cs.sort_by_key(|c| std::cmp::Reverse(c.appearances));
+    if cs.is_empty() {
+        return "(none yet - every character you see is new)".into();
+    }
+    cs.iter()
+        .take(limit)
+        .map(|c| {
+            let mut s = format!("- {}", c.name);
+            if !c.aliases.is_empty() {
+                s += &format!(" (also called: {})", c.aliases.join(", "));
+            }
+            if !c.description.is_empty() {
+                s += &format!(": {}", truncate(&c.description, 200));
+            }
+            if !c.traits.is_empty() {
+                s += &format!(" [traits: {}]", c.traits.join(", "));
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) struct PagePrompt<'a> {
+    pub brain: &'a Brain,
+    pub label: &'a str,
+    pub index: usize,
+    pub total: usize,
+    pub file: &'a str,
+    pub size: (u32, u32),
+    pub prev_summary: &'a str,
+    pub faces: &'a [(String, PathBuf)],
+}
+
+pub(crate) fn page_prompt(p: &PagePrompt) -> String {
+    let (w, h) = p.size;
+    let layout = if is_webtoon(w, h) {
+        "WEBTOON / vertical strip: read strictly top-to-bottom, left-to-right."
+    } else {
+        "Manga page: if this is Japanese manga read right-to-left (top-right panel first); if it is clearly left-to-right (Western comic / manhwa page) read left-to-right."
+    };
+    let mut s = format!(
+        "MANGA: {}\nCHAPTER: {} - page {} of {} (file {}, {}x{} px)\nLAYOUT: {}\n",
+        if p.brain.manga_title.is_empty() { "(untitled)" } else { &p.brain.manga_title },
+        p.label,
+        p.index + 1,
+        p.total,
+        p.file,
+        w,
+        h,
+        layout
+    );
+    let notes: String = {
+        let n = p.brain.notes.trim();
+        let skip = n.chars().count().saturating_sub(1200);
+        n.chars().skip(skip).collect()
+    };
+    if !notes.is_empty() {
+        s += &format!("\nSTORY MEMORY SO FAR (most recent last):\n{notes}\n");
+    }
+    s += &format!("\nPREVIOUS PAGE: {}\n", if p.prev_summary.is_empty() { "(this is the first page read)" } else { p.prev_summary });
+    s += &format!("\nCHARACTER BANK (reuse these exact names):\n{}\n", roster_text(p.brain, 40));
+    s += "\nATTACHED IMAGES:\nImage 1 = the page to read.";
+    for (i, (name, path)) in p.faces.iter().enumerate() {
+        let f = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        s += &format!("\nImage {} = reference face of {} ({}).", i + 2, name, f);
+    }
+    s += "\n\nRead Image 1 now and reply with the JSON object only.";
+    s
+}
+
+fn model_label(m: &ModelChoice) -> String {
+    format!("{}/{}", m.provider.as_str(), m.model)
+}
+
+fn recent_names(read: &ChapterRead, index: usize) -> Vec<String> {
+    let Some(prev) = index.checked_sub(1).and_then(|p| read.pages.iter().find(|x| x.index == p)) else { return vec![] };
+    prev.panels.iter().flat_map(|p| p.characters.iter().map(|c| c.name.clone())).collect()
+}
+
+// ── main loop ────────────────────────────────────────────────────────────────────────────────────
+
+/// Read a chapter (see module docs). Cancelling returns `Err("cancelled")` after the finished pages are saved.
+pub async fn read_chapter(
+    reg: Arc<Registry>,
+    model: ModelChoice,
+    ch: ChapterRef,
+    brain: Arc<Mutex<Brain>>,
+    opts: ReadOptions,
+    progress: ProgressFn,
+    cancel: CancellationToken,
+) -> Result<ChapterRead> {
+    read_chapter_with(&reg, &model, &ch, &brain, &opts, &progress, &cancel).await
+}
+
+pub(crate) async fn read_chapter_with(
+    llm: &dyn Llm,
+    model: &ModelChoice,
+    ch: &ChapterRef,
+    brain: &Mutex<Brain>,
+    opts: &ReadOptions,
+    progress: &ProgressFn,
+    cancel: &CancellationToken,
+) -> Result<ChapterRead> {
+    let fail = |msg: String| -> anyhow::Error {
+        progress(Progress::Failed(msg.clone()));
+        anyhow!(msg)
+    };
+    let pages = list_pages(&ch.pages_dir);
+    if pages.is_empty() {
+        return Err(fail(format!("No page images found in {}", ch.pages_dir.display())));
+    }
+    let mut read = load_read(ch).unwrap_or_default();
+    read.chapter_id = ch.chapter_id.clone();
+    read.model = model_label(model);
+    let done: Vec<usize> = read.pages.iter().map(|p| p.index).collect();
+    let mut targets: Vec<usize> = match &opts.pages {
+        Some(p) => p.iter().copied().filter(|&i| i < pages.len()).collect(),
+        None if opts.force => (0..pages.len()).collect(),
+        None => (0..pages.len()).filter(|i| !done.contains(i)).collect(),
+    };
+    targets.sort_unstable();
+    targets.dedup();
+
+    let work = chapter_dir(ch).join("work");
+    std::fs::create_dir_all(&work).context("create studio work dir")?;
+    std::fs::create_dir_all(panels_dir(ch)).context("create panels dir")?;
+    if targets.is_empty() {
+        progress(Progress::Log("All pages are already read.".into()));
+        progress(Progress::Done);
+        return Ok(read);
+    }
+    let total = targets.len();
+
+    for (k, &i) in targets.iter().enumerate() {
+        if cancel.is_cancelled() {
+            progress(Progress::Failed("Cancelled".into()));
+            return Err(anyhow!("cancelled"));
+        }
+        let page_path = pages[i].clone();
+        let file = page_path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+
+        let (wp, wk) = (page_path.clone(), work.clone());
+        let prepped = tokio::task::spawn_blocking(move || prep_page(&wp, &wk, i)).await.map_err(|e| anyhow!(e))?;
+        let (send_path, w, h) = match prepped {
+            Ok(x) => x,
+            Err(e) => {
+                progress(Progress::Log(format!("Page {}: {e}", i + 1)));
+                upsert(&mut read, PageRead { index: i, file, summary: format!("(unreadable image: {e})"), ..Default::default() });
+                save_read(ch, &read)?;
+                progress(Progress::Page { done: k + 1, total, page: i });
+                continue;
+            }
+        };
+
+        let prev_summary = i.checked_sub(1).and_then(|p| read.pages.iter().find(|x| x.index == p)).map(|p| p.summary.clone()).unwrap_or_default();
+        let recent = recent_names(&read, i);
+        let (prompt, faces) = {
+            let b = brain.lock().unwrap();
+            let faces = pick_faces(&b, &recent);
+            let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces });
+            (prompt, faces)
+        };
+        let mut images = vec![send_path];
+        images.extend(faces.iter().map(|(_, p)| p.clone()));
+        let req = request(model, vec![AiMessage::system(READ_SYSTEM), AiMessage::user(prompt)], images, Some(work.clone()));
+
+        let answer = match ask_json(llm, req, cancel).await {
+            Ok(a) => a,
+            Err(e) if is_cancelled(&e) => {
+                progress(Progress::Failed("Cancelled".into()));
+                return Err(e);
+            }
+            Err(e) => return Err(fail(format!("Page {}: {e}", i + 1))),
+        };
+        let mut parsed = match answer {
+            Ok(v) => parse_page(&v, i, &file),
+            Err(raw) => {
+                progress(Progress::Log(format!("Page {}: the model did not return valid JSON; stored its raw text instead.", i + 1)));
+                Parsed { page: PageRead { index: i, file: file.clone(), summary: truncate(&raw, 600), ..Default::default() }, extras: vec![], memory: None }
+            }
+        };
+
+        let (events, jobs) = {
+            let mut b = brain.lock().unwrap();
+            apply_to_brain(&mut b, &mut parsed, &ch.chapter_id, &ch.label)
+        };
+        for (name, new) in events {
+            progress(Progress::Character { name, new });
+        }
+        let assets = Assets {
+            page: page_path,
+            page_index: i,
+            panels: parsed.page.panels.iter().enumerate().filter_map(|(n, p)| p.bbox.map(|b| (n, b))).collect(),
+            faces: jobs,
+            panels_dir: panels_dir(ch),
+        };
+        match tokio::task::spawn_blocking(move || write_assets(assets)).await.map_err(|e| anyhow!(e))? {
+            Ok(faces) => {
+                let mut b = brain.lock().unwrap();
+                for (id, p) in faces {
+                    b.add_face(&id, p);
+                }
+            }
+            Err(e) => progress(Progress::Log(format!("Page {}: crops failed: {e}", i + 1))),
+        }
+        {
+            let b = brain.lock().unwrap().clone();
+            if let Err(e) = b.save() {
+                progress(Progress::Log(format!("Could not save the brain: {e}")));
+            }
+        }
+        upsert(&mut read, parsed.page);
+        save_read(ch, &read)?;
+        progress(Progress::Page { done: k + 1, total, page: i });
+    }
+    progress(Progress::Done);
+    Ok(read)
+}
+
+fn upsert(read: &mut ChapterRead, page: PageRead) {
+    read.pages.retain(|p| p.index != page.index);
+    read.pages.push(page);
+    read.pages.sort_by_key(|p| p.index);
+}

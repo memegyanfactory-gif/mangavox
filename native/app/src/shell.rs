@@ -110,11 +110,17 @@ pub struct Shell {
     parked: std::collections::HashMap<Section, Parked>,
     dock: Option<AnyView>,
     dock_open: bool,
+    /// Sidebar state to restore after leaving the (wide) Studio page.
+    saved_collapsed: Option<bool>,
     _keys: Subscription,
+    _mode: Subscription,
+    _update: Subscription,
 }
 
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        mv_ui::mode::init(cx, ui_settings::studio_saved());
+        let mode = cx.observe_global_in::<mv_ui::mode::StudioMode>(window, |this, window, cx| this.mode_changed(window, cx));
         let shell = cx.entity().downgrade();
         set_navigator(cx, move |route, window, cx| {
             if let Some(s) = shell.upgrade() {
@@ -128,6 +134,8 @@ impl Shell {
                 this.back(window, cx);
             }
         });
+        let updater = mv_ui::update::updater(cx);
+        let update = cx.observe(&updater, |_, _, cx| cx.notify());
         let route = Route::Library;
         let page = Self::resolve(&route, window, cx);
         Self {
@@ -140,7 +148,10 @@ impl Shell {
             parked: Default::default(),
             dock: None,
             dock_open: false,
+            saved_collapsed: None,
             _keys: keys,
+            _mode: mode,
+            _update: update,
         }
     }
 
@@ -202,8 +213,30 @@ impl Shell {
         }
     }
 
-    fn sync_back(&self, cx: &mut App) {
+    /// Called after every route change: keeps the back target current and gives the wide
+    /// Studio page the 60px rail, restoring the user's own sidebar state afterwards.
+    fn sync_back(&mut self, cx: &mut App) {
         set_back_target(cx, self.back_route());
+        if self.route == Route::Studio {
+            if self.saved_collapsed.is_none() {
+                self.saved_collapsed = Some(self.collapsed);
+                self.collapsed = true;
+            }
+        } else if let Some(prev) = self.saved_collapsed.take() {
+            self.collapsed = prev;
+        }
+    }
+
+    /// Studio mode toggled: hide the Studio entries immediately.
+    fn mode_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !mv_ui::mode::studio_enabled(cx) {
+            self.dock_open = false;
+            if self.route == Route::Studio {
+                let home = self.section.home();
+                self.go(home, window, cx);
+            }
+        }
+        cx.notify();
     }
 
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -339,8 +372,34 @@ impl Shell {
             })
             .collect();
 
-        let assistant = self.side_button("Assistant", "icons/sparkles.svg", self.dock_open).on_click(cx.listener(|this, _, w, cx| this.toggle_dock(w, cx)));
-        let studio = self.side_item("Studio", "icons/wand-sparkles.svg", self.route == Route::Studio, Route::Studio, cx);
+        let studio_on = mv_ui::mode::studio_enabled(cx);
+        let studio_group = studio_on.then(|| {
+            let assistant = self.side_button("Assistant", "icons/sparkles.svg", self.dock_open).on_click(cx.listener(|this, _, w, cx| this.toggle_dock(w, cx)));
+            let studio = self.side_item("Studio", "icons/wand-sparkles.svg", self.route == Route::Studio, Route::Studio, cx);
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .p(px(4.))
+                .rounded(px(10.))
+                .bg(Tokens::accent_soft())
+                .border_1()
+                .border_color(Tokens::border())
+                .when(!collapsed, |d| {
+                    d.child(
+                        div()
+                            .px(px(6.))
+                            .pt(px(2.))
+                            .pb(px(4.))
+                            .text_size(px(size::XS))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(Tokens::accent())
+                            .child("STUDIO"),
+                    )
+                })
+                .child(studio)
+                .child(assistant)
+        });
         let settings = self.side_item("Settings", "icons/settings.svg", matches!(self.route, Route::Settings { .. }), Route::Settings { tab: None }, cx);
 
         div()
@@ -381,9 +440,21 @@ impl Shell {
             )
             .child(segment)
             .child(div().flex().flex_col().gap(px(1.)).children(items))
-            .child(div().flex().flex_col().gap(px(1.)).child(assistant).child(studio))
+            .children(studio_group)
             .child(div().flex_1())
-            .child(div().flex().flex_col().gap(px(2.)).pt(px(10.)).border_t_1().border_color(Tokens::border()).child(settings))
+            .children(mv_ui::update::prompt(cx))
+            .child(
+                div()
+                    .flex()
+                    .when(collapsed, |d| d.flex_col().items_center())
+                    .when(!collapsed, |d| d.items_center())
+                    .gap(px(2.))
+                    .pt(px(10.))
+                    .border_t_1()
+                    .border_color(Tokens::border())
+                    .child(div().when(!collapsed, |d| d.flex_1()).child(settings))
+                    .child(mv_ui::update::badge(collapsed, cx)),
+            )
     }
 
     fn side_button(&self, label: &'static str, ic: &'static str, active: bool) -> Stateful<Div> {
@@ -427,7 +498,9 @@ impl Render for Shell {
         let focus = is_focus(&self.route);
         // Settings brings its own navigation rail; the app sidebar would make four columns.
         let in_settings = matches!(self.route, Route::Settings { .. });
-        let dock = self.dock.clone().filter(|_| self.dock_open && !focus);
+        // Studio embeds its own chat on the right, so the docked assistant stays away from it.
+        let studio_on = mv_ui::mode::studio_enabled(cx);
+        let dock = self.dock.clone().filter(|_| self.dock_open && !focus && studio_on && self.route != Route::Studio);
         div()
             .flex()
             .flex_col()

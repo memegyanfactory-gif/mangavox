@@ -1,6 +1,6 @@
 //! Ollama `/api/chat` (NDJSON streaming).
 
-use super::{emit_reasoning, emit_text, non_empty, StepContext};
+use super::{emit_reasoning, emit_text, non_empty, ImageData, StepContext};
 use crate::stream::{for_each_line, get_json, new_call_id, post_json, AiError, Result};
 use crate::types::{AiMessage, AiModel, AiProviderId, AiRole, AiStepResult, AiToolCall, AiUsage, Emit};
 use serde_json::{json, Map, Value};
@@ -99,11 +99,23 @@ impl OllamaAcc {
     }
 }
 
+/// Add `"images": [base64...]` to the last user message.
+pub fn attach_images(messages: &mut [Value], images: &[ImageData]) {
+    if images.is_empty() {
+        return;
+    }
+    if let Some(m) = super::last_user_mut(messages) {
+        m["images"] = images.iter().map(|i| json!(i.b64)).collect();
+    }
+}
+
 async fn run(ctx: &StepContext, with_tools: bool) -> Result<AiStepResult> {
     let req = &ctx.req;
+    let mut messages = to_ollama_messages(&req.messages);
+    attach_images(&mut messages, &super::load_images(&req.images, &ctx.emit));
     let mut body = json!({
         "model": req.model,
-        "messages": to_ollama_messages(&req.messages),
+        "messages": messages,
         "stream": true,
     });
     if let Some(tools) = req.tools.as_ref().filter(|t| with_tools && !t.is_empty()) {
@@ -215,5 +227,13 @@ mod tests {
         assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "f");
         assert_eq!(out[2]["tool_name"], "f");
         assert_eq!(out[0]["role"], "user");
+    }
+
+    #[test]
+    fn images_go_in_the_images_field() {
+        let mut m = to_ollama_messages(&[AiMessage::user("a"), AiMessage::user("b")]);
+        attach_images(&mut m, &[ImageData { mime: "image/png", b64: "QUJD".into() }]);
+        assert!(m[0].get("images").is_none());
+        assert_eq!(m[1]["images"], json!(["QUJD"]));
     }
 }

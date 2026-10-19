@@ -28,7 +28,8 @@ pub fn surface() -> Div {
     div().flex().flex_col().rounded(px(12.)).bg(Tokens::surface()).border_1().border_color(Tokens::border())
 }
 
-/// Section card: title + optional description, then rows (`row`, `divided`).
+/// Flat section: hairline above, a title and optional description, then rows (`row`, `divided`).
+/// No background or border of its own, so sections never nest as cards.
 pub fn card(title: &str, desc: Option<&str>) -> Div {
     let head = div()
         .flex()
@@ -37,7 +38,7 @@ pub fn card(title: &str, desc: Option<&str>) -> Div {
         .pb(px(6.))
         .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title.to_string()))
         .when_some(desc, |d, t| d.child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(t.to_string())));
-    surface().px(px(20.)).pt(px(16.)).pb(px(6.)).child(head)
+    div().flex().flex_col().border_t_1().border_color(Tokens::border()).pt(px(18.)).pb(px(6.)).child(head)
 }
 
 /// Label and description on the left, control on the right.

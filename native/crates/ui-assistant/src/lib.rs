@@ -7,13 +7,17 @@ pub mod agent;
 mod dock;
 mod fit;
 mod hub;
+mod picker;
 mod providers;
 mod shared;
 pub mod store;
 pub mod tools;
 mod ui;
 
+pub use agent::set_studio_context;
+pub use picker::ModelPicker;
 pub use tools::set_page_context;
+pub use ui::provider_logo;
 
 pub fn open(_route: &Route, _window: &mut Window, _cx: &mut App) -> Option<AnyView> {
     None
@@ -64,3 +68,24 @@ pub fn models_dir() -> std::path::PathBuf {
     mv_ai::ModelHub::new(mv_core::paths::config(), mv_core::paths::root()).models_dir()
 }
 
+
+/// The shared mv-ai registry (same instance the assistant dock uses).
+pub fn registry(cx: &mut App) -> std::sync::Arc<mv_ai::Registry> {
+    shared::shared(cx).read(cx).registry.clone()
+}
+
+/// Display name of the assistant's current model, e.g. "Sonnet 5.5" ("Select model" when unset).
+pub fn model_label(cx: &mut App) -> String {
+    picker::current_label(shared::shared(cx).read(cx))
+}
+
+/// T3-style model button + popover that opens *below* the button (toolbars). Writes the choice
+/// into the shared assistant prefs, so the dock and `assistant_model` see it immediately.
+pub fn model_picker(window: &mut Window, cx: &mut App) -> AnyView {
+    picker::create(false, window, cx)
+}
+
+/// Same as [`model_picker`] but the popover opens *above* the button (bottom composers).
+pub fn model_picker_above(window: &mut Window, cx: &mut App) -> AnyView {
+    picker::create(true, window, cx)
+}

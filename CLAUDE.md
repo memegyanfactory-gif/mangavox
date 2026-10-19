@@ -41,10 +41,9 @@ Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 
 Full guide: [docs/DEBUGGING.md](docs/DEBUGGING.md). Essentials:
 
-- `npm run dev` opens CDP on **9222** in dev (`MANGAVOX_CDP_PORT=<port>|off`; use another port if 9222 is taken by a parallel instance). Kill only your own instance.
-- Drive the running app with `node scripts/mv.js <status|eval|nav|invoke|shot|errors|logs|diag|sources|reload|targets>`; in the dev renderer `window.__mv` exposes `navigate/state/invoke/errors`.
-- Logs are JSON lines in `~/.mangavox/logs/` — `main.log` (all main `console.*`, crashes), `renderer.log` (window errors, rejections, console.error/warn, ErrorBoundary + page), `ipc.log` (every IPC call; errors with args + stack; SLOW > 3 s). Shared by all instances — filter with `--pid`.
-- Verify a fix: `mv eval "__mv.clearErrors()"` → reproduce via `mv nav`/`mv eval` → `mv errors` and `mv logs ipc --level error` show nothing new → `mv shot` for UI → `npx tsc --noEmit`.
+- The product is the native Rust/GPUI app in `native/`: `cd native && cargo build -p mangavox`, run `native\target\debug\mangavox.exe` (or `npm run dev`). The old Electron app has been removed.
+- Logs are JSON lines in `~/.mangavox/logs/` (`main.log`, rotated); `MANGAVOX_LOG_DIR` / `MANGAVOX_LOG_LEVEL` override.
+- Verify a change: `cd native && cargo check -p mangavox` and `cargo test -p <crate>`; launch the exe to check UI. Kill only your own instance.
 
 <!-- nexa-context:start -->
 # Your rules (mirrored by Nexa)

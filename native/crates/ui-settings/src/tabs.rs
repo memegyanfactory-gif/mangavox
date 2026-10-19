@@ -6,7 +6,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::{button, size, ButtonKind, Tokens};
 
-use crate::ui::{card, divided, format_bytes, row, surface};
+use crate::ui::{card, divided, format_bytes, row};
 use crate::{data, Notice, SettingsView};
 
 /// Input on the right of a setting row.
@@ -171,60 +171,45 @@ impl SettingsView {
 
     pub(crate) fn render_mode(&self, cx: &mut Context<Self>) -> Div {
         let studio = self.mode == "studio";
-        let option = |id: &'static str, title: &'static str, badge: &'static str, desc: &'static str, active: bool, mode: &'static str| {
-            div()
-                .id(id)
-                .flex_1()
-                .min_w_0()
-                .p(px(18.))
-                .rounded(px(12.))
-                .bg(Tokens::surface())
-                .border_1()
-                .border_color(if active { Tokens::accent() } else { Tokens::border() })
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_mode(mode, cx)))
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title))
-                        .when(active, |d| d.child(div().text_size(px(size::SM)).text_color(Tokens::accent()).child("Active"))),
-                )
-                .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(badge.to_uppercase()))
-                .child(div().mt(px(4.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(desc))
-        };
+        div().flex().flex_col().gap(px(16.)).child(
+            card("Workspace", Some("Changing modes never removes your library, downloads, or settings.")).child(row(
+                "Studio mode",
+                "Adds the Studio workspace and the Assistant to the sidebar, plus Studio settings. Off keeps the app to manga, anime and movies.",
+                Switch::new("mode-studio")
+                    .checked(studio)
+                    .on_change(cx.listener(|this, on: &bool, _, cx| this.set_mode(if *on { "studio" } else { "entertainment" }, cx))),
+            )),
+        )
+    }
 
+    pub(crate) fn render_studio(&self, cx: &mut Context<Self>) -> Div {
+        let p = &self.studio;
+        let res_btn = |id: &'static str, v: &'static str, cx: &mut Context<Self>| {
+            let kind = if p.resolution == v { ButtonKind::Primary } else { ButtonKind::Secondary };
+            button(id, v, kind).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_resolution(v, cx)))
+        };
         div()
             .flex()
             .flex_col()
-            .gap(px(20.))
+            .gap(px(16.))
             .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(option(
-                        "mode-entertainment",
-                        "MangaVox",
-                        "Entertainment",
-                        "Manga, anime, movies, reader, library, favorites, history, downloads, subtitles, and themes. Assistant and production controls stay hidden.",
-                        !studio,
-                        "entertainment",
-                    ))
-                    .child(option(
-                        "mode-studio",
-                        "Manga Studio",
-                        "Full workspace",
-                        "Unlocks Assistant, Text, Audio, Video, Dashboard, Pipeline, AI Models, and production controls.",
-                        studio,
-                        "studio",
-                    )),
+                card("Narration", Some("Defaults for new Studio projects."))
+                    .child(row("Default voice", "Voice name used for narration", div().w(px(280.)).child(Input::new(&self.studio_voice))))
+                    .child(divided(row("Speed", "Speaking rate, 1.0 is normal", div().w(px(120.)).child(Input::new(&self.studio_speed))))),
+            )
+            .child(
+                card("Output", None).child(row(
+                    "Default resolution",
+                    "Video size for exported projects",
+                    div().flex().gap(px(6.)).child(res_btn("studio-720", "720p", cx)).child(res_btn("studio-1080", "1080p", cx)),
+                )),
             )
             .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(
-                "Switch at any time. Changing modes never removes your library, downloads, or settings.",
+                "Pick the AI model in Studio's model button; it uses the same model as the Assistant.",
+            ))
+            .child(actions(
+                button("studio-save", "Save changes", ButtonKind::Primary)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_studio(cx))),
             ))
     }
 
@@ -316,11 +301,11 @@ impl SettingsView {
             .flex_col()
             .gap(px(16.))
             .child(
-                surface()
-                    .flex_row()
+                div()
+                    .flex()
                     .items_center()
                     .gap(px(14.))
-                    .p(px(20.))
+                    .pb(px(6.))
                     .child(
                         div()
                             .flex()
@@ -341,12 +326,13 @@ impl SettingsView {
                             .flex_col()
                             .gap(px(2.))
                             .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("MangaVox"))
-                            .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(format!("Version {version} · native")))
+                            .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(format!("Version {version} · Made by Aayush Datta")))
                             .child(div().pt(px(4.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(
                                 "Browse, read and watch, then turn manga into narrated audio and video. Processing runs locally on your machine.",
                             )),
                     ),
             )
+            .child(card("Updates", None).child(mv_ui::update::about(cx)))
             .child(
                 card("Data", None)
                     .child(row(

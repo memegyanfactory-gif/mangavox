@@ -9,25 +9,6 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "skipFiles": ["<node_internals>/**"]
-    },
-    {
-      "name": "MangaVox Dev",
-      "type": "node",
-      "request": "launch",
-      "program": "${workspaceFolder}/scripts/dev.js",
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "skipFiles": ["<node_internals>/**"]
-    },
-    {
-      "name": "MangaVox Debug (Main Process)",
-      "type": "node",
-      "request": "launch",
-      "program": "${workspaceFolder}/scripts/dev.js",
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "skipFiles": ["<node_internals>/**"],
-      "env": { "ELECTRON_ENABLE_LOGGING": "1" }
     }
   ]
 }

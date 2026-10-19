@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     copy.pages_dir = pages;
     copy.output_dir = tmp.join("pipeline");
     copy.has_text = false;
-    let req = NarrationRequest { voice: "af_heart".into(), speed: 1.0, video: false, resolution: "720p".into() };
+    let req = NarrationRequest { voice: "af_heart".into(), speed: 1.0, video: false, resolution: "720p".into(), stages: None, force_regen: true };
     let job = build_job(&req, &env, &copy);
     println!("\n== Running job on a 3-page copy in {}\nstages: {:?}", tmp.display(), job.stages);
 

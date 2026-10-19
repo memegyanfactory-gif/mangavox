@@ -253,9 +253,9 @@ impl ModelLibrary {
             .flex()
             .items_center()
             .gap(px(8.))
-            .h(px(30.))
+            .h(px(28.))
             .px(px(10.))
-            .rounded(px(8.))
+            .rounded(px(7.))
             .border_1()
             .text_size(px(size::SM))
             .cursor_pointer()
@@ -266,17 +266,19 @@ impl ModelLibrary {
                     d.border_color(transparent_black()).text_color(Tokens::text_2()).hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1()))
                 }
             })
-            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(div().truncate().child(label))
             .when_some(count, |d, n| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(n.to_string())))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_page(page, window, cx)))
     }
 
+    /// Horizontal segmented tabs (primary pages, then categories) with a one-line folder / hardware strip.
     fn render_subnav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let total = self.inv.as_ref().map(|i| i.models.len());
-        let mut list = div()
+        let mut tabs = div()
             .flex()
-            .flex_col()
-            .gap(px(2.))
+            .flex_wrap()
+            .items_center()
+            .gap(px(4.))
             .child(self.nav_item("ml-inuse", "In use".into(), None, Page::InUse, cx))
             .child(self.nav_item("ml-downloaded", match total {
                 Some(n) => format!("Downloaded ({n})"),
@@ -284,79 +286,49 @@ impl ModelLibrary {
             }, None, Page::Downloaded, cx))
             .child(self.nav_item("ml-downloads", "Downloads".into(), None, Page::Downloads, cx))
             .child(self.nav_item("ml-engines", "Engines".into(), None, Page::Engines, cx))
-            .child(div().my(px(10.)).h(px(1.)).bg(Tokens::border()))
-            .child(div().px(px(10.)).pb(px(4.)).child(section_label("Categories")));
+            .child(div().mx(px(6.)).h(px(16.)).w(px(1.)).bg(Tokens::border()));
         for (i, c) in Category::ALL.into_iter().enumerate() {
             let n = self.inv.as_ref().map(|inv| inv.count(c)).unwrap_or(0);
             if c == Category::Other && n == 0 {
                 continue;
             }
             let ids = ["ml-c0", "ml-c1", "ml-c2", "ml-c3", "ml-c4", "ml-c5", "ml-c6"];
-            list = list.child(self.nav_item(ids[i], c.label().into(), self.inv.as_ref().map(|_| n), Page::Category(c), cx));
+            let label = if self.inv.is_some() { format!("{} ({n})", c.label()) } else { c.label().to_string() };
+            tabs = tabs.child(self.nav_item(ids[i], label, None, Page::Category(c), cx));
         }
 
         let folder = self.inv.as_ref().map(|i| i.models_dir.display().to_string()).unwrap_or_else(|| "…".into());
         let free = self.inv.as_ref().and_then(|i| i.free_bytes).map(|b| format!("{} free", format_bytes(b)));
         let hw = self.system.as_ref();
-        let footer = div()
+        let hw_text = hw.map(|h| {
+            let gpu = h.gpu_name.clone().unwrap_or_else(|| "No dedicated GPU".into());
+            let vram = if h.vram_gb > 0.0 { format!(" · {:.0} GB VRAM", h.vram_gb) } else { String::new() };
+            format!("{gpu}{vram} · {:.0} GB RAM", h.ram_gb)
+        });
+        let strip = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(12.))
+            .gap_y(px(2.))
+            .text_size(px(size::XS))
+            .text_color(Tokens::text_3())
+            .child(div().max_w(px(420.)).text_color(Tokens::text_2()).truncate().child(format!("Models folder: {folder}")))
+            .when_some(free, |d, f| d.child(f))
+            .child(link("ml-folder", "Change folder").text_size(px(size::XS)).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.change_folder(window, cx))))
+            .when_some(hw_text, |d, t| d.child(icon("icons/cpu.svg", Tokens::text_3(), 12.)).child(t));
+
+        div()
             .flex()
             .flex_col()
             .gap(px(10.))
-            .pt(px(14.))
-            .border_t_1()
+            .px(px(32.))
+            .pt(px(24.))
+            .pb(px(12.))
+            .border_b_1()
             .border_color(Tokens::border())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .child(section_label("Models folder"))
-                    .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).truncate().child(folder))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .text_size(px(size::XS))
-                            .text_color(Tokens::text_3())
-                            .when_some(free, |d, f| d.child(f))
-                            .child(link("ml-folder", "Change folder").text_size(px(size::XS)).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.change_folder(window, cx)))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(px(8.))
-                    .child(icon("icons/cpu.svg", Tokens::text_3(), 14.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .min_w_0()
-                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).truncate().child(hw.and_then(|h| h.gpu_name.clone()).unwrap_or_else(|| if hw.is_some() { "No dedicated GPU".into() } else { "Detecting hardware…".into() })))
-                            .when_some(hw, |d, h| {
-                                let vram = if h.vram_gb > 0.0 { format!("{:.0} GB VRAM · ", h.vram_gb) } else { String::new() };
-                                d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{vram}{:.0} GB RAM", h.ram_gb)))
-                            }),
-                    ),
-            );
-
-        div()
-            .w(px(240.))
-            .flex_none()
-            .h_full()
-            .flex()
-            .flex_col()
-            .justify_between()
-            .gap(px(12.))
-            .px(px(12.))
-            .py(px(20.))
-            .border_r_1()
-            .border_color(Tokens::border())
-            .child(div().id("ml-subnav").flex_1().min_h_0().overflow_y_scroll().child(list))
-            .child(footer)
+            .child(tabs)
+            .child(strip)
     }
 
     // ── Pages ───────────────────────────────────────────────────────────────
@@ -828,7 +800,7 @@ impl Render for ModelLibrary {
         };
         let inner = div()
             .w_full()
-            .max_w(px(860.))
+            .max_w(px(760.))
             .when(downloads, |d| d.max_w(px(1200.)).h_full())
             .px(px(32.))
             .py(px(28.))
@@ -840,6 +812,7 @@ impl Render for ModelLibrary {
         div()
             .size_full()
             .flex()
+            .flex_col()
             .child(self.render_subnav(cx))
             .child(
                 div()

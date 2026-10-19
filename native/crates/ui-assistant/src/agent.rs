@@ -58,6 +58,8 @@ pub struct AgentParams {
     pub system: String,
     pub history: Vec<AiMessage>,
     pub tools_enabled: bool,
+    /// Images attached to the user's message; sent with the first round only.
+    pub images: Vec<std::path::PathBuf>,
 }
 
 /// System prompt with live app context (port of `systemPrompt`).
@@ -82,6 +84,17 @@ pub fn system_prompt(tools_enabled: bool, page: Option<&str>, section: Option<&s
     }
     lines.push("Be concise and friendly. Use markdown (short lists, tables, code) only when it helps.".into());
     lines.join("\n")
+}
+
+static STUDIO_CONTEXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Extra context (e.g. the Studio page/transcript) appended to the system prompt; `None` clears it.
+pub fn set_studio_context(text: Option<String>) {
+    *STUDIO_CONTEXT.lock().unwrap_or_else(|e| e.into_inner()) = text.filter(|t| !t.trim().is_empty());
+}
+
+pub fn studio_context() -> Option<String> {
+    STUDIO_CONTEXT.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// `YYYY-MM-DD` for today (UTC) without a date crate.
@@ -144,6 +157,8 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
             tools: p.tools_enabled.then(|| specs.clone()),
             effort: Some(p.effort),
             access: Some(*p.access.lock().unwrap_or_else(|e| e.into_inner())),
+            images: if round == 0 { p.images.clone() } else { vec![] },
+            workspace: None,
         };
         let result = runner.step(req, emit, cancel.clone()).await;
         if result.stopped || cancel.is_cancelled() {
@@ -283,6 +298,7 @@ mod tests {
             system: "sys".into(),
             history: vec![AiMessage::user("hi")],
             tools_enabled,
+            images: vec![],
         }
     }
 

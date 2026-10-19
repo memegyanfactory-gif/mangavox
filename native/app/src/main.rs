@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod perf;
 mod shell;
 #[cfg(windows)]
@@ -35,12 +36,19 @@ fn init_sources() {
 }
 
 fn main() {
+    // Settings → Apps → Uninstall runs `mangavox.exe --uninstall` (user data in ~/.mangavox stays).
+    if std::env::args().any(|a| a == "--uninstall") {
+        if let Err(e) = mv_update::uninstall() {
+            eprintln!("uninstall: {e:#}");
+        }
+        return;
+    }
     perf::mark_start();
     init_sources();
     // Remote posters/avatars load through GPUI's image cache, which needs an HTTP client.
     let http = reqwest_client::ReqwestClient::user_agent(mv_net::BROWSER_UA).expect("http client");
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
+        .with_assets(mv_ui::Assets)
         .with_http_client(std::sync::Arc::new(http))
         .run(|cx| {
         gpui_kit::init(cx);

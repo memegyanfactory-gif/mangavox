@@ -9,7 +9,7 @@ use crate::types::{AiAccessMode, AiProviderId, AiStepRequest, AiStepResult, AiUs
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -131,6 +131,72 @@ fn full(req: &AiStepRequest) -> bool {
 }
 
 pub fn cli_args(req: &AiStepRequest) -> Vec<String> {
+    cli_args_with(req, &[])
+}
+
+/// Directory (inside the workspace) that attached images are copied to for the duration of a step.
+pub const ATTACH_DIR: &str = ".attach";
+
+/// Workspace-relative, forward-slash names (`.attach/<index>_<sanitized name>`) for the images, in order.
+pub fn attachment_names(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let raw = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+            let clean: String = raw.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
+            format!("{ATTACH_DIR}/{i}_{clean}")
+        })
+        .collect()
+}
+
+/// Text appended to the stdin prompt so the CLI opens the attached files.
+pub fn attachment_prompt(id: AiProviderId, rels: &[String]) -> String {
+    if rels.is_empty() {
+        return String::new();
+    }
+    match id {
+        AiProviderId::GeminiCli => format!("
+
+{}", rels.iter().map(|r| format!("@{r}")).collect::<Vec<_>>().join("
+")),
+        AiProviderId::Opencode => String::new(), // attached with -f
+        _ => format!(
+            "
+
+Attached images - open every one with the {} before answering, in this order:
+{}",
+            if id == AiProviderId::ClaudeCode { "Read tool" } else { "image viewer" },
+            rels.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("
+")
+        ),
+    }
+}
+
+/// Copy the images into `<workspace>/.attach`, returning their relative names. Failures become Status events.
+fn stage_attachments(ctx: &StepContext) -> Vec<String> {
+    let paths = &ctx.req.images;
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let dir = ctx.workspace.join(ATTACH_DIR);
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        ctx.status(format!("Could not attach images: {e}"));
+        return Vec::new();
+    }
+    let mut ok = Vec::new();
+    for (p, rel) in paths.iter().zip(attachment_names(paths)) {
+        match std::fs::copy(p, ctx.workspace.join(&rel)) {
+            Ok(_) => ok.push(rel),
+            Err(e) => ctx.status(format!("Skipped {} ({e})", p.display())),
+        }
+    }
+    ok
+}
+
+/// Like [`cli_args`] with the workspace-relative attachment names from [`attachment_names`].
+pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut add = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
     match req.provider_id {
@@ -143,9 +209,16 @@ pub fn cli_args(req: &AiStepRequest) -> Vec<String> {
                 add(&["--effort", e.as_str()]);
             }
             add(&["--permission-mode", if full(req) { "acceptEdits" } else { "default" }]);
+            if !rels.is_empty() {
+                add(&["--allowedTools", "Read"]);
+            }
         }
         AiProviderId::Codex => {
-            add(&["exec", "--json", "--skip-git-repo-check", "--ephemeral", "--sandbox", if full(req) { "workspace-write" } else { "read-only" }]);
+            add(&["exec"]);
+            for r in rels {
+                add(&["-i", r]);
+            }
+            add(&["--json", "--skip-git-repo-check", "--ephemeral", "--sandbox", if full(req) { "workspace-write" } else { "read-only" }]);
             if has_model(req) {
                 add(&["-m", &req.model]);
             }
@@ -171,6 +244,9 @@ pub fn cli_args(req: &AiStepRequest) -> Vec<String> {
             }
             if full(req) {
                 add(&["--auto"]);
+            }
+            for r in rels {
+                add(&["-f", r]);
             }
         }
         _ => {}
@@ -465,9 +541,19 @@ pub fn last_meaningful_line(text: &str) -> String {
 pub async fn cli_step(ctx: &StepContext) -> Result<AiStepResult> {
     let id = ctx.req.provider_id;
     let bin = cli_binary(id).ok_or_else(|| AiError::msg(format!("{} is not a CLI provider", id.as_str())))?;
-    let args = cli_args(&ctx.req);
-    let prompt = build_transcript(&ctx.req.messages);
-    let mut cmd = start_cli(bin, &args, &ctx.workspace)?;
+    let rels = stage_attachments(ctx);
+    let args = cli_args_with(&ctx.req, &rels);
+    let mut prompt = build_transcript(&ctx.req.messages);
+    prompt.push_str(&attachment_prompt(id, &rels));
+    let res = run_cli(ctx, id, bin, &args, prompt).await;
+    if !ctx.req.images.is_empty() {
+        let _ = std::fs::remove_dir_all(ctx.workspace.join(ATTACH_DIR));
+    }
+    res
+}
+
+async fn run_cli(ctx: &StepContext, id: AiProviderId, bin: &'static str, args: &[String], prompt: String) -> Result<AiStepResult> {
+    let mut cmd = start_cli(bin, args, &ctx.workspace)?;
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| AiError::msg(format!("{bin} could not start: {e}")))?;
     let pid = child.id();
@@ -695,6 +781,8 @@ mod tests {
             tools: None,
             effort: Some(AiEffort::High),
             access: Some(AiAccessMode::Full),
+            images: vec![],
+            workspace: None,
         };
         let a = cli_args(&req);
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
@@ -712,6 +800,53 @@ mod tests {
         assert!(a.iter().all(|x| safe_arg(x)));
     }
 
+    #[test]
+    fn image_attachments_per_cli() {
+        let rels = attachment_names(&[PathBuf::from("/x/My Page 003.jpg"), PathBuf::from(r"C:\a\face.png")]);
+        assert_eq!(rels, [".attach/0_My_Page_003.jpg", ".attach/1_face.png"]);
+        let mut req = AiStepRequest {
+            request_id: "r".into(),
+            provider_id: AiProviderId::ClaudeCode,
+            model: "claude-haiku-5-5".into(),
+            messages: vec![AiMessage::user("x")],
+            tools: None,
+            effort: None,
+            access: None,
+            images: vec![],
+            workspace: None,
+        };
+        let none = cli_args_with(&req, &[]);
+        assert!(!none.contains(&"--allowedTools".to_string()));
+        let a = cli_args_with(&req, &rels);
+        assert!(a.windows(2).any(|w| w == ["--allowedTools", "Read"]));
+        assert!(a.iter().all(|x| safe_arg(x)));
+        assert!(attachment_prompt(AiProviderId::ClaudeCode, &rels).contains("- .attach/0_My_Page_003.jpg"));
+        req.provider_id = AiProviderId::Codex;
+        let a = cli_args_with(&req, &rels);
+        assert_eq!(a.last().unwrap(), "-");
+        assert!(a.windows(2).any(|w| w == ["-i", ".attach/1_face.png"]));
+        assert!(a.iter().all(|x| safe_arg(x)));
+        req.provider_id = AiProviderId::GeminiCli;
+        assert_eq!(cli_args_with(&req, &rels), cli_args(&req));
+        assert_eq!(attachment_prompt(AiProviderId::GeminiCli, &rels), "
+
+@.attach/0_My_Page_003.jpg
+@.attach/1_face.png");
+        req.provider_id = AiProviderId::Opencode;
+        let a = cli_args_with(&req, &rels);
+        assert!(a.windows(2).any(|w| w == ["-f", ".attach/0_My_Page_003.jpg"]));
+        assert!(a.iter().all(|x| safe_arg(x)));
+        assert_eq!(attachment_prompt(AiProviderId::Opencode, &rels), "");
+        assert_eq!(attachment_prompt(AiProviderId::Codex, &[]), "");
+    }
+
+    #[test]
+    fn claude_code_model_ids_are_safe() {
+        for m in ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "haiku", "sonnet", "opus"] {
+            assert!(safe_arg(m), "{m}");
+        }
+    }
+
     /// Live: needs the `opencode` CLI; `opencode/big-pickle` is free.
     #[tokio::test]
     #[ignore]
@@ -727,6 +862,8 @@ mod tests {
                 tools: None,
                 effort: None,
                 access: None,
+                images: vec![],
+                workspace: None,
             },
             cancel: CancellationToken::new(),
             api_key: None,
@@ -756,6 +893,8 @@ mod tests {
                 tools: None,
                 effort: None,
                 access: None,
+                images: vec![],
+                workspace: None,
             },
             cancel: cancel.clone(),
             api_key: None,

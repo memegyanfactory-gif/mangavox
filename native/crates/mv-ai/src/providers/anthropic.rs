@@ -5,7 +5,7 @@
 //! raw assistant blocks are replayed unchanged; tools are sent with `eager_input_streaming`;
 //! tool calls are ignored when the response stopped on `max_tokens` or `refusal`.
 
-use super::{emit_reasoning, emit_text, non_empty, StepContext};
+use super::{emit_reasoning, emit_text, non_empty, ImageData, StepContext};
 use crate::stream::{for_each_line, get_json, hdr, post_json, safe_json_parse, sse_data, AiError, Result};
 use crate::types::{AiMessage, AiModel, AiProviderId, AiRole, AiStepRequest, AiStepResult, AiToolCall, AiUsage, Emit};
 use regex::Regex;
@@ -74,7 +74,16 @@ pub fn to_anthropic(messages: &[AiMessage]) -> AnthropicMessages {
 }
 
 pub fn build_body(req: &AiStepRequest) -> Value {
-    let AnthropicMessages { system, messages } = to_anthropic(&req.messages);
+    build_body_with(req, &[])
+}
+
+/// Like [`build_body`], attaching `images` (before the text) to the last user message.
+pub fn build_body_with(req: &AiStepRequest, images: &[ImageData]) -> Value {
+    let AnthropicMessages { system, mut messages } = to_anthropic(&req.messages);
+    if let Some(Value::Array(c)) = super::last_user_mut(&mut messages).and_then(|m| m.get_mut("content")) {
+        let blocks = images.iter().map(|i| json!({ "type": "image", "source": { "type": "base64", "media_type": i.mime, "data": i.b64 } }));
+        c.splice(0..0, blocks);
+    }
     let mut body = json!({
         "model": req.model,
         "max_tokens": 32000,
@@ -210,7 +219,7 @@ impl AnthropicAcc {
 }
 
 pub async fn anthropic_step(ctx: &StepContext) -> Result<AiStepResult> {
-    let body = build_body(&ctx.req);
+    let body = build_body_with(&ctx.req, &super::load_images(&ctx.req.images, &ctx.emit));
     let headers = [hdr("x-api-key", ctx.api_key.clone().unwrap_or_default()), hdr("anthropic-version", VERSION)];
     let res = post_json(&ctx.client, &format!("{}/v1/messages", ctx.base_url), &body, &headers, &ctx.cancel).await?;
     let mut acc = AnthropicAcc::default();
@@ -355,6 +364,8 @@ data: {"type":"message_stop"}
             tools: Some(vec![AiToolSpec { name: "t".into(), description: "d".into(), parameters: json!({"type":"object"}) }]),
             effort: Some(AiEffort::High),
             access: None,
+            images: vec![],
+            workspace: None,
         }
     }
 
@@ -392,5 +403,14 @@ data: {"type":"message_stop"}
         assert_eq!(out.messages[2]["role"], "user");
         assert_eq!(out.messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(out.messages[2]["content"][1]["text"], "more");
+    }
+
+    #[test]
+    fn images_attach_to_last_user_message_before_text() {
+        let b = build_body_with(&req("claude-sonnet-5-5"), &[ImageData { mime: "image/png", b64: "QUJD".into() }]);
+        let c = &b["messages"][0]["content"];
+        assert_eq!(c[0], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}));
+        assert_eq!(c[1]["type"], "text");
+        assert_eq!(build_body(&req("claude-sonnet-5-5"))["messages"][0]["content"].as_array().unwrap().len(), 1);
     }
 }

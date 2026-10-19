@@ -1,6 +1,6 @@
 //! Gemini `streamGenerateContent?alt=sse`.
 
-use super::{emit_reasoning, emit_text, non_empty, StepContext};
+use super::{emit_reasoning, emit_text, non_empty, ImageData, StepContext};
 use crate::stream::{for_each_line, get_json, hdr, new_call_id, post_json, sse_data, AiError, Result};
 use crate::types::{AiEffort, AiMessage, AiModel, AiProviderId, AiRole, AiStepRequest, AiStepResult, AiToolCall, AiUsage, Emit};
 use regex::Regex;
@@ -71,8 +71,17 @@ fn thinking_budget(e: AiEffort) -> u32 {
 }
 
 pub fn build_body(req: &AiStepRequest) -> Value {
+    build_body_with(req, &[])
+}
+
+/// Like [`build_body`], attaching `images` (before the text) to the last user message.
+pub fn build_body_with(req: &AiStepRequest, images: &[ImageData]) -> Value {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let GeminiContents { system, contents } = to_gemini(&req.messages);
+    let GeminiContents { system, mut contents } = to_gemini(&req.messages);
+    if let Some(Value::Array(p)) = super::last_user_mut(&mut contents).and_then(|m| m.get_mut("parts")) {
+        let parts = images.iter().map(|i| json!({ "inline_data": { "mime_type": i.mime, "data": i.b64 } }));
+        p.splice(0..0, parts);
+    }
     let mut body = json!({ "contents": contents });
     if !system.is_empty() {
         body["systemInstruction"] = json!({ "parts": [{ "text": system }] });
@@ -160,7 +169,7 @@ impl GeminiAcc {
 }
 
 pub async fn gemini_step(ctx: &StepContext) -> Result<AiStepResult> {
-    let body = build_body(&ctx.req);
+    let body = build_body_with(&ctx.req, &super::load_images(&ctx.req.images, &ctx.emit));
     let url = format!("{}/models/{}:streamGenerateContent?alt=sse", ctx.base_url, encode_uri_component(&ctx.req.model));
     let res = post_json(&ctx.client, &url, &body, &[hdr("x-goog-api-key", ctx.api_key.clone().unwrap_or_default())], &ctx.cancel).await?;
     let mut acc = GeminiAcc::default();
@@ -237,6 +246,8 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":"it up."},{"fun
             tools: Some(vec![AiToolSpec { name: "t".into(), description: "d".into(), parameters: schema }]),
             effort: Some(AiEffort::Medium),
             access: None,
+            images: vec![],
+            workspace: None,
         };
         let b = build_body(&req);
         assert_eq!(b["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096);
@@ -252,5 +263,23 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":"it up."},{"fun
         let c = to_gemini(&[AiMessage::user("q"), t]);
         assert_eq!(c.contents.len(), 1); // same role merges
         assert_eq!(c.contents[0]["parts"][1]["functionResponse"]["response"]["result"], "ok");
+    }
+
+    #[test]
+    fn images_become_inline_data_parts() {
+        let req = AiStepRequest {
+            request_id: "r".into(),
+            provider_id: AiProviderId::Gemini,
+            model: "gemini-2.5-flash".into(),
+            messages: vec![AiMessage::user("u")],
+            tools: None,
+            effort: None,
+            access: None,
+            images: vec![],
+            workspace: None,
+        };
+        let b = build_body_with(&req, &[ImageData { mime: "image/jpeg", b64: "QUJD".into() }]);
+        assert_eq!(b["contents"][0]["parts"][0], json!({"inline_data":{"mime_type":"image/jpeg","data":"QUJD"}}));
+        assert_eq!(b["contents"][0]["parts"][1]["text"], "u");
     }
 }

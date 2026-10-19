@@ -9,38 +9,23 @@ pub fn muted(text: impl Into<SharedString>) -> Div {
     div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(text.into())
 }
 
-/// Two-letter badge for a provider (port of PROVIDER_MONOGRAM).
-pub fn monogram(id: AiProviderId, dim: bool) -> Div {
-    let (short, hue): (&str, f32) = match id {
-        AiProviderId::Ollama => ("Ol", 210.),
-        AiProviderId::Lmstudio => ("LM", 260.),
-        AiProviderId::Llamacpp => ("Ll", 30.),
-        AiProviderId::Anthropic => ("An", 18.),
-        AiProviderId::Openai => ("OA", 160.),
-        AiProviderId::Gemini => ("Ge", 220.),
-        AiProviderId::Openrouter => ("OR", 280.),
-        AiProviderId::Groq => ("Gq", 8.),
-        AiProviderId::Deepseek => ("DS", 225.),
-        AiProviderId::Mistral => ("Mi", 35.),
-        AiProviderId::Xai => ("xA", 0.),
-        AiProviderId::Custom => ("··", 200.),
-        AiProviderId::ClaudeCode => ("CC", 18.),
-        AiProviderId::Codex => ("Cx", 160.),
-        AiProviderId::GeminiCli => ("GC", 220.),
-        AiProviderId::Opencode => ("OC", 50.),
+/// Brand logo for a provider, tinted with its brand colour (`brand/*.svg`, served by `mv_ui::Assets`).
+pub fn provider_logo(id: AiProviderId, size: f32) -> impl IntoElement {
+    let (path, color): (&'static str, u32) = match id {
+        AiProviderId::Anthropic | AiProviderId::ClaudeCode => ("brand/claude.svg", 0xD97757),
+        AiProviderId::Openai | AiProviderId::Codex => ("brand/openai.svg", 0xE6E8EB),
+        AiProviderId::Gemini | AiProviderId::GeminiCli => ("brand/gemini.svg", 0x8E75FF),
+        AiProviderId::Opencode => ("brand/opencode.svg", 0xE6E8EB),
+        AiProviderId::Ollama | AiProviderId::Llamacpp => ("brand/ollama.svg", 0xE6E8EB),
+        AiProviderId::Lmstudio => ("brand/lmstudio.svg", 0x8B7CF6),
+        AiProviderId::Openrouter => ("brand/openrouter.svg", 0x94A3B8),
+        AiProviderId::Groq => ("brand/groq.svg", 0xF55036),
+        AiProviderId::Deepseek => ("brand/deepseek.svg", 0x4D6BFE),
+        AiProviderId::Mistral => ("brand/mistral.svg", 0xFA520F),
+        AiProviderId::Xai => ("brand/xai.svg", 0xE6E8EB),
+        AiProviderId::Custom => ("brand/generic.svg", 0x9AA3AE),
     };
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .flex_none()
-        .size(px(26.))
-        .rounded(px(7.))
-        .bg(hsla(hue / 360., 0.45, 0.32, if dim { 0.5 } else { 1. }))
-        .text_size(px(size::XS))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(if dim { Tokens::text_3() } else { Tokens::text_1() })
-        .child(short)
+    svg().path(path).size(px(size)).flex_none().text_color(rgb(color))
 }
 
 pub fn state_text(s: AiProviderState) -> &'static str {

@@ -6,7 +6,13 @@ fn main() {
     {
         let mut res = winresource::WindowsResource::new();
         res.set_icon_with_id("assets/icon.ico", "1");
-        res.set("ProductName", "MangaVox").set("FileDescription", "MangaVox");
+        let v = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+        res.set("ProductName", "MangaVox")
+            .set("FileDescription", "MangaVox")
+            .set("CompanyName", "Aayush Datta")
+            .set("LegalCopyright", "Copyright Aayush Datta")
+            .set("ProductVersion", &v)
+            .set("FileVersion", &v);
         res.compile().expect("embed Windows resources");
     }
 }

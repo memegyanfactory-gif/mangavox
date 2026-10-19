@@ -10,20 +10,19 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ai::{provider_def, AiAccessMode, AiEffort, AiMessage, AiModel, AiProviderId, AiProviderSettings, AiProviderState, AiRole, CancellationToken, StreamEvent};
+use mv_ai::{provider_def, AiAccessMode, AiEffort, AiMessage, AiProviderState, AiRole, CancellationToken, StreamEvent};
 use mv_ui::{icon, icon_button, size, Route, Tokens};
 
 use crate::agent::{self, AgentEvent, AgentParams, Outcome};
 use crate::shared::{shared, Shared};
-use crate::store::{model_key, now_ms, title_from, ChatItem, ItemRole, ItemStatus, StepState, ToolStep};
+use crate::store::{now_ms, title_from, ChatItem, ItemRole, ItemStatus, StepState, ToolStep};
 use crate::tools::{self, AppTools};
-use crate::ui::{ago_ms, field, menu_row, monogram, muted, popup_surface, set_value, text_state, value_of};
+use crate::ui::{ago_ms, field, menu_row, muted, popup_surface, set_value, text_state, value_of};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     Effort,
     Access,
-    Model,
 }
 
 struct Run {
@@ -42,14 +41,12 @@ pub struct Dock {
     shared: Entity<Shared>,
     input: Entity<TextareaState>,
     search: Entity<InputState>,
-    picker_search: Entity<InputState>,
-    custom_model: Entity<InputState>,
+    picker: AnyView,
+    attachments: Vec<std::path::PathBuf>,
     rename: Option<Rename>,
     confirm_delete: Option<String>,
     drawer: bool,
     menu: Option<Menu>,
-    /// `None` shows favourites across all providers.
-    picker_provider: Option<AiProviderId>,
     scroll: ScrollHandle,
     expanded: HashSet<String>,
     run: Option<Run>,
@@ -63,10 +60,9 @@ pub fn create(window: &mut Window, cx: &mut App) -> AnyView {
 impl Dock {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let shared = shared(cx);
-        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder("Ask anything, or tell me what to do…"));
+        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder("Ask for changes, send follow-ups, or attach images"));
         let search = text_state("Search chats", window, cx);
-        let picker_search = text_state("Search models", window, cx);
-        let custom_model = text_state("Custom model id", window, cx);
+        let picker = crate::picker::create(true, window, cx);
         let mut subs = vec![];
         subs.push(cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = ev {
@@ -74,9 +70,8 @@ impl Dock {
             }
         }));
         subs.push(cx.observe(&search, |_, _, cx| cx.notify()));
-        subs.push(cx.observe(&picker_search, |_, _, cx| cx.notify()));
         subs.push(cx.observe(&shared, |this, _, cx| {
-            this.autopick(cx);
+            this.shared.update(cx, |s, cx| s.autopick(cx));
             cx.notify();
         }));
         shared.update(cx, |s, cx| {
@@ -89,13 +84,12 @@ impl Dock {
             shared,
             input,
             search,
-            picker_search,
-            custom_model,
+            picker,
+            attachments: vec![],
             rename: None,
             confirm_delete: None,
             drawer: false,
             menu: None,
-            picker_provider: None,
             scroll: ScrollHandle::new(),
             expanded: HashSet::new(),
             run: None,
@@ -103,32 +97,15 @@ impl Dock {
         }
     }
 
-    /// First launch: choose a ready provider and its default model.
-    fn autopick(&mut self, cx: &mut Context<Self>) {
-        self.shared.update(cx, |s, cx| {
-            if !s.store.prefs.model.is_empty() || !s.providers_loaded {
-                return;
-            }
-            let ready = |p: &&mv_ai::AiProviderStatus| p.state == AiProviderState::Ready;
-            let cand = s.providers.iter().filter(ready).find(|p| p.id == s.store.prefs.provider).or_else(|| s.providers.iter().find(ready)).map(|p| (p.id, p.default_model.clone()));
-            if let Some((id, default)) = cand {
-                let first = s.models.get(&id).and_then(|m| m.first()).map(|m| m.id.clone());
-                match default.or(first) {
-                    Some(m) => s.use_in_assistant(id, &m, cx),
-                    None => s.load_models(id, false, cx),
-                }
-            }
-        });
-    }
-
-    // ── Sending ──────────────────────────────────────────────────────────────
+    // ── Sending ──
 
     fn send_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
-        if text.trim().is_empty() || self.run.is_some() {
+        if (text.trim().is_empty() && self.attachments.is_empty()) || self.run.is_some() {
             return;
         }
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
+        let text = if text.trim().is_empty() { "Look at the attached image(s).".to_string() } else { text };
         self.send(text, window, cx);
     }
 
@@ -138,6 +115,7 @@ impl Dock {
             return;
         }
         self.menu = None;
+        let images = std::mem::take(&mut self.attachments);
         let (thread_id, item_id, prefs, history) = self.shared.update(cx, |s, cx| {
             let id = match s.store.active.clone().filter(|id| s.store.thread(id).is_some()) {
                 Some(id) => id,
@@ -170,13 +148,19 @@ impl Dock {
         let cancel = CancellationToken::new();
         let (tx, mut rx) = mpsc::unbounded::<AgentEvent>();
         let registry = self.shared.read(cx).registry.clone();
-        let params = AgentParams { provider: prefs.provider, model: prefs.model.clone(), effort: prefs.effort, access: access.clone(), system: String::new(), history, tools_enabled: def.supports_tools };
+        let params = AgentParams { provider: prefs.provider, model: prefs.model.clone(), effort: prefs.effort, access: access.clone(), system: String::new(), history, tools_enabled: def.supports_tools, images };
         let token = cancel.clone();
         mv_ui::bg::runtime().spawn(async move {
             let mut params = params;
             let (page, section) = tools::page_context().map(|r| (tools::page_name(&r), tools::section_name(&r))).unzip();
             let library = tokio::task::spawn_blocking(|| mv_core::library::open_readonly().and_then(|c| mv_core::library::list_manga(&c)).map(|m| m.len()).ok()).await.ok().flatten();
             params.system = agent::system_prompt(params.tools_enabled, page, section, library, &agent::today_string());
+            if let Some(extra) = agent::studio_context() {
+                params.system.push_str("
+
+");
+                params.system.push_str(&extra);
+            }
             agent::run_agent(&registry, &AppTools, params, tx, token).await;
         });
 
@@ -360,34 +344,6 @@ impl Dock {
         }
     }
 
-    fn pick_model(&mut self, provider: AiProviderId, model: String, cx: &mut Context<Self>) {
-        self.shared.update(cx, |s, cx| s.use_in_assistant(provider, &model, cx));
-        self.menu = None;
-        cx.notify();
-    }
-
-    fn add_custom_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = value_of(&self.custom_model, cx).trim().to_string();
-        let Some(provider) = self.picker_provider.or(Some(self.shared.read(cx).store.prefs.provider)) else { return };
-        if id.is_empty() {
-            return;
-        }
-        let reg = self.shared.read(cx).registry.clone();
-        let mut extra = reg.read_settings(provider).extra_models.unwrap_or_default();
-        if !extra.contains(&id) {
-            extra.push(id.clone());
-        }
-        let _ = reg.update_provider_settings(provider, &AiProviderSettings { extra_models: Some(extra), ..Default::default() });
-        set_value(&self.custom_model, "", window, cx);
-        self.shared.update(cx, |s, cx| {
-            s.models.remove(&provider);
-            s.load_models(provider, true, cx);
-        });
-        self.pick_model(provider, id, cx);
-    }
-
-    // ── Rendering ────────────────────────────────────────────────────────────
-
     fn header(&self, title: String, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -528,7 +484,7 @@ impl Dock {
                         .px(px(12.))
                         .py(px(8.))
                         .rounded(px(14.))
-                        .bg(Tokens::surface_2())
+                        .bg(rgba(0xffffff0f))
                         .text_size(px(size::MD))
                         .text_color(Tokens::text_1())
                         .child(item.text.clone()),
@@ -587,15 +543,13 @@ impl Dock {
         }
 
         if !item.steps.is_empty() {
-            let key = format!("steps:{}", item.id);
-            let n = item.steps.len();
-            let running = item.steps.iter().any(|s| matches!(s.state, StepState::Running | StepState::AwaitingApproval));
-            let open = self.expanded.contains(&key);
-            let title = if running { "Working…".to_string() } else { format!("Ran {n} action{}", if n == 1 { "" } else { "s" }) };
-            col = col.child(self.collapsible(key, title, open, cx));
-            if open {
-                col = col.child(div().flex().flex_col().gap(px(4.)).pl(px(8.)).border_l_1().border_color(Tokens::border()).children(item.steps.iter().map(step_row)));
+            let mut rows = div().flex().flex_col().gap(px(1.));
+            for st in &item.steps {
+                let key = format!("step:{}", st.id);
+                let open = self.expanded.contains(&key);
+                rows = rows.child(step_row(st, key, open, cx));
             }
+            col = col.child(rows);
             for st in item.steps.iter().filter(|s| s.state == StepState::AwaitingApproval) {
                 col = col.child(self.approval_card(st, cx));
             }
@@ -732,17 +686,27 @@ impl Dock {
         move |_, _, cx| {
             let _ = view.update(cx, |this, cx| {
                 this.menu = if this.menu == Some(m) { None } else { Some(m) };
-                if m == Menu::Model {
-                    let p = this.shared.read(cx).store.prefs.provider;
-                    this.picker_provider = Some(p);
-                    this.shared.update(cx, |s, cx| {
-                        s.load_models(p, false, cx);
-                        s.refresh_providers(false, cx);
-                    });
-                }
                 cx.notify();
             });
         }
+    }
+
+    fn attach(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach images".into()) });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    for p in paths {
+                        let ok = p.extension().and_then(|e| e.to_str()).map(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif")).unwrap_or(false);
+                        if ok && !this.attachments.contains(&p) {
+                            this.attachments.push(p);
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -752,47 +716,64 @@ impl Dock {
         };
         let running = self.run.is_some();
         let empty = self.input.read(cx).value().trim().is_empty();
-        let model_label = if prefs.model.is_empty() { "Select model".to_string() } else { short_model(&prefs.model) };
         let chip = |id: &'static str, label: SharedString, active: bool| {
             div()
                 .id(id)
                 .flex()
                 .items_center()
-                .gap(px(4.))
-                .h(px(26.))
+                .gap(px(5.))
+                .h(px(28.))
                 .px(px(8.))
                 .rounded(px(8.))
                 .cursor_pointer()
-                .text_size(px(size::XS))
-                .text_color(if active { Tokens::text_1() } else { Tokens::text_2() })
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if active { Tokens::text_1() } else { Tokens::text_3() })
                 .when(active, |d| d.bg(Tokens::active()))
                 .hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1()))
                 .child(label)
         };
-        let (t_model, t_effort, t_access) = (Self::toggle(cx.weak_entity(), Menu::Model), Self::toggle(cx.weak_entity(), Menu::Effort), Self::toggle(cx.weak_entity(), Menu::Access));
+        let sep = || div().w(px(1.)).h(px(16.)).mx(px(2.)).flex_none().bg(Tokens::border());
+        let (t_effort, t_access) = (Self::toggle(cx.weak_entity(), Menu::Effort), Self::toggle(cx.weak_entity(), Menu::Access));
 
-        let model_chip = div()
-            .relative()
-            .child(chip("chip-model", model_label.into(), self.menu == Some(Menu::Model)).child(icon("icons/chevron-down.svg", Tokens::text_3(), 12.)).on_click(t_model))
-            .when(self.menu == Some(Menu::Model), |d| d.child(deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(self.model_picker(cx))).with_priority(2)));
+        let effort_label = {
+            let e = prefs.effort.as_str();
+            let mut cs = e.chars();
+            cs.next().map(|f| f.to_uppercase().collect::<String>() + cs.as_str()).unwrap_or_default()
+        };
         let effort_chip = div()
             .relative()
-            .child(chip("chip-effort", prefs.effort.as_str().into(), self.menu == Some(Menu::Effort)).on_click(t_effort))
+            .child(chip("chip-effort", effort_label.into(), self.menu == Some(Menu::Effort)).child(icon("icons/chevron-down.svg", Tokens::text_3(), 12.)).on_click(t_effort))
             .when(self.menu == Some(Menu::Effort), |d| {
-                d.child(deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(self.effort_menu(prefs.effort, cx))).with_priority(2))
+                d.child(div().absolute().top_0().left_0().child(deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(self.effort_menu(prefs.effort, cx))).with_priority(2)))
             });
-        let access_label = match prefs.access {
-            AiAccessMode::Ask => "Ask",
-            AiAccessMode::Auto => "Auto",
-            AiAccessMode::Full => "Full",
+        let (access_label, lock) = match prefs.access {
+            AiAccessMode::Ask => ("Ask", "icons/lock.svg"),
+            AiAccessMode::Auto => ("Auto", "icons/lock.svg"),
+            AiAccessMode::Full => ("Full", "icons/lock-open.svg"),
         };
         let access_chip = div()
             .relative()
-            .child(chip("chip-access", access_label.into(), self.menu == Some(Menu::Access)).on_click(t_access))
+            .child(chip("chip-access", access_label.into(), self.menu == Some(Menu::Access)).child(icon("icons/chevron-down.svg", Tokens::text_3(), 12.)).on_click(t_access))
             .when(self.menu == Some(Menu::Access), |d| {
-                d.child(deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(self.access_menu(prefs.access, cx))).with_priority(2))
+                d.child(div().absolute().top_0().left_0().child(deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(self.access_menu(prefs.access, cx))).with_priority(2)))
             });
+        let access_chip = div().flex().items_center().gap(px(2.)).child(icon(lock, Tokens::text_3(), 14.)).child(access_chip);
 
+        let attach = div()
+            .id("dock-attach")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .size(px(28.))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .hover(|s| s.bg(Tokens::hover()))
+            .child(icon("icons/paperclip.svg", Tokens::text_3(), 15.))
+            .on_click(cx.listener(|this, _, _, cx| this.attach(cx)));
+
+        let can_send = !empty || !self.attachments.is_empty();
         let send = div()
             .id("dock-send")
             .flex()
@@ -803,17 +784,49 @@ impl Dock {
             .rounded(px(14.))
             .map(|d| {
                 if running {
-                    d.bg(Tokens::text_1()).cursor_pointer()
-                } else if empty {
-                    d.bg(Tokens::active())
-                } else {
                     d.bg(Tokens::accent()).cursor_pointer()
+                } else if can_send {
+                    d.bg(Tokens::accent()).cursor_pointer().hover(|s| s.opacity(0.88))
+                } else {
+                    d.bg(rgba(0xffffff14))
                 }
             })
-            .child(icon(if running { "icons/square.svg" } else { "icons/arrow-up.svg" }, if running || !empty { Tokens::base() } else { Tokens::text_3() }, 15.))
+            .child(icon(if running { "icons/square.svg" } else { "icons/arrow-up.svg" }, if running || can_send { Tokens::base() } else { Tokens::text_3() }, if running { 12. } else { 15. }))
             .on_click(cx.listener(move |this, _, w, cx| if this.run.is_some() { this.stop(cx) } else { this.send_from_composer(w, cx) }));
 
         let provider_note = status.filter(|s| !matches!(s.state, AiProviderState::Ready)).map(|s| format!("{}: {}", s.label, crate::ui::state_text(s.state)));
+
+        let chips = self.attachments.iter().enumerate().map(|(i, p)| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("image").to_string();
+            div()
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .h(px(24.))
+                .pl(px(8.))
+                .pr(px(4.))
+                .rounded(px(7.))
+                .bg(rgba(0xffffff0f))
+                .text_size(px(size::XS))
+                .text_color(Tokens::text_2())
+                .child(icon("icons/image.svg", Tokens::text_3(), 12.))
+                .child(div().max_w(px(140.)).truncate().child(name))
+                .child(
+                    div()
+                        .id(("att-x", i))
+                        .p(px(2.))
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(Tokens::active()))
+                        .child(icon("icons/x.svg", Tokens::text_3(), 11.))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if i < this.attachments.len() {
+                                this.attachments.remove(i);
+                            }
+                            cx.notify();
+                        })),
+                )
+        });
 
         div()
             .flex_none()
@@ -824,12 +837,30 @@ impl Dock {
                 div()
                     .flex()
                     .flex_col()
-                    .rounded(px(14.))
+                    .rounded(px(16.))
                     .border_1()
-                    .border_color(rgba(0xffffff1f))
-                    .bg(Tokens::surface())
-                    .child(div().px(px(8.)).pt(px(6.)).child(Textarea::new(&self.input).appearance(false).bordered(false)))
-                    .child(div().flex().items_center().gap(px(2.)).px(px(6.)).pb(px(6.)).child(model_chip).child(effort_chip).child(access_chip).child(div().flex_1()).child(send)),
+                    .border_color(rgba(0xffffff14))
+                    .bg(rgb(0x111214))
+                    .when(!self.attachments.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(6.)).px(px(12.)).pt(px(10.)).children(chips)))
+                    .child(div().px(px(8.)).pt(px(8.)).child(Textarea::new(&self.input).appearance(false).bordered(false)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.))
+                            .px(px(8.))
+                            .pb(px(8.))
+                            .pt(px(4.))
+                            .child(self.picker.clone())
+                            .child(sep())
+                            .child(effort_chip)
+                            .child(sep())
+                            .child(access_chip)
+                            .child(div().flex_1())
+                            .child(attach)
+                            .child(div().w(px(4.)))
+                            .child(send),
+                    ),
             )
             .when_some(provider_note, |d, n| d.child(div().pt(px(6.)).px(px(4.)).text_size(px(size::XS)).text_color(Tokens::warning()).child(n)))
     }
@@ -865,193 +896,6 @@ impl Dock {
             }))
         }))
     }
-
-    fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let q = value_of(&self.picker_search, cx).to_lowercase();
-        let (prefs, providers, models, loading) = {
-            let s = self.shared.read(cx);
-            (s.store.prefs.clone(), s.providers.clone(), s.models.clone(), s.models_loading.clone())
-        };
-        let sel = self.picker_provider;
-
-        // Rail: favourites star + every provider.
-        let mut rail = div().id("picker-rail").flex().flex_col().gap(px(4.)).items_center().w(px(46.)).py(px(8.)).flex_none().overflow_y_scroll().border_r_1().border_color(Tokens::border());
-        rail = rail.child(
-            div()
-                .id("rail-fav")
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .rounded(px(8.))
-                .cursor_pointer()
-                .when(sel.is_none(), |d| d.bg(Tokens::active()))
-                .hover(|s| s.bg(Tokens::hover()))
-                .child(icon("icons/star.svg", if sel.is_none() { Tokens::warning() } else { Tokens::text_3() }, 15.))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.picker_provider = None;
-                    cx.notify();
-                })),
-        );
-        for p in mv_ai::PROVIDERS.iter() {
-            let id = p.id;
-            let ready = providers.iter().find(|s| s.id == id).map(|s| s.state == AiProviderState::Ready).unwrap_or(false);
-            rail = rail.child(
-                div()
-                    .id(SharedString::from(format!("rail-{}", id.as_str())))
-                    .p(px(2.))
-                    .rounded(px(9.))
-                    .cursor_pointer()
-                    .when(sel == Some(id), |d| d.bg(Tokens::active()))
-                    .hover(|s| s.bg(Tokens::hover()))
-                    .child(monogram(id, !ready))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.picker_provider = Some(id);
-                        this.shared.update(cx, |s, cx| s.load_models(id, false, cx));
-                        cx.notify();
-                    })),
-            );
-        }
-
-        // Model rows.
-        let mut rows: Vec<(AiProviderId, AiModel)> = vec![];
-        match sel {
-            Some(p) => rows.extend(models.get(&p).into_iter().flatten().cloned().map(|m| (p, m))),
-            None => {
-                for key in &prefs.favourites {
-                    if let Some((pid, mid)) = key.split_once("::") {
-                        if let Some(p) = mv_ai::PROVIDERS.iter().find(|d| d.id.as_str() == pid).map(|d| d.id) {
-                            let m = models.get(&p).and_then(|l| l.iter().find(|m| m.id == mid).cloned()).unwrap_or_else(|| AiModel::new(p, mid, mid));
-                            rows.push((p, m));
-                        }
-                    }
-                }
-            }
-        }
-        rows.retain(|(_, m)| q.is_empty() || m.id.to_lowercase().contains(&q) || m.label.to_lowercase().contains(&q));
-        // Favourites float to the top inside a provider.
-        rows.sort_by_key(|(p, m)| !prefs.favourites.contains(&model_key(*p, &m.id)));
-        let is_loading = sel.map(|p| loading.contains(&p)).unwrap_or(false);
-        let status = sel.and_then(|p| providers.iter().find(|s| s.id == p).cloned());
-
-        let list_rows = rows.into_iter().enumerate().map(|(i, (p, m))| {
-            let fav = prefs.favourites.contains(&model_key(p, &m.id));
-            let current = prefs.provider == p && prefs.model == m.id;
-            let (pick_id, fav_id) = (m.id.clone(), m.id.clone());
-            div()
-                .id(("model-row", i))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(8.))
-                .h(px(34.))
-                .rounded(px(8.))
-                .cursor_pointer()
-                .when(current, |d| d.bg(Tokens::accent_soft()))
-                .hover(|s| s.bg(Tokens::hover()))
-                .when(sel.is_none(), |d| d.child(monogram(p, false).size(px(20.))))
-                .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).text_color(Tokens::text_1()).child(m.label.clone()))
-                .when_some(m.size_bytes.filter(|b| *b > 0), |d, b| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(crate::ui::fmt_bytes(b))))
-                .child(
-                    div()
-                        .id(("fav", i))
-                        .flex_none()
-                        .p(px(3.))
-                        .rounded(px(6.))
-                        .hover(|s| s.bg(Tokens::active()))
-                        .child(icon("icons/star.svg", if fav { Tokens::warning() } else { Tokens::text_3() }, 13.))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.shared.update(cx, |s, cx| {
-                                s.store.toggle_favourite(p, &fav_id);
-                                s.save();
-                                cx.notify();
-                            });
-                        })),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.pick_model(p, pick_id.clone(), cx)))
-        });
-
-        let body = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .child(div().p(px(8.)).child(field(&self.picker_search).small().cleanable(true)))
-            .child(
-                div()
-                    .id("picker-list")
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(6.))
-                    .children(list_rows)
-                    .when(is_loading, |d| d.child(div().p(px(10.)).child(muted("Loading models…"))))
-                    .when_some(status.filter(|s| s.state != AiProviderState::Ready), |d, s| {
-                        d.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.))
-                                .p(px(10.))
-                                .child(muted(s.detail.clone().unwrap_or_else(|| format!("{} is {}.", s.label, crate::ui::state_text(s.state).to_lowercase()))))
-                                .child(
-                                    div()
-                                        .id("picker-setup")
-                                        .text_size(px(size::SM))
-                                        .text_color(Tokens::accent())
-                                        .cursor_pointer()
-                                        .child("Set up in Settings")
-                                        .on_click(cx.listener(|this, _, w, cx| {
-                                            this.menu = None;
-                                            mv_ui::navigate(Route::Settings { tab: Some("providers".into()) }, w, cx);
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .p(px(8.))
-                    .border_t_1()
-                    .border_color(Tokens::border())
-                    .child(div().flex_1().child(field(&self.custom_model).small()))
-                    .child(
-                        div()
-                            .id("custom-use")
-                            .px(px(10.))
-                            .h(px(26.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(7.))
-                            .bg(Tokens::active())
-                            .cursor_pointer()
-                            .text_size(px(size::SM))
-                            .text_color(Tokens::text_1())
-                            .hover(|s| s.opacity(0.85))
-                            .child("Use")
-                            .on_click(cx.listener(|this, _, w, cx| this.add_custom_model(w, cx))),
-                    ),
-            );
-
-        popup_surface()
-            .w(px(380.))
-            .h(px(380.))
-            .flex_row()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.menu = None;
-                cx.notify();
-            }))
-            .child(rail)
-            .child(body)
-    }
 }
 
 fn push_activity(item: &mut ChatItem, line: String) {
@@ -1061,39 +905,48 @@ fn push_activity(item: &mut ChatItem, line: String) {
     }
 }
 
-fn short_model(id: &str) -> String {
-    let base = id.rsplit('/').next().unwrap_or(id);
-    if base.chars().count() > 22 {
-        format!("{}…", base.chars().take(21).collect::<String>())
-    } else {
-        base.to_string()
-    }
-}
-
-fn step_row(st: &ToolStep) -> Div {
+fn step_row(st: &ToolStep, key: String, open: bool, cx: &mut Context<Dock>) -> Stateful<Div> {
     let (ico, color) = match st.state {
-        StepState::Done => ("icons/check.svg", Tokens::accent()),
+        StepState::Done => ("icons/check.svg", Tokens::text_3()),
         StepState::Error => ("icons/triangle-alert.svg", Tokens::danger()),
         StepState::Denied => ("icons/x.svg", Tokens::text_3()),
         StepState::AwaitingApproval => ("icons/shield-check.svg", Tokens::warning()),
-        StepState::Running => ("icons/loader.svg", Tokens::text_3()),
+        StepState::Running => ("icons/loader.svg", Tokens::accent()),
     };
+    let result = st.result.clone().filter(|r| !r.trim().is_empty());
+    let has_result = result.is_some();
+    let k = key.clone();
     div()
+        .id(SharedString::from(format!("step-{key}")))
         .flex()
         .flex_col()
-        .gap(px(1.))
+        .gap(px(2.))
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(6.))
+                .py(px(2.))
                 .text_size(px(size::SM))
-                .text_color(Tokens::text_2())
+                .text_color(Tokens::text_3())
+                .when(has_result, |d| d.cursor_pointer().hover(|s| s.text_color(Tokens::text_1())))
+                .child(icon(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }, Tokens::text_3(), 12.))
                 .child(icon(ico, color, 12.))
                 .child(div().flex_1().min_w_0().truncate().child(st.label.clone()))
-                .when(st.state == StepState::Denied, |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("declined"))),
+                .when(st.state == StepState::Denied, |d| d.child(div().text_size(px(size::XS)).child("declined"))),
         )
-        .when_some(st.result.clone().filter(|_| st.state == StepState::Error), |d, r| d.child(div().pl(px(18.)).text_size(px(size::XS)).text_color(Tokens::danger()).child(r)))
+        .when_some(result.filter(|_| open || st.state == StepState::Error), |d, r| {
+            let r: String = if r.chars().count() > 800 { r.chars().take(800).collect::<String>() + "…" } else { r };
+            d.child(div().ml(px(18.)).pl(px(8.)).border_l_1().border_color(Tokens::border()).text_size(px(size::XS)).text_color(if st.state == StepState::Error { Tokens::danger() } else { Tokens::text_3() }).child(r))
+        })
+        .when(has_result, |d| {
+            d.on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded.remove(&k) {
+                    this.expanded.insert(k.clone());
+                }
+                cx.notify();
+            }))
+        })
 }
 
 /// Starter prompts that fit the page the user is on.
