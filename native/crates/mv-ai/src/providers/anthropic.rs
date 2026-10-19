@@ -366,6 +366,7 @@ data: {"type":"message_stop"}
             access: None,
             images: vec![],
             workspace: None,
+            lean: false,
         }
     }
 

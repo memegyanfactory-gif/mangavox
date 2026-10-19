@@ -214,11 +214,15 @@ pub(crate) fn crop_panel(img: &DynamicImage, b: Bbox, out: &Path) -> Result<()> 
 pub(crate) fn prep_page(path: &Path, work: &Path, index: usize) -> Result<(PathBuf, u32, u32)> {
     let (w, h) = image::image_dimensions(path).with_context(|| format!("cannot read image {}", path.display()))?;
     let webtoon = is_webtoon(w, h);
-    let factor = if webtoon { (1600.0 / w as f32).min(7000.0 / h as f32) } else { 2000.0 / w.max(h) as f32 };
-    if factor >= 1.0 {
+    // Claude scales anything past 1568 px down anyway, so larger pages only cost upload time.
+    let factor = if webtoon { (1600.0 / w as f32).min(7000.0 / h as f32) } else { 1568.0 / w.max(h) as f32 };
+    // Images go inline in the request, which caps their size: re-encode heavy files even when small enough.
+    let heavy = std::fs::metadata(path).map(|m| m.len() > 3_000_000).unwrap_or(false);
+    if factor >= 1.0 && !heavy {
         return Ok((path.to_path_buf(), w, h));
     }
     let img = image::open(path)?;
+    let factor = factor.min(1.0);
     let small = img.resize(((w as f32 * factor) as u32).max(1), ((h as f32 * factor) as u32).max(1), FilterType::Triangle);
     let out = work.join(format!("page_{index:04}.jpg"));
     save_jpeg(&small, &out)?;

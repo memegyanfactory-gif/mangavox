@@ -127,9 +127,19 @@ pub fn brain(manga_id: &str, title: &str) -> Arc<Mutex<Brain>> {
     g.get_or_insert_with(HashMap::new).entry(manga_id.to_string()).or_insert_with(|| Arc::new(Mutex::new(Brain::load(manga_id, title)))).clone()
 }
 
-/// Copy of a brain for rendering.
-pub fn brain_snapshot(manga_id: &str, title: &str) -> Brain {
-    brain(manga_id, title).lock().unwrap_or_else(|e| e.into_inner()).clone()
+/// Copy of a brain for rendering. Shared until the next change (every brain edit bumps
+/// [`version`]), so rows drawn every animation frame don't each clone the whole brain.
+pub fn brain_snapshot(manga_id: &str, title: &str) -> Arc<Brain> {
+    static SNAPS: Mutex<Option<HashMap<String, (u64, Arc<Brain>)>>> = Mutex::new(None);
+    let v = version();
+    let mut g = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let snaps = g.get_or_insert_with(HashMap::new);
+    if let Some((_, b)) = snaps.get(manga_id).filter(|(at, _)| *at == v) {
+        return b.clone();
+    }
+    let b = Arc::new(brain(manga_id, title).lock().unwrap_or_else(|e| e.into_inner()).clone());
+    snaps.insert(manga_id.to_string(), (v, b.clone()));
+    b
 }
 
 /// Edits a brain and saves it.
@@ -176,7 +186,7 @@ fn finish(res: anyhow::Result<()>, cancel: &CancellationToken) {
         };
         let line = match &r.state {
             RunState::Done => "Finished.".to_string(),
-            RunState::Cancelled => "Stopped. Finished pages are saved; Read again to continue.".to_string(),
+            RunState::Cancelled => "Stopped. Finished pages are saved: Continue picks up where it stopped.".to_string(),
             RunState::Failed(e) => format!("Failed: {e}"),
             RunState::Running => String::new(),
         };

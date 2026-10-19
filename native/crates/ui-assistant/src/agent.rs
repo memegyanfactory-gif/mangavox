@@ -159,6 +159,7 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
             access: Some(*p.access.lock().unwrap_or_else(|e| e.into_inner())),
             images: if round == 0 { p.images.clone() } else { vec![] },
             workspace: None,
+            lean: false,
         };
         let result = runner.step(req, emit, cancel.clone()).await;
         if result.stopped || cancel.is_cancelled() {

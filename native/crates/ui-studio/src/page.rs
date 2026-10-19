@@ -11,7 +11,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_recap::{ChapterRead, ChapterRef, ModelChoice, PhaseStatus, Prefs, Story, Transcript};
-use mv_ui::{button, empty_state, error_state, icon, icon_button, size, ButtonKind, Route, Tokens};
+use mv_ui::{button, dot_trail, empty_state, error_state, icon, icon_button, size, spinner, ButtonKind, Route, Tokens};
 
 use crate::data::{self, ChapterItem, MangaGroup};
 use crate::run::{self, RunInfo};
@@ -385,6 +385,11 @@ impl StudioPage {
         }
     }
 
+    /// A target has some pages read but not all: a stopped read to continue or restart.
+    pub(crate) fn partly_read(&self) -> bool {
+        self.targets().iter().any(|c| self.statuses.get(&c.id).is_some_and(|s| s.read_pages > 0 && s.read_pages < s.total_pages))
+    }
+
     pub(crate) fn target_label(&self, verb: &str) -> String {
         match self.selected.len() {
             0 => verb.to_string(),
@@ -462,7 +467,7 @@ impl StudioPage {
         let (Some((model, _)), Some(f)) = (self.model(cx), &self.focus) else { return };
         let current = self.editor_text(Phase::Transcript, page, cx).unwrap_or_else(|| transcript_text(f, page));
         let ch = f.chref.clone();
-        let brain = run::brain_snapshot(&ch.manga_id, &ch.manga_title);
+        let brain = (*run::brain_snapshot(&ch.manga_id, &ch.manga_title)).clone();
         let reg = ui_assistant::registry(cx);
         self.asking = Some(page);
         cx.spawn(async move |this, cx| {
@@ -719,7 +724,7 @@ impl StudioPage {
             .when(self.show_setup, |d| d.bg(Tokens::active()))
             .hover(|s| s.bg(Tokens::hover()))
             .map(|d| match (checked, issues) {
-                (false, _) => d.text_color(Tokens::text_3()).child(icon("icons/loader-circle.svg", Tokens::text_3(), 13.)).child("Checking"),
+                (false, _) => d.text_color(Tokens::text_3()).child(spinner("setup-spin", Tokens::text_3(), 13.)).child("Checking"),
                 (true, 0) => d.text_color(Tokens::text_2()).child(icon("icons/circle-check.svg", Tokens::accent(), 13.)).child("Ready"),
                 (true, n) => d.text_color(Tokens::warning()).child(icon("icons/triangle-alert.svg", Tokens::warning(), 13.)).child(format!("Setup · {n}")),
             })
@@ -969,11 +974,8 @@ impl StudioPage {
                     .text_color(if focused { Tokens::text_1() } else { Tokens::text_2() })
                     .child(c.label()),
             )
-            .when(running, |d| d.child(icon("icons/loader-circle.svg", Tokens::accent(), 12.)))
-            .child(div().flex().gap(px(3.)).children(Phase::ALL.map(|p| {
-                let on = p.done(&st);
-                div().size(px(5.)).rounded_full().bg(if on { Tokens::accent() } else { Tokens::active() })
-            })))
+            .when(running, |d| d.child(spinner(SharedString::from(format!("row-spin-{}", c.id)), Tokens::accent(), 13.)))
+            .child(dot_trail(SharedString::from(format!("row-dots-{}", c.id)), Phase::ALL.iter().map(|p| p.done(&st)).collect(), running, 5.))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.focus_chapter(item.clone(), cx)))
     }
 

@@ -238,6 +238,10 @@ pub struct AiStepRequest {
     /// Overrides the registry workspace (cwd) for CLI providers for this step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<std::path::PathBuf>,
+    /// A one-shot answer, not an agent turn: CLI providers drop their own agent prompt, tools,
+    /// MCP servers and skills, and get images inline when they can (far fewer tokens).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lean: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -431,6 +435,7 @@ mod image_tests {
             access: None,
             images: vec![],
             workspace: None,
+            lean: false,
         };
         let j = serde_json::to_string(&r).unwrap();
         assert!(!j.contains("images") && !j.contains("workspace"));

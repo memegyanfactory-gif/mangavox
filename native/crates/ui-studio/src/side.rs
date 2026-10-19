@@ -4,7 +4,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ui::{empty_state, icon, icon_button, size, Tokens};
+use mv_ui::{button, empty_state, icon, icon_button, pulse_dot, size, ButtonKind, Tokens};
 
 use crate::page::{plural, vbar, Side, StudioPage, MONO, SIDE_W};
 use crate::phases::{face_avatar, progress_line, tag};
@@ -111,7 +111,7 @@ impl StudioPage {
                                 .gap(px(8.))
                                 .child(icon(if r.kind == RunKind::Read { "icons/scan-eye.svg" } else { "icons/feather.svg" }, Tokens::text_2(), 14.))
                                 .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).child(what))
-                                .child(tag(status, color))
+                                .when(r.running(), |d| d.child(pulse_dot("act-live", Tokens::accent(), 7.))).child(tag(status, color))
                                 .when(r.running(), |d| {
                                     d.child(icon_button("act-stop", "icons/circle-stop.svg", true).on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                         run::cancel();
@@ -122,7 +122,32 @@ impl StudioPage {
                         .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("Model: {}", r.model)))
                         .when(r.running(), |d| {
                             let label = r.status_line();
-                            d.child(progress_line(r.progress(), label))
+                            d.child(progress_line("act-run", r.progress(), label))
+                        })
+                        .when(r.state == RunState::Cancelled && r.kind == RunKind::Read, |d| {
+                            let at = match (&r.chapter, r.total) {
+                                (Some(c), t) if t > 0 => format!("Stopped in {c} after {} of {t} pages. Finished pages are saved.", r.done.min(t)),
+                                _ => "Stopped. Finished pages are saved.".to_string(),
+                            };
+                            d.child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(at)).child(
+                                div()
+                                    .flex()
+                                    .gap(px(8.))
+                                    .child(
+                                        button("act-continue", "Continue", ButtonKind::Primary)
+                                            .flex_1()
+                                            .child(icon("icons/play.svg", Tokens::base(), 13.))
+                                            .flex_row_reverse()
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(false, cx))),
+                                    )
+                                    .child(
+                                        button("act-restart", "Restart", ButtonKind::Secondary)
+                                            .flex_1()
+                                            .child(icon("icons/rotate-ccw.svg", Tokens::text_1(), 13.))
+                                            .flex_row_reverse()
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(true, cx))),
+                                    ),
+                            )
                         })
                         .when(!r.new_characters.is_empty(), |d| {
                             let n = r.new_characters.len();
@@ -201,7 +226,7 @@ impl StudioPage {
                                     }))
                                 }),
                         )
-                        .when(!j.state.finished(), |d| d.child(progress_line(j.progress() as f32, j.status.clone())))
+                        .when(!j.state.finished(), |d| d.child(progress_line(&format!("job-{}", j.id), j.progress() as f32, j.status.clone())))
                         .when_some(if let JobView::Failed(e) = &j.state { Some(e.clone()) } else { None }, |d, e| {
                             d.child(div().text_size(px(size::XS)).text_color(Tokens::danger()).child(e))
                         })

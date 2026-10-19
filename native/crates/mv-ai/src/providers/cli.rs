@@ -2,10 +2,10 @@
 //! Prompts always go over stdin; argv only ever carries allow-listed flag values, because
 //! Windows npm shims (`.cmd`) need a shell (`cmd /C`) to start.
 
-use super::{emit_reasoning, emit_text, StepContext};
+use super::{emit_reasoning, emit_text, load_images, StepContext};
 use crate::stream::{js_str, AiError, LineBuffer, Result};
 use crate::transcript::build_transcript;
-use crate::types::{AiAccessMode, AiProviderId, AiStepRequest, AiStepResult, AiUsage, Emit, StreamEvent};
+use crate::types::{AiAccessMode, AiProviderId, AiRole, AiStepRequest, AiStepResult, AiUsage, Emit, StreamEvent};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -29,7 +29,13 @@ pub fn cli_binary(id: AiProviderId) -> Option<&'static str> {
     }
 }
 
+/// Stands for an empty argument value (e.g. `--tools ""`); passed through quoted on Windows, as "" elsewhere.
+pub const EMPTY_ARG: &str = "\"\"";
+
 fn safe_arg(a: &str) -> bool {
+    if a == EMPTY_ARG {
+        return true;
+    }
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[\w.:/@~+=,-]+$").unwrap()).is_match(a)
 }
@@ -52,7 +58,7 @@ pub fn start_cli(bin: &str, args: &[String], workspace: &Path) -> Result<Command
     #[cfg(not(windows))]
     let mut cmd = {
         let mut c = Command::new(bin);
-        c.args(args);
+        c.args(args.iter().map(|a| if a == EMPTY_ARG { "" } else { a.as_str() }));
         c
     };
     cmd.current_dir(workspace).env("NO_COLOR", "1").env("FORCE_COLOR", "0").kill_on_drop(true);
@@ -246,6 +252,18 @@ pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut add = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
     match req.provider_id {
+        AiProviderId::ClaudeCode if req.lean => {
+            // Our own short system prompt, no tools / MCP servers / skills / session file, and the
+            // prompt + images as one stream-json message: one short turn instead of an agent loop.
+            add(&["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
+            add(&["--system-prompt-file", LEAN_SYSTEM_FILE, "--tools", EMPTY_ARG, "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"]);
+            if has_model(req) {
+                add(&["--model", &req.model]);
+            }
+            if let Some(e) = req.effort {
+                add(&["--effort", e.as_str()]);
+            }
+        }
         AiProviderId::ClaudeCode => {
             add(&["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]);
             if has_model(req) {
@@ -412,7 +430,11 @@ impl CliAcc {
                     let sub = js_str(ev.get("subtype"));
                     self.error = Some(if !r.is_empty() { r } else if !sub.is_empty() { sub } else { "Claude Code failed".into() });
                 }
-                self.input_tokens = ev.pointer("/usage/input_tokens").and_then(Value::as_u64);
+                // Cache writes and reads are input the account pays for too.
+                self.input_tokens = ev.pointer("/usage/input_tokens").and_then(Value::as_u64).map(|n| {
+                    let u = |k: &str| ev.pointer(&format!("/usage/{k}")).and_then(Value::as_u64).unwrap_or(0);
+                    n + u("cache_creation_input_tokens") + u("cache_read_input_tokens")
+                });
                 self.output_tokens = ev.pointer("/usage/output_tokens").and_then(Value::as_u64);
                 if self.text.is_empty() && self.error.is_none() {
                     if let Some(r) = ev.get("result").and_then(Value::as_str) {
@@ -678,9 +700,36 @@ pub fn last_meaningful_line(text: &str) -> String {
 
 // ── Running ──────────────────────────────────────────────────────────────────
 
+/// Workspace-relative file that holds the system prompt of a lean Claude Code step.
+pub const LEAN_SYSTEM_FILE: &str = ".lean-system.md";
+
+fn lean_system(req: &AiStepRequest) -> String {
+    req.messages.iter().filter(|m| m.role == AiRole::System).map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n\n")
+}
+
+/// One stream-json `user` event: each image labelled "Image N:" and inlined as base64, then the conversation.
+pub fn lean_claude_payload(req: &AiStepRequest, emit: &Emit) -> String {
+    let turns: Vec<_> = req.messages.iter().filter(|m| m.role != AiRole::System).cloned().collect();
+    let mut content = vec![];
+    for (i, img) in load_images(&req.images, emit).into_iter().enumerate() {
+        content.push(serde_json::json!({ "type": "text", "text": format!("Image {}:", i + 1) }));
+        content.push(serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": img.mime, "data": img.b64 } }));
+    }
+    content.push(serde_json::json!({ "type": "text", "text": build_transcript(&turns) }));
+    format!("{}\n", serde_json::json!({ "type": "user", "message": { "role": "user", "content": content } }))
+}
+
 pub async fn cli_step(ctx: &StepContext) -> Result<AiStepResult> {
     let id = ctx.req.provider_id;
     let bin = cli_binary(id).ok_or_else(|| AiError::msg(format!("{} is not a CLI provider", id.as_str())))?;
+    if ctx.req.lean && id == AiProviderId::ClaudeCode {
+        let sys = ctx.workspace.join(LEAN_SYSTEM_FILE);
+        std::fs::create_dir_all(&ctx.workspace).and_then(|_| std::fs::write(&sys, lean_system(&ctx.req))).map_err(|e| AiError::msg(format!("Could not write the system prompt: {e}")))?;
+        let payload = lean_claude_payload(&ctx.req, &ctx.emit);
+        let res = run_cli(ctx, id, bin, &cli_args(&ctx.req), payload).await;
+        let _ = std::fs::remove_file(sys);
+        return res;
+    }
     let rels = stage_attachments(ctx);
     let args = cli_args_with(&ctx.req, &rels);
     let mut prompt = build_transcript(&ctx.req.messages);
@@ -953,6 +1002,7 @@ mod tests {
             access: Some(AiAccessMode::Full),
             images: vec![],
             workspace: None,
+            lean: false,
         };
         let a = cli_args(&req);
         assert_eq!(&a[..4], ["--output-format", "streaming-json", "-p", "-"]);
@@ -1010,6 +1060,7 @@ mod tests {
             access: Some(AiAccessMode::Full),
             images: vec![],
             workspace: None,
+            lean: false,
         };
         let a = cli_args(&req);
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
@@ -1041,6 +1092,7 @@ mod tests {
             access: None,
             images: vec![],
             workspace: None,
+            lean: false,
         };
         let none = cli_args_with(&req, &[]);
         assert!(!none.contains(&"--allowedTools".to_string()));
@@ -1091,6 +1143,7 @@ mod tests {
                 access: None,
                 images: vec![],
                 workspace: None,
+                lean: false,
             },
             cancel: CancellationToken::new(),
             api_key: None,
@@ -1102,6 +1155,41 @@ mod tests {
         let r = cli_step(&ctx).await.expect("opencode run");
         assert!(!r.text.trim().is_empty(), "empty reply");
         assert!(!log.lock().unwrap().is_empty());
+    }
+
+    /// Live: needs `claude` signed in. A lean step answers in one short turn with the image inline.
+    /// `MV_LIVE_IMAGE` = any jpg/png.
+    #[tokio::test]
+    #[ignore]
+    async fn live_claude_lean_one_turn() {
+        let dir = std::env::temp_dir().join("mv-ai-live-lean");
+        let (emit, _) = recorder();
+        let img = std::env::var("MV_LIVE_IMAGE").map(PathBuf::from).expect("MV_LIVE_IMAGE");
+        let ctx = StepContext {
+            req: AiStepRequest {
+                request_id: "lean".into(),
+                provider_id: AiProviderId::ClaudeCode,
+                model: "claude-haiku-5-5".into(),
+                messages: vec![AiMessage::system("Answer in at most five words."), AiMessage::user("What is in Image 1?")],
+                tools: None,
+                effort: None,
+                access: None,
+                images: vec![img],
+                workspace: None,
+                lean: true,
+            },
+            cancel: CancellationToken::new(),
+            api_key: None,
+            base_url: String::new(),
+            emit,
+            client: crate::stream::build_client(),
+            workspace: dir,
+        };
+        let r = cli_step(&ctx).await.expect("claude lean run");
+        let input = r.usage.and_then(|u| u.input_tokens).unwrap_or(0);
+        eprintln!("reply: {} · input tokens: {input}", r.text.trim());
+        assert!(!r.text.trim().is_empty());
+        assert!(input > 0 && input < 8_000, "lean step used {input} input tokens");
     }
 
     /// Live: cancelling kills the whole process tree promptly.
@@ -1122,6 +1210,7 @@ mod tests {
                 access: None,
                 images: vec![],
                 workspace: None,
+                lean: false,
             },
             cancel: cancel.clone(),
             api_key: None,

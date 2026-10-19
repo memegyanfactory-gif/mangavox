@@ -8,7 +8,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_recap::{PageRead, STYLES};
 use mv_ui::nav::PlayRequest;
-use mv_ui::{button, chip, empty_state, icon, size, ButtonKind, Route, Tokens};
+use mv_ui::{button, chip, empty_state, icon, progress_bar, scan_overlay, spinner, size, ButtonKind, Route, Tokens};
 
 use crate::page::{plural, transcript_text, Focus, Phase, StudioPage};
 use crate::run::RunKind;
@@ -112,6 +112,14 @@ impl StudioPage {
         let actions = match self.phase {
             Phase::Read => match run.as_ref().filter(|r| r.kind == RunKind::Read) {
                 Some(_) => actions.child(stop_button(cx)),
+                // Part-read (usually a stopped read): pick up where it stopped, or start over.
+                None if self.partly_read() => actions
+                    .child(self.model_button.clone())
+                    .child(button("read-restart", "Restart", ButtonKind::Ghost).child(icon("icons/rotate-ccw.svg", Tokens::text_2(), 13.)).flex_row_reverse().on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(true, cx))))
+                    .child(
+                        primary("read-continue", "icons/play.svg", if self.selected.len() > 1 { self.target_label("Continue") } else { format!("Continue from page {}", f.status.read_pages + 1) }, run.is_none())
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(false, cx))),
+                    ),
                 None => actions
                     .child(self.model_button.clone())
                     .when(f.status.read_pages > 0, |d| {
@@ -159,10 +167,10 @@ impl StudioPage {
         }
         if let Some(r) = run.filter(|r| matches!((r.kind, self.phase), (RunKind::Read, Phase::Read) | (RunKind::Story, Phase::Story))) {
             let label = format!("{} · {}", r.status_line(), r.model);
-            head = head.child(progress_line(r.progress(), label));
+            head = head.child(progress_line("head-run", r.progress(), label));
         }
         if let Some(j) = self.jobs.iter().find(|j| j.chapter_id == f.item.id && !j.state.finished()).filter(|_| matches!(self.phase, Phase::Audio | Phase::Video)) {
-            head = head.child(progress_line(j.progress() as f32, j.status.clone()));
+            head = head.child(progress_line("head-job", j.progress() as f32, j.status.clone()));
         }
         head
     }
@@ -216,7 +224,16 @@ impl StudioPage {
                     .border_color(if reading_now { Tokens::accent() } else { Tokens::border() })
                     .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("Page {}", ix + 1)))
                     .map(|d| match &read {
-                        None if reading_now => d.child(div().text_size(px(size::SM)).text_color(Tokens::accent()).child("Reading this page…")),
+                        None if reading_now => d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .text_size(px(size::SM))
+                                .text_color(Tokens::accent())
+                                .child(spinner(SharedString::from(format!("pg-read-{ix}")), Tokens::accent(), 14.))
+                                .child("Reading this page…"),
+                        ),
                         None => d.child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child("Not read yet.")),
                         Some(p) => d.child(page_notes(p, &faces)),
                     })
@@ -407,11 +424,13 @@ impl StudioPage {
                         .rounded_full()
                         .bg(Tokens::surface_2())
                         .hover(|s| s.bg(Tokens::active()))
-                        .child(icon(
-                            if previewing { "icons/loader-circle.svg" } else if sample_playing { "icons/square.svg" } else { "icons/play.svg" },
-                            Tokens::text_1(),
-                            13.,
-                        ))
+                        .map(|d| {
+                            if previewing {
+                                d.child(spinner(SharedString::from(format!("voice-spin-{id}")), Tokens::text_1(), 13.))
+                            } else {
+                                d.child(icon(if sample_playing { "icons/square.svg" } else { "icons/play.svg" }, Tokens::text_1(), 13.))
+                            }
+                        })
                         .when(ready.usable(), |d| {
                             d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 cx.stop_propagation();
@@ -731,6 +750,7 @@ fn page_image(ix: usize, path: &Path, ratio: Option<f32>, max_w: f32, glow: bool
             Some(r) => d.child(div().w_full().aspect_ratio(r).child(im.size_full())),
             None => d.child(im.w_full()),
         })
+        .when(glow, |d| d.child(scan_overlay(SharedString::from(format!("scan-{ix}")))))
         .child(
             div()
                 .absolute()
@@ -880,15 +900,22 @@ fn stop_button(cx: &mut Context<StudioPage>) -> Stateful<Div> {
     }))
 }
 
-pub(crate) fn progress_line(p: f32, label: String) -> Div {
+/// Spinner, status and percent over an animated bar. `id` keeps each bar's animation apart.
+pub(crate) fn progress_line(id: &str, p: f32, label: String) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(px(6.))
-        .child(div().flex().items_center().gap(px(8.)).child(icon("icons/loader-circle.svg", Tokens::accent(), 12.)).child(div().flex_1().truncate().text_size(px(size::XS)).text_color(Tokens::text_2()).child(label)).child(
-            div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{}%", (p * 100.).round() as i32)),
-        ))
-        .child(div().w_full().h(px(3.)).rounded_full().bg(Tokens::active()).child(div().h_full().rounded_full().bg(Tokens::accent()).w(relative(p.clamp(0.0, 1.0)))))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(spinner(SharedString::from(format!("{id}-spin")), Tokens::accent(), 13.))
+                .child(div().flex_1().truncate().text_size(px(size::XS)).text_color(Tokens::text_2()).child(label))
+                .child(div().text_size(px(size::XS)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_2()).child(format!("{}%", (p * 100.).round() as i32))),
+        )
+        .child(progress_bar(SharedString::from(format!("{id}-bar")), p, true))
 }
 
 fn play_video(title: &str, path: &Path, window: &mut Window, cx: &mut App) {
