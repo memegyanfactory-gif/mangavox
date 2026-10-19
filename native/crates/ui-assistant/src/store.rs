@@ -75,6 +75,9 @@ pub struct ChatItem {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// How long the model reasoned before it started answering ("Thought for 12s").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_ms: Option<u64>,
     pub created_at: u64,
 }
 
@@ -84,7 +87,7 @@ fn done_status() -> ItemStatus {
 
 impl ChatItem {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { id: new_id("u"), role: ItemRole::User, text: text.into(), reasoning: None, activity: vec![], steps: vec![], status: ItemStatus::Done, error: None, model: None, created_at: now_ms() }
+        Self { id: new_id("u"), role: ItemRole::User, text: text.into(), reasoning: None, activity: vec![], steps: vec![], status: ItemStatus::Done, error: None, model: None, reasoning_ms: None, created_at: now_ms() }
     }
     pub fn assistant(model: &str) -> Self {
         Self {
@@ -97,6 +100,7 @@ impl ChatItem {
             status: ItemStatus::Streaming,
             error: None,
             model: Some(model.to_string()),
+            reasoning_ms: None,
             created_at: now_ms(),
         }
     }
@@ -238,9 +242,28 @@ impl Store {
     }
 
     pub fn delete_thread(&mut self, id: &str) {
-        self.threads.retain(|t| t.id != id);
+        let _ = self.take_thread(id);
+    }
+
+    /// Removes a thread and returns it with its position, so an Undo can put it back.
+    pub fn take_thread(&mut self, id: &str) -> Option<(usize, Thread)> {
+        let ix = self.threads.iter().position(|t| t.id == id)?;
+        let t = self.threads.remove(ix);
         if self.active.as_deref() == Some(id) {
             self.active = self.threads.first().map(|t| t.id.clone());
+        }
+        Some((ix, t))
+    }
+
+    /// Puts back a thread from [`Store::take_thread`] (Undo), optionally making it active again.
+    pub fn restore_thread(&mut self, ix: usize, thread: Thread, make_active: bool) {
+        if self.thread(&thread.id).is_some() {
+            return;
+        }
+        let id = thread.id.clone();
+        self.threads.insert(ix.min(self.threads.len()), thread);
+        if make_active {
+            self.active = Some(id);
         }
     }
 
@@ -262,7 +285,7 @@ impl Store {
             .iter()
             .filter(|t| q.is_empty() || t.title.to_lowercase().contains(&q) || t.items.iter().any(|i| i.text.to_lowercase().contains(&q)))
             .collect();
-        v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        v.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
         v
     }
 
@@ -314,6 +337,25 @@ mod tests {
         assert_eq!(s.search("").len(), 2);
         s.delete_thread(&b);
         assert_eq!(s.active.as_deref(), Some(a.as_str()));
+    }
+
+    #[test]
+    fn deleted_threads_can_be_restored() {
+        let mut s = Store::default();
+        let a = s.new_thread();
+        s.thread_mut(&a).unwrap().items.push(ChatItem::user("one"));
+        let b = s.new_thread();
+        s.thread_mut(&b).unwrap().items.push(ChatItem::user("two"));
+        let (ix, t) = s.take_thread(&b).unwrap();
+        assert_eq!(ix, 0);
+        assert_eq!(s.active.as_deref(), Some(a.as_str()));
+        s.restore_thread(ix, t.clone(), true);
+        assert_eq!(s.threads[0].id, b);
+        assert_eq!(s.active.as_deref(), Some(b.as_str()));
+        // Restoring twice is a no-op.
+        s.restore_thread(ix, t, false);
+        assert_eq!(s.threads.len(), 2);
+        assert!(s.take_thread("missing").is_none());
     }
 
     #[test]

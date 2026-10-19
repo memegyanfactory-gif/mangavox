@@ -206,6 +206,70 @@ phosphor! {
     // vendor-phosphor:end
 }
 
+/// One glyph per meaning, so a destination or action looks the same on every page and in every
+/// section (the sidebar, a page title and an empty state all say "History" with one clock).
+/// Use these before reaching for a raw `ph::` const. Apple HIG SF Symbols: use one symbol for one
+/// meaning: <https://developer.apple.com/design/human-interface-guidelines/sf-symbols>
+pub mod glyphs {
+    use super::{ph, Ph};
+
+    // Destinations.
+    pub const HOME: Ph = ph::HOUSE_SIMPLE;
+    pub const BROWSE: Ph = ph::COMPASS;
+    /// Same meaning as [`BROWSE`]: explore what is out there.
+    pub const DISCOVER: Ph = ph::COMPASS;
+    pub const LIBRARY: Ph = ph::BOOKS;
+    pub const SEARCH: Ph = ph::MAGNIFYING_GLASS;
+    /// Favourites are stars everywhere (filled gold when on: `favorite_star`).
+    pub const FAVORITES: Ph = ph::STAR;
+    pub const HISTORY: Ph = ph::CLOCK_COUNTER_CLOCKWISE;
+    pub const DOWNLOADS: Ph = ph::DOWNLOAD_SIMPLE;
+    pub const MANGA: Ph = ph::BOOK_OPEN;
+    pub const ANIME: Ph = ph::TELEVISION_SIMPLE;
+    pub const MOVIES: Ph = ph::FILM_SLATE;
+    pub const STUDIO: Ph = ph::MAGIC_WAND;
+    pub const ASSISTANT: Ph = ph::SPARKLE;
+    pub const SOURCES: Ph = ph::PUZZLE_PIECE;
+    pub const SETTINGS: Ph = ph::GEAR_SIX;
+
+    // Things.
+    /// Saved / in library / on the watchlist (fill weight when saved).
+    pub const SAVED: Ph = ph::BOOKMARK_SIMPLE;
+    pub const VOICE: Ph = ph::MICROPHONE;
+    pub const MUSIC: Ph = ph::MUSIC_NOTES;
+    pub const MODEL: Ph = ph::CUBE;
+    pub const STORAGE: Ph = ph::HARD_DRIVE;
+    pub const FOLDER: Ph = ph::FOLDER_SIMPLE;
+    pub const IMAGE: Ph = ph::IMAGE;
+    pub const SUBTITLES: Ph = ph::SUBTITLES;
+    pub const LANGUAGE: Ph = ph::TRANSLATE;
+
+    // Studio phases.
+    pub const READ: Ph = ph::SCAN;
+    pub const STORY: Ph = ph::NOTE_PENCIL;
+    pub const NARRATE: Ph = ph::MICROPHONE;
+    pub const VIDEO: Ph = ph::FILM_STRIP;
+
+    // Actions.
+    pub const ADD: Ph = ph::PLUS;
+    pub const EDIT: Ph = ph::PENCIL_SIMPLE;
+    pub const DELETE: Ph = ph::TRASH;
+    pub const MORE: Ph = ph::DOTS_THREE;
+    pub const CLOSE: Ph = ph::X;
+    pub const BACK: Ph = ph::ARROW_LEFT;
+    pub const REFRESH: Ph = ph::ARROWS_CLOCKWISE;
+    pub const RETRY: Ph = ph::ARROW_CLOCKWISE;
+    pub const FILTER: Ph = ph::FUNNEL;
+    pub const SORT: Ph = ph::SORT_ASCENDING;
+    pub const COPY: Ph = ph::COPY;
+    pub const DOWNLOAD: Ph = ph::DOWNLOAD_SIMPLE;
+    pub const UPLOAD: Ph = ph::UPLOAD_SIMPLE;
+    /// Opens something outside the app (browser, Explorer).
+    pub const EXTERNAL: Ph = ph::ARROW_SQUARE_OUT;
+    pub const PLAY: Ph = ph::PLAY;
+    pub const PAUSE: Ph = ph::PAUSE;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -218,10 +218,8 @@ mod imp {
                 SetCursor(std::ptr::null_mut());
                 return 1;
             }
-            WM_NCDESTROY => {
-                if RemoveWindowSubclass(hwnd, Some(overlay_proc), id) != 0 {
-                    drop(Rc::from_raw(data as *const Shared));
-                }
+            WM_NCDESTROY if RemoveWindowSubclass(hwnd, Some(overlay_proc), id) != 0 => {
+                drop(Rc::from_raw(data as *const Shared));
             }
             _ => {}
         }

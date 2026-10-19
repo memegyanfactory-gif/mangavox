@@ -130,7 +130,13 @@ pub fn list_pages(pages_dir: &Path) -> Vec<PathBuf> {
 pub fn chapter_status(ch: &ChapterRef) -> PhaseStatus {
     let dir = chapter_dir(ch);
     let audio_files = std::fs::read_dir(ch.output_dir.join("audio"))
-        .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("wav"))).count())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("wav")))
+                // A take being voiced (tts_bridge writes `page_NNNN.new.wav` first) is not a clip yet.
+                .filter(|e| !e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".new.wav"))
+                .count()
+        })
         .unwrap_or(0);
     let video = ch.output_dir.join("video_final.mp4");
     let mut reels: Vec<PathBuf> = std::fs::read_dir(ch.output_dir.join("reels"))

@@ -7,6 +7,7 @@ mod backend;
 pub mod logic;
 pub mod mpv;
 mod overlay;
+mod ui;
 mod view;
 
 static WATCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

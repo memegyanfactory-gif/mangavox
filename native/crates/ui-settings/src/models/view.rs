@@ -1,5 +1,6 @@
-//! Model Library view: a sub-navigation column (In use, Downloaded, Downloads, Engines,
-//! categories, folder + hardware footer) and the selected page.
+//! Model Library view: four primary pages in a segmented control (In use, On this PC, Get models,
+//! Engines), category filter chips on "On this PC", a folder and hardware strip, then the page.
+//! Hick's law, fewer clearer choices: <https://lawsofux.com/hicks-law/>.
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,11 +10,13 @@ use gpui_kit::component::IndexPath;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ai::HubSystemFit;
-use mv_ui::{button, icon, size, ButtonKind, Tokens};
+use mv_ui::theme::{icon as icon_px, radius};
+use mv_ui::toast::{self, Toast};
+use mv_ui::{btn, empty_view, filter_chip, glyphs, icon, icon_button, icon_tag, ph, ph_icon, segmented, size, skeleton, skeleton_line, skeleton_row, tag, ButtonKind, Hue, Ph, Tokens, Tone, Weight};
 
 use super::jobs::{self, Choice, Job, Selections, Status};
 use super::scan::{self, Category, Engine, EngineId, EngineState, Inventory, LocalModel, Source};
-use crate::ui::{format_bytes, link, page_title, pill, section_label, surface, tag, tile};
+use crate::ui::{format_bytes, hero_tile, page_head, state_pill, surface};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -29,8 +32,8 @@ impl Page {
     pub fn from_id(id: &str) -> Option<Page> {
         Some(match id {
             "in-use" | "inuse" => Page::InUse,
-            "downloaded" | "installed" => Page::Downloaded,
-            "downloads" | "hub" => Page::Downloads,
+            "downloaded" | "installed" | "on-this-pc" => Page::Downloaded,
+            "downloads" | "hub" | "get" => Page::Downloads,
             "engines" => Page::Engines,
             "language" => Page::Category(Category::Language),
             "voice" => Page::Category(Category::Voice),
@@ -41,7 +44,19 @@ impl Page {
             _ => return None,
         })
     }
+
+    /// Index in the primary segmented control (categories live under "On this PC").
+    fn primary(self) -> usize {
+        match self {
+            Page::InUse => 0,
+            Page::Downloaded | Page::Category(_) => 1,
+            Page::Downloads => 2,
+            Page::Engines => 3,
+        }
+    }
 }
+
+const PRIMARY: [Page; 4] = [Page::InUse, Page::Downloaded, Page::Downloads, Page::Engines];
 
 /// Asks the Settings page to switch tabs (e.g. "Use my own…" opens AI providers).
 pub enum LibraryEvent {
@@ -59,7 +74,6 @@ pub struct ModelLibrary {
     lists: HashMap<Job, Vec<Choice>>,
     pickers: HashMap<Job, Picker>,
     hub: Option<AnyView>,
-    notice: Option<(String, bool)>,
     busy: HashSet<EngineId>,
     _subs: Vec<Subscription>,
 }
@@ -77,7 +91,6 @@ impl ModelLibrary {
             lists: HashMap::new(),
             pickers: HashMap::new(),
             hub: None,
-            notice: None,
             busy: HashSet::new(),
             _subs: vec![],
         };
@@ -97,7 +110,6 @@ impl ModelLibrary {
 
     pub fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         self.page = page;
-        self.notice = None;
         self.ensure_hub(window, cx);
         cx.notify();
     }
@@ -126,6 +138,26 @@ impl ModelLibrary {
                     t.apply(inv, sel, window, cx);
                 }
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Rereads what each job uses without scanning the disk again: Settings → Audio's star and the
+    /// assistant's model picker change the same settings while this page stays open, and the job
+    /// cards showed the old narrator until a Rescan.
+    pub fn refresh_selections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inv.is_none() || self.scanning {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(sel) = mv_ui::bg::blocking(jobs::load_selections).await else { return };
+            this.update_in(cx, |t, window, cx| {
+                if let Some(inv) = t.inv.clone().filter(|_| !t.scanning) {
+                    t.apply(inv, sel, window, cx);
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -182,12 +214,15 @@ impl ModelLibrary {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let r = mv_ui::bg::blocking(move || jobs::save_choice(job, &value)).await.and_then(|r| r);
-            this.update(cx, |t, cx| {
-                t.notice = Some(match r {
-                    Ok(()) if job.wired() => (format!("{} now uses {label}.", job.title()), false),
-                    Ok(()) => (format!("Saved {label} for {}.", job.title().to_lowercase()), false),
-                    Err(e) => (format!("Could not save: {e:#}"), true),
-                });
+            this.update(cx, |_, cx| {
+                toast::show(
+                    cx,
+                    match r {
+                        Ok(()) if job.wired() => Toast::success(format!("{} now uses {label}", job.title())),
+                        Ok(()) => Toast::success(format!("Saved {label} for {}", job.title().to_lowercase())),
+                        Err(e) => Toast::error(format!("Could not save: {e:#}")),
+                    },
+                );
                 cx.notify();
             })
             .ok();
@@ -195,7 +230,7 @@ impl ModelLibrary {
         .detach();
     }
 
-    /// Picks a model from a Downloaded row and updates that job's dropdown.
+    /// Picks a model from an "On this PC" row and updates that job's dropdown.
     fn use_for(&mut self, job: Job, value: String, window: &mut Window, cx: &mut Context<Self>) {
         if let (Some(p), Some(i)) = (self.pickers.get(&job), self.lists.get(&job).and_then(|l| l.iter().position(|c| c.value == value))) {
             p.update(cx, |s, cx| s.set_selected_index(Some(IndexPath::new(i)), window, cx));
@@ -216,7 +251,7 @@ impl ModelLibrary {
             this.update_in(cx, |t, window, cx| {
                 t.busy.remove(&id);
                 if let Err(e) = r {
-                    t.notice = Some((format!("Could not start: {e:#}"), true));
+                    toast::show(cx, Toast::error(format!("Could not start {}: {e:#}", short_name(id))));
                 }
                 t.rescan(window, cx);
             })
@@ -233,10 +268,13 @@ impl ModelLibrary {
             let d = dir.to_string_lossy().into_owned();
             let r = mv_ui::bg::blocking(move || crate::data::save_models_dir(&d)).await.and_then(|r| r);
             this.update_in(cx, |t, window, cx| {
-                t.notice = Some(match r {
-                    Ok(()) => (format!("Models folder set to {}.", dir.display()), false),
-                    Err(e) => (format!("{e:#}"), true),
-                });
+                toast::show(
+                    cx,
+                    match r {
+                        Ok(()) => Toast::success(format!("Models folder set to {}", dir.display())),
+                        Err(e) => Toast::error(format!("{e:#}")),
+                    },
+                );
                 t.rescan(window, cx);
             })
             .ok();
@@ -244,63 +282,62 @@ impl ModelLibrary {
         .detach();
     }
 
-    // ── Sub-navigation ──────────────────────────────────────────────────────
-
-    fn nav_item(&self, id: &'static str, label: String, count: Option<usize>, page: Page, cx: &mut Context<Self>) -> Stateful<Div> {
-        let active = self.page == page;
-        div()
-            .id(id)
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .h(px(28.))
-            .px(px(10.))
-            .rounded(px(7.))
-            .border_1()
-            .text_size(px(size::SM))
-            .cursor_pointer()
-            .map(|d| {
-                if active {
-                    d.bg(Tokens::active()).border_color(rgba(0x2bd49a55)).text_color(Tokens::text_1()).font_weight(FontWeight::MEDIUM)
-                } else {
-                    d.border_color(transparent_black()).text_color(Tokens::text_2()).hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1()))
-                }
-            })
-            .child(div().truncate().child(label))
-            .when_some(count, |d, n| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(n.to_string())))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_page(page, window, cx)))
+    fn open_audio(&mut self, cx: &mut Context<Self>) {
+        cx.emit(LibraryEvent::OpenTab("audio"));
     }
 
-    /// Horizontal segmented tabs (primary pages, then categories) with a one-line folder / hardware strip.
+    // ── Sub-navigation ──────────────────────────────────────────────────────
+
     fn render_subnav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let total = self.inv.as_ref().map(|i| i.models.len());
-        let mut tabs = div()
+        let on_pc = match total {
+            Some(n) => format!("On this PC · {n}"),
+            None => "On this PC".into(),
+        };
+        let pages = segmented(
+            "ml-pages",
+            [(Some(ph::CHECK_CIRCLE), "In use".to_string()), (Some(glyphs::STORAGE), on_pc), (Some(glyphs::DOWNLOAD), "Get models".to_string()), (Some(ph::HARD_DRIVES), "Engines".to_string())],
+            self.page.primary(),
+        )
+        .on_change(cx.listener(|this, ix: &usize, window, cx| this.set_page(PRIMARY[*ix], window, cx)));
+        let top = div()
             .flex()
-            .flex_wrap()
             .items_center()
-            .gap(px(4.))
-            .child(self.nav_item("ml-inuse", "In use".into(), None, Page::InUse, cx))
-            .child(self.nav_item("ml-downloaded", match total {
-                Some(n) => format!("Downloaded ({n})"),
-                None => "Downloaded".into(),
-            }, None, Page::Downloaded, cx))
-            .child(self.nav_item("ml-downloads", "Downloads".into(), None, Page::Downloads, cx))
-            .child(self.nav_item("ml-engines", "Engines".into(), None, Page::Engines, cx))
-            .child(div().mx(px(6.)).h(px(16.)).w(px(1.)).bg(Tokens::border()));
-        for (i, c) in Category::ALL.into_iter().enumerate() {
-            let n = self.inv.as_ref().map(|inv| inv.count(c)).unwrap_or(0);
-            if c == Category::Other && n == 0 {
-                continue;
-            }
-            let ids = ["ml-c0", "ml-c1", "ml-c2", "ml-c3", "ml-c4", "ml-c5", "ml-c6"];
-            let label = if self.inv.is_some() { format!("{} ({n})", c.label()) } else { c.label().to_string() };
-            tabs = tabs.child(self.nav_item(ids[i], label, None, Page::Category(c), cx));
-        }
+            .gap(px(12.))
+            .child(pages)
+            .child(div().flex_1())
+            .child(
+                btn("ml-rescan", if self.scanning { "Scanning…" } else { "Rescan" }, ButtonKind::Ghost)
+                    .small()
+                    .icon(glyphs::REFRESH)
+                    .loading(self.scanning)
+                    .tooltip("Look for models on this PC again")
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.rescan(window, cx))),
+            );
 
-        let folder = self.inv.as_ref().map(|i| i.models_dir.display().to_string()).unwrap_or_else(|| "…".into());
+        // Categories filter "On this PC" (Material 3 filter chips).
+        let categories = matches!(self.page, Page::Downloaded | Page::Category(_)).then(|| {
+            let mut chips = div().flex().flex_wrap().gap(px(6.)).child(
+                filter_chip("ml-cat-all", "All", self.page == Page::Downloaded).count(total.unwrap_or(0)).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.set_page(Page::Downloaded, window, cx))),
+            );
+            for (i, c) in Category::ALL.into_iter().enumerate() {
+                let n = self.inv.as_ref().map(|inv| inv.count(c)).unwrap_or(0);
+                if c == Category::Other && n == 0 {
+                    continue;
+                }
+                chips = chips.child(
+                    filter_chip(("ml-cat", i), c.label(), self.page == Page::Category(c))
+                        .icon(c.icon())
+                        .count(n)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_page(Page::Category(c), window, cx))),
+                );
+            }
+            chips
+        });
+
+        let folder = self.inv.as_ref().map(|i| i.models_dir.display().to_string());
         let free = self.inv.as_ref().and_then(|i| i.free_bytes).map(|b| format!("{} free", format_bytes(b)));
-        let hw = self.system.as_ref();
-        let hw_text = hw.map(|h| {
+        let hw_text = self.system.as_ref().map(|h| {
             let gpu = h.gpu_name.clone().unwrap_or_else(|| "No dedicated GPU".into());
             let vram = if h.vram_gb > 0.0 { format!(" · {:.0} GB VRAM", h.vram_gb) } else { String::new() };
             format!("{gpu}{vram} · {:.0} GB RAM", h.ram_gb)
@@ -309,14 +346,30 @@ impl ModelLibrary {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap_x(px(12.))
-            .gap_y(px(2.))
+            .gap_x(px(14.))
+            .gap_y(px(4.))
             .text_size(px(size::XS))
             .text_color(Tokens::text_3())
-            .child(div().max_w(px(420.)).text_color(Tokens::text_2()).truncate().child(format!("Models folder: {folder}")))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w_0()
+                    .child(ph_icon(glyphs::FOLDER, Weight::Bold, Tokens::text_3(), icon_px::XS))
+                    .child(match folder {
+                        Some(f) => div().max_w(px(380.)).overflow_hidden().whitespace_nowrap().text_ellipsis_middle().font_family(mv_ui::MONO_FONT).text_color(Tokens::text_2()).child(f).into_any_element(),
+                        None => skeleton_line(px(200.)).into_any_element(),
+                    }),
+            )
             .when_some(free, |d, f| d.child(f))
-            .child(link("ml-folder", "Change folder").text_size(px(size::XS)).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.change_folder(window, cx))))
-            .when_some(hw_text, |d, t| d.child(icon("icons/cpu.svg", Tokens::text_3(), 12.)).child(t));
+            .child(
+                btn("ml-folder", "Change folder", ButtonKind::Ghost)
+                    .small()
+                    .icon(ph::PENCIL_SIMPLE)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.change_folder(window, cx))),
+            )
+            .when_some(hw_text, |d, t| d.child(div().flex().items_center().gap(px(6.)).child(ph_icon(ph::CPU, Weight::Bold, Tokens::text_3(), icon_px::XS)).child(t)));
 
         div()
             .flex()
@@ -327,25 +380,27 @@ impl ModelLibrary {
             .pb(px(12.))
             .border_b_1()
             .border_color(Tokens::border())
-            .child(tabs)
+            .child(top)
+            .children(categories)
             .child(strip)
     }
 
     // ── Pages ───────────────────────────────────────────────────────────────
 
     fn engine_line(&self, job: Job, e: &Engine, cx: &mut Context<Self>) -> Div {
-        let id = e.id;
-        let busy = self.busy.contains(&id);
-        let dot = engine_dot(e.state);
+        let busy = self.busy.contains(&e.id);
+        let (icon, color, _) = engine_state(e.state);
         div()
             .flex()
             .items_center()
             .gap(px(10.))
             .px(px(12.))
             .py(px(9.))
-            .rounded(px(8.))
-            .bg(Tokens::surface_2())
-            .child(div().flex_none().size(px(7.)).rounded_full().bg(dot))
+            .rounded(px(radius::MD))
+            .bg(Tokens::well())
+            .border_1()
+            .border_color(Tokens::border())
+            .child(ph_icon(icon, Weight::Fill, color, icon_px::SM))
             .child(
                 div()
                     .flex_1()
@@ -363,27 +418,35 @@ impl ModelLibrary {
         let id = e.id;
         let key = |what: &str| SharedString::from(format!("{}-{}-{}-{what}", scope.0, scope.1, id_str(id)));
         let mut out: Vec<AnyElement> = vec![];
-        let small = |b: Stateful<Div>| b.h(px(28.)).px(px(10.));
         if busy {
-            out.push(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("Starting…").into_any_element());
+            out.push(btn(key("starting"), "Starting…", ButtonKind::Secondary).small().loading(true).into_any_element());
             return out;
         }
         match (id, e.state) {
             (EngineId::Ollama | EngineId::LmStudio | EngineId::ComfyUi, EngineState::Stopped) => {
-                out.push(small(button(key("start"), "Start", ButtonKind::Secondary)).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_engine(id, window, cx))).into_any_element());
+                out.push(btn(key("start"), "Start", ButtonKind::Secondary).small().icon(glyphs::PLAY).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_engine(id, window, cx))).into_any_element());
             }
+            (EngineId::PythonTts, _) => {}
             (_, EngineState::NotInstalled) => {
                 let url = install_url(id);
-                out.push(small(button(key("get"), format!("Get {}", short_name(id)), ButtonKind::Secondary)).on_click(move |_, _, cx| cx.open_url(url)).into_any_element());
+                out.push(btn(key("get"), format!("Get {}", short_name(id)), ButtonKind::Secondary).small().trailing_icon(ph::ARROW_UP_RIGHT).tooltip(url).on_click(move |_, _, cx| cx.open_url(url)).into_any_element());
             }
             _ => {}
         }
         match id {
-            EngineId::Ollama | EngineId::LmStudio => out.push(small(button(key("own"), "Use my own…", ButtonKind::Ghost)).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(LibraryEvent::OpenTab("providers")))).into_any_element()),
-            EngineId::PythonTts => out.push(small(button(key("studio"), "Open Studio", ButtonKind::Ghost)).on_click(|_, window, cx| mv_ui::navigate(mv_ui::Route::Studio, window, cx)).into_any_element()),
+            EngineId::Ollama | EngineId::LmStudio => out.push(
+                btn(key("own"), "Use my own…", ButtonKind::Ghost)
+                    .small()
+                    .icon(ph::KEY)
+                    .tooltip("Connect a server or key in AI providers")
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(LibraryEvent::OpenTab("providers"))))
+                    .into_any_element(),
+            ),
+            // Voices are set up in one place: Settings → Audio.
+            EngineId::PythonTts => out.push(btn(key("voices"), "Manage voices", ButtonKind::Secondary).small().icon(ph::WAVEFORM).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_audio(cx))).into_any_element()),
             EngineId::Ffmpeg | EngineId::ComfyUi => {
                 if let Some(p) = e.path.clone().filter(|_| e.installed()) {
-                    out.push(small(button(key("reveal"), "Show in folder", ButtonKind::Ghost)).on_click(move |_, _, cx| cx.reveal_path(&p)).into_any_element());
+                    out.push(icon_button(key("reveal"), ph::FOLDER_OPEN, "Show in Explorer").small().on_click(move |_, _, cx| cx.reveal_path(&p)).into_any_element());
                 }
             }
         }
@@ -409,8 +472,8 @@ impl ModelLibrary {
                             .items_center()
                             .gap(px(6.))
                             .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).truncate().child(m.name.clone()))
-                            .when(m.vision && m.category == Category::Language, |d| d.child(tag("Vision", Tokens::text_2())))
-                            .when_some(m.quant.clone(), |d, q| d.child(tag(q, Tokens::text_3()))),
+                            .when(m.vision && m.category == Category::Language, |d| d.child(icon_tag(ph::EYE, "Vision", Tone::Info)))
+                            .when_some(m.quant.clone(), |d, q| d.child(tag(q, Tone::Neutral))),
                     )
                     .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(format!("{} · {} · {}", m.family, format_bytes(m.size), m.source.label()))),
             )
@@ -432,24 +495,19 @@ impl ModelLibrary {
             )
         });
 
+        // Icon plus words, never a colour dot alone (WCAG 1.4.1).
         let status_row = {
-            let (dot, text) = match &st {
-                Status::Uses { label, .. } if job.wired() => (Tokens::accent(), format!("MangaVox uses: {label}")),
-                Status::Uses { label, .. } => (Tokens::accent(), format!("Saved: {label}")),
-                Status::Auto { label, .. } => (Tokens::accent(), format!("MangaVox picks: {label}")),
-                Status::Cloud { label } => (rgb(0x60a5fa), format!("Cloud: {label}")),
-                Status::Missing { label } => (Tokens::warning(), format!("Not on this PC: {label}")),
-                Status::None if list.is_empty() => (Tokens::text_3(), "None: the AI won't do this on your PC".to_string()),
-                Status::None => (Tokens::text_3(), format!("Not chosen yet: {} model{} available", list.len(), if list.len() == 1 { "" } else { "s" })),
+            let (icon, color, fill, text) = match &st {
+                Status::Uses { label, .. } if job.wired() => (ph::CHECK_CIRCLE, Tokens::success(), Tokens::success_soft(), format!("MangaVox uses: {label}")),
+                Status::Uses { label, .. } => (ph::CHECK_CIRCLE, Tokens::success(), Tokens::success_soft(), format!("Saved: {label}")),
+                Status::Auto { label, .. } => (ph::SPARKLE, Tokens::accent(), Tokens::accent_soft(), format!("MangaVox picks: {label}")),
+                Status::Cloud { label } => (ph::CLOUD, Tokens::info(), Tokens::info_soft(), format!("Cloud: {label}")),
+                Status::Missing { label } => (ph::WARNING, Tokens::warning(), Tokens::warning_soft(), format!("Not on this PC: {label}")),
+                Status::None if list.is_empty() => (ph::CIRCLE_DASHED, Tokens::text_3(), Tokens::active(), "None: the AI won't do this on your PC".to_string()),
+                Status::None => (ph::CIRCLE_DASHED, Tokens::text_2(), Tokens::active(), format!("Not chosen yet: {} model{} available", list.len(), if list.len() == 1 { "" } else { "s" })),
             };
             let missing = matches!(st, Status::None | Status::Missing { .. }) && list.is_empty();
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .min_w_0()
-                .child(pill(dot, text))
-                .when(missing, |d| d.child(self.get_link(job, cx)))
+            div().flex().items_center().gap(px(10.)).min_w_0().child(status_pill(icon, color, fill, text, !matches!(st, Status::None))).when(missing, |d| d.child(self.get_link(job, cx)))
         };
 
         // With nothing chosen, show the engine behind the first available model.
@@ -465,30 +523,36 @@ impl ModelLibrary {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .child(tile(job.icon(), 32.))
+                    .child(hero_tile(job.icon(), job.category().hue(), 36.))
                     .child(div().flex_1().min_w_0().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(job.title()))
                     .child(picker),
             )
             .child(status_row)
             .when_some(model, |d, m| d.child(Self::model_line(&m)))
             .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(job.explain()))
-            .when(show_engine, |d| d.child(self.engine_line(job, engine.as_ref().unwrap(), cx)))
+            .when_some(engine.filter(|_| show_engine), |d, e| d.child(self.engine_line(job, &e, cx)))
     }
 
-    /// "Download one" style link for a job with nothing available.
+    /// The next step for a job with nothing available.
     fn get_link(&self, job: Job, cx: &mut Context<Self>) -> AnyElement {
         let id = SharedString::from(format!("get-{}", job.id()));
         match job {
-            Job::Assistant => link(id, "Download one").on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.set_page(Page::Downloads, window, cx))).into_any_element(),
-            Job::Vision => link(id, "How to get one")
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.notice = Some(("Install Ollama, then run: ollama pull minicpm-v:8b (about 5 GB). Rescan when it finishes.".into(), false));
-                    cx.notify();
-                }))
+            Job::Assistant => btn(id, "Get a chat model", ButtonKind::Ghost).small().icon(glyphs::DOWNLOAD).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.set_page(Page::Downloads, window, cx))).into_any_element(),
+            Job::Vision => btn(id, "How to get one", ButtonKind::Ghost)
+                .small()
+                .icon(ph::INFO)
+                .on_click(|_, _, cx| {
+                    toast::show(
+                        cx,
+                        Toast::info("Install Ollama, then run ollama pull minicpm-v:8b (about 5 GB). Rescan when it finishes.")
+                            .duration(Duration::from_secs(10))
+                            .action("Copy command", |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(ui_studio::setup::OLLAMA_PULL_CMD.to_string()))),
+                    )
+                })
                 .into_any_element(),
-            Job::Voice => link(id, "Set up in Studio").on_click(|_, window, cx| mv_ui::navigate(mv_ui::Route::Studio, window, cx)).into_any_element(),
-            Job::Transcription => link(id, "Get Whisper").on_click(|_, _, cx| cx.open_url("https://huggingface.co/Systran/faster-whisper-small")).into_any_element(),
-            Job::Image => link(id, "Get ComfyUI").on_click(|_, _, cx| cx.open_url("https://www.comfy.org/download")).into_any_element(),
+            Job::Voice => btn(id, "Manage voices", ButtonKind::Ghost).small().icon(ph::WAVEFORM).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_audio(cx))).into_any_element(),
+            Job::Transcription => btn(id, "Get Whisper", ButtonKind::Ghost).small().trailing_icon(ph::ARROW_UP_RIGHT).on_click(|_, _, cx| cx.open_url("https://huggingface.co/Systran/faster-whisper-small")).into_any_element(),
+            Job::Image => btn(id, "Get ComfyUI", ButtonKind::Ghost).small().trailing_icon(ph::ARROW_UP_RIGHT).on_click(|_, _, cx| cx.open_url("https://www.comfy.org/download")).into_any_element(),
         }
     }
 
@@ -497,28 +561,14 @@ impl ModelLibrary {
             .flex()
             .flex_col()
             .gap(px(16.))
-            .child(self.header("Model Library", "Choose which model MangaVox uses for each job. Everything listed here runs on this PC.", cx));
+            .child(page_head(glyphs::MODEL, Hue::Green, "Model Library", "Choose which model MangaVox uses for each job. Everything listed here runs on this PC."));
         if self.inv.is_none() {
-            return col.child(loading());
+            return col.children((0..3).map(|_| skeleton_job()));
         }
         for job in Job::ALL {
             col = col.child(self.job_card(job, cx));
         }
         col
-    }
-
-    fn header(&self, title: &str, desc: &str, cx: &mut Context<Self>) -> Div {
-        div()
-            .flex()
-            .items_start()
-            .gap(px(16.))
-            .child(div().flex_1().min_w_0().child(page_title(title.to_string(), desc.to_string())))
-            .child(
-                button("ml-rescan", if self.scanning { "Scanning…" } else { "Rescan" }, ButtonKind::Ghost)
-                    .h(px(30.))
-                    .child(icon("icons/refresh-cw.svg", Tokens::text_2(), 13.))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.rescan(window, cx))),
-            )
     }
 
     /// Jobs a detected model can be picked for, with whether it is the current pick.
@@ -540,10 +590,20 @@ impl ModelLibrary {
         let in_use: Vec<&str> = uses.iter().filter(|u| u.2).map(|u| u.0.title()).collect();
         let offer = uses.iter().find(|u| !u.2 && u.0 != Job::Voice).cloned();
         let path = m.path.clone();
-        let used_text = if !in_use.is_empty() {
-            Some((format!("In use: {}", in_use.join(", ")), Tokens::accent()))
+        let used: Option<AnyElement> = if !in_use.is_empty() {
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .text_size(px(size::XS))
+                    .text_color(Tokens::success())
+                    .child(ph_icon(ph::CHECK_CIRCLE, Weight::Fill, Tokens::success(), icon_px::XS))
+                    .child(div().truncate().child(format!("In use: {}", in_use.join(", "))))
+                    .into_any_element(),
+            )
         } else if uses.is_empty() {
-            Some((not_used_reason(m).to_string(), Tokens::text_3()))
+            Some(div().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(not_used_reason(m)).into_any_element())
         } else {
             None
         };
@@ -568,12 +628,14 @@ impl ModelLibrary {
                             .gap(px(6.))
                             .min_w_0()
                             .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).truncate().child(m.name.clone()))
-                            .when(m.vision && m.category == Category::Language, |d| d.child(tag("Vision", Tokens::text_2())))
-                            .when_some(m.quant.clone(), |d, q| d.child(tag(q, Tokens::text_3()))),
+                            .when(m.vision && m.category == Category::Language, |d| d.child(icon_tag(ph::EYE, "Vision", Tone::Info)))
+                            .when_some(m.quant.clone(), |d, q| d.child(tag(q, Tone::Neutral))),
                     )
                     .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(format!("{} · {}", m.family, m.source.label())))
-                    .when(!m.path.as_os_str().is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(m.path.display().to_string())))
-                    .when_some(used_text, |d, (t, c)| d.child(div().text_size(px(size::XS)).text_color(c).truncate().child(t))),
+                    .when(!m.path.as_os_str().is_empty(), |d| {
+                        d.child(div().overflow_hidden().whitespace_nowrap().text_ellipsis_middle().font_family(mv_ui::MONO_FONT).text_size(px(size::XS)).text_color(Tokens::text_3()).child(m.path.display().to_string()))
+                    })
+                    .children(used),
             )
             .child(div().flex_none().w(px(64.)).text_size(px(size::SM)).text_color(Tokens::text_2()).flex().justify_end().child(format_bytes(m.size)))
             .child(
@@ -584,27 +646,13 @@ impl ModelLibrary {
                     .gap(px(4.))
                     .when_some(offer, |d, (job, value, _)| {
                         d.child(
-                            button(("ml-use", idx), use_label(job), ButtonKind::Secondary)
-                                .h(px(28.))
-                                .px(px(10.))
+                            btn(("ml-use", idx), use_label(job), ButtonKind::Secondary)
+                                .small()
+                                .icon(ph::CHECK_CIRCLE)
                                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.use_for(job, value.clone(), window, cx))),
                         )
                     })
-                    .when(!path.as_os_str().is_empty(), |d| {
-                        d.child(
-                            div()
-                                .id(("ml-reveal", idx))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(28.))
-                                .rounded(px(7.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(Tokens::hover()))
-                                .child(icon("icons/folder-open.svg", Tokens::text_2(), 14.))
-                                .on_click(move |_, _, cx| cx.reveal_path(&path)),
-                        )
-                    }),
+                    .when(!path.as_os_str().is_empty(), |d| d.child(icon_button(("ml-reveal", idx), ph::FOLDER_OPEN, "Show in Explorer").small().on_click(move |_, _, cx| cx.reveal_path(&path)))),
             )
     }
 
@@ -618,30 +666,40 @@ impl ModelLibrary {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .when_some(title, |d, t| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .px(px(2.))
-                        .child(section_label(t))
-                        .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{} · {}", models.len(), format_bytes(size)))),
-                )
-            })
+            .when_some(title, |d, t| d.child(mv_ui::section_label(t.to_string()).child(div().text_color(Tokens::text_3()).font_weight(FontWeight::NORMAL).child(format!("· {} · {}", models.len(), format_bytes(size))))))
             .child(card)
     }
 
+    /// What a category's empty state offers as the next step.
+    fn empty_action(&self, c: Category, cx: &mut Context<Self>) -> Option<AnyElement> {
+        Some(match c {
+            Category::Language => btn("ml-empty-get", "Get a chat model", ButtonKind::Primary).icon(glyphs::DOWNLOAD).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.set_page(Page::Downloads, window, cx))).into_any_element(),
+            Category::Voice => btn("ml-empty-voices", "Manage voices", ButtonKind::Primary).icon(ph::WAVEFORM).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_audio(cx))).into_any_element(),
+            Category::Transcription => btn("ml-empty-whisper", "Get Whisper", ButtonKind::Secondary).trailing_icon(ph::ARROW_UP_RIGHT).on_click(|_, _, cx| cx.open_url("https://huggingface.co/Systran/faster-whisper-small")).into_any_element(),
+            Category::ImageGen => btn("ml-empty-comfy", "Get ComfyUI", ButtonKind::Secondary).trailing_icon(ph::ARROW_UP_RIGHT).on_click(|_, _, cx| cx.open_url("https://www.comfy.org/download")).into_any_element(),
+            _ => return None,
+        })
+    }
+
     fn render_downloaded(&self, cx: &mut Context<Self>) -> Div {
+        let head = |desc: String| page_head(glyphs::STORAGE, Hue::Blue, "On this PC", desc);
         let Some(inv) = self.inv.as_ref() else {
-            return div().flex().flex_col().gap(px(16.)).child(self.header("Downloaded", "Models found on this PC.", cx)).child(loading());
+            return div().flex().flex_col().gap(px(16.)).child(head("Looking for models on this PC…".into())).child(skeleton_list());
         };
         let total: u64 = inv.models.iter().map(|m| m.size).sum();
-        let mut col = div().flex().flex_col().gap(px(20.)).child(self.header(
-            "Downloaded",
-            &format!("{} models found on this PC, {} in total. Includes Ollama, LM Studio, Hugging Face, ComfyUI and MangaVox's own folder.", inv.models.len(), format_bytes(total)),
-            cx,
-        ));
+        let mut col = div().flex().flex_col().gap(px(20.)).child(head(format!(
+            "{} models, {} in total. Includes Ollama, LM Studio, Hugging Face, ComfyUI and MangaVox's own folder.",
+            inv.models.len(),
+            format_bytes(total)
+        )));
+        if inv.models.is_empty() {
+            return col.child(
+                surface().child(
+                    empty_view(glyphs::MODEL, "No models found yet", "Download a chat model, or install Ollama or LM Studio and rescan.")
+                        .action(btn("ml-empty-all", "Get a chat model", ButtonKind::Primary).icon(glyphs::DOWNLOAD).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.set_page(Page::Downloads, window, cx)))),
+                ),
+            );
+        }
         let mut start = 0;
         for c in Category::ALL {
             let group: Vec<&LocalModel> = inv.models.iter().filter(|m| m.category == c).collect();
@@ -651,22 +709,19 @@ impl ModelLibrary {
             col = col.child(self.model_group(start, Some(c.label()), &group, cx));
             start += group.len();
         }
-        if inv.models.is_empty() {
-            col = col.child(empty("No models found yet", "Download a chat model from Downloads, or install Ollama or LM Studio and rescan."));
-        }
         col
     }
 
     fn render_category(&self, c: Category, cx: &mut Context<Self>) -> Div {
-        let mut col = div().flex().flex_col().gap(px(20.)).child(self.header(c.label(), c.description(), cx));
-        let Some(inv) = self.inv.as_ref() else { return col.child(loading()) };
+        let mut col = div().flex().flex_col().gap(px(20.)).child(page_head(c.icon(), c.hue(), c.label(), c.description()));
+        let Some(inv) = self.inv.as_ref() else { return col.child(skeleton_list()) };
         let group: Vec<&LocalModel> = inv.models.iter().filter(|m| m.category == c).collect();
         if group.is_empty() {
-            let mut e = empty("Nothing here yet", empty_hint(c));
-            if c == Category::Language {
-                e = e.child(button("ml-browse", "Browse downloads", ButtonKind::Primary).mt(px(8.)).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.set_page(Page::Downloads, window, cx))));
+            let mut e = empty_view(c.icon(), format!("No {} on this PC yet", c.label().to_lowercase()), empty_hint(c));
+            if let Some(a) = self.empty_action(c, cx) {
+                e = e.action(a);
             }
-            return col.child(e);
+            return col.child(surface().child(e));
         }
         // Language models: split by where they run.
         if c == Category::Language {
@@ -684,8 +739,8 @@ impl ModelLibrary {
     }
 
     fn render_engines(&self, cx: &mut Context<Self>) -> Div {
-        let mut col = div().flex().flex_col().gap(px(16.)).child(self.header("Engines", "The programs that run models. MangaVox finds them on this PC and can start the ones that are stopped.", cx));
-        let Some(inv) = self.inv.as_ref() else { return col.child(loading()) };
+        let mut col = div().flex().flex_col().gap(px(16.)).child(page_head(ph::HARD_DRIVES, Hue::Slate, "Engines", "The programs that run models. MangaVox finds them on this PC and can start the ones that are stopped."));
+        let Some(inv) = self.inv.as_ref() else { return col.children((0..3).map(|_| skeleton_job())) };
         for e in &inv.engines {
             let busy = self.busy.contains(&e.id);
             let models = match e.id {
@@ -694,6 +749,7 @@ impl ModelLibrary {
                 EngineId::ComfyUi => Some(inv.models.iter().filter(|m| m.source == Source::ComfyUi).count()),
                 _ => None,
             };
+            let (icon, color, fill) = engine_state(e.state);
             col = col.child(
                 surface()
                     .p(px(18.))
@@ -703,7 +759,7 @@ impl ModelLibrary {
                             .flex()
                             .items_center()
                             .gap(px(12.))
-                            .child(tile(engine_icon(e.id), 32.))
+                            .child(engine_tile(e.id))
                             .child(
                                 div()
                                     .flex_1()
@@ -714,7 +770,7 @@ impl ModelLibrary {
                                     .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(e.name))
                                     .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(e.detail.clone())),
                             )
-                            .child(pill(engine_dot(e.state), capitalize(e.status_text()))),
+                            .child(state_pill(icon, color, fill, capitalize(e.status_text()))),
                     )
                     .child(
                         div()
@@ -725,9 +781,11 @@ impl ModelLibrary {
                                 div()
                                     .flex_1()
                                     .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis_middle()
                                     .text_size(px(size::XS))
                                     .text_color(Tokens::text_3())
-                                    .truncate()
                                     .child(match (&e.path, models) {
                                         (Some(p), Some(n)) => format!("{} · {n} model{} found", p.display(), if n == 1 { "" } else { "s" }),
                                         (Some(p), None) => p.display().to_string(),
@@ -749,7 +807,7 @@ impl ModelLibrary {
             .flex()
             .flex_col()
             .gap(px(16.))
-            .child(self.header("Downloads", "Get chat models from Hugging Face as GGUF files. Downloads resume if interrupted and land in the models folder.", cx))
+            .child(page_head(glyphs::DOWNLOAD, Hue::Green, "Get models", "Chat models from Hugging Face as GGUF files. Downloads resume if interrupted and land in the models folder."))
             .child(
                 surface()
                     .flex_row()
@@ -757,9 +815,9 @@ impl ModelLibrary {
                     .gap(px(12.))
                     .px(px(16.))
                     .py(px(12.))
-                    .child(tile("icons/audio-lines.svg", 28.))
-                    .child(div().flex_1().min_w_0().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Voices (Kokoro, Piper) are installed by Studio the first time you narrate a chapter."))
-                    .child(button("ml-dl-studio", "Open Studio", ButtonKind::Ghost).h(px(28.)).on_click(|_, window, cx| mv_ui::navigate(mv_ui::Route::Studio, window, cx))),
+                    .child(hero_tile(ph::WAVEFORM, Hue::Cyan, 32.))
+                    .child(div().flex_1().min_w_0().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Narration voices (Kokoro, Chatterbox, Piper) are set up in Settings → Audio."))
+                    .child(btn("ml-dl-audio", "Manage voices", ButtonKind::Secondary).small().icon(ph::WAVEFORM).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_audio(cx)))),
             )
             .child(div().flex_1().min_h(px(420.)).when_some(self.hub.clone(), |d, h| d.child(h)))
     }
@@ -767,29 +825,6 @@ impl ModelLibrary {
 
 impl Render for ModelLibrary {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let notice = self.notice.clone().map(|(text, error)| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .px(px(14.))
-                .py(px(9.))
-                .rounded(px(10.))
-                .bg(Tokens::surface())
-                .border_1()
-                .border_color(if error { rgba(0xf8717155) } else { rgba(0x2bd49a44) })
-                .child(div().flex_1().text_size(px(size::SM)).text_color(if error { Tokens::danger() } else { Tokens::text_2() }).child(text))
-                .child(
-                    div()
-                        .id("ml-notice-x")
-                        .cursor_pointer()
-                        .child(icon("icons/x.svg", Tokens::text_3(), 13.))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.notice = None;
-                            cx.notify();
-                        })),
-                )
-        });
         let downloads = self.page == Page::Downloads;
         let body = match self.page {
             Page::InUse => self.render_in_use(cx),
@@ -798,35 +833,49 @@ impl Render for ModelLibrary {
             Page::Engines => self.render_engines(cx),
             Page::Category(c) => self.render_category(c, cx),
         };
-        let inner = div()
-            .w_full()
-            .max_w(px(760.))
-            .when(downloads, |d| d.max_w(px(1200.)).h_full())
-            .px(px(32.))
-            .py(px(28.))
-            .flex()
-            .flex_col()
-            .gap(px(14.))
-            .when_some(notice, |d, n| d.child(n))
-            .child(body);
+        let inner = div().w_full().max_w(px(780.)).when(downloads, |d| d.max_w(px(1200.)).h_full()).px(px(32.)).py(px(28.)).flex().flex_col().gap(px(14.)).child(body);
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(self.render_subnav(cx))
-            .child(
-                div()
-                    .id("ml-content")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .when(!downloads, |d| d.overflow_y_scroll())
-                    .child(inner),
-            )
+            .child(div().id("ml-content").flex_1().min_w_0().h_full().when(!downloads, |d| d.overflow_y_scroll()).child(inner))
     }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Status pill whose text truncates (job status lines carry model names). The glyph is filled
+/// when something is chosen and bold when nothing is (Fluent 2: filled marks a chosen state).
+fn status_pill(icon: Ph, color: Rgba, fill: Rgba, text: String, chosen: bool) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .min_w_0()
+        .h(px(24.))
+        .px(px(9.))
+        .rounded(px(radius::PILL))
+        .bg(fill)
+        .text_size(px(size::SM))
+        .text_color(color)
+        .child(ph_icon(icon, if chosen { Weight::Fill } else { Weight::Bold }, color, icon_px::SM))
+        .child(div().min_w_0().truncate().child(text))
+}
+
+/// Shaped like a job card while the scan runs.
+fn skeleton_job() -> Div {
+    surface()
+        .p(px(18.))
+        .gap(px(14.))
+        .child(div().flex().items_center().gap(px(12.)).child(skeleton(px(36.), px(36.), radius::LG)).child(skeleton_line(px(180.))).child(div().flex_1()).child(skeleton(px(260.), px(32.), radius::MD)))
+        .child(skeleton(px(220.), px(24.), radius::PILL))
+        .child(mv_ui::skeleton_text(2))
+}
+
+fn skeleton_list() -> Div {
+    surface().px(px(10.)).py(px(6.)).children((0..4).map(|_| skeleton_row()))
+}
 
 fn thumb(m: &LocalModel, side: f32) -> AnyElement {
     match &m.thumbnail {
@@ -842,7 +891,7 @@ fn thumb(m: &LocalModel, side: f32) -> AnyElement {
             .into_any_element(),
         None => {
             let letter = m.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-            let hue = m.source as u8 as f32 * 47.0 + 190.0;
+            let hue = Hue::ALL[m.source as usize % Hue::ALL.len()];
             div()
                 .flex()
                 .flex_none()
@@ -850,36 +899,20 @@ fn thumb(m: &LocalModel, side: f32) -> AnyElement {
                 .justify_center()
                 .size(px(side))
                 .rounded(px(side * 0.25))
-                .bg(hsla((hue % 360.0) / 360.0, 0.28, 0.22, 1.0))
-                .border_1()
-                .border_color(Tokens::border())
+                .bg(Tokens::hue_soft(hue))
                 .text_size(px(side * 0.4))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(Tokens::text_1())
+                .text_color(Tokens::hue(hue))
                 .child(letter)
                 .into_any_element()
         }
     }
 }
 
-fn loading() -> Div {
-    div().py(px(40.)).flex().justify_center().text_size(px(size::SM)).text_color(Tokens::text_3()).child("Looking for models on this PC…")
-}
-
-fn empty(title: &str, body: &str) -> Div {
-    surface()
-        .items_center()
-        .justify_center()
-        .gap(px(6.))
-        .py(px(40.))
-        .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title.to_string()))
-        .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(body.to_string()))
-}
-
 fn empty_hint(c: Category) -> &'static str {
     match c {
         Category::Language => "Download a GGUF model, or install one with Ollama or LM Studio.",
-        Category::Voice => "Studio downloads Kokoro voices the first time you narrate.",
+        Category::Voice => "Download narration voices in Settings → Audio. They show up here once they are on this PC.",
         Category::Transcription => "Whisper models appear here once downloaded (for example by faster-whisper).",
         Category::Ocr => "PaddleOCR or manga-ocr models appear here after Studio installs them.",
         Category::ImageGen => "Install ComfyUI and download a checkpoint to see it here.",
@@ -890,7 +923,7 @@ fn empty_hint(c: Category) -> &'static str {
 
 fn not_used_reason(m: &LocalModel) -> &'static str {
     match (m.source, m.category) {
-        (Source::MangaVox, Category::Language) => "Add it to Ollama (Downloads) to chat with it",
+        (Source::MangaVox, Category::Language) => "Add it to Ollama (Get models) to chat with it",
         (Source::HuggingFace, Category::Language) => "Transformers format: MangaVox runs GGUF models",
         (_, Category::Audio) | (_, Category::Ocr) => "Used automatically by the tools that downloaded it",
         (Source::ComfyUi, _) => "Add-on used inside ComfyUI workflows",
@@ -908,21 +941,34 @@ fn use_label(job: Job) -> &'static str {
     }
 }
 
-fn engine_dot(s: EngineState) -> Rgba {
+/// (icon, colour, soft fill) for an engine state: status in words and shape, not colour alone.
+fn engine_state(s: EngineState) -> (Ph, Rgba, Rgba) {
     match s {
-        EngineState::Running | EngineState::Ready => Tokens::accent(),
-        EngineState::Stopped | EngineState::NeedsSetup => Tokens::text_3(),
-        EngineState::NotInstalled => Tokens::warning(),
+        EngineState::Running => (ph::PLAY_CIRCLE, Tokens::success(), Tokens::success_soft()),
+        EngineState::Ready => (ph::CHECK_CIRCLE, Tokens::success(), Tokens::success_soft()),
+        EngineState::Stopped => (ph::PAUSE_CIRCLE, Tokens::text_2(), Tokens::active()),
+        EngineState::NeedsSetup => (ph::WRENCH, Tokens::warning(), Tokens::warning_soft()),
+        EngineState::NotInstalled => (ph::DOWNLOAD_SIMPLE, Tokens::text_3(), Tokens::active()),
     }
 }
 
-fn engine_icon(id: EngineId) -> &'static str {
-    match id {
-        EngineId::Ollama => "icons/server.svg",
-        EngineId::LmStudio => "icons/boxes.svg",
-        EngineId::PythonTts => "icons/terminal.svg",
-        EngineId::Ffmpeg => "icons/film.svg",
-        EngineId::ComfyUi => "icons/wand-sparkles.svg",
+/// Engine tile: the vendor's mark where MangaVox ships one (Ollama, LM Studio), else a glyph.
+fn engine_tile(id: EngineId) -> Div {
+    let brand = match id {
+        EngineId::Ollama => Some("brand/ollama.svg"),
+        EngineId::LmStudio => Some("brand/lmstudio.svg"),
+        _ => None,
+    };
+    match brand {
+        Some(path) => div().flex().flex_none().items_center().justify_center().size(px(36.)).rounded(px(radius::LG)).bg(Tokens::surface_2()).border_1().border_color(Tokens::border()).child(icon(path, Tokens::text_1(), icon_px::LG)),
+        None => {
+            let (glyph, hue) = match id {
+                EngineId::PythonTts => (ph::WAVEFORM, Hue::Cyan),
+                EngineId::Ffmpeg => (glyphs::VIDEO, Hue::Violet),
+                _ => (ph::PAINT_BRUSH, Hue::Rose),
+            };
+            hero_tile(glyph, hue, 36.)
+        }
     }
 }
 

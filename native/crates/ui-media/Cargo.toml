@@ -12,4 +12,5 @@ mv-core = { path = "../mv-core" }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 futures = "0.3"
+chrono = "0.4"
 serde = { workspace = true }

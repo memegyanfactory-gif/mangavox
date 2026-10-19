@@ -15,6 +15,7 @@ pub mod service;
 pub mod setup;
 mod setup_view;
 mod side;
+mod widgets;
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {

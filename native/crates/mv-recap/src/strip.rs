@@ -236,7 +236,7 @@ mod tests {
     fn sliced_strip_is_recut_at_panel_gaps() {
         let dir = tempfile::tempdir().unwrap();
         // 600 rows sliced into 4 files of 150; the only real gap is rows 180-200 (inside file 2).
-        let full = strip_rows(600, &[180..200]);
+        let full = strip_rows(600, std::slice::from_ref(&(180..200)));
         let pages: Vec<PathBuf> = (0..4)
             .map(|n| {
                 let p = dir.path().join(format!("{n:03}.png"));

@@ -454,7 +454,7 @@ mod tests {
         assert!(!CliInfo { latest: None, ..i.clone() }.update_available());
         assert!(!CliInfo { installed: None, ..i }.update_available());
         for s in CLIS {
-            assert_eq!(s.update[0] == s.bin || s.update[0] == "npm", true, "{}", s.id);
+            assert!(s.update[0] == s.bin || s.update[0] == "npm", "{}", s.id);
             assert!(s.update.iter().all(|a| a.bytes().all(|b| b.is_ascii_alphanumeric() || b"-@./_".contains(&b))), "{}", s.id);
             assert_eq!(mv_ai::providers::cli::cli_binary(s.provider), Some(s.bin));
         }

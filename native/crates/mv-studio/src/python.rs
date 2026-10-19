@@ -261,7 +261,7 @@ pub fn requirement_names(text: &str) -> Vec<String> {
             continue;
         }
         let end = line
-            .find(|c: char| matches!(c, '=' | '<' | '>' | '!' | '~' | '[' | ';' | ' ' | '@'))
+            .find(['=', '<', '>', '!', '~', '[', ';', ' ', '@'])
             .unwrap_or(line.len());
         let name = line[..end].trim();
         if !name.is_empty() {

@@ -42,21 +42,25 @@ pub enum SortMode {
 }
 
 impl SortMode {
+    pub const ALL: [SortMode; 4] = [Self::Recent, Self::Title, Self::Unread, Self::Added];
+    /// Stored in the config as `librarySort`.
+    pub fn config(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Title => "title",
+            Self::Unread => "unread",
+            Self::Added => "added",
+        }
+    }
+    pub fn from_config(s: &str) -> Self {
+        Self::ALL.into_iter().find(|m| m.config() == s).unwrap_or(Self::Recent)
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Recent => "Last read",
             Self::Title => "Title",
             Self::Unread => "Unread count",
             Self::Added => "Date added",
-        }
-    }
-    /// Next mode in the sort cycle.
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Recent => Self::Title,
-            Self::Title => Self::Unread,
-            Self::Unread => Self::Added,
-            Self::Added => Self::Recent,
         }
     }
 }
@@ -138,17 +142,11 @@ pub fn keep_language<T>(items: Vec<T>, pref: &str, lang: impl Fn(&T) -> &str) ->
 }
 
 /// Chapter list options on the manga page.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ChapterView {
     pub unread_only: bool,
     pub downloaded_only: bool,
     pub newest_first: bool,
-}
-
-impl Default for ChapterView {
-    fn default() -> Self {
-        Self { unread_only: false, downloaded_only: false, newest_first: false }
-    }
 }
 
 /// Indices of `chapters` (ascending) to show, in display order.
@@ -453,6 +451,24 @@ impl Fit {
             Self::Original => "Original",
         }
     }
+    /// One-word label for the reader's segmented control.
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Screen => "Screen",
+            Self::Width => "Width",
+            Self::Original => "Original",
+        }
+    }
+}
+
+/// Whole chapter numbers skipped between two neighbours (Ch. 12 -> Ch. 14 skips 1). Decimals
+/// count by their whole part (12.5 -> 14 skips 13); unknown numbers never warn.
+/// Mihon's transition warning: <https://mihon.app/docs/guides/reader-settings>
+pub fn missing_between(a: Option<f64>, b: Option<f64>) -> usize {
+    match (a, b) {
+        (Some(a), Some(b)) if a.is_finite() && b.is_finite() => ((b.floor() - a.floor()).abs() as i64 - 1).max(0) as usize,
+        _ => 0,
+    }
 }
 
 /// Which third of the page a click landed in, in reading order: -1 previous, 0 menu, 1 next.
@@ -603,6 +619,16 @@ mod tests {
         for f in Fit::ALL {
             assert_eq!(Fit::from_config(f.config()), f);
         }
+        for s in SortMode::ALL {
+            assert_eq!(SortMode::from_config(s.config()), s);
+        }
+        assert_eq!(SortMode::from_config("nonsense"), SortMode::Recent);
+        assert_eq!(missing_between(Some(12.), Some(14.)), 1);
+        assert_eq!(missing_between(Some(14.), Some(12.)), 1);
+        assert_eq!(missing_between(Some(12.), Some(13.)), 0);
+        assert_eq!(missing_between(Some(12.5), Some(14.)), 1);
+        assert_eq!(missing_between(Some(12.), Some(12.5)), 0);
+        assert_eq!(missing_between(None, Some(9.)), 0);
         assert_eq!(tap_zone(10.0, 100.0, ReaderMode::Ltr), -1);
         assert_eq!(tap_zone(10.0, 100.0, ReaderMode::Rtl), 1);
         assert_eq!(tap_zone(50.0, 100.0, ReaderMode::Rtl), 0);

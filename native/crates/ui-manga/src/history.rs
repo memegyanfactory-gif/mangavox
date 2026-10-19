@@ -1,15 +1,23 @@
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::history::{self, ReadingHistory};
-use mv_ui::{button, icon, page_header, size, ButtonKind, CoverSource, Route, Tokens};
+use mv_ui::theme::radius;
+use mv_ui::toast::{self, Toast};
+use mv_ui::{btn, confirm_dialog, empty_view, error_view, glyphs, icon_button, muted, page_title, ph, size, skeleton, skeleton_line, ButtonKind, CoverSource, Interactive, Route, Tokens};
 
 use crate::backend;
 use crate::logic;
-use crate::ui::{error_view, icon_tip, muted, search_box, spawn_cover_downloads, state_view, Load};
+use crate::ui::{search_box, spawn_cover_downloads, thumb, Load};
+
+/// A removed entry stays in the database until its Undo toast has had its time.
+const UNDO_WINDOW: Duration = Duration::from_millis(6_500);
 
 pub struct HistoryPage {
     state: Load<Vec<ReadingHistory>>,
@@ -17,7 +25,8 @@ pub struct HistoryPage {
     scroll: ScrollHandle,
     query: String,
     input: Entity<InputState>,
-    confirm_clear: bool,
+    /// Entries removed in the UI (manga ids) whose delete waits for the Undo window.
+    hidden: HashSet<String>,
     seen_version: u64,
     _sub: Subscription,
 }
@@ -45,7 +54,7 @@ impl HistoryPage {
             scroll: ScrollHandle::new(),
             query: String::new(),
             input,
-            confirm_clear: false,
+            hidden: HashSet::new(),
             seen_version: backend::data_version(),
             _sub: sub,
         };
@@ -72,37 +81,89 @@ impl HistoryPage {
         .detach();
     }
 
-    fn remove(&mut self, manga_id: String, cx: &mut Context<Self>) {
-        if let Load::Ready(items) = &mut self.state {
-            items.retain(|h| h.manga_id != manga_id);
-        }
+    /// Hide the entry now and delete it after the Undo window. An Undo that comes later puts it
+    /// back at its chapter and page (as just read).
+    /// NN/g, undo for routine removals: https://www.nngroup.com/articles/confirmation-dialog/
+    fn remove(&mut self, h: &ReadingHistory, cx: &mut Context<Self>) {
+        let mid = h.manga_id.clone();
+        self.hidden.insert(mid.clone());
         cx.notify();
-        cx.spawn(async move |_, _| {
-            let _ = mv_ui::bg::blocking(move || backend::with_db(|c| history::remove(c, &manga_id))).await;
-        })
-        .detach();
+        let undone = Rc::new(Cell::new(false));
+        let committed = Rc::new(Cell::new(false));
+        {
+            let (undone, committed, mid) = (undone.clone(), committed.clone(), mid.clone());
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(UNDO_WINDOW).await;
+                if undone.get() {
+                    return;
+                }
+                committed.set(true);
+                let id = mid.clone();
+                let _ = mv_ui::bg::blocking(move || backend::with_db(|c| history::remove(c, &id))).await;
+                let _ = this.update(cx, |t, _| {
+                    t.hidden.remove(&mid);
+                    if let Load::Ready(items) = &mut t.state {
+                        items.retain(|h| h.manga_id != mid);
+                    }
+                });
+            })
+            .detach();
+        }
+        let weak = cx.entity().downgrade();
+        let (chapter, page) = (h.chapter_id.clone(), h.page);
+        toast::show(
+            cx,
+            Toast::success(format!("Removed {} from history", h.manga_title)).action("Undo", move |_, cx| {
+                undone.set(true);
+                let (m, c, weak) = (mid.clone(), chapter.clone(), weak.clone());
+                if !committed.get() {
+                    let _ = weak.update(cx, |t, cx| {
+                        t.hidden.remove(&m);
+                        cx.notify();
+                    });
+                    return;
+                }
+                // Already deleted: write the entry back, then re-read the list.
+                cx.spawn(async move |cx| {
+                    let _ = mv_ui::bg::blocking(move || backend::with_db(|conn| history::add(conn, &m, &c, page))).await;
+                    backend::bump_data();
+                    let _ = weak.update(cx, |_, cx| cx.notify());
+                })
+                .detach();
+            }),
+        );
     }
 
-    fn clear(&mut self, cx: &mut Context<Self>) {
-        if !self.confirm_clear {
-            self.confirm_clear = true;
-            cx.notify();
-            return;
-        }
-        self.confirm_clear = false;
-        self.state = Load::Ready(vec![]);
-        cx.notify();
-        cx.spawn(async move |_, _| {
-            let _ = mv_ui::bg::blocking(|| backend::with_db(|c| history::clear(c))).await;
+    fn clear(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        confirm_dialog(
+            "Clear reading history?",
+            format!("{} leave History. Your library, downloads and reading progress stay as they are.", if n == 1 { "1 title".to_string() } else { format!("All {n} titles") }),
+            "Clear history",
+            true,
+        )
+        .icon(ph::BROOM)
+        .cancel_label("Keep history")
+        .on_confirm(move |_, cx| {
+            let _ = weak.update(cx, |t, cx| {
+                t.state = Load::Ready(vec![]);
+                cx.notify();
+                cx.spawn(async move |_, _| {
+                    let _ = mv_ui::bg::blocking(|| backend::with_db(|c| history::clear(c))).await;
+                    backend::bump_data();
+                })
+                .detach();
+            });
+            toast::show(cx, Toast::success("Reading history cleared"));
         })
-        .detach();
+        .open(window, cx);
     }
 
     fn row(&self, h: &ReadingHistory, cx: &mut Context<Self>) -> Stateful<Div> {
         let resume = Route::Reader { manga_id: h.manga_id.clone(), chapter_id: h.chapter_id.clone() };
         let resume2 = resume.clone();
         let detail = Route::MangaDetail { manga_id: h.manga_id.clone(), source_id: Some(h.source_plugin.clone()) };
-        let mid = h.manga_id.clone();
+        let entry = h.clone();
         let ch = match (h.chapter_number, h.chapter_title.as_deref().map(str::trim).filter(|t| !t.is_empty())) {
             (Some(n), Some(t)) => format!("Ch. {} - {t}", logic::fmt_number(n)),
             (Some(n), None) => format!("Ch. {}", logic::fmt_number(n)),
@@ -111,6 +172,8 @@ impl HistoryPage {
         };
         let time = logic::local_time(&h.read_at).map(|t| t.format("%H:%M").to_string()).unwrap_or_default();
         let cover = h.cover_url.as_deref().and_then(|u| self.covers.get(u)).cloned().map(CoverSource::File);
+        // The whole row resumes reading; details and removal are explicit buttons.
+        // NN/g, visible affordances: https://www.nngroup.com/articles/tooltip-guidelines/
         div()
             .id(SharedString::from(format!("h-{}", h.id)))
             .flex()
@@ -118,31 +181,13 @@ impl HistoryPage {
             .gap(px(14.))
             .px(px(10.))
             .py(px(8.))
-            .rounded(px(10.))
-            .cursor_pointer()
+            .rounded(px(radius::LG))
+            .role(Role::Link)
+            .aria_label(SharedString::from(format!("Resume {} {ch}", h.manga_title)))
             .hover(|s| s.bg(Tokens::hover()))
+            .pressable()
             .on_click(move |_, w, cx| mv_ui::navigate(resume.clone(), w, cx))
-            .child(
-                div()
-                    .id(SharedString::from(format!("hc-{}", h.id)))
-                    .w(px(44.))
-                    .h(px(66.))
-                    .flex_none()
-                    .rounded(px(6.))
-                    .overflow_hidden()
-                    .bg(Tokens::surface_2())
-                    .border_1()
-                    .border_color(Tokens::border())
-                    .hover(|s| s.border_color(rgba(0xffffff40)))
-                    .map(|d| match cover {
-                        Some(c) => d.child(c.into_img().size_full().object_fit(ObjectFit::Cover)),
-                        None => d.flex().items_center().justify_center().child(icon("icons/book-open.svg", rgba(0xffffff1f), 18.)),
-                    })
-                    .on_click(move |_, w, cx| {
-                        cx.stop_propagation();
-                        mv_ui::navigate(detail.clone(), w, cx);
-                    }),
-            )
+            .child(thumb(cover, 44., 66.))
             .child(
                 div()
                     .flex_1()
@@ -164,15 +209,30 @@ impl HistoryPage {
                             .when(!time.is_empty(), |d| d.child("·").child(div().flex_none().child(time))),
                     ),
             )
-            .child(icon_tip(SharedString::from(format!("resume-{}", h.id)), "icons/play.svg", "Resume").on_click(move |_, w, cx| {
+            .child(icon_button(SharedString::from(format!("resume-{}", h.id)), ph::PLAY, "Resume").on_click(move |_, w, cx| {
                 cx.stop_propagation();
                 mv_ui::navigate(resume2.clone(), w, cx);
             }))
-            .child(icon_tip(SharedString::from(format!("rm-{}", h.id)), "icons/trash.svg", "Remove from history").on_click(cx.listener(move |this, _, _, cx| {
+            .child(icon_button(SharedString::from(format!("info-{}", h.id)), ph::INFO, "Title details and chapters").on_click(move |_, w, cx| {
                 cx.stop_propagation();
-                this.remove(mid.clone(), cx);
+                mv_ui::navigate(detail.clone(), w, cx);
+            }))
+            .child(icon_button(SharedString::from(format!("rm-{}", h.id)), ph::X, "Remove from history").on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.remove(&entry, cx);
             })))
     }
+}
+
+fn row_skeleton() -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(14.))
+        .px(px(10.))
+        .py(px(8.))
+        .child(skeleton(px(44.), px(66.), radius::SM))
+        .child(div().flex().flex_col().gap(px(8.)).flex_1().child(skeleton_line(px(220.))).child(skeleton_line(px(140.)).h(px(10.))))
 }
 
 impl Render for HistoryPage {
@@ -182,47 +242,43 @@ impl Render for HistoryPage {
             self.seen_version = v;
             self.reload(cx);
         }
-        let has_items = matches!(&self.state, Load::Ready(i) if !i.is_empty());
-        let count = match &self.state {
-            Load::Ready(i) if !i.is_empty() => Some(SharedString::from(format!("{} titles", i.len()))),
-            _ => None,
+        let visible: Vec<&ReadingHistory> = match &self.state {
+            Load::Ready(i) => i.iter().filter(|h| !self.hidden.contains(&h.manga_id)).collect(),
+            _ => vec![],
         };
-        let header = div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(div().flex_1().min_w_0().child(page_header("History", count)))
-            .when(has_items, |d| {
-                d.child(div().mb(px(20.)).child(search_box(&self.input))).child(
-                    div().mb(px(20.)).child(
-                        button("clear", if self.confirm_clear { "Click again to clear" } else { "Clear all" }, ButtonKind::Ghost)
-                            .when(self.confirm_clear, |d| d.text_color(Tokens::danger()))
-                            .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
-                    ),
-                )
+        let n = visible.len();
+        let has_items = n > 0;
+        let header = page_title("History")
+            .icon(glyphs::HISTORY)
+            .when(has_items, |h| h.subtitle(if n == 1 { "1 title".to_string() } else { format!("{n} titles") }))
+            .when(has_items, |h| {
+                h.action(search_box(&self.input))
+                    .action(btn("clear", "Clear history", ButtonKind::Ghost).icon(ph::BROOM).tooltip("Remove every title from History").on_click(cx.listener(move |this, _, w, cx| this.clear(n, w, cx))))
             });
         let body: AnyElement = match &self.state {
-            Load::Loading => div()
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .children((0..6).map(|_| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(14.))
-                        .px(px(10.))
-                        .child(div().w(px(44.)).h(px(66.)).rounded(px(6.)).bg(Tokens::surface_2()))
-                        .child(div().flex().flex_col().gap(px(6.)).child(div().w(px(220.)).h(px(12.)).rounded(px(4.)).bg(Tokens::surface_2())).child(div().w(px(140.)).h(px(10.)).rounded(px(4.)).bg(Tokens::surface_2())))
+            Load::Loading => div().flex().flex_col().gap(px(4.)).children((0..6).map(|_| row_skeleton())).into_any_element(),
+            Load::Failed(e) => error_view(e.clone())
+                .title("Could not open History")
+                .retry(cx.listener(|this, _, _, cx| {
+                    this.state = Load::Loading;
+                    this.reload(cx);
+                    cx.notify();
                 }))
                 .into_any_element(),
-            Load::Failed(e) => error_view(e.clone()).into_any_element(),
-            Load::Ready(items) if items.is_empty() => state_view("icons/clock.svg", "Nothing read yet", "Chapters you open in the reader show up here.").into_any_element(),
-            Load::Ready(items) => {
+            Load::Ready(_) if !has_items => empty_view(glyphs::HISTORY, "Nothing read yet", "Chapters you open in the reader show up here, so you can pick up where you left off.")
+                .action(btn("go-library", "Open Library", ButtonKind::Primary).icon(glyphs::LIBRARY).on_click(|_, w, cx| mv_ui::navigate(Route::Library, w, cx)))
+                .into_any_element(),
+            Load::Ready(_) => {
                 let q = self.query.trim().to_lowercase();
-                let shown: Vec<&ReadingHistory> = items.iter().filter(|h| q.is_empty() || h.manga_title.to_lowercase().contains(&q)).collect();
+                let shown: Vec<&ReadingHistory> = visible.iter().copied().filter(|h| q.is_empty() || h.manga_title.to_lowercase().contains(&q)).collect();
                 if shown.is_empty() {
-                    state_view("icons/search.svg", "No matches", "Nothing in your history matches this search.").into_any_element()
+                    empty_view(glyphs::SEARCH, "No matches", "Nothing in your history matches this search.")
+                        .action(btn("clear-search", "Clear search", ButtonKind::Secondary).icon(ph::X).on_click(cx.listener(|this, _, w, cx| {
+                            this.query.clear();
+                            this.input.update(cx, |s, cx| s.set_value("", w, cx));
+                            cx.notify();
+                        })))
+                        .into_any_element()
                 } else {
                     let today = chrono::Local::now().date_naive();
                     let mut col = div().flex().flex_col();

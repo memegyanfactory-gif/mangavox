@@ -12,7 +12,7 @@ struct Host {
 
 impl Render for Host {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().flex().flex_col().bg(rgb(0x0b0d10)).child(TitleBar::new().child("MangaVox")).child(div().flex_1().min_h_0().child(self.page.clone()))
+        div().size_full().flex().flex_col().bg(mv_ui::Tokens::base()).child(TitleBar::new().child("MangaVox")).child(div().flex_1().min_h_0().child(self.page.clone()))
     }
 }
 
@@ -20,9 +20,10 @@ fn main() {
     let arg = |i: usize, default: &str| std::env::args().nth(i).unwrap_or_else(|| default.to_string());
     let (source, title, imdb) = (arg(1, SAMPLE), arg(2, "Sintel"), arg(3, "tt1727587"));
     let http = reqwest_client::ReqwestClient::user_agent("Mozilla/5.0 MangaVox-dev").expect("http client");
-    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).with_http_client(std::sync::Arc::new(http)).run(move |cx| {
+    gpui_kit::application().with_assets(mv_ui::Assets).with_http_client(std::sync::Arc::new(http)).run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
+        mv_ui::theme::init(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         gpui_kit::open_window(
             WindowOptions {

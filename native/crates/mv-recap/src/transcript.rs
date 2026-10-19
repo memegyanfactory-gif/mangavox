@@ -61,6 +61,7 @@ pub fn update_transcript(ch: &ChapterRef, read: &ChapterRead) -> Result<Transcri
 const REWRITE_SYSTEM: &str = "You are a careful script editor for a manga recap video. You are given ONE manga page image and its current transcript text (dialogue the narrator will work from). Apply the user's instruction to the transcript of this page and reply with the new page text ONLY: plain text, one balloon per line in the same `Speaker: text` format, no JSON, no markdown, no explanations, no quotes around the answer. Look at the image to verify who speaks and what is said; use the character names from the roster; never invent dialogue that is not on the page unless the instruction asks for it. Do not run commands or open other files.";
 
 /// Ask the model to fix / reword / re-attribute one page of the transcript (the page image is attached).
+#[allow(clippy::too_many_arguments)] // each is one independent input of the request
 pub async fn rewrite_page(
     reg: Arc<Registry>,
     model: ModelChoice,
@@ -74,6 +75,7 @@ pub async fn rewrite_page(
     rewrite_page_with(&reg, &model, &ch, page_index, &current_text, &instruction, &brain_snapshot, &cancel).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn rewrite_page_with(
     llm: &dyn Llm,
     model: &ModelChoice,

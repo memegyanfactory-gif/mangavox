@@ -95,6 +95,50 @@ impl Tokens {
         let base = palette().base;
         linear_gradient(angle, linear_color_stop(base.alpha(0.), 0.), linear_color_stop(base, 1.))
     }
+
+    /// A categorical colour (icon tiles, storage segments, chart series). Same in every preset.
+    pub fn hue(h: Hue) -> Rgba {
+        rgb(h.hex())
+    }
+
+    /// 14% tint of a hue, for the tile behind a hue-coloured icon.
+    pub fn hue_soft(h: Hue) -> Rgba {
+        a8(rgb(h.hex()), SOFT)
+    }
+}
+
+/// Categorical hues for telling things apart (Settings rail tiles, storage categories, chart
+/// series), never for status. All from the Tailwind 400 tier, the lightness the status colours
+/// use, so each reaches 3:1 on every surface (WCAG 1.4.11) and dark text reads on a hue fill.
+/// Carbon data-vis palette guidance: <https://carbondesignsystem.com/data-visualization/color-palettes/>
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hue {
+    Blue,
+    Violet,
+    Cyan,
+    Green,
+    Amber,
+    Orange,
+    Rose,
+    Slate,
+}
+
+impl Hue {
+    /// Every hue, in the order to hand them out.
+    pub const ALL: [Hue; 8] = [Hue::Blue, Hue::Violet, Hue::Cyan, Hue::Green, Hue::Amber, Hue::Orange, Hue::Rose, Hue::Slate];
+
+    fn hex(self) -> u32 {
+        match self {
+            Hue::Blue => 0x60a5fa,
+            Hue::Violet => 0xa78bfa,
+            Hue::Cyan => 0x22d3ee,
+            Hue::Green => 0x4ade80,
+            Hue::Amber => 0xfbbf24,
+            Hue::Orange => 0xfb923c,
+            Hue::Rose => 0xfb7185,
+            Hue::Slate => 0x94a3b8,
+        }
+    }
 }
 
 /// One Settings → Appearance preset: id, copy and the three swatch colours (base, accent, secondary).
@@ -634,6 +678,22 @@ mod tests {
             }
             let r = contrast(p.on_accent, p.accent);
             assert!(r >= 4.5, "{id}: on_accent on accent is {r:.2}:1");
+        }
+    }
+
+    /// Hues are non-text indicators (3:1 on every surface) and carry dark text (4.5:1).
+    #[test]
+    fn hues_read_on_every_surface() {
+        for (id, p) in all() {
+            for h in super::Hue::ALL {
+                let c = super::rgb(h.hex());
+                for (name, bg) in surfaces(&p) {
+                    let r = contrast(c, bg);
+                    assert!(r >= 3., "{id}: {h:?} on {name} is {r:.2}:1");
+                }
+                let r = contrast(p.base, c);
+                assert!(r >= 4.5, "{id}: base text on {h:?} is {r:.2}:1");
+            }
         }
     }
 

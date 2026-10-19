@@ -7,7 +7,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::controls::{btn, ButtonKind, ClickHandler};
+use crate::controls::{btn, ButtonKind, ClickHandler, FlagHandler, IndexHandler, WindowHandler};
 use crate::icons::{ph, Ph, Weight};
 use crate::interact::{element_builder, glyph, refine, render_once_element, tip, IconSrc, Interactive};
 use crate::motion::{appear, shimmer, spinner};
@@ -459,6 +459,56 @@ pub fn meter(value: f32, max: usize) -> Div {
     div().flex().flex_none().items_center().gap(px(2.)).children((0..max).map(|i| div().w(px(10.)).h(px(4.)).rounded_full().bg(if i < lit { Tokens::accent() } else { Tokens::active() })))
 }
 
+/// Stacked usage bar (Storage): one segment per `(amount, colour)`, each sized by its share of
+/// `total` (or of the sum, when that is larger), on a quiet 8px track (free space). Use
+/// `Tokens::hue(..)` for the colours and name each segment in a legend next to it.
+/// Apple HIG charts (part-to-whole): <https://developer.apple.com/design/human-interface-guidelines/charts>
+pub fn usage_bar(segments: &[(f32, Rgba)], total: f32) -> Div {
+    let shares = usage_shares(&segments.iter().map(|s| s.0).collect::<Vec<_>>(), total);
+    div()
+        .flex()
+        .w_full()
+        .h(px(8.))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(Tokens::active())
+        .children(segments.iter().zip(shares).filter(|(_, w)| *w > 0.).map(|((_, color), w)| div().flex_none().h_full().w(relative(w)).bg(*color)))
+}
+
+/// Each amount's share of `total` (or of the sum when larger), so the shares never add up past 1.
+pub(crate) fn usage_shares(amounts: &[f32], total: f32) -> Vec<f32> {
+    let clean: Vec<f32> = amounts.iter().map(|a| if a.is_finite() { a.max(0.) } else { 0. }).collect();
+    let whole = clean.iter().sum::<f32>().max(if total.is_finite() { total } else { 0. });
+    clean.into_iter().map(|a| if whole > 0. { a / whole } else { 0. }).collect()
+}
+
+/// Score with a filled gold star: "★ 8.4". `icon_size` 14 for cards and rows, 16 to 20 on detail
+/// pages; the number follows at a matching size in `text_1`, semibold.
+pub fn rating_badge(score: f32, icon_size: f32) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px((icon_size / 4.).round().max(3.)))
+        .text_size(px((icon_size - 1.).max(size::XS)))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(Tokens::text_1())
+        .whitespace_nowrap()
+        .child(glyph(IconSrc::Ph(ph::STAR), Weight::Fill, Tokens::rating(), icon_size))
+        .child(fmt_score(score))
+}
+
+/// "8.4" for a 0-10 score, "86" for a 0-100 one, "–" when unknown.
+pub(crate) fn fmt_score(score: f32) -> String {
+    if !score.is_finite() || score < 0. {
+        "–".into()
+    } else if score > 10. {
+        format!("{}", score.round() as u32)
+    } else {
+        format!("{score:.1}")
+    }
+}
+
 /// Determinate circular progress, 20px. For an unknown duration use [`crate::spinner`].
 pub fn progress_ring(p: f32) -> AnyElement {
     progress_ring_sized(p, 20.)
@@ -589,7 +639,7 @@ pub struct Stepper {
     failed: Option<usize>,
     tooltips: Vec<SharedString>,
     compact: bool,
-    on_select: Option<Rc<dyn Fn(&usize, &mut Window, &mut App)>>,
+    on_select: Option<IndexHandler>,
 }
 
 element_builder!(Stepper => Stateful<Div>);
@@ -697,7 +747,7 @@ pub struct Disclosure {
     trailing: Option<AnyElement>,
     default_open: bool,
     open: Option<bool>,
-    on_toggle: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
+    on_toggle: Option<FlagHandler>,
 }
 
 render_once_element!(Disclosure);
@@ -847,8 +897,6 @@ impl ConfirmInline {
     }
 }
 
-type WindowHandler = Rc<dyn Fn(&mut Window, &mut App)>;
-
 /// Modal confirmation on the gpui-component `Dialog`: title, one sentence of consequence and two
 /// outcome-labelled buttons ("Delete chat" / "Keep"), Cancel first, the confirming button last.
 /// Nothing is focused when it opens and, when `danger`, Enter does not confirm, so a stray key
@@ -948,7 +996,23 @@ impl ConfirmDialog {
 
 #[cfg(test)]
 mod tests {
-    use super::{connector_state, count_text, step_state, Connector, StepState};
+    use super::{connector_state, count_text, fmt_score, step_state, usage_shares, Connector, StepState};
+
+    #[test]
+    fn usage_shares_never_overflow() {
+        assert_eq!(usage_shares(&[25., 25.], 100.), vec![0.25, 0.25]);
+        // More used than the stated total: shares of the sum instead.
+        assert_eq!(usage_shares(&[60., 60.], 100.), vec![0.5, 0.5]);
+        assert_eq!(usage_shares(&[0., f32::NAN, -3.], 0.), vec![0., 0., 0.]);
+    }
+
+    #[test]
+    fn scores_read_naturally() {
+        assert_eq!(fmt_score(8.43), "8.4");
+        assert_eq!(fmt_score(10.), "10.0");
+        assert_eq!(fmt_score(86.4), "86");
+        assert_eq!(fmt_score(f32::NAN), "–");
+    }
 
     #[test]
     fn step_state_precedence() {

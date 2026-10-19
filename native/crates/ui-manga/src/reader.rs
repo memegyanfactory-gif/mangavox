@@ -4,38 +4,49 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
+use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::chapter::{self, Chapter};
 use mv_core::repo::manga;
-use mv_ui::{button, icon, size, ButtonKind, Route, Tokens};
+use mv_ui::theme::{icon as icon_px, radius, ramp};
+use mv_ui::{
+    btn, error_view, glyphs, icon_button, icon_ph, icon_tag, kbd, muted, ph, ph_icon, progress_ring_sized, segmented, shimmer_text, size, spinner, tip, tip_kbd, ButtonKind, Ph,
+    RampExt, Route, Tokens, Tone, Weight,
+};
 
 use crate::backend;
+use crate::downloads::{downloads, ChapterDl, Downloads, Job};
 use crate::logic::{self, Fit, ReaderMode};
 use crate::store;
-use crate::ui::{muted, spinner, Load};
+use crate::ui::{fill_menu, icon_trigger, Entry, Load};
 
 const MAX_INFLIGHT: usize = 3;
 const STRIP_WIDTH: f32 = 860.0;
+/// Widest a fit-width page gets in paged mode.
+const PAGED_WIDTH: f32 = 1100.0;
 /// Overlay hides after this long without activity near the bars.
 const OVERLAY_IDLE: Duration = Duration::from_millis(2600);
 /// Mouse within this distance of the top / bottom edge reveals the overlay.
 const EDGE_TOP: f32 = 72.0;
-const EDGE_BOTTOM: f32 = 120.0;
+const EDGE_BOTTOM: f32 = 140.0;
+/// Paged-mode zoom range and button step.
+const MAX_ZOOM: f32 = 4.0;
+const ZOOM_STEP: f32 = 1.25;
 
 #[derive(Clone)]
 enum PageState {
     Idle,
     Loading,
-    /// The file and its width / height ratio (when the header could be read).
-    Ready(PathBuf, Option<f32>),
+    /// The file and its pixel size (when the header could be read).
+    Ready(PathBuf, Option<(f32, f32)>),
     Failed(String),
 }
 
-/// Width / height of an image file, read from its header only.
-fn aspect(path: &Path) -> Option<f32> {
+/// Pixel width and height of an image file, read from its header only.
+fn dims(path: &Path) -> Option<(f32, f32)> {
     let s = imagesize::size(path).ok()?;
-    (s.width > 0 && s.height > 0).then(|| s.width as f32 / s.height as f32)
+    (s.width > 0 && s.height > 0).then_some((s.width as f32, s.height as f32))
 }
 
 struct PageEntry {
@@ -89,7 +100,7 @@ async fn load_chapter(chapter_id: String, at_end: bool) -> Result<Loaded> {
     let source = if ch.source_plugin.is_empty() { m.source_plugin.clone() } else { ch.source_plugin.clone() };
     let local = local_pages(&ch);
     let pages: Vec<PageEntry> = if !local.is_empty() {
-        local.into_iter().map(|p| PageEntry { url: String::new(), state: PageState::Ready(p.clone(), aspect(&p)) }).collect()
+        local.into_iter().map(|p| PageEntry { url: String::new(), state: PageState::Ready(p.clone(), dims(&p)) }).collect()
     } else {
         let src = backend::source(&source).await?;
         let urls = src.get_page_urls(&ch.source_id).await.map_err(|e| anyhow!("{e}"))?;
@@ -113,6 +124,41 @@ fn bounds_probe(cell: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
     canvas(move |b, _, _| cell.set(b), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
 }
 
+fn mode_icon(m: ReaderMode) -> Ph {
+    match m {
+        ReaderMode::Ltr => ph::ARROW_LINE_RIGHT,
+        ReaderMode::Rtl => ph::ARROW_LINE_LEFT,
+        ReaderMode::Strip => ph::ROWS,
+    }
+}
+
+fn fit_icon(f: Fit) -> Ph {
+    match f {
+        Fit::Screen => ph::FRAME_CORNERS,
+        Fit::Width => ph::ARROWS_LEFT_RIGHT,
+        Fit::Original => ph::ARROWS_OUT_SIMPLE,
+    }
+}
+
+/// Every reader shortcut, for the help panel (key, what it does).
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("right", "Next page (previous in right-to-left)"),
+    ("left", "Previous page (next in right-to-left)"),
+    ("space", "Next page; Shift+Space goes back"),
+    ("home", "First page"),
+    ("end", "Last page"),
+    ("n", "Next chapter"),
+    ("p", "Previous chapter"),
+    ("m", "Change reading mode"),
+    ("f", "Change page fit"),
+    ("=", "Zoom in (or Ctrl + mouse wheel, or double-click the middle)"),
+    ("-", "Zoom out"),
+    ("0", "Reset zoom"),
+    ("f11", "Full screen"),
+    ("?", "Show these shortcuts"),
+    ("escape", "Close, unzoom or go back"),
+];
+
 pub struct ReaderPage {
     manga_id: String,
     title: String,
@@ -130,7 +176,7 @@ pub struct ReaderPage {
     focus: FocusHandle,
     /// Long-strip scroll position (one child per page).
     strip_scroll: ScrollHandle,
-    /// Paged mode scroll (fit width / original size pages can be taller than the window).
+    /// Paged mode scroll (fit width / original size / zoomed pages can be larger than the window).
     page_scroll: ScrollHandle,
     overlay: bool,
     last_activity: Instant,
@@ -139,12 +185,37 @@ pub struct ReaderPage {
     root_bounds: Rc<Cell<Bounds<Pixels>>>,
     slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     dragging: bool,
+    /// Paged-mode zoom, 1 = the chosen fit.
+    zoom: f32,
+    /// Drag-to-pan while zoomed: pointer position and scroll offset at the press.
+    pan: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// The press became a drag, so its click must not turn the page.
+    panned: bool,
+    show_keys: bool,
+    /// The chapter list menu is open (its pointer is outside the bars, so they must not hide).
+    menu_open: bool,
+    /// Keyboard focus is on a control inside the reader (a bar button reached with Tab); hiding
+    /// the bars would drop that focus and with it every reader shortcut.
+    focus_inside: bool,
+    queue: Entity<Downloads>,
+    /// The open chapter was queued or downloading at the last queue change.
+    dl_pending: bool,
+    _watch: Subscription,
 }
 
 impl ReaderPage {
     pub fn new(manga_id: String, chapter_id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        let queue = downloads(cx);
+        let watch = cx.observe(&queue, |this, q, cx| {
+            let pending = this.chapter.as_ref().is_some_and(|c| q.read(cx).status(&c.id).is_some());
+            if this.dl_pending && !pending {
+                this.refresh_download_state(cx);
+            }
+            this.dl_pending = pending;
+            cx.notify();
+        });
         let mut p = Self {
             manga_id,
             title: String::new(),
@@ -168,6 +239,15 @@ impl ReaderPage {
             root_bounds: Rc::new(Cell::new(Bounds::default())),
             slider_bounds: Rc::new(Cell::new(Bounds::default())),
             dragging: false,
+            zoom: 1.0,
+            pan: None,
+            panned: false,
+            show_keys: false,
+            menu_open: false,
+            focus_inside: false,
+            queue,
+            dl_pending: false,
+            _watch: watch,
         };
         p.open_chapter(chapter_id, false, cx);
         p.show_overlay(cx);
@@ -178,6 +258,12 @@ impl ReaderPage {
         self.mode == ReaderMode::Strip
     }
 
+    /// Kit controls do not take focus on a mouse press, so every bar control hands it back to
+    /// the reader explicitly to keep its keyboard shortcuts working.
+    fn refocus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus, cx);
+    }
+
     fn open_chapter(&mut self, chapter_id: String, at_end: bool, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
@@ -185,6 +271,7 @@ impl ReaderPage {
         self.inflight = 0;
         self.current = 0;
         self.transition = None;
+        self.zoom = 1.0;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = mv_ui::bg::run(load_chapter(chapter_id, at_end)).await.and_then(|r| r);
@@ -198,6 +285,7 @@ impl ReaderPage {
                         this.source = l.source;
                         this.chapters = l.chapters;
                         this.current = l.start;
+                        this.dl_pending = this.queue.read(cx).status(&l.chapter.id).is_some();
                         this.chapter = Some(l.chapter);
                         this.pages = Load::Ready(l.pages);
                         this.page_scroll.set_offset(point(px(0.), px(0.)));
@@ -211,6 +299,23 @@ impl ReaderPage {
                     Err(e) => this.pages = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Re-read the open chapter's download state after its download finished.
+    fn refresh_download_state(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.chapter.as_ref().map(|c| c.id.clone()) else { return };
+        cx.spawn(async move |this, cx| {
+            let cid = id.clone();
+            let fresh = mv_ui::bg::blocking(move || backend::with_db(|c| chapter::get(c, &cid))).await.ok().and_then(|r| r.ok()).flatten();
+            let _ = this.update(cx, |this, cx| {
+                if let (Some(f), Some(c)) = (fresh, this.chapter.as_mut().filter(|c| c.id == id)) {
+                    c.download_status = f.download_status;
+                    c.pages_dir = f.pages_dir;
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -252,7 +357,7 @@ impl ReaderPage {
             self.inflight += 1;
             let (url, src, generation) = (pages[i].url.clone(), self.source.clone(), self.generation);
             cx.spawn(async move |this, cx| {
-                let res = mv_ui::bg::run(async move { backend::download_page(url, Some(src)).await.map(|p| { let r = aspect(&p); (p, r) }) }).await.and_then(|r| r);
+                let res = mv_ui::bg::run(async move { backend::download_page(url, Some(src)).await.map(|p| { let d = dims(&p); (p, d) }) }).await.and_then(|r| r);
                 let _ = this.update(cx, |this, cx| {
                     if this.generation != generation {
                         return;
@@ -260,7 +365,7 @@ impl ReaderPage {
                     this.inflight = this.inflight.saturating_sub(1);
                     if let Load::Ready(pages) = &mut this.pages {
                         pages[i].state = match res {
-                            Ok((p, r)) => PageState::Ready(p, r),
+                            Ok((p, d)) => PageState::Ready(p, d),
                             Err(e) => PageState::Failed(format!("{e:#}")),
                         };
                     }
@@ -280,6 +385,7 @@ impl ReaderPage {
             return;
         }
         self.current = page;
+        self.zoom = 1.0;
         self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.save(cx);
         self.pump(cx);
@@ -386,6 +492,7 @@ impl ReaderPage {
         }
         self.mode = mode;
         self.transition = None;
+        self.zoom = 1.0;
         backend::set_config_str("readerMode", mode.config());
         if mode == ReaderMode::Strip {
             self.strip_scroll.scroll_to_top_of_item(self.current);
@@ -396,9 +503,64 @@ impl ReaderPage {
 
     fn set_fit(&mut self, fit: Fit, cx: &mut Context<Self>) {
         self.fit = fit;
+        self.zoom = 1.0;
         backend::set_config_str("readerFit", fit.config());
         self.page_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
+    }
+
+    // ------------------------------------------------------------ zoom
+
+    /// Size of the current page box at zoom 1 for the chosen fit (window pixels).
+    fn zoom_base(&self) -> (f32, f32) {
+        let b = self.root_bounds.get();
+        let (vw, vh) = (f32::from(b.size.width).max(1.), f32::from(b.size.height).max(1.));
+        let px_dims = match &self.pages {
+            Load::Ready(p) => match p.get(self.current).map(|e| &e.state) {
+                Some(PageState::Ready(_, d)) => *d,
+                _ => None,
+            },
+            _ => None,
+        };
+        match (self.fit, px_dims) {
+            (Fit::Screen, _) => (vw, vh),
+            (Fit::Width, Some((w, h))) => {
+                let bw = vw.min(PAGED_WIDTH);
+                (bw, bw * h / w)
+            }
+            (Fit::Width, None) => (vw.min(PAGED_WIDTH), vh),
+            (Fit::Original, Some(d)) => d,
+            (Fit::Original, None) => (vw, vh),
+        }
+    }
+
+    /// Zoom paged mode to `z`, keeping the point under `anchor` (window coordinates; the centre
+    /// when `None`) where it is. Mihon reader settings (double tap to zoom): https://mihon.app/docs/guides/reader-settings
+    fn set_zoom(&mut self, z: f32, anchor: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let z = z.clamp(1., MAX_ZOOM);
+        if self.strip() || self.transition.is_some() || (z - self.zoom).abs() < 0.001 {
+            return;
+        }
+        let b = self.root_bounds.get();
+        let p = anchor.map(|a| a - b.origin).unwrap_or(point(b.size.width / 2., b.size.height / 2.));
+        let (bw, bh) = self.zoom_base();
+        let (z0, off) = (self.zoom, self.page_scroll.offset());
+        let axis = |p: Pixels, off: Pixels, base: f32, view: Pixels| -> Pixels {
+            let (p, off, v) = (f32::from(p), f32::from(off), f32::from(view));
+            let (s0, s1) = (base * z0, base * z);
+            let (o0, o1) = (((v - s0) / 2.).max(0.), ((v - s1) / 2.).max(0.));
+            let c = (p - off - o0) / z0;
+            px((p - o1 - c * z).min(0.).max(-(s1 - v).max(0.)))
+        };
+        self.page_scroll.set_offset(point(axis(p.x, off.x, bw, b.size.width), axis(p.y, off.y, bh, b.size.height)));
+        self.zoom = z;
+        cx.notify();
+    }
+
+    fn zoom_by(&mut self, factor: f32, anchor: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let z = self.zoom * factor;
+        // Snap back to exactly 1 near the bottom of the range.
+        self.set_zoom(if z < 1.05 { 1. } else { z }, anchor, cx);
     }
 
     // ------------------------------------------------------------ overlay
@@ -414,7 +576,7 @@ impl ReaderPage {
                 cx.background_executor().timer(Duration::from_millis(400)).await;
                 let done = this
                     .update(cx, |t, cx| {
-                        let keep = t.over_bars || t.dragging || !matches!(t.pages, Load::Ready(_)) || t.transition.is_some();
+                        let keep = t.over_bars || t.dragging || t.show_keys || t.menu_open || t.focus_inside || !matches!(t.pages, Load::Ready(_)) || t.transition.is_some();
                         if keep {
                             t.last_activity = Instant::now();
                         }
@@ -438,8 +600,17 @@ impl ReaderPage {
     fn hide_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay = false;
         self.over_bars = false;
+        self.menu_open = false;
         self.hide_task = None;
         cx.notify();
+    }
+
+    fn toggle_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.overlay {
+            self.hide_overlay(cx)
+        } else {
+            self.show_overlay(cx)
+        }
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -448,6 +619,18 @@ impl ReaderPage {
                 self.slide_to(ev.position.x, cx);
             } else {
                 self.dragging = false;
+            }
+        }
+        if let Some((start, off)) = self.pan {
+            if ev.pressed_button == Some(MouseButton::Left) {
+                let d = ev.position - start;
+                if f32::from(d.x).abs() + f32::from(d.y).abs() > 3. {
+                    self.panned = true;
+                }
+                self.page_scroll.set_offset(off + d);
+                cx.notify();
+            } else {
+                self.pan = None;
             }
         }
         let b = self.root_bounds.get();
@@ -463,20 +646,26 @@ impl ReaderPage {
     }
 
     /// Click on the page: left / right thirds turn pages (mirrored for right-to-left), the middle
-    /// toggles the overlay. The overlay bars sit above this area and swallow their own clicks.
-    fn on_page_click(&mut self, ev: &ClickEvent, cx: &mut Context<Self>) {
+    /// toggles the overlay, and a double-click in the middle zooms in on that spot. While zoomed a
+    /// drag pans and a click only toggles the overlay. The bars swallow their own clicks.
+    fn on_page_click(&mut self, ev: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.refocus(window, cx);
+        if std::mem::take(&mut self.panned) {
+            return;
+        }
         let b = self.root_bounds.get();
-        let zone = if self.strip() { 0 } else { logic::tap_zone(f32::from(ev.position().x - b.left()), f32::from(b.size.width), self.mode) };
+        let zoomed = self.zoom > 1.;
+        let zone = if self.strip() || zoomed { 0 } else { logic::tap_zone(f32::from(ev.position().x - b.left()), f32::from(b.size.width), self.mode) };
+        if ev.click_count() == 2 && zone == 0 && !self.strip() && self.transition.is_none() {
+            // The first click of the pair toggled the overlay: put it back, then zoom.
+            self.toggle_overlay(cx);
+            self.set_zoom(if zoomed { 1. } else { 2. }, ev.mouse_position(), cx);
+            return;
+        }
         match zone {
             -1 => self.prev(cx),
             1 => self.next(cx),
-            _ => {
-                if self.overlay {
-                    self.hide_overlay(cx)
-                } else {
-                    self.show_overlay(cx)
-                }
-            }
+            _ => self.toggle_overlay(cx),
         }
     }
 
@@ -500,7 +689,16 @@ impl ReaderPage {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let rtl = self.mode == ReaderMode::Rtl;
+        // A bar control reached with Tab takes Space as its own click (GPUI fires it on key up),
+        // so the page must not turn as well.
+        let on_control = !self.focus.is_focused(window);
         match k.key.as_str() {
+            "space" if on_control => {}
+            "escape" if self.show_keys => {
+                self.show_keys = false;
+                cx.notify();
+            }
+            "escape" if self.zoom > 1. => self.set_zoom(1., None, cx),
             "escape" => mv_ui::navigate(Route::Back, window, cx),
             "right" if rtl => self.prev(cx),
             "left" if rtl => self.next(cx),
@@ -526,8 +724,22 @@ impl ReaderPage {
             "p" => {
                 self.step_chapter(-1, cx);
             }
+            "=" | "+" => self.zoom_by(ZOOM_STEP, None, cx),
+            "-" => self.zoom_by(1. / ZOOM_STEP, None, cx),
+            "0" => self.set_zoom(1., None, cx),
+            "f11" => window.toggle_fullscreen(),
+            "?" => self.toggle_keys(cx),
+            "/" if k.modifiers.shift => self.toggle_keys(cx),
             _ => {}
         }
+    }
+
+    fn toggle_keys(&mut self, cx: &mut Context<Self>) {
+        self.show_keys = !self.show_keys;
+        if self.show_keys {
+            self.show_overlay(cx);
+        }
+        cx.notify();
     }
 
     fn retry(&mut self, i: usize, cx: &mut Context<Self>) {
@@ -540,44 +752,50 @@ impl ReaderPage {
         cx.notify();
     }
 
+    fn download_chapter(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = &self.chapter else { return };
+        let job = Job { manga_id: self.manga_id.clone(), manga_title: self.title.clone(), chapter_id: c.id.clone(), label: logic::chapter_short(c) };
+        self.dl_pending = true;
+        self.queue.update(cx, |d, cx| d.enqueue(vec![job], cx));
+    }
+
     // ------------------------------------------------------------ views
 
-    fn page_view(&self, i: usize, fit: Fit, strip: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn page_view(&self, i: usize, fit: Fit, strip: bool, zoomed: bool, cx: &mut Context<Self>) -> AnyElement {
         let Load::Ready(pages) = &self.pages else { return div().into_any_element() };
         match &pages[i].state {
-            PageState::Ready(p, ratio) => {
+            PageState::Ready(p, d) => {
                 let im = img(p.clone());
+                let ratio = d.map(|(w, h)| w / h);
                 match (strip, fit) {
                     // A relative width leaves the image box at the file's own pixel height, which
                     // shows as black gaps once the page is scaled; size the box from the ratio instead.
                     (true, _) | (false, Fit::Width) => match ratio {
-                        Some(r) => div().w_full().aspect_ratio(*r).child(im.size_full()).into_any_element(),
+                        Some(r) => div().w_full().aspect_ratio(r).child(im.size_full()).into_any_element(),
                         None => im.w_full().into_any_element(),
                     },
-                    // Fit the whole page in the window: the container has a definite size
-                    // (absolutely positioned), so tall pages scale down instead of being cut off.
+                    // Fit the whole page in its box: the box has a definite size, so tall pages
+                    // scale down instead of being cut off.
                     (false, Fit::Screen) => im.size_full().object_fit(ObjectFit::Contain).into_any_element(),
+                    (false, Fit::Original) if zoomed => im.size_full().into_any_element(),
                     (false, Fit::Original) => im.into_any_element(),
                 }
             }
             PageState::Failed(e) => div()
                 .id(SharedString::from(format!("retry-{i}")))
                 .w_full()
-                .h(px(if strip { 420. } else { 280. }))
+                .h(px(if strip { 420. } else { 320. }))
                 .flex()
-                .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(6.))
-                .cursor_pointer()
-                .child(icon("icons/triangle-alert.svg", Tokens::danger(), 22.))
-                .child(div().text_size(px(size::MD)).text_color(Tokens::text_1()).child(format!("Page {} failed to load", i + 1)))
-                .child(div().max_w(px(480.)).text_center().child(muted(e.clone())))
-                .child(button(SharedString::from(format!("retry-btn-{i}")), "Retry", ButtonKind::Secondary))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.retry(i, cx)
                 }))
+                .child(error_view(e.clone()).title(format!("Page {} did not load", i + 1)).compact().retry(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.retry(i, cx)
+                })))
                 .into_any_element(),
             _ => div()
                 .w_full()
@@ -587,60 +805,96 @@ impl ReaderPage {
                 .items_center()
                 .justify_center()
                 .gap(px(10.))
-                .child(spinner(SharedString::from(format!("pg-spin-{i}")), 22.))
+                .child(spinner(SharedString::from(format!("pg-spin-{i}")), Tokens::text_3(), icon_px::XL))
                 .child(muted(format!("Page {}", i + 1)))
                 .into_any_element(),
         }
     }
 
-    /// "Finished / Next" card between chapters (paged mode and the end of the strip).
+    /// "Finished / Next" card between chapters (paged mode and the end of the strip), with the
+    /// next chapter's offline state and a warning when chapter numbers skip.
+    /// Mihon chapter transitions: https://mihon.app/docs/guides/reader-settings
     fn transition_card(&self, dir: i32, cx: &mut Context<Self>) -> Div {
-        let cur = self.chapter.as_ref().map(logic::chapter_label).unwrap_or_default();
-        let other = self.neighbour(dir).map(logic::chapter_label);
-        let (k1, k2) = if dir > 0 { ("Finished", "Next") } else { ("Current", "Previous") };
-        let line = |k: &'static str, v: String, strong: bool| {
+        let cur = self.chapter.as_ref();
+        let other = self.neighbour(dir);
+        let (k1, k2, i1, i2) = if dir > 0 { ("Finished", "Next", ph::CHECK_CIRCLE, ph::SKIP_FORWARD) } else { ("Current", "Previous", ph::BOOK_OPEN, ph::SKIP_BACK) };
+        let line = |icon: Ph, k: &'static str, v: String, strong: bool| {
             div()
                 .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(k))
-                .child(div().text_size(px(size::LG)).font_weight(if strong { FontWeight::SEMIBOLD } else { FontWeight::NORMAL }).text_color(if strong { Tokens::text_1() } else { Tokens::text_2() }).child(v))
+                .items_start()
+                .gap(px(12.))
+                .child(div().pt(px(2.)).child(ph_icon(icon, if strong { Weight::Fill } else { Weight::Regular }, if strong { Tokens::accent() } else { Tokens::text_3() }, icon_px::LG)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .min_w_0()
+                        .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(k))
+                        .child(div().ramp(if strong { ramp::SUBTITLE_2 } else { ramp::BODY }).text_color(if strong { Tokens::text_1() } else { Tokens::text_2() }).child(v)),
+                )
         };
+        let gap = match (cur, other) {
+            (Some(a), Some(b)) => logic::missing_between(a.number, b.number),
+            _ => 0,
+        };
+        let offline = other.map(|c| c.download_status == "complete");
         div()
             .flex()
             .flex_col()
             .gap(px(16.))
-            .w(px(380.))
+            .w(px(400.))
             .p(px(24.))
-            .rounded(px(14.))
+            .rounded(px(radius::XL))
             .bg(Tokens::surface())
             .border_1()
             .border_color(Tokens::border())
-            .child(line(k1, cur, false))
+            .shadow_lg()
+            .child(line(i1, k1, cur.map(logic::chapter_label).unwrap_or_default(), false))
             .child(match other {
-                Some(o) => line(k2, o, true).into_any_element(),
+                Some(o) => line(i2, k2, logic::chapter_label(o), true).into_any_element(),
                 None => div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
                     .text_size(px(size::MD))
                     .text_color(Tokens::text_2())
-                    .child(if dir > 0 { "There is no next chapter." } else { "There is no previous chapter." })
+                    .child(icon_ph(ph::INFO, Tokens::text_3(), icon_px::LG))
+                    .child(if dir > 0 { "There is no next chapter yet." } else { "This is the first chapter." })
                     .into_any_element(),
+            })
+            .when(other.is_some(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .child(match offline {
+                            Some(true) => icon_tag(glyphs::DOWNLOAD, "Downloaded", Tone::Success),
+                            _ => icon_tag(ph::GLOBE, "Reads online", Tone::Neutral),
+                        })
+                        .when(gap > 0, |d| d.child(icon_tag(ph::WARNING, if gap == 1 { "1 chapter missing".to_string() } else { format!("{gap} chapters missing") }, Tone::Warning))),
+                )
             })
             .child(
                 div()
                     .flex()
                     .gap(px(8.))
-                    .when(self.neighbour(dir).is_some(), |d| {
+                    .when(other.is_some(), |d| {
                         d.child(
-                            button(SharedString::from(format!("tr-go-{dir}")), if dir > 0 { "Read next chapter" } else { "Read previous chapter" }, ButtonKind::Primary)
+                            btn(SharedString::from(format!("tr-go-{dir}")), if dir > 0 { "Read next chapter" } else { "Read previous chapter" }, ButtonKind::Primary)
+                                .icon(if dir > 0 { ph::ARROW_RIGHT } else { ph::ARROW_LEFT })
+                                .kbd(if dir > 0 { "n" } else { "p" })
                                 .occlude()
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, w, cx| {
                                     cx.stop_propagation();
+                                    this.refocus(w, cx);
                                     this.step_chapter(dir, cx);
                                 })),
                         )
                     })
-                    .when(self.neighbour(dir).is_none(), |d| {
-                        d.child(button("tr-back", "Back to the manga", ButtonKind::Secondary).occlude().on_click(|_, w, cx| {
+                    .when(other.is_none(), |d| {
+                        d.child(btn("tr-back", "Back to the manga", ButtonKind::Secondary).icon(glyphs::BACK).occlude().on_click(|_, w, cx| {
                             cx.stop_propagation();
                             mv_ui::navigate(Route::Back, w, cx)
                         }))
@@ -648,8 +902,71 @@ impl ReaderPage {
             )
     }
 
-    fn top_bar(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn chapter_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.entity().downgrade();
+        let cur = self.chapter.as_ref().map(|c| c.id.clone());
+        let entries: Vec<Entry> = std::iter::once(Entry::Heading(format!("{} chapters", self.chapters.len()).into()))
+            .chain(self.chapters.iter().rev().map(|c| {
+                let (w, id) = (weak.clone(), c.id.clone());
+                let hint = if c.is_read {
+                    Some("Read".to_string())
+                } else if c.read_progress > 0 {
+                    Some(format!("Page {}", c.read_progress + 1))
+                } else {
+                    None
+                };
+                let e = Entry::new(logic::chapter_label(c), move |window, cx| {
+                    let _ = w.update(cx, |t, cx| {
+                        t.open_chapter(id.clone(), false, cx);
+                        t.refocus(window, cx);
+                    });
+                })
+                .checked(cur.as_deref() == Some(c.id.as_str()));
+                match hint {
+                    Some(h) => e.hint(h),
+                    None => e,
+                }
+            }))
+            .collect();
+        let w = cx.entity().downgrade();
+        icon_trigger("reader-chapters", icon_ph(ph::LIST_NUMBERS, Tokens::text_1(), icon_px::MD), "Chapters")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| fill_menu(menu.min_w(px(300.)).max_h(px(440.)).scrollable(true), &entries))
+            .on_open_change(move |open, window, cx| {
+                let _ = w.update(cx, |t, cx| {
+                    t.menu_open = *open;
+                    if *open {
+                        t.show_overlay(cx);
+                    } else {
+                        t.refocus(window, cx);
+                    }
+                });
+            })
+    }
+
+    fn download_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(c) = &self.chapter else { return div().into_any_element() };
+        match self.queue.read(cx).status(&c.id) {
+            Some(st) => {
+                let f = match st {
+                    ChapterDl::Active(f) => f,
+                    ChapterDl::Queued => 0.,
+                };
+                let label = if matches!(st, ChapterDl::Queued) { "Queued for download".to_string() } else { format!("Downloading · {}%", (f * 100.).round()) };
+                div().id("reader-dl").flex().flex_none().items_center().justify_center().size(px(32.)).tooltip(tip(label)).child(progress_ring_sized(f, 18.)).into_any_element()
+            }
+            None if c.download_status == "complete" => icon_button("reader-dl", ph::CHECK_CIRCLE, "Saved for offline reading").selected(true).color(Tokens::accent()).into_any_element(),
+            None => icon_button("reader-dl", glyphs::DOWNLOAD, "Download this chapter")
+                .on_click(cx.listener(|this, _, w, cx| {
+                    this.refocus(w, cx);
+                    this.download_chapter(cx);
+                }))
+                .into_any_element(),
+        }
+    }
+
+    fn top_bar(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let label = self.chapter.as_ref().map(logic::chapter_label).unwrap_or_default();
+        let full = window.is_fullscreen();
         div()
             .id("reader-top")
             .absolute()
@@ -659,11 +976,11 @@ impl ReaderPage {
             .h(px(56.))
             .flex()
             .items_center()
-            .gap(px(12.))
+            .gap(px(8.))
             .px(px(12.))
-            .bg(rgba(0x0b0d10f0))
+            .bg(Tokens::glass_strong())
             .border_b_1()
-            .border_color(Tokens::border())
+            .border_color(Tokens::glass_border())
             // The bar owns every click inside it: nothing reaches the page-turn area below.
             .occlude()
             .on_hover(cx.listener(|this, h: &bool, _, _| this.over_bars = *h))
@@ -679,8 +996,100 @@ impl ReaderPage {
                     .child(div().truncate().text_size(px(size::SM)).text_color(Tokens::text_3()).child(label)),
             )
             .when(self.total() > 0, |d| {
-                d.child(div().flex_none().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} / {}", self.current + 1, self.total())))
+                d.child(div().flex_none().mr(px(4.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} / {}", self.current + 1, self.total())))
             })
+            .when(!self.chapters.is_empty(), |d| d.child(self.chapter_menu(cx)))
+            .child(self.download_button(cx))
+            .child(icon_button("reader-keys", ph::KEYBOARD, "Keyboard shortcuts").kbd("?").selected(self.show_keys).on_click(cx.listener(|this, _, w, cx| {
+                this.refocus(w, cx);
+                this.toggle_keys(cx);
+            })))
+            .child(icon_button("reader-full", if full { ph::CORNERS_IN } else { ph::CORNERS_OUT }, if full { "Exit full screen" } else { "Full screen" }).kbd("f11").on_click(cx.listener(|this, _, w, cx| {
+                this.refocus(w, cx);
+                w.toggle_fullscreen();
+                cx.notify();
+            })))
+    }
+
+    fn slider(&self, frac: f32, rtl: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let big = self.dragging;
+        let (rest, grown) = (14., 18.);
+        let place = move |d: Div, size: f32| {
+            let d = d.size(px(size)).top(px((28. - size) / 2.));
+            if rtl {
+                d.right(relative(frac)).mr(px(-size / 2.))
+            } else {
+                d.left(relative(frac)).ml(px(-size / 2.))
+            }
+        };
+        let thumb = place(div().absolute().rounded_full().bg(Tokens::text_1()).shadow_md(), if big { grown } else { rest })
+            .when(big, |d| d.border_2().border_color(Tokens::accent()))
+            .when(!big, |d| {
+                d.group_hover("reader-slider", move |s| {
+                    let s = s.size(px(grown)).top(px((28. - grown) / 2.)).border_2().border_color(Tokens::accent());
+                    if rtl {
+                        s.mr(px(-grown / 2.))
+                    } else {
+                        s.ml(px(-grown / 2.))
+                    }
+                })
+            });
+        // While dragging, a bubble names the page under the thumb (WCAG 1.4.11 track contrast via Tokens::track).
+        let bubble = big.then(|| {
+            let d = div()
+                .absolute()
+                .bottom(px(30.))
+                .w(px(72.))
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(radius::SM))
+                .bg(Tokens::surface_3())
+                .border_1()
+                .border_color(Tokens::border_strong())
+                .shadow_md()
+                .text_size(px(size::SM))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(Tokens::text_1())
+                .child(format!("Page {}", self.current + 1));
+            if rtl {
+                d.right(relative(frac)).mr(px(-36.))
+            } else {
+                d.left(relative(frac)).ml(px(-36.))
+            }
+        });
+        div()
+            .id("slider")
+            .relative()
+            .flex_1()
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .group("reader-slider")
+            .child(bounds_probe(self.slider_bounds.clone()))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(6.))
+                    .flex()
+                    .when(rtl, |d| d.justify_end())
+                    .rounded_full()
+                    .bg(Tokens::track())
+                    .child(div().h_full().rounded_full().bg(Tokens::accent()).w(relative(frac))),
+            )
+            .child(thumb)
+            .children(bubble)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                    cx.stop_propagation();
+                    this.refocus(w, cx);
+                    this.dragging = true;
+                    this.slide_to(ev.position.x, cx);
+                }),
+            )
     }
 
     fn bottom_bar(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -689,79 +1098,46 @@ impl ReaderPage {
         let has_next = self.neighbour(1).is_some();
         let frac = if total > 1 { self.current as f32 / (total - 1) as f32 } else { 1. };
         let rtl = self.mode == ReaderMode::Rtl;
-        let seg = |id: &'static str, label: &'static str, active: bool| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .h(px(26.))
-                .px(px(10.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .text_size(px(size::XS))
-                .font_weight(FontWeight::MEDIUM)
-                .map(|d| if active { d.bg(Tokens::active()).text_color(Tokens::text_1()) } else { d.text_color(Tokens::text_3()).hover(|s| s.text_color(Tokens::text_1())) })
-                .child(label)
+        let chapter_btn = |id: &'static str, icon: Ph, tip_text: &'static str, key: &'static str, enabled: bool, why: &'static str, dir: i32, cx: &mut Context<Self>| {
+            icon_button(id, icon, tip_text).kbd(key).map(|b| if enabled { b } else { b.disabled(why) }).on_click(cx.listener(move |this, _, w, cx| {
+                this.refocus(w, cx);
+                this.step_chapter(dir, cx);
+            }))
         };
-        let group = || div().flex().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(rgba(0x00000066)).border_1().border_color(Tokens::border());
-        let chapter_btn = |id: &'static str, path: &'static str, tip: &'static str, enabled: bool| {
-            div()
-                .id(id)
-                .size(px(34.))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(999.))
-                .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(Tokens::hover())))
-                .tooltip(move |w, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(w, cx))
-                .child(icon(path, if enabled { Tokens::text_1() } else { rgba(0x7d859066) }, 18.))
-        };
-        let slider_bounds = self.slider_bounds.clone();
-        let track = div()
-            .id("slider")
-            .relative()
-            .flex_1()
-            .h(px(24.))
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .child(bounds_probe(slider_bounds))
-            .child(
-                div()
-                    .w_full()
-                    .h(px(4.))
-                    .flex()
-                    .when(rtl, |d| d.justify_end())
-                    .rounded(px(2.))
-                    .bg(rgba(0xffffff26))
-                    .child(div().h_full().rounded(px(2.)).bg(Tokens::accent()).w(relative(frac))),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(5.))
-                    .size(px(14.))
-                    .rounded(px(999.))
-                    .bg(Tokens::text_1())
-                    .shadow_md()
-                    .map(|d| if rtl { d.right(relative(frac)).mr(px(-7.)) } else { d.left(relative(frac)).ml(px(-7.)) }),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.dragging = true;
-                    this.slide_to(ev.position.x, cx);
-                }),
-            );
+        // In right-to-left the left button goes forward, like the pages.
         let (left_btn, right_btn) = if rtl {
-            (chapter_btn("next-ch", "icons/skip-back.svg", "Next chapter (N)", has_next), chapter_btn("prev-ch", "icons/skip-forward.svg", "Previous chapter (P)", has_prev))
+            (chapter_btn("next-ch", ph::SKIP_BACK, "Next chapter", "n", has_next, "This is the last chapter", 1, cx), chapter_btn("prev-ch", ph::SKIP_FORWARD, "Previous chapter", "p", has_prev, "This is the first chapter", -1, cx))
         } else {
-            (chapter_btn("prev-ch", "icons/skip-back.svg", "Previous chapter (P)", has_prev), chapter_btn("next-ch", "icons/skip-forward.svg", "Next chapter (N)", has_next))
+            (chapter_btn("prev-ch", ph::SKIP_BACK, "Previous chapter", "p", has_prev, "This is the first chapter", -1, cx), chapter_btn("next-ch", ph::SKIP_FORWARD, "Next chapter", "n", has_next, "This is the last chapter", 1, cx))
         };
-        let (left_dir, right_dir) = if rtl { (1, -1) } else { (-1, 1) };
         let strip = self.strip();
+        let mode_ix = ReaderMode::ALL.iter().position(|m| *m == self.mode).unwrap_or(0);
+        let fit_ix = Fit::ALL.iter().position(|f| *f == self.fit).unwrap_or(0);
+        let zoom = self.zoom;
+        let zoom_group = (!strip && self.transition.is_none()).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(
+                    icon_button("zoom-out", ph::MINUS, "Zoom out").small().kbd("-").map(|b| if zoom <= 1. { b.disabled("Already at the page fit") } else { b }).on_click(cx.listener(|this, _, w, cx| {
+                        this.refocus(w, cx);
+                        this.zoom_by(1. / ZOOM_STEP, None, cx);
+                    })),
+                )
+                .child(
+                    btn("zoom-reset", format!("{}%", (zoom * 100.).round()), ButtonKind::Ghost).small().min_w(px(56.)).tooltip("Reset zoom").kbd("0").on_click(cx.listener(|this, _, w, cx| {
+                        this.refocus(w, cx);
+                        this.set_zoom(1., None, cx);
+                    })),
+                )
+                .child(
+                    icon_button("zoom-in", ph::PLUS, "Zoom in").small().kbd("=").map(|b| if zoom >= MAX_ZOOM { b.disabled("Already at the largest zoom") } else { b }).on_click(cx.listener(|this, _, w, cx| {
+                        this.refocus(w, cx);
+                        this.zoom_by(ZOOM_STEP, None, cx);
+                    })),
+                )
+        });
         div()
             .id("reader-bottom")
             .absolute()
@@ -775,95 +1151,145 @@ impl ReaderPage {
                 div()
                     .id("reader-bottom-panel")
                     .w_full()
-                    .max_w(px(760.))
+                    .max_w(px(820.))
                     .flex()
                     .flex_col()
                     .gap(px(8.))
                     .px(px(12.))
                     .py(px(10.))
-                    .rounded(px(14.))
-                    .bg(rgba(0x14181cf2))
+                    .rounded(px(radius::XL))
+                    .bg(Tokens::glass_strong())
                     .border_1()
-                    .border_color(Tokens::border())
+                    .border_color(Tokens::glass_border())
                     .shadow_lg()
                     .occlude()
                     .on_hover(cx.listener(|this, h: &bool, _, _| this.over_bars = *h))
                     // the panel occludes the root, so slider drags are tracked here as well
                     .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| this.on_mouse_move(ev, cx)))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.dragging = false;
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(10.))
-                            .child(left_btn.on_click(cx.listener(move |this, _, _, cx| {
-                                this.step_chapter(left_dir, cx);
-                            })))
+                            .child(left_btn)
                             .child(div().w(px(28.)).flex_none().text_right().text_size(px(size::SM)).text_color(Tokens::text_2()).child(if total > 0 { (self.current + 1).to_string() } else { "-".into() }))
-                            .child(track)
+                            .child(self.slider(frac, rtl, cx))
                             .child(div().w(px(28.)).flex_none().text_size(px(size::SM)).text_color(Tokens::text_2()).child(if total > 0 { total.to_string() } else { "-".into() }))
-                            .child(right_btn.on_click(cx.listener(move |this, _, _, cx| {
-                                this.step_chapter(right_dir, cx);
-                            }))),
+                            .child(right_btn),
                     )
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(10.))
-                            .child(group().children(ReaderMode::ALL.map(|m| {
-                                let id = match m {
-                                    ReaderMode::Ltr => "mode-ltr",
-                                    ReaderMode::Rtl => "mode-rtl",
-                                    ReaderMode::Strip => "mode-strip",
-                                };
-                                seg(id, m.label(), self.mode == m).on_click(cx.listener(move |this, _, _, cx| this.set_mode(m, cx)))
-                            })))
+                            .child(
+                                segmented("reader-mode", ReaderMode::ALL.map(|m| (Some(mode_icon(m)), m.short())), mode_ix)
+                                    .small()
+                                    .tooltip(tip_kbd("Reading mode", "m"))
+                                    .on_change(cx.listener(|this, ix: &usize, w, cx| {
+                                        this.refocus(w, cx);
+                                        this.set_mode(ReaderMode::ALL[*ix], cx);
+                                    })),
+                            )
                             .when(!strip, |d| {
-                                d.child(group().children(Fit::ALL.map(|f| {
-                                    let id = match f {
-                                        Fit::Screen => "fit-screen",
-                                        Fit::Width => "fit-width",
-                                        Fit::Original => "fit-original",
-                                    };
-                                    seg(id, f.label(), self.fit == f).on_click(cx.listener(move |this, _, _, cx| this.set_fit(f, cx)))
-                                })))
+                                d.child(
+                                    segmented("reader-fit", Fit::ALL.map(|f| (Some(fit_icon(f)), f.short())), fit_ix).small().tooltip(tip_kbd("Page fit", "f")).on_change(cx.listener(|this, ix: &usize, w, cx| {
+                                        this.refocus(w, cx);
+                                        this.set_fit(Fit::ALL[*ix], cx);
+                                    })),
+                                )
                             })
                             .child(div().flex_1())
-                            .child(muted("Esc back  ·  M mode  ·  F fit")),
+                            .children(zoom_group),
                     ),
+            )
+    }
+
+    /// Help panel listing every shortcut with key caps (Apple HIG: make shortcuts discoverable
+    /// where the command lives): https://developer.apple.com/design/human-interface-guidelines/keyboards
+    fn keys_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("reader-keys-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Tokens::overlay())
+            .occlude()
+            .on_click(cx.listener(|this, _, w, cx| {
+                this.refocus(w, cx);
+                this.show_keys = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("reader-keys")
+                    .w(px(460.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .p(px(20.))
+                    .rounded(px(radius::XL))
+                    .bg(Tokens::surface_3())
+                    .border_1()
+                    .border_color(Tokens::border_strong())
+                    .shadow_lg()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .pb(px(8.))
+                            .child(ph_icon(ph::KEYBOARD, Weight::Fill, Tokens::accent(), icon_px::LG))
+                            .child(div().flex_1().ramp(ramp::SUBTITLE_2).text_color(Tokens::text_1()).child("Reader shortcuts"))
+                            .child(icon_button("reader-keys-close", ph::X, "Close").small().kbd("escape").on_click(cx.listener(|this, _, w, cx| {
+                                this.refocus(w, cx);
+                                this.show_keys = false;
+                                cx.notify();
+                            }))),
+                    )
+                    .children(SHORTCUTS.iter().map(|(k, what)| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .h(px(28.))
+                            .child(div().w(px(72.)).flex().child(kbd(*k)))
+                            .child(div().flex_1().text_size(px(size::SM)).text_color(Tokens::text_2()).child(*what))
+                    })),
             )
     }
 }
 
 /// Back control: reacts on mouse *down* so it can never lose the click to a re-render or to the
-/// page-turn area, and stops the event from reaching anything below it.
+/// page-turn area, and stops the event from reaching anything below it (Enter / Space work too).
 fn back_button(id: &'static str, label: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(px(6.))
-        .h(px(36.))
-        .px(px(10.))
-        .rounded(px(8.))
-        .cursor_pointer()
-        .text_size(px(size::SM))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(Tokens::text_1())
-        .hover(|s| s.bg(Tokens::hover()))
-        .occlude()
-        .child(icon("icons/arrow-left.svg", Tokens::text_1(), 18.))
-        .when(label, |d| d.child("Back"))
+    let el = if label { btn(id, "Back", ButtonKind::Ghost).icon(glyphs::BACK).kbd("escape").build() } else { icon_button(id, glyphs::BACK, "Back").kbd("escape").build() };
+    el.occlude()
         .on_mouse_down(MouseButton::Left, |_, w, cx| {
             cx.stop_propagation();
             mv_ui::navigate(Route::Back, w, cx);
         })
+        .on_click(|ev, w, cx| {
+            if ev.is_keyboard() {
+                mv_ui::navigate(Route::Back, w, cx);
+            }
+        })
 }
 
 impl Render for ReaderPage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Focus on a descendant (not the reader itself) means a control was reached with Tab.
+        self.focus_inside = self.focus.contains_focused(window, cx) && !self.focus.is_focused(window);
         let strip = self.strip();
         let body: AnyElement = match &self.pages {
             Load::Loading => div()
@@ -873,29 +1299,23 @@ impl Render for ReaderPage {
                 .items_center()
                 .justify_center()
                 .gap(px(12.))
-                .child(spinner("chapter-spin", 28.))
-                .child(muted("Loading chapter..."))
+                .child(spinner("chapter-spin", Tokens::text_2(), icon_px::HERO))
+                .child(div().text_size(px(size::MD)).child(shimmer_text("Loading chapter\u{2026}")))
                 .into_any_element(),
             Load::Failed(e) => div()
                 .size_full()
                 .flex()
-                .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(10.))
-                .child(icon("icons/triangle-alert.svg", Tokens::danger(), 28.))
-                .child(div().text_size(px(size::LG)).text_color(Tokens::text_1()).child("Could not open this chapter"))
-                .child(div().max_w(px(520.)).text_center().child(muted(e.clone())))
                 .child(
-                    div()
-                        .flex()
-                        .gap(px(8.))
-                        .child(button("reload", "Try again", ButtonKind::Primary).on_click(cx.listener(|this, _, _, cx| {
+                    error_view(e.clone())
+                        .title("Could not open this chapter")
+                        .retry(cx.listener(|this, _, _, cx| {
                             if let Some(c) = this.chapter.as_ref().map(|c| c.id.clone()) {
                                 this.open_chapter(c, false, cx);
                             }
-                        })))
-                        .child(button("fail-back", "Back", ButtonKind::Secondary).on_click(|_, w, cx| mv_ui::navigate(Route::Back, w, cx))),
+                        }))
+                        .secondary(btn("fail-back", "Back", ButtonKind::Ghost).icon(glyphs::BACK).on_click(|_, w, cx| mv_ui::navigate(Route::Back, w, cx))),
                 )
                 .into_any_element(),
             Load::Ready(pages) if strip => {
@@ -915,24 +1335,74 @@ impl Render for ReaderPage {
                         // after the scroll has been applied
                         cx.defer_in(window, |this, _, cx| this.sync_strip_page(cx));
                     }))
-                    .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| this.on_page_click(ev, cx)))
+                    .on_click(cx.listener(|this, ev: &ClickEvent, w, cx| this.on_page_click(ev, w, cx)))
                     // one child per page, so `top_item` / `scroll_to_top_of_item` map to pages
-                    .children((0..n).map(|i| div().w_full().max_w(px(STRIP_WIDTH)).flex_none().child(self.page_view(i, Fit::Width, true, cx))))
+                    .children((0..n).map(|i| div().w_full().max_w(px(STRIP_WIDTH)).flex_none().child(self.page_view(i, Fit::Width, true, false, cx))))
                     .child(div().flex_none().flex().justify_center().py(px(48.)).pb(px(160.)).child(self.transition_card(1, cx)))
                     .into_any_element()
             }
             Load::Ready(_) => {
-                let content: AnyElement = match self.transition {
+                let zoomed = self.zoom > 1. && self.transition.is_none();
+                // Ctrl + wheel zooms. The handler sits on a child that covers the whole area so it
+                // runs before the scroll container's own wheel handling and can stop it.
+                let wheel = cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                    if ev.modifiers.control || ev.modifiers.platform {
+                        let dy = f32::from(ev.delta.pixel_delta(px(20.)).y);
+                        if dy != 0. {
+                            this.zoom_by(if dy > 0. { 1.1 } else { 1. / 1.1 }, Some(ev.position), cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                });
+                let surface: AnyElement = match self.transition {
                     Some(dir) => div().size_full().flex().items_center().justify_center().child(self.transition_card(dir, cx)).into_any_element(),
+                    None if zoomed => {
+                        let (bw, bh) = self.zoom_base();
+                        let page = self.page_view(self.current, self.fit, false, true, cx);
+                        div()
+                            .id("zoom-surface")
+                            .flex_none()
+                            .min_w(relative(1.))
+                            .min_h(relative(1.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_scroll_wheel(wheel)
+                            .child(div().flex_none().w(px(bw * self.zoom)).h(px(bh * self.zoom)).child(page))
+                            .into_any_element()
+                    }
                     None => {
-                        let page = self.page_view(self.current, self.fit, false, cx);
+                        let page = self.page_view(self.current, self.fit, false, false, cx);
+                        // `flex_none`: the scroll container sizes its scroll range from this child, so
+                        // it must keep the page's full height instead of shrinking to the window.
                         match self.fit {
-                            Fit::Screen => div().size_full().child(page).into_any_element(),
-                            Fit::Width => div().flex_none().w_full().max_w(px(1100.)).child(page).into_any_element(),
-                            Fit::Original => div().flex_none().child(page).into_any_element(),
+                            Fit::Screen => div().id("zoom-surface").size_full().on_scroll_wheel(wheel).child(page).into_any_element(),
+                            Fit::Width => div()
+                                .id("zoom-surface")
+                                .flex_none()
+                                .w_full()
+                                .min_h(relative(1.))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .on_scroll_wheel(wheel)
+                                .child(div().flex_none().w_full().max_w(px(PAGED_WIDTH)).child(page))
+                                .into_any_element(),
+                            Fit::Original => div()
+                                .id("zoom-surface")
+                                .flex_none()
+                                .w_full()
+                                .min_h(relative(1.))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .on_scroll_wheel(wheel)
+                                .child(div().flex_none().child(page))
+                                .into_any_element(),
                         }
                     }
                 };
+                let grabbing = self.pan.is_some();
                 div()
                     .id("paged")
                     .absolute()
@@ -941,11 +1411,20 @@ impl Render for ReaderPage {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .when(self.fit != Fit::Screen || self.transition.is_some(), |d| d.overflow_y_scroll())
+                    .map(|d| if zoomed { d.items_start().overflow_scroll().cursor(if grabbing { CursorStyle::ClosedHand } else { CursorStyle::OpenHand }) } else { d.items_center() })
+                    .when(!zoomed && (self.fit != Fit::Screen || self.transition.is_some()), |d| d.overflow_y_scroll())
                     .track_scroll(&self.page_scroll)
-                    .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| this.on_page_click(ev, cx)))
-                    .child(content)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseDownEvent, _, _| {
+                            if this.zoom > 1. {
+                                this.pan = Some((ev.position, this.page_scroll.offset()));
+                                this.panned = false;
+                            }
+                        }),
+                    )
+                    .on_click(cx.listener(|this, ev: &ClickEvent, w, cx| this.on_page_click(ev, w, cx)))
+                    .child(surface)
                     .into_any_element()
             }
         };
@@ -956,16 +1435,25 @@ impl Render for ReaderPage {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| this.on_key(ev, w, cx)))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| this.on_mouse_move(ev, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.dragging = false;
+                this.pan = None;
+                cx.notify();
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.dragging = false;
+                this.pan = None;
+                cx.notify();
+            }))
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x000000))
+            .bg(Tokens::canvas())
             .child(bounds_probe(self.root_bounds.clone()))
             .child(body)
-            .when(overlay, |d| d.child(self.top_bar(cx)).child(self.bottom_bar(cx)))
+            .when(overlay, |d| d.child(self.top_bar(window, cx)).child(self.bottom_bar(cx)))
             // With the overlay hidden a small back button stays in the corner for mouse users.
-            .when(!overlay, |d| d.child(div().absolute().top(px(10.)).left(px(10.)).opacity(0.55).hover(|s| s.opacity(1.)).rounded(px(8.)).bg(rgba(0x000000a0)).child(back_button("reader-back-mini", false))))
+            .when(!overlay, |d| d.child(div().absolute().top(px(10.)).left(px(10.)).opacity(0.55).hover(|s| s.opacity(1.)).rounded(px(radius::MD)).bg(Tokens::glass()).child(back_button("reader-back-mini", false))))
+            .when(self.show_keys, |d| d.child(self.keys_panel(cx)))
     }
 }

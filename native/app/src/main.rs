@@ -1,8 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod keys;
+mod palette;
 mod perf;
+mod prefs;
+mod routes;
 mod shell;
 #[cfg(windows)]
 mod tray;
+mod updates;
 
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
@@ -72,6 +77,9 @@ fn main() {
     for line in mv_core::paths::prepare() {
         eprintln!("[data] {line}");
     }
+    // First run or not, decided once before anything below creates files in the data folder
+    // (`MANGAVOX_WELCOME=1|0` or `--welcome` force it; see mv_core::onboarding).
+    let welcome = mv_core::onboarding::init().shows_welcome();
     // Child processes (the Python voice and video scripts) save under the same data folder.
     std::env::set_var("MANGAVOX_DATA", mv_core::paths::root());
     // Files an update moved aside; the previous process may still be exiting, so wait a bit.
@@ -85,12 +93,19 @@ fn main() {
     gpui_kit::application()
         .with_assets(mv_ui::Assets)
         .with_http_client(std::sync::Arc::new(http))
-        .run(|cx| {
+        .run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         // Saved Appearance preset and reduce-motion, mapped onto Tokens and the component theme.
         mv_ui::theme::init(cx);
-        ui_media::warm_up();
+        // App-wide shortcuts (Ctrl+K palette, Ctrl+B sidebar, Alt+Left/Right...): see keys.rs.
+        keys::bind(cx);
+        // The Anime and Movies catalogs are fetched ahead only when they are wanted: not while
+        // the welcome setup is open (it starts this when Anime/Movies is chosen), and not after a
+        // setup that left them out.
+        if !welcome && mv_core::onboarding::wants_media(&mv_core::paths::root()) {
+            ui_media::warm_up();
+        }
         ui_settings::start_cli_update_checks(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         let main = gpui_kit::open_window(

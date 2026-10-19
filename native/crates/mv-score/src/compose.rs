@@ -273,8 +273,8 @@ pub fn compose(cues: &[Cue], energy: &EnergyCurve, pages: &[PageInfo], spans: &[
                 };
                 match pat {
                     KeysPat::Arp8 => {
-                        for k in 0..8 {
-                            push(t0 + k as f64 * beat / 2.0, beat * 0.9, up[k], vel(e, 0.55) * if k % 2 == 0 { 1.0 } else { 0.8 });
+                        for (k, &p) in up.iter().enumerate() {
+                            push(t0 + k as f64 * beat / 2.0, beat * 0.9, p, vel(e, 0.55) * if k % 2 == 0 { 1.0 } else { 0.8 });
                         }
                     }
                     KeysPat::Arp16 => {

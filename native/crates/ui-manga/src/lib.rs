@@ -5,6 +5,7 @@ use mv_ui::Route;
 
 pub mod backend;
 mod browse;
+mod categories;
 mod detail;
 mod discover;
 mod downloads;

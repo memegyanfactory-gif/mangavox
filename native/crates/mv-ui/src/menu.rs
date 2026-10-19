@@ -8,7 +8,7 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::controls::{ClickHandler, ControlSize};
+use crate::controls::{ClickHandler, ControlSize, WindowHandler};
 use crate::icons::{ph, Ph, Weight};
 use crate::interact::{element_builder, glyph, kbd_label, refine, tip, IconSrc, Interactive};
 use crate::theme::{icon as icon_px, radius, size, Tokens};
@@ -30,7 +30,7 @@ pub struct MenuItem {
     danger: bool,
     kbd: Option<SharedString>,
     disabled: bool,
-    handler: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    handler: Option<WindowHandler>,
 }
 
 impl MenuItem {

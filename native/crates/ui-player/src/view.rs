@@ -3,29 +3,37 @@
 //! soft gradients over the picture, auto-hiding with the cursor, animated scrubber and menus.
 //!
 //! The app window keeps keyboard focus (keys are handled here); the overlay handles the mouse
-//! and forwards window-level actions (fullscreen, back, next) to the app window.
+//! and forwards window-level actions (fullscreen, back, next) to the app window. Kit controls
+//! never take focus on a mouse press, so every click in the overlay hands focus back to the
+//! player root explicitly (`keep_focus`) and the shortcuts keep working.
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use gpui_kit::component::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_media::types::{SkipSegment, SkipType, StremioSubtitle};
 use mv_ui::nav::{navigate, PlayRequest, Route};
-use mv_ui::theme::{size, Tokens};
-use mv_ui::{bg, button, icon, ButtonKind};
+use mv_ui::theme::{duration, easing, icon as icon_px, radius, ramp, size, Tokens};
+use mv_ui::toast::{self, Toast};
+use mv_ui::{
+    appear, bg, btn, copy_button, disclosure, error_view, glyphs, icon, icon_button, motion, ph, progress_bar, progress_ring_sized, shimmer_text, skeleton, spinner, ButtonKind, Hue, Ph,
+    RampExt as _, MONO_FONT,
+};
 
-use crate::backend::{self, Ident, Resolved};
-use crate::logic::{self, BOTTOM_H, MENU_HEAD_H, MENU_RIGHT, MENU_ROW_H, TOP_H};
+use crate::backend::{self, Ident, NextInfo, Resolved};
+use crate::logic::{self, PlaybackPrefs, BOTTOM_H, MENU_RIGHT, TOP_H};
 use crate::mpv::{Event, Mpv, Track, TrackKind};
 use crate::overlay::{self, Follower};
+use crate::ui::{self, ctl, ctl_box, ctl_shell, frame_btn, glass_panel, jump_ctl, light, shade, text_ctl, track_row, video_bg};
 
 const TICK: Duration = Duration::from_millis(33);
 const POLL_EVERY: u32 = 4; // ticks (~130 ms)
 const TRACKS_EVERY: u32 = 8; // polls (~1 s)
 const SAVE_EVERY: Duration = Duration::from_secs(10);
-/// Controls fade in / out.
-const FADE: Duration = Duration::from_millis(240);
+/// Controls fade in / out (the kit's slow transition).
+const FADE: Duration = duration::SLOW;
 /// Scrubber grows on hover.
 const GROW: Duration = Duration::from_millis(150);
 /// Centre play / pause / volume indicator.
@@ -34,7 +42,13 @@ const FLASH: Duration = Duration::from_millis(700);
 const SCRUB_SEEK_EVERY: Duration = Duration::from_millis(90);
 const TRACKS_W: f32 = 580.0;
 const SPEED_W: f32 = 240.0;
-const AUDIO_W: f32 = 320.0;
+const UP_NEXT_W: f32 = 400.0;
+/// Past this share of the episode the next one is looked up (and warmed when the
+/// "Pre-download next episode" setting is on).
+const PREFETCH_AT: f64 = 0.75;
+/// Transport glyphs (play, rewind, forward) and the rest of the bar.
+const TRANSPORT_PX: f32 = icon_px::HERO;
+const BAR_PX: f32 = icon_px::XL;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Phase {
@@ -46,9 +60,9 @@ enum Phase {
     Error(String),
 }
 
+/// Bottom-bar menus. Audio and subtitles share one menu (Netflix's two-column picker).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
-    Audio,
     Tracks,
     Speed,
 }
@@ -57,6 +71,33 @@ enum Menu {
 enum Drag {
     Seek,
     Volume,
+}
+
+/// The following episode's stream lookup.
+#[derive(Clone, Debug, PartialEq)]
+enum NextState {
+    Idle,
+    Looking,
+    Ready(PlayRequest),
+    Failed,
+}
+
+/// Something fetched in the background for display.
+#[derive(Clone, Debug, PartialEq)]
+enum Fetch<T> {
+    Idle,
+    Loading,
+    Done(T),
+}
+
+/// The Up Next card.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct UpNext {
+    shown: bool,
+    /// Cancelled for this pass through the end of the episode.
+    dismissed: bool,
+    /// Countdown seconds left (auto-play on).
+    left: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -77,6 +118,8 @@ struct Snap {
     buffering: bool,
     /// mpv's `cache-buffering-state` (0..100) while stalled.
     cache_pct: f64,
+    /// Playback reached the end (mpv keeps the last frame and pauses).
+    eof: bool,
 }
 
 pub struct PlayerView {
@@ -97,17 +140,39 @@ pub struct PlayerView {
     phase: Phase,
     started: Instant,
     info_hash: Option<String>,
+    /// The source's info hash before the torrent is added (stats while connecting only).
+    pending_hash: Option<String>,
     torrent: Option<TorrentStats>,
     snap: Snap,
     /// Buffered (instantly seekable) ranges.
     ranges: Vec<(f64, f64)>,
     tracks: Vec<Track>,
+    /// Last subtitle track that was on, for the `c` toggle.
+    last_sid: Option<i64>,
     skip: Vec<SkipSegment>,
     skip_requested: bool,
     subs_requested: bool,
+    /// Intros already skipped automatically (start, deciseconds), so Undo does not loop.
+    auto_skipped: Vec<i64>,
+    /// Saved position playback resumes from; its "Resuming at" toast waits for the first frame,
+    /// because mpv cannot seek (Start over) before the file is loaded.
+    resume_note: Option<f64>,
+    /// Settings → Playback.
+    prefs: PlaybackPrefs,
+    /// Backdrop for the loader and the Up Next card.
+    artwork: Option<String>,
+    next: NextState,
+    /// Play the next episode as soon as its lookup finishes.
+    next_wanted: bool,
+    /// The next episode's torrent has been warmed.
+    next_warm: bool,
+    next_info: Fetch<Option<NextInfo>>,
+    up_next: UpNext,
     menu: Option<Menu>,
     /// Bumped on every menu open so its entrance animation replays.
     menu_serial: u32,
+    /// The keyboard shortcut sheet (`?`).
+    help: bool,
     drag: Option<Drag>,
     /// Scrub handle position while dragging.
     scrub: Option<f64>,
@@ -121,11 +186,12 @@ pub struct PlayerView {
     seek_hot_at: Instant,
     ticks: u32,
     polls: u32,
+    last_poll: Instant,
     last_save: Instant,
     played_logged: bool,
     complete_logged: bool,
-    toast: Option<(String, Instant)>,
-    flash: Option<(&'static str, String, Instant)>,
+    /// Centre indicator: glyph (asset path), label, start.
+    flash: Option<(Option<&'static str>, String, Instant)>,
     // Overlay visibility.
     last_input: Instant,
     controls: bool,
@@ -137,13 +203,40 @@ pub struct PlayerView {
     title_drag: Option<Point<Pixels>>,
     /// The video popup is shown once there is a picture to show.
     video_shown: bool,
-    next_busy: bool,
     /// Set once Back was requested, so repeated clicks / keys don't pop twice.
     leaving: bool,
 }
 
+actions!(player, [StayOnPlayer]);
+
+/// Marks the player's key bindings as registered (once per app).
+struct PlayerKeys;
+impl Global for PlayerKeys {}
+
+/// Tab / Shift+Tab on the player. The kit root binds them to "focus next", and the next Tab stops
+/// in the app window are the shell's title-bar buttons, hidden behind the video: focus would land
+/// on a control nobody can see, Space would then click it, and every player shortcut would stop
+/// working until the next click. WCAG 2.4.11 Focus Not Obscured:
+/// <https://www.w3.org/WAI/WCAG22/Understanding/focus-not-obscured-minimum.html>
+///
+/// Ctrl+K too: the shell's command palette would open in the app window, under the video, take
+/// keyboard focus and silence every player shortcut until Escape. The shell skips keys an action
+/// handled, so binding it here keeps it on the player (shell's `SHORTCUTS` table, app/src/keys.rs).
+fn bind_keys(cx: &mut App) {
+    if cx.has_global::<PlayerKeys>() {
+        return;
+    }
+    cx.set_global(PlayerKeys);
+    cx.bind_keys([
+        KeyBinding::new("tab", StayOnPlayer, Some("Player")),
+        KeyBinding::new("shift-tab", StayOnPlayer, Some("Player")),
+        KeyBinding::new("ctrl-k", StayOnPlayer, Some("Player")),
+    ]);
+}
+
 /// Opens the player for `Route::Player`.
 pub fn open_view(req: PlayRequest, window: &mut Window, cx: &mut App) -> AnyView {
+    bind_keys(cx);
     cx.new(|cx| PlayerView::new(req, window, cx)).into()
 }
 
@@ -152,6 +245,7 @@ impl PlayerView {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let ident = backend::ident(&req);
+        let pending_hash = backend::source_hash(&req);
         let now = Instant::now();
         let mut this = Self {
             req,
@@ -169,15 +263,27 @@ impl PlayerView {
             phase: Phase::Connecting,
             started: now,
             info_hash: None,
+            pending_hash,
             torrent: None,
             snap: Snap { volume: 100.0, speed: 1.0, ..Default::default() },
             ranges: vec![],
             tracks: vec![],
+            last_sid: None,
             skip: vec![],
             skip_requested: false,
             subs_requested: false,
+            auto_skipped: vec![],
+            resume_note: None,
+            prefs: PlaybackPrefs::default(),
+            artwork: None,
+            next: NextState::Idle,
+            next_wanted: false,
+            next_warm: false,
+            next_info: Fetch::Idle,
+            up_next: UpNext::default(),
             menu: None,
             menu_serial: 0,
+            help: false,
             drag: None,
             scrub: None,
             scrub_sent: None,
@@ -187,10 +293,10 @@ impl PlayerView {
             seek_hot_at: now,
             ticks: 0,
             polls: 0,
+            last_poll: now,
             last_save: now,
             played_logged: false,
             complete_logged: false,
-            toast: None,
             flash: None,
             last_input: now,
             controls: true,
@@ -200,10 +306,10 @@ impl PlayerView {
             mouse_in_bar: false,
             title_drag: None,
             video_shown: false,
-            next_busy: false,
             leaving: false,
         };
         this.begin(window, cx);
+        this.fetch_artwork(cx);
         this.open_overlay(window, cx);
         cx.on_release(|this, cx| {
             this.follower = None;
@@ -287,6 +393,14 @@ impl PlayerView {
         });
     }
 
+    /// Keyboard focus back on the player root (the shortcuts live there). Kit controls do not
+    /// move focus on a mouse press, so nothing else would put it back after a click.
+    fn keep_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.leaving && !self.focus.is_focused(window) {
+            window.focus(&self.focus, cx);
+        }
+    }
+
     /// Resolves the source (torrent metadata etc.) then starts mpv.
     fn begin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.phase = Phase::Connecting;
@@ -295,21 +409,36 @@ impl PlayerView {
         let req = self.req.clone();
         let ident = self.ident.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let resume = bg::blocking(move || backend::load_resume(&ident)).await.ok().flatten();
+            let (resume, prefs) = bg::blocking(move || (backend::load_resume(&ident), backend::load_prefs())).await.unwrap_or_default();
             let resolved = bg::run(async move { backend::resolve(&req).await }).await.and_then(|r| r);
-            let _ = this.update_in(cx, |this, window, cx| this.on_resolved(resolved, resume, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.on_resolved(resolved, resume, prefs, window, cx));
         })
         .detach();
     }
 
-    fn on_resolved(&mut self, resolved: anyhow::Result<Resolved>, resume: Option<f64>, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Loader / Up Next backdrop (anime too, through its MAL id).
+    fn fetch_artwork(&mut self, cx: &mut Context<Self>) {
+        let req = self.req.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(Some(url)) = bg::run(backend::artwork(req)).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.artwork = Some(url);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn on_resolved(&mut self, resolved: anyhow::Result<Resolved>, resume: Option<f64>, prefs: PlaybackPrefs, _window: &mut Window, cx: &mut Context<Self>) {
         if self.leaving {
             return;
         }
+        self.prefs = prefs;
         let r = match resolved {
             Ok(r) => r,
             Err(e) => {
-                self.phase = Phase::Error(format!("{e:#}"));
+                self.fail(format!("{e:#}"));
                 cx.notify();
                 return;
             }
@@ -321,12 +450,14 @@ impl PlayerView {
         };
         match created {
             Ok(m) => {
+                // Settings → Playback → Subtitle language picks the embedded track mpv selects.
+                let _ = m.set("slang", &logic::slang(&self.prefs.subtitle_language));
+                self.resume_note = resume;
                 if let Some(t) = resume {
                     let _ = m.set("start", &format!("{t:.1}"));
-                    self.toast(format!("Resuming at {}", logic::format_time(t)));
                 }
                 if let Err(e) = m.load_str(&r.target) {
-                    self.phase = Phase::Error(format!("{e:#}"));
+                    self.fail(format!("{e:#}"));
                 } else {
                     self.phase = Phase::Loading;
                 }
@@ -335,13 +466,31 @@ impl PlayerView {
                 }
                 self.mpv = Some(m);
             }
-            Err(e) => self.phase = Phase::Error(format!("{e:#}")),
+            Err(e) => self.fail(format!("{e:#}")),
         }
         if matches!(self.phase, Phase::Error(_)) {
             self.mpv = None;
         }
         self.sync_video_popup();
         cx.notify();
+    }
+
+    /// Playback failed: log the raw error, show the friendly error screen.
+    fn fail(&mut self, raw: String) {
+        log_error("playback failed", &raw);
+        self.phase = Phase::Error(raw);
+    }
+
+    /// "Resuming at 12:34" with Start over (YouTube / Netflix offer the same choice).
+    fn resume_toast(&mut self, at: f64, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        toast::show(
+            cx,
+            Toast::info(format!("Resuming at {}", logic::format_time(at))).icon(glyphs::HISTORY).action("Start over", move |_, cx| {
+                let _ = this.update(cx, |p, cx| p.seek_to(0.0, cx));
+            }),
+        );
+        self.reveal();
     }
 
     /// `video_shown` switches the UI from the loader to the controls. The popup itself is shown
@@ -358,16 +507,15 @@ impl PlayerView {
         }
     }
 
-    /// Short message in the top bar (also reveals the controls).
-    fn toast(&mut self, text: String) {
-        self.toast = Some((text, Instant::now()));
+    /// Brings the controls back (with a toast or a state change worth seeing).
+    fn reveal(&mut self) {
         self.last_input = Instant::now();
         self.set_controls(true);
     }
 
     /// Big centre indicator (play / pause / volume / seek).
-    fn flash(&mut self, icon: &'static str, label: impl Into<String>) {
-        self.flash = Some((icon, label.into(), Instant::now()));
+    fn flash(&mut self, glyph: Option<&'static str>, label: impl Into<String>) {
+        self.flash = Some((glyph, label.into(), Instant::now()));
     }
 
     /// Shows / hides the controls, keeping the fade continuous if it is mid-way.
@@ -413,15 +561,17 @@ impl PlayerView {
         if let Some(f) = &self.follower {
             f.sync();
         }
-        if self.ticks % POLL_EVERY != 0 {
+        if !self.ticks.is_multiple_of(POLL_EVERY) {
             return;
         }
         self.polls = self.polls.wrapping_add(1);
+        let dt = self.last_poll.elapsed().as_secs_f64().min(1.0);
+        self.last_poll = Instant::now();
         let mut changed = false;
 
         // Torrent stats (connecting screen and buffering).
-        if self.polls % 4 == 0 {
-            if let (Some(h), Some(engine)) = (&self.info_hash, backend::engine_if_started()) {
+        if self.polls.is_multiple_of(4) {
+            if let (Some(h), Some(engine)) = (self.info_hash.as_ref().or(self.pending_hash.as_ref()), backend::engine_if_started()) {
                 let stats = engine.stats(h).ok().map(|s| TorrentStats { peers: s.peers, speed: s.download_speed, progress: s.progress });
                 if stats != self.torrent {
                     self.torrent = stats;
@@ -432,8 +582,8 @@ impl PlayerView {
         self.update_overlay_state(cx, &mut changed);
 
         let Some(mpv) = &self.mpv else {
-            if self.phase == Phase::Connecting && self.polls % 2 == 0 {
-                changed = true; // elapsed timer
+            if self.phase == Phase::Connecting && self.polls.is_multiple_of(2) {
+                changed = true; // slow-start hint
             }
             if changed {
                 cx.notify();
@@ -461,15 +611,16 @@ impl PlayerView {
             speed: mpv.get_f64("speed").unwrap_or(1.0),
             buffering: paused_for_cache || (self.phase == Phase::Loading && !loaded) || (seeking && self.pending_seek.is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(700))),
             cache_pct: if paused_for_cache { mpv.get_f64("cache-buffering-state").unwrap_or(0.0) } else { 0.0 },
+            eof: ended || mpv.get_bool("eof-reached").unwrap_or(false),
         };
-        if self.polls % TRACKS_EVERY == 0 || loaded {
+        if self.polls.is_multiple_of(TRACKS_EVERY) || loaded {
             let t = mpv.tracks();
             if t != self.tracks {
                 self.tracks = t;
                 changed = true;
             }
         }
-        if self.polls % 2 == 0 || loaded {
+        if self.polls.is_multiple_of(2) || loaded {
             let r = mpv.cache_ranges();
             if r != self.ranges {
                 self.ranges = r;
@@ -488,7 +639,7 @@ impl PlayerView {
         }
 
         if let Some(msg) = failed {
-            self.phase = Phase::Error(msg);
+            self.fail(msg);
             self.set_video_shown(false);
             changed = true;
         } else if loaded || (self.phase == Phase::Loading && self.snap.dur > 0.0) {
@@ -499,6 +650,10 @@ impl PlayerView {
         if !self.video_shown && self.phase == Phase::Playing && (!self.snap.buffering || self.snap.pos > 0.0) {
             self.set_video_shown(true);
             changed = true;
+            // Now the picture is up and seeking works, so Start over does what it says.
+            if let Some(t) = self.resume_note.take() {
+                self.resume_toast(t, cx);
+            }
         }
         if loaded {
             self.on_loaded(cx);
@@ -515,9 +670,9 @@ impl PlayerView {
         if self.last_save.elapsed() >= SAVE_EVERY && self.snap.dur > 0.0 && !self.snap.paused {
             self.save("progress");
         }
-        if let Some((_, at)) = &self.toast {
-            if at.elapsed() > Duration::from_secs(3) {
-                self.toast = None;
+        if self.phase == Phase::Playing {
+            self.auto_skip(cx);
+            if self.update_up_next(dt, window, cx) {
                 changed = true;
             }
         }
@@ -548,7 +703,7 @@ impl PlayerView {
 
     /// Controls stay up while paused, loading, scrubbing, in a menu or hovering a bar.
     fn pinned(&self) -> bool {
-        self.phase != Phase::Playing || self.snap.paused || self.menu.is_some() || self.drag.is_some() || self.mouse_in_bar
+        self.phase != Phase::Playing || self.snap.paused || self.menu.is_some() || self.help || self.drag.is_some() || self.mouse_in_bar
     }
 
     /// Loading / buffering indicator over the video.
@@ -558,6 +713,21 @@ impl PlayerView {
 
     fn skip_segment(&self) -> Option<SkipSegment> {
         (self.phase == Phase::Playing).then(|| logic::active_segment(&self.skip, self.snap.pos)).flatten()
+    }
+
+    fn up_next_visible(&self) -> bool {
+        self.up_next.shown && !self.up_next.dismissed && !matches!(self.phase, Phase::Error(_)) && !self.leaving
+    }
+
+    /// The next-episode lookup has been asked for and is still running.
+    fn next_busy(&self) -> bool {
+        self.next_wanted && self.next == NextState::Looking
+    }
+
+    /// The request came from a title's source list, so going back offers other sources.
+    fn can_switch_source(&self) -> bool {
+        !matches!(logic::classify_source(&self.req.source), logic::SourceKind::File(_))
+            && (self.req.imdb_id.as_deref().is_some_and(|s| !s.is_empty()) || self.req.mal_id.as_deref().is_some_and(|s| !s.is_empty()))
     }
 
     fn activity(&mut self, cx: &mut Context<Self>) {
@@ -584,6 +754,7 @@ impl PlayerView {
         }
         self.fetch_skip(cx);
         self.fetch_subtitles(cx);
+        self.fetch_next_info(cx);
     }
 
     fn fetch_skip(&mut self, cx: &mut Context<Self>) {
@@ -625,6 +796,23 @@ impl PlayerView {
         .detach();
     }
 
+    /// Title and still of the next episode for the Up Next card.
+    fn fetch_next_info(&mut self, cx: &mut Context<Self>) {
+        if self.next_info != Fetch::Idle || !backend::has_next(&self.req) {
+            return;
+        }
+        self.next_info = Fetch::Loading;
+        let req = self.req.clone();
+        cx.spawn(async move |this, cx| {
+            let info = bg::run(backend::next_info(req)).await.ok().flatten();
+            let _ = this.update(cx, |this, cx| {
+                this.next_info = Fetch::Done(info);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Adds external subtitles (max 3 per language); `auto` keeps mpv's own language preference.
     fn add_subtitles(&mut self, subs: &[StremioSubtitle]) {
         let Some(mpv) = &self.mpv else { return };
@@ -657,6 +845,142 @@ impl PlayerView {
         });
     }
 
+    // ── Settings-driven behaviour: skip intro, Up Next, pre-download ──
+
+    /// Settings → "Skip intro automatically": jumps past an opening once, with Undo.
+    fn auto_skip(&mut self, cx: &mut Context<Self>) {
+        if !self.prefs.skip_intro || self.drag.is_some() || self.pending_seek.is_some() {
+            return;
+        }
+        let Some(seg) = self.skip_segment().filter(|s| logic::is_intro(s.kind)) else { return };
+        let key = (seg.start * 10.0) as i64;
+        if self.auto_skipped.contains(&key) {
+            return;
+        }
+        self.auto_skipped.push(key);
+        let from = self.snap.pos;
+        self.seek_to(seg.end, cx);
+        let this = cx.entity().downgrade();
+        toast::show(
+            cx,
+            Toast::info("Skipped intro").icon(ph::SKIP_FORWARD).action("Undo", move |_, cx| {
+                let _ = this.update(cx, |p, cx| p.seek_to(from, cx));
+            }),
+        );
+    }
+
+    /// Shows the Up Next card near the end, runs the auto-play countdown and warms the next
+    /// episode. True when something on screen changed.
+    fn update_up_next(&mut self, dt: f64, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.leaving || !backend::has_next(&self.req) {
+            return false;
+        }
+        let dur = self.snap.dur;
+        let Some(start) = logic::up_next_start(dur, self.prefs.countdown, logic::outro_start(&self.skip)) else { return false };
+        let pos = self.shown_pos();
+        if pos >= dur * PREFETCH_AT {
+            self.ensure_next(self.prefs.pre_download_next, window, cx);
+        }
+        if pos < start && !self.snap.eof {
+            // Seeking back before the credits resets the card.
+            let was = self.up_next != UpNext::default();
+            self.up_next = UpNext::default();
+            return was;
+        }
+        if self.up_next.dismissed {
+            return false;
+        }
+        // The lookup already failed (the last episode, or no source for the next one): no card
+        // counting down to an episode that will not play. N and the Next button still retry.
+        if self.next == NextState::Failed && !self.next_wanted {
+            let was = self.up_next.shown;
+            self.up_next.dismissed = true;
+            return was;
+        }
+        let mut changed = false;
+        if !self.up_next.shown {
+            self.up_next = UpNext { shown: true, dismissed: false, left: self.prefs.countdown as f64 };
+            self.ensure_next(self.prefs.pre_download_next, window, cx);
+            changed = true;
+        }
+        if self.prefs.auto_play && !self.next_wanted {
+            // The countdown waits while paused (except on the last frame) and while a menu or the
+            // shortcut sheet is open, so the episode never changes mid-choice (WCAG 2.2.1).
+            let choosing = self.menu.is_some() || self.help;
+            if !choosing && (!self.snap.paused || self.snap.eof) {
+                self.up_next.left -= dt;
+                changed = true;
+            }
+            if self.up_next.left <= 0.0 {
+                self.play_next(window, cx);
+            }
+        }
+        changed
+    }
+
+    /// Starts the next-episode lookup if it has not run (or retries a failed one that is wanted).
+    /// `warm` also pre-downloads its torrent.
+    fn ensure_next(&mut self, warm: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.next {
+            NextState::Ready(next) => {
+                if warm && !self.next_warm {
+                    self.next_warm = true;
+                    backend::prefetch(next);
+                }
+                return;
+            }
+            NextState::Looking => {
+                self.next_warm |= warm;
+                return;
+            }
+            NextState::Failed if !self.next_wanted => return,
+            NextState::Failed | NextState::Idle => {}
+        }
+        self.next = NextState::Looking;
+        self.next_warm |= warm;
+        let req = self.req.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = bg::run(backend::next_episode(req)).await.and_then(|r| r);
+            let _ = this.update_in(cx, |this, window, cx| this.on_next(res, window, cx));
+        })
+        .detach();
+    }
+
+    fn on_next(&mut self, res: anyhow::Result<PlayRequest>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.leaving {
+            return;
+        }
+        match res {
+            Ok(next) => {
+                if self.next_warm {
+                    backend::prefetch(&next);
+                }
+                self.next = NextState::Ready(next.clone());
+                if self.next_wanted {
+                    self.go_next(next, window, cx);
+                }
+            }
+            Err(e) => {
+                self.next = NextState::Failed;
+                if self.next_wanted {
+                    self.next_wanted = false;
+                    // Stop the countdown from retrying every frame; the toast offers Retry.
+                    self.up_next.dismissed = true;
+                    let this = cx.entity().downgrade();
+                    let ep = self.req.episode.map(|e| e + 1).unwrap_or(0);
+                    log_error("next episode", &e);
+                    toast::show(
+                        cx,
+                        Toast::error(format!("Couldn't find a source for episode {ep}")).action("Retry", move |_, cx| {
+                            let _ = this.update(cx, |p, cx| p.with_main(cx, |p, window, cx| p.play_next(window, cx)));
+                        }),
+                    );
+                }
+            }
+        }
+        cx.notify();
+    }
+
     // ── actions ──
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
@@ -668,7 +992,7 @@ impl PlayerView {
             self.snap.paused = !self.snap.paused;
             m.set_pause(self.snap.paused);
             let paused = self.snap.paused;
-            self.flash(if paused { "icons/pause.svg" } else { "icons/play.svg" }, "");
+            self.flash(Some(if paused { ph::PAUSE.fill() } else { ph::PLAY.fill() }), "");
             cx.notify();
         }
     }
@@ -681,7 +1005,7 @@ impl PlayerView {
         let t = logic::seek_target(self.shown_pos(), delta, self.snap.dur);
         self.seek_to(t, cx);
         let label = if delta < 0.0 { format!("-{}s", -delta as i64) } else { format!("+{}s", delta as i64) };
-        self.flash(if delta < 0.0 { "icons/rotate-ccw.svg" } else { "icons/rotate-cw.svg" }, label);
+        self.flash(Some(if delta < 0.0 { ph::ARROW_COUNTER_CLOCKWISE.bold() } else { ph::ARROW_CLOCKWISE.bold() }), label);
     }
 
     fn seek_to(&mut self, t: f64, cx: &mut Context<Self>) {
@@ -707,10 +1031,17 @@ impl PlayerView {
 
     fn volume_flash(&mut self) {
         let v = if self.snap.muted { 0.0 } else { self.snap.volume };
-        self.flash(volume_icon(self.snap.muted, v), format!("{v:.0}%"));
+        self.flash(Some(volume_glyph(self.snap.muted, v).fill()), format!("{v:.0}%"));
     }
 
     fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        // Volume dragged to 0 already shows as muted ("Unmute"); unmuting brings the sound back
+        // instead of muting silence (YouTube does the same).
+        if self.mpv.is_some() && !self.snap.muted && self.snap.volume <= 0.0 {
+            self.set_volume(50.0, cx);
+            self.volume_flash();
+            return;
+        }
         if let Some(m) = &self.mpv {
             self.snap.muted = !self.snap.muted;
             let _ = m.set("mute", if self.snap.muted { "yes" } else { "no" });
@@ -728,6 +1059,13 @@ impl PlayerView {
         }
     }
 
+    /// Shift+< / Shift+>: one step down or up the speed list.
+    fn step_speed(&mut self, up: bool, cx: &mut Context<Self>) {
+        let s = logic::speed_step(self.snap.speed, up);
+        self.set_speed(s, cx);
+        self.flash(Some(ph::GAUGE.bold()), if (s - 1.0).abs() < 0.01 { "Normal speed".to_string() } else { logic::format_rate(s) });
+    }
+
     fn select_track(&mut self, kind: TrackKind, id: Option<i64>, cx: &mut Context<Self>) {
         if let Some(m) = &self.mpv {
             let (prop, val) = match (kind, id) {
@@ -737,18 +1075,51 @@ impl PlayerView {
                 (TrackKind::Sub, None) => ("sid", "no".into()),
             };
             let _ = m.set(prop, &val);
+            if kind == TrackKind::Sub && id.is_some() {
+                self.last_sid = id;
+            }
             self.tracks = m.tracks();
             cx.notify();
         }
     }
 
+    /// `c`: subtitles off, or back on with the last (or first) track (YouTube).
+    fn toggle_subtitles(&mut self, cx: &mut Context<Self>) {
+        if self.mpv.is_none() {
+            return;
+        }
+        let subs: Vec<&Track> = self.tracks.iter().filter(|t| t.kind == TrackKind::Sub).collect();
+        if let Some(cur) = subs.iter().find(|t| t.selected).map(|t| t.id) {
+            self.last_sid = Some(cur);
+            self.select_track(TrackKind::Sub, None, cx);
+            self.flash(Some(glyphs::SUBTITLES.regular()), "Subtitles off");
+            return;
+        }
+        let pick = self.last_sid.and_then(|id| subs.iter().find(|t| t.id == id)).or(subs.first()).map(|t| (t.id, logic::track_label(t)));
+        match pick {
+            Some((id, label)) => {
+                self.select_track(TrackKind::Sub, Some(id), cx);
+                self.flash(Some(glyphs::SUBTITLES.fill()), label);
+            }
+            None => self.flash(Some(ph::SUBTITLES_SLASH.regular()), "No subtitles for this video"),
+        }
+        cx.notify();
+    }
+
     fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.help = false;
         self.menu = if self.menu == Some(menu) {
             None
         } else {
             self.menu_serial = self.menu_serial.wrapping_add(1);
             Some(menu)
         };
+        cx.notify();
+    }
+
+    fn toggle_help(&mut self, cx: &mut Context<Self>) {
+        self.help = !self.help;
+        self.menu = None;
         cx.notify();
     }
 
@@ -761,6 +1132,15 @@ impl PlayerView {
     fn skip_now(&mut self, cx: &mut Context<Self>) {
         if let Some(seg) = self.skip_segment() {
             self.seek_to(seg.end, cx);
+        }
+    }
+
+    /// `,` / `.`: one frame back or forward (pauses), YouTube style.
+    fn frame_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(m) = &self.mpv {
+            let _ = m.command(&[if forward { "frame-step" } else { "frame-back-step" }]);
+            self.snap.paused = true;
+            cx.notify();
         }
     }
 
@@ -784,42 +1164,52 @@ impl PlayerView {
             window.toggle_fullscreen();
         }
         self.leave();
+        // Player toasts (Undo a skip, Start over) mean nothing once the player is gone.
+        toast::dismiss(cx);
         window.defer(cx, |window, cx| navigate(Route::Back, window, cx));
     }
 
-    /// Looks up the next episode's stream, then replaces this player with it.
+    /// Plays the following episode: at once when its lookup is done, else when it finishes.
     fn play_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.next_busy || !backend::has_next(&self.req) {
+        if self.leaving || !backend::has_next(&self.req) {
             return;
         }
-        self.next_busy = true;
-        self.toast("Finding the next episode…".into());
+        if let NextState::Ready(next) = &self.next {
+            let next = next.clone();
+            self.go_next(next, window, cx);
+            return;
+        }
+        if self.next_wanted {
+            return;
+        }
+        self.next_wanted = true;
+        if self.next != NextState::Looking {
+            self.ensure_next(self.prefs.pre_download_next, window, cx);
+        }
+        // The Up Next card's Play now already shows a spinner.
+        if !self.up_next_visible() {
+            toast::show(cx, Toast::info("Finding the next episode…").icon(ph::SKIP_FORWARD));
+        }
+        self.reveal();
         cx.notify();
-        let req = self.req.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let res = bg::run(backend::next_episode(req)).await.and_then(|r| r);
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.next_busy = false;
-                match res {
-                    Ok(next) => {
-                        // Same torrent (season pack): keep it alive for the next player.
-                        if this.info_hash.as_ref().is_some_and(|h| next.source.to_ascii_lowercase().contains(&h.to_ascii_lowercase())) {
-                            this.info_hash = None;
-                        }
-                        this.leaving = true;
-                        this.leave();
-                        // Back first so history stays `detail → player`.
-                        window.defer(cx, move |window, cx| {
-                            navigate(Route::Back, window, cx);
-                            navigate(Route::Player { request: next }, window, cx);
-                        });
-                    }
-                    Err(e) => this.toast(format!("{e:#}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+    }
+
+    /// Replaces this player with `next`.
+    fn go_next(&mut self, next: PlayRequest, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.leaving, true) {
+            return;
+        }
+        // Same torrent (season pack): keep it alive for the next player.
+        if self.info_hash.as_ref().is_some_and(|h| next.source.to_ascii_lowercase().contains(&h.to_ascii_lowercase())) {
+            self.info_hash = None;
+        }
+        self.leave();
+        toast::dismiss(cx);
+        // Back first so history stays `detail → player`.
+        window.defer(cx, move |window, cx| {
+            navigate(Route::Back, window, cx);
+            navigate(Route::Player { request: next }, window, cx);
+        });
     }
 
     fn retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -829,13 +1219,33 @@ impl PlayerView {
     }
 
     /// Keyboard (from the app window, which keeps focus; the overlay forwards here too).
+    /// YouTube's documented player keys: <https://support.google.com/youtube/answer/7631406>
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let m = &ev.keystroke.modifiers;
+        let k = &ev.keystroke;
+        let m = &k.modifiers;
         if m.control || m.alt || m.platform {
             return;
         }
         self.activity(cx);
-        match ev.keystroke.key.as_str() {
+        let key = k.key.as_str();
+        let ch = k.key_char.as_deref().unwrap_or("");
+        // Punctuation is matched on the character typed when there is one, so layouts with their
+        // own `<` key (German, Nordic: Shift+< is `>`) get the right direction; without it, as the
+        // character or Shift + the US base key.
+        let is = |c: &str, base: &str| if ch.is_empty() { key == c || (m.shift && key == base) } else { ch == c };
+        if is("?", "/") {
+            self.toggle_help(cx);
+            return;
+        }
+        if is("<", ",") {
+            self.step_speed(false, cx);
+            return;
+        }
+        if is(">", ".") {
+            self.step_speed(true, cx);
+            return;
+        }
+        match key {
             "space" | "k" => self.toggle_pause(cx),
             "left" | "j" => self.seek_by(-10.0, cx),
             "right" | "l" => self.seek_by(10.0, cx),
@@ -851,8 +1261,23 @@ impl PlayerView {
             "m" => self.toggle_mute(cx),
             "n" => self.play_next(window, cx),
             "s" => self.skip_now(cx),
+            "c" => self.toggle_subtitles(cx),
+            // Unshifted only: Shift+, / Shift+. are other characters on many layouts.
+            "," if !m.shift => self.frame_step(false, cx),
+            "." if !m.shift => self.frame_step(true, cx),
+            "home" => self.seek_to(0.0, cx),
+            "end" if self.snap.dur > 0.0 => self.seek_to((self.snap.dur - 1.0).max(0.0), cx),
+            d if !m.shift && d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {
+                if let Some(t) = logic::percent_target(u32::from(d.as_bytes()[0] - b'0'), self.snap.dur) {
+                    self.seek_to(t, cx);
+                    self.flash(None, logic::format_time(t));
+                }
+            }
             "escape" => {
-                if self.menu.is_some() {
+                if self.help {
+                    self.help = false;
+                    cx.notify();
+                } else if self.menu.is_some() {
                     self.menu = None;
                     cx.notify();
                 } else if window.is_fullscreen() {
@@ -935,7 +1360,7 @@ impl PlayerView {
 
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let dy = ev.delta.pixel_delta(px(20.)).y.as_f32();
-        if dy.abs() < 0.5 || self.mpv.is_none() || self.menu.is_some() {
+        if dy.abs() < 0.5 || self.mpv.is_none() || self.menu.is_some() || self.help {
             return;
         }
         self.activity(cx);
@@ -946,24 +1371,24 @@ impl PlayerView {
     // ── rendering ──
 
     fn menu_size(&self, menu: Menu) -> (f32, f32) {
-        match menu {
-            Menu::Audio => (AUDIO_W, logic::menu_height(self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count().max(1))),
+        let (w, h) = match menu {
             Menu::Tracks => {
                 let count = |k| self.tracks.iter().filter(|t| t.kind == k).count();
                 (TRACKS_W, logic::menu_height(count(TrackKind::Audio).max(count(TrackKind::Sub) + 1).max(2)))
             }
             Menu::Speed => (SPEED_W, logic::menu_height(logic::SPEEDS.len())),
-        }
+        };
+        // Short windows: shrink to the room above the bar (the lists scroll) instead of running
+        // under the top bar and losing the column heads.
+        (w, logic::menu_fit(h, self.ov_bounds.get().size.height.as_f32()))
     }
 
-    /// The overlay window's content.
-    fn render_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The overlay window's content. `in_overlay` is false for the fallback drawn in the app
+    /// window (which already has the shell's toast layer).
+    fn render_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>, in_overlay: bool) -> AnyElement {
         let fade_t = self.controls_at.elapsed();
-        let mut o = logic::fade(self.controls, fade_t, FADE);
+        let o = logic::fade(self.controls, fade_t, FADE);
         let error = matches!(self.phase, Phase::Error(_));
-        if error {
-            o = 0.0;
-        }
         let mut animating = fade_t < FADE || self.seek_hot_at.elapsed() < GROW;
         if let Some((_, _, at)) = &self.flash {
             if at.elapsed() < FLASH {
@@ -976,9 +1401,14 @@ impl PlayerView {
             window.request_animation_frame();
         }
         let menu = self.menu.filter(|_| self.controls && !error);
-        let skip = self.skip_segment();
+        let up_next = self.up_next_visible();
+        // Up Next replaces "Skip outro" (Netflix swaps Skip Credits for Next Episode).
+        let skip = self.skip_segment().filter(|_| !up_next);
         let ov_bounds = self.ov_bounds.clone();
         let loading_screen = !error && !self.video_shown;
+        let bars = o > 0.01;
+        // Toasts sit above the bottom bar while it shows.
+        let toast_lift = if error { 0.0 } else { 96.0 * o };
 
         div()
             .id("player-overlay")
@@ -1005,12 +1435,13 @@ impl PlayerView {
                 }
             }))
             .child(canvas(move |b, _, _| ov_bounds.set(b), |_, _, _, _| {}).absolute().size_full())
-            .when(loading_screen, |d| d.child(self.loading_screen()))
             // Click target for the whole video: pause, double-click fullscreen, close menus.
             .child(div().id("stage").absolute().top_0().left_0().size_full().on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                    if this.menu.take().is_some() {
+                    if this.help || this.menu.is_some() {
+                        this.help = false;
+                        this.menu = None;
                         cx.notify();
                     } else if matches!(this.phase, Phase::Error(_)) {
                     } else if ev.click_count == 2 {
@@ -1022,17 +1453,28 @@ impl PlayerView {
                     }
                 }),
             ))
+            // Above the stage so the loader's own button gets its clicks; empty loader space
+            // still reaches the stage (no hitbox there).
+            .when(loading_screen, |d| d.child(self.loading_screen(cx)))
             .when(!loading_screen && self.busy(), |d| d.child(self.buffering_badge()))
             .children(self.flash_view())
-            .children(self.error_view(cx))
-            .when(o > 0.01, |d| d.child(self.top_bar(o, cx)).child(self.bottom_bar(o, cx)))
-            .children(menu.map(|m| self.menu_view(m, cx)))
+            .children(self.error_screen(cx))
+            .when(bars, |d| d.child(self.top_bar(o, cx)))
+            .when(bars && !error, |d| d.child(self.bottom_bar(o, cx)))
             .children(skip.map(|s| self.skip_button(s, o, cx)))
+            .when(up_next && self.video_shown, |d| d.child(self.up_next_card(o, cx)))
+            // After Skip and Up Next: they sit where the menu opens, and the menu the viewer just
+            // opened must be on top and take the clicks.
+            .children(menu.map(|m| self.menu_view(m, cx)))
+            .when(self.help, |d| d.child(self.help_sheet(cx)))
+            .when(in_overlay, |d| d.child(div().absolute().top_0().left_0().right_0().bottom(px(toast_lift)).child(toast::host(cx))))
             .into_any_element()
     }
 
-    /// Full-screen loader before the first frame: dimmed backdrop, title, animated status.
-    fn loading_screen(&self) -> impl IntoElement {
+    /// Full-screen loader before the first frame: dimmed artwork, title, live status, and after a
+    /// long wait a way out ("Try another source"). Apple HIG Loading:
+    /// <https://developer.apple.com/design/human-interface-guidelines/loading>
+    fn loading_screen(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let torrent = matches!(logic::classify_source(&self.req.source), logic::SourceKind::Torrent(_));
         let status = if self.mpv.is_none() {
             if torrent {
@@ -1046,27 +1488,53 @@ impl PlayerView {
             "Starting playback"
         };
         let episode = logic::episode_label(&self.req.title, self.req.season, self.req.episode);
-        let backdrop = self.req.imdb_id.as_deref().filter(|s| s.starts_with("tt")).map(|id| format!("https://images.metahub.space/background/medium/{id}/img"));
         let progress = if self.snap.cache_pct > 0.0 { Some((self.snap.cache_pct / 100.0) as f32) } else { None };
-        div()
+        let slow = logic::slow_start(self.started.elapsed(), torrent, self.torrent.map(|t| t.peers));
+        let calm = motion::reduced();
+        let backdrop = self.artwork.clone().map(|url| {
+            let el = img(url).absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover).with_fallback(|| div().into_any_element());
+            if calm {
+                el.opacity(0.6).into_any_element()
+            } else {
+                el.with_animation("backdrop-in", Animation::new(Duration::from_millis(900)).with_easing(easing::standard), |el, d| el.opacity(0.6 * d)).into_any_element()
+            }
+        });
+        let hint = slow.then(|| {
+            let (title, body) = if torrent && self.torrent.is_none_or(|t| t.peers == 0) {
+                ("No one is sharing this file right now", "It may never start. Another source usually plays.")
+            } else {
+                ("This is taking longer than usual", "The source is slow to respond.")
+            };
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(6.))
+                .mt(px(14.))
+                .max_w(px(460.))
+                // Clicks on the hint never pause / play the video underneath.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(div().ramp(ramp::BODY_STRONG).text_color(Tokens::text_1()).text_center().child(title))
+                .child(div().ramp(ramp::CAPTION).text_color(Tokens::text_2()).text_center().child(body))
+                .when(self.can_switch_source(), |d| {
+                    d.child(
+                        btn("load-switch", "Try another source", ButtonKind::Primary)
+                            .icon(ph::SWAP)
+                            .tooltip("Go back and pick a different source")
+                            .mt(px(8.))
+                            .on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.exit(window, cx)))),
+                    )
+                })
+        });
+        let el = div()
             .absolute()
             .top_0()
             .left_0()
             .size_full()
-            .bg(rgb(0x000000))
-            .children(backdrop.map(|url| {
-                img(url).absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover).with_animation(
-                    "backdrop-in",
-                    Animation::new(Duration::from_millis(900)).with_easing(ease_in_out),
-                    |el, d| el.opacity(0.6 * d),
-                )
-            }))
+            .bg(video_bg())
+            .children(backdrop)
             // Soft vignette so text stays readable over any backdrop.
-            .child(div().absolute().top_0().left_0().size_full().bg(linear_gradient(
-                180.,
-                linear_color_stop(rgba(0x00000073), 0.),
-                linear_color_stop(rgba(0x000000e0), 1.),
-            )))
+            .child(div().absolute().top_0().left_0().size_full().bg(linear_gradient(180., linear_color_stop(shade(0.45), 0.), linear_color_stop(shade(0.88), 1.))))
             .child(
                 div()
                     .absolute()
@@ -1077,41 +1545,23 @@ impl PlayerView {
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap(px(14.))
-                    .child(ring_spinner(56.))
-                    .child(
-                        div()
-                            .mt(px(10.))
-                            .max_w(relative(0.7))
-                            .truncate()
-                            .text_size(px(30.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(Tokens::text_1())
-                            .child(self.req.title.clone()),
-                    )
-                    .children(episode.map(|e| div().text_size(px(size::LG)).text_color(Tokens::text_2()).child(e)))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(2.))
-                            .mt(px(4.))
-                            .text_size(px(size::LG))
-                            .text_color(Tokens::text_2())
-                            .child(status)
-                            .child(dots()),
-                    )
+                    .gap(px(12.))
+                    .child(spinner("load-spin", Tokens::accent(), 48.))
+                    .child(div().mt(px(10.)).max_w(relative(0.7)).truncate().ramp(ramp::TITLE).text_color(Tokens::text_1()).child(self.req.title.clone()))
+                    .children(episode.map(|e| div().ramp(ramp::BODY_LARGE).text_color(Tokens::text_2()).child(e)))
+                    .child(shimmer_text(status).ramp(ramp::BODY).text_color(Tokens::text_2()).mt(px(2.)))
                     .children(self.torrent.map(stat_chips))
-                    .child(progress_line(progress, 280.))
-                    .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(format!("{}s", self.started.elapsed().as_secs()))),
-            )
-            .with_animation("loader-in", Animation::new(Duration::from_millis(350)).with_easing(ease_in_out), |el, d| el.opacity(d))
+                    .child(div().mt(px(10.)).w(px(280.)).child(progress_bar("load-progress", progress.unwrap_or(0.), true)))
+                    .children(hint),
+            );
+        appear("loader-in", el)
     }
 
     /// Compact buffering indicator over a playing video.
     fn buffering_badge(&self) -> impl IntoElement {
         let label = if self.snap.cache_pct > 0.0 { format!("Buffering {:.0}%", self.snap.cache_pct) } else { "Buffering".to_string() };
-        div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().child(
+        div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().child(appear(
+            "buffer-in",
             div()
                 .flex()
                 .flex_col()
@@ -1119,40 +1569,21 @@ impl PlayerView {
                 .gap(px(12.))
                 .px(px(30.))
                 .py(px(24.))
-                .rounded(px(18.))
-                .bg(rgba(0x0000008c))
-                .child(ring_spinner(46.))
-                .child(div().text_size(px(size::LG)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(label))
-                .children(self.torrent.map(stat_chips))
-                .with_animation("buffer-in", Animation::new(Duration::from_millis(250)).with_easing(ease_in_out), |el, d| el.opacity(d)),
-        )
+                .rounded(px(radius::XL))
+                .bg(Tokens::glass())
+                .child(spinner("buffer-spin", Tokens::accent(), 40.))
+                .child(div().ramp(ramp::BODY_STRONG).text_color(Tokens::text_1()).child(label))
+                .children(self.torrent.map(stat_chips)),
+        ))
     }
 
-    /// Fading centre indicator for play / pause / seek / volume.
+    /// Fading centre indicator for play / pause / seek / volume (it grows a little as it fades,
+    /// except under reduced motion).
     fn flash_view(&self) -> Option<impl IntoElement> {
-        let (path, label, at) = self.flash.as_ref()?;
+        let (glyph, label, at) = self.flash.as_ref()?;
         let p = logic::ease_out(at.elapsed(), FLASH);
         let o = (1.0 - p).clamp(0.0, 1.0);
-        let s = 78.0 + 18.0 * p;
-        Some(
-            div().absolute().top_0().left_0().size_full().flex().flex_col().items_center().justify_center().gap(px(10.)).opacity(o).child(
-                div()
-                    .size(px(s))
-                    .rounded_full()
-                    .bg(rgba(0x0000008c))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(path, Tokens::text_1(), s * 0.42)),
-            )
-            .when(!label.is_empty(), |d| {
-                d.child(div().px(px(12.)).py(px(4.)).rounded(px(8.)).bg(rgba(0x0000008c)).text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(label.clone()))
-            }),
-        )
-    }
-
-    fn error_view(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let Phase::Error(msg) = &self.phase else { return None };
+        let s = if motion::reduced() { 84.0 } else { 78.0 + 18.0 * p };
         Some(
             div()
                 .absolute()
@@ -1163,20 +1594,53 @@ impl PlayerView {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(12.))
-                .bg(rgb(0x000000))
-                .child(div().size(px(72.)).rounded_full().bg(rgba(0xf8717124)).flex().items_center().justify_center().child(icon("icons/triangle-alert.svg", Tokens::danger(), 34.)))
-                .child(div().mt(px(6.)).text_size(px(size::XXL)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child("Couldn't play this"))
-                .child(div().max_w(px(560.)).text_center().text_size(px(size::MD)).text_color(Tokens::text_3()).child(msg.clone()))
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(10.))
-                        .mt(px(10.))
-                        .child(button("retry", "Retry", ButtonKind::Primary).on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.retry(window, cx)))))
-                        .child(button("err-back", "Back", ButtonKind::Secondary).on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.exit(window, cx))))),
-                )
-                .with_animation("error-in", Animation::new(Duration::from_millis(300)).with_easing(ease_in_out), |el, d| el.opacity(d)),
+                .gap(px(10.))
+                .opacity(o)
+                .children(glyph.map(|g| div().size(px(s)).rounded_full().bg(Tokens::glass()).flex().items_center().justify_center().child(icon(g, Tokens::text_1(), s * 0.42))))
+                .when(!label.is_empty(), |d| {
+                    d.child(div().px(px(12.)).py(px(4.)).rounded(px(radius::MD)).bg(Tokens::glass()).ramp(ramp::SUBTITLE_2).text_color(Tokens::text_1()).child(label.clone()))
+                }),
+        )
+    }
+
+    /// Playback failure in plain words with a way forward; the raw error sits under Details.
+    /// NN/g error messages: <https://www.nngroup.com/articles/error-message-guidelines/>
+    fn error_screen(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let Phase::Error(raw) = &self.phase else { return None };
+        let fe = logic::friendly_error(raw, matches!(logic::classify_source(&self.req.source), logic::SourceKind::File(_)));
+        let switch = fe.other_source && self.can_switch_source();
+        let retry = btn("err-retry", "Try again", if switch { ButtonKind::Secondary } else { ButtonKind::Primary })
+            .icon(glyphs::RETRY)
+            .on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.retry(window, cx))));
+        let other = if switch {
+            btn("err-switch", "Try another source", ButtonKind::Primary).icon(ph::SWAP).tooltip("Go back and pick a different source")
+        } else {
+            btn("err-back", "Back", ButtonKind::Secondary).icon(glyphs::BACK).kbd("escape")
+        }
+        .on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.exit(window, cx))));
+        let (primary, secondary) = if switch { (other.into_any_element(), retry.into_any_element()) } else { (retry.into_any_element(), other.into_any_element()) };
+        let details = div()
+            .flex()
+            .items_start()
+            .gap(px(8.))
+            .max_w(px(520.))
+            .child(div().flex_1().min_w_0().font_family(MONO_FONT).text_size(px(size::SM)).line_height(px(18.)).text_color(Tokens::text_3()).child(raw.clone()))
+            .child(copy_button("err-copy", raw.clone()));
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .bg(video_bg())
+                .child(appear(
+                    "error-in",
+                    error_view(fe.body).title(fe.title).action(primary).secondary(secondary).max_w(px(600.)).build().child(div().mt(px(6.)).child(disclosure("err-details", "Details").content(details))),
+                )),
         )
     }
 
@@ -1184,10 +1648,11 @@ impl PlayerView {
         let episode = logic::episode_label(&self.req.title, self.req.season, self.req.episode);
         let windowed = !self.fullscreen;
         let maximized = self.follower.as_ref().is_some_and(|f| f.is_maximized());
+        let slide = if motion::reduced() { 0.0 } else { -(1.0 - o) * 14.0 };
         div()
             .id("top-bar")
             .absolute()
-            .top(px(-(1.0 - o) * 14.0))
+            .top(px(slide))
             .left_0()
             .w_full()
             .h(px(TOP_H + 30.))
@@ -1197,7 +1662,7 @@ impl PlayerView {
             .pl(px(18.))
             .pt(px(14.))
             .gap(px(12.))
-            .bg(linear_gradient(180., linear_color_stop(rgba(0x000000b3), 0.), linear_color_stop(rgba(0x00000000), 1.)))
+            .bg(linear_gradient(180., linear_color_stop(shade(0.7), 0.), linear_color_stop(shade(0.), 1.)))
             // Empty top-bar space moves the window (drag) / maximizes it (double-click).
             .on_mouse_down(
                 MouseButton::Left,
@@ -1217,7 +1682,13 @@ impl PlayerView {
                     }
                 }),
             )
-            .child(round_ctl("back", "icons/arrow-left.svg", 24.).on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.exit(window, cx)))))
+            .child(
+                ctl("back", glyphs::BACK.bold(), BAR_PX, "Back", Some("escape"))
+                    .bg(Tokens::glass())
+                    .border_1()
+                    .border_color(Tokens::glass_border())
+                    .on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.exit(window, cx)))),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1226,43 +1697,30 @@ impl PlayerView {
                     .flex()
                     .flex_col()
                     .justify_center()
-                    .child(div().truncate().text_size(px(19.)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(self.req.title.clone()))
-                    .children(episode.map(|e| div().text_size(px(size::MD)).text_color(Tokens::text_2()).child(e))),
+                    .child(div().truncate().ramp(ramp::SUBTITLE).text_color(Tokens::text_1()).child(self.req.title.clone()))
+                    .children(episode.map(|e| div().ramp(ramp::BODY).text_color(Tokens::text_2()).child(e))),
             )
-            .children(self.toast.as_ref().map(|(t, _)| {
-                div()
-                    .flex_none()
-                    .mt(px(6.))
-                    .max_w(px(420.))
-                    .truncate()
-                    .px(px(14.))
-                    .py(px(7.))
-                    .rounded_full()
-                    .bg(rgba(0x00000099))
-                    .border_1()
-                    .border_color(rgba(0xffffff1f))
-                    .text_size(px(size::SM))
-                    .text_color(Tokens::text_1())
-                    .child(t.clone())
-                    .with_animation("toast-in", Animation::new(Duration::from_millis(220)).with_easing(ease_in_out), |el, d| el.opacity(d))
-            }))
             .when(windowed, |d| {
                 d.child(
                     div()
                         .flex()
                         .flex_none()
                         .mt(px(-14.))
-                        .child(frame_btn("win-min", "icons/minus.svg", false).on_click(cx.listener(|this, _, _w, _cx| {
+                        .child(frame_btn("win-min", IconName::WindowMinimize, false, "Minimize").on_click(cx.listener(|this, _, _w, _cx| {
                             if let Some(f) = &this.follower {
                                 f.minimize();
                             }
                         })))
-                        .child(frame_btn("win-max", if maximized { "icons/copy.svg" } else { "icons/square.svg" }, false).on_click(cx.listener(|this, _, _w, _cx| {
-                            if let Some(f) = &this.follower {
-                                f.toggle_maximize();
-                            }
-                        })))
-                        .child(frame_btn("win-close", "icons/x.svg", true).on_click(cx.listener(|this, _, _w, _cx| {
+                        .child(
+                            frame_btn("win-max", if maximized { IconName::WindowRestore } else { IconName::WindowMaximize }, false, if maximized { "Restore down" } else { "Maximize" }).on_click(
+                                cx.listener(|this, _, _w, _cx| {
+                                    if let Some(f) = &this.follower {
+                                        f.toggle_maximize();
+                                    }
+                                }),
+                            ),
+                        )
+                        .child(frame_btn("win-close", IconName::WindowClose, true, "Close").on_click(cx.listener(|this, _, _w, _cx| {
                             if let Some(f) = &this.follower {
                                 f.close();
                             }
@@ -1297,72 +1755,62 @@ impl PlayerView {
         let snap = &self.snap;
         let ready = self.mpv.is_some() && self.video_shown;
         let shown_pos = self.shown_pos();
-        let vol_icon = volume_icon(snap.muted, snap.volume);
         let time_text = if snap.dur > 0.0 {
             format!("{} / {}", logic::format_time(shown_pos), logic::format_time(snap.dur))
         } else {
             logic::format_time(shown_pos)
         };
+        let muted = snap.muted || snap.volume <= 0.0;
         let left = div()
             .flex()
             .items_center()
             .gap(px(4.))
-            .child(ctl("play", if snap.paused { "icons/play.svg" } else { "icons/pause.svg" }, 30.).on_click(cx.listener(|this, _, _w, cx| this.toggle_pause(cx))))
-            .child(jump_ctl("rew", "icons/rotate-ccw.svg").on_click(cx.listener(|this, _, _w, cx| this.seek_by(-10.0, cx))))
-            .child(jump_ctl("fwd", "icons/rotate-cw.svg").on_click(cx.listener(|this, _, _w, cx| this.seek_by(10.0, cx))))
-            .child(ctl("mute", vol_icon, 24.).on_click(cx.listener(|this, _, _w, cx| this.toggle_mute(cx))))
+            .child(
+                ctl("play", if snap.paused { ph::PLAY.fill() } else { ph::PAUSE.fill() }, TRANSPORT_PX, if snap.paused { "Play" } else { "Pause" }, Some("space"))
+                    .on_click(cx.listener(|this, _, _w, cx| this.toggle_pause(cx))),
+            )
+            .child(jump_ctl("rew", ph::ARROW_COUNTER_CLOCKWISE.bold(), TRANSPORT_PX, "Back 10 seconds", "j").on_click(cx.listener(|this, _, _w, cx| this.seek_by(-10.0, cx))))
+            .child(jump_ctl("fwd", ph::ARROW_CLOCKWISE.bold(), TRANSPORT_PX, "Forward 10 seconds", "l").on_click(cx.listener(|this, _, _w, cx| this.seek_by(10.0, cx))))
+            .child(ctl("mute", volume_glyph(snap.muted, snap.volume).fill(), BAR_PX, if muted { "Unmute" } else { "Mute" }, Some("m")).on_click(cx.listener(|this, _, _w, cx| this.toggle_mute(cx))))
             .child(self.volume_slider(cx))
-            .child(div().ml(px(14.)).text_size(px(size::MD)).text_color(Tokens::text_2()).child(time_text));
+            .child(div().ml(px(14.)).ramp(ramp::BODY).text_color(Tokens::text_2()).child(time_text));
         let menu = self.menu;
+        let subs_on = self.tracks.iter().any(|t| t.kind == TrackKind::Sub && t.selected);
+        let speed = snap.speed;
+        let normal_speed = (speed - 1.0).abs() < 0.01;
         let right = div()
             .flex()
             .items_center()
             .gap(px(4.))
             .when(backend::has_next(&self.req), |d| {
-                d.child(
-                    div()
-                        .id("next")
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .h(px(40.))
-                        .px(px(14.))
-                        .mr(px(6.))
-                        .rounded_full()
-                        .cursor_pointer()
-                        .bg(rgba(0xffffff14))
-                        .hover(|s| s.bg(rgba(0xffffff29)))
-                        .text_size(px(size::MD))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(Tokens::text_1())
-                        .child(icon("icons/skip-forward.svg", Tokens::text_1(), 18.))
-                        .child(if self.next_busy { "Finding…" } else { "Next episode" })
-                        .on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.play_next(window, cx)))),
-                )
+                d.child(if self.next_busy() {
+                    ctl_shell("next", ctl_box(BAR_PX), "Finding the next episode…", None, false).child(spinner("next-spin", Tokens::text_1(), BAR_PX))
+                } else {
+                    ctl("next", ph::SKIP_FORWARD.fill(), BAR_PX, "Next episode", Some("n")).on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.play_next(window, cx))))
+                })
             })
             .child(
-                ctl("audio", "icons/audio-lines.svg", 24.)
-                    .when(menu == Some(Menu::Audio), |d| d.bg(rgba(0xffffff26)))
-                    .on_click(cx.listener(|this, _, _w, cx| this.toggle_menu(Menu::Audio, cx))),
-            )
-            .child(
-                ctl("tracks", "icons/captions.svg", 24.)
-                    .when(menu == Some(Menu::Tracks), |d| d.bg(rgba(0xffffff26)))
+                ctl_shell("tracks", ctl_box(BAR_PX), "Audio & subtitles", None, menu == Some(Menu::Tracks))
+                    .child(icon(glyphs::SUBTITLES.path(if subs_on { mv_ui::Weight::Fill } else { mv_ui::Weight::Bold }), Tokens::text_1(), BAR_PX))
                     .on_click(cx.listener(|this, _, _w, cx| this.toggle_menu(Menu::Tracks, cx))),
             )
             .child(
-                ctl("speed", "icons/gauge.svg", 24.)
-                    .when(menu == Some(Menu::Speed), |d| d.bg(rgba(0xffffff26)))
-                    .on_click(cx.listener(|this, _, _w, cx| this.toggle_menu(Menu::Speed, cx))),
+                if normal_speed {
+                    ctl_shell("speed", ctl_box(BAR_PX), "Playback speed", None, menu == Some(Menu::Speed)).child(icon(ph::GAUGE.bold(), Tokens::text_1(), BAR_PX))
+                } else {
+                    text_ctl("speed", logic::format_rate(speed), BAR_PX, format!("Playback speed: {}", logic::format_rate(speed)), menu == Some(Menu::Speed))
+                }
+                .on_click(cx.listener(|this, _, _w, cx| this.toggle_menu(Menu::Speed, cx))),
             )
             .child(
-                ctl("fs", if self.fullscreen { "icons/minimize.svg" } else { "icons/maximize.svg" }, 24.)
+                ctl("fs", if self.fullscreen { ph::CORNERS_IN.bold() } else { ph::CORNERS_OUT.bold() }, BAR_PX, if self.fullscreen { "Exit full screen" } else { "Full screen" }, Some("f"))
                     .on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.toggle_fullscreen(window, cx)))),
             );
+        let slide = if motion::reduced() { 0.0 } else { -(1.0 - o) * 14.0 };
         div()
             .id("bottom-bar")
             .absolute()
-            .bottom(px(-(1.0 - o) * 14.0))
+            .bottom(px(slide))
             .left_0()
             .w_full()
             .h(px(BOTTOM_H + 40.))
@@ -1373,12 +1821,9 @@ impl PlayerView {
             .flex_col()
             .justify_end()
             .gap(px(8.))
-            .bg(linear_gradient(0., linear_color_stop(rgba(0x000000d9), 0.), linear_color_stop(rgba(0x00000000), 1.)))
+            .bg(linear_gradient(0., linear_color_stop(shade(0.85), 0.), linear_color_stop(shade(0.), 1.)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .when(ready, |d| {
-                d.child(div().flex().items_center().child(self.scrubber(cx)))
-                .child(div().flex().items_center().justify_between().h(px(50.)).child(left).child(right))
-            })
+            .when(ready, |d| d.child(div().flex().items_center().child(self.scrubber(cx))).child(div().flex().items_center().justify_between().h(px(56.)).child(left).child(right)))
     }
 
     fn scrubber(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1423,18 +1868,20 @@ impl PlayerView {
                     .w_full()
                     .h(px(track_h))
                     .rounded(px(track_h / 2.))
-                    .bg(rgba(0xffffff2e))
+                    // 3:1 against the dark gradient (WCAG 1.4.11 non-text contrast).
+                    .bg(Tokens::track())
                     // Buffered ranges.
                     .children(self.ranges.iter().filter(|_| dur > 0.0).map(|&(s, e)| {
-                        div().absolute().top_0().h_full().left(relative(frac(s))).w(relative((frac(e) - frac(s)).max(0.0))).rounded(px(track_h / 2.)).bg(rgba(0xffffff4d))
+                        div().absolute().top_0().h_full().left(relative(frac(s))).w(relative((frac(e) - frac(s)).max(0.0))).rounded(px(track_h / 2.)).bg(light(0.3))
                     }))
                     // Hover preview fill.
-                    .children(hover.map(|f| div().absolute().top_0().left_0().h_full().w(relative(f as f32)).rounded(px(track_h / 2.)).bg(rgba(0xffffff26))))
+                    .children(hover.map(|f| div().absolute().top_0().left_0().h_full().w(relative(f as f32)).rounded(px(track_h / 2.)).bg(light(0.22))))
+                    // Intro / recap / credits markers.
                     .when(dur > 0.0, |d| {
                         d.children(self.skip.iter().map(|s| {
                             let color = match s.kind {
-                                SkipType::Ed | SkipType::MixedEd => rgba(0xfbbf2466),
-                                _ => rgba(0x2bd49a55),
+                                SkipType::Ed | SkipType::MixedEd => Tokens::hue(Hue::Amber).alpha(0.5),
+                                _ => Tokens::hue(Hue::Cyan).alpha(0.45),
                             };
                             div().absolute().top_0().h_full().left(relative(frac(s.start))).w(relative(frac(s.end - s.start))).bg(color)
                         }))
@@ -1460,13 +1907,12 @@ impl PlayerView {
                     .ml(px(-38.))
                     .w(px(76.))
                     .py(px(5.))
-                    .rounded(px(8.))
-                    .bg(rgba(0x14161af0))
+                    .rounded(px(radius::MD))
+                    .bg(Tokens::glass_strong())
                     .border_1()
-                    .border_color(rgba(0xffffff1a))
+                    .border_color(Tokens::glass_border())
                     .text_center()
-                    .text_size(px(size::MD))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .ramp(ramp::BODY_STRONG)
                     .text_color(Tokens::text_1())
                     .child(logic::format_time(f * dur))
             }))
@@ -1491,13 +1937,14 @@ impl PlayerView {
                     this.drag_to(ev.position.x.as_f32(), cx);
                 }),
             )
+            .tooltip(mv_ui::tip(format!("Volume {v:.0}%")))
             .child(
                 div()
                     .relative()
                     .w_full()
                     .h(px(4.))
                     .rounded(px(2.))
-                    .bg(rgba(0xffffff33))
+                    .bg(Tokens::track())
                     .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
                     .child(
                         div()
@@ -1507,6 +1954,7 @@ impl PlayerView {
                             .h_full()
                             .w(relative(frac))
                             .rounded(px(2.))
+                            // Over 100% is amplified and may distort.
                             .bg(if self.snap.volume > 100.0 { Tokens::warning() } else { Tokens::text_1() }),
                     )
                     .child(div().absolute().top(px(-4.)).left(relative(frac)).ml(px(-6.)).size(px(12.)).rounded_full().bg(Tokens::text_1())),
@@ -1514,79 +1962,31 @@ impl PlayerView {
     }
 
     fn menu_view(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
-        let row = |id: String, flag_el: Option<AnyElement>, label: String, selected: bool| {
-            div()
-                .id(SharedString::from(id))
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(10.))
-                .h(px(MENU_ROW_H))
-                .px(px(10.))
-                .rounded(px(8.))
-                .cursor_pointer()
-                .text_size(px(size::MD))
-                .text_color(if selected { Tokens::text_1() } else { Tokens::text_2() })
-                .when(selected, |d| d.bg(rgba(0xffffff0f)).font_weight(FontWeight::SEMIBOLD))
-                .hover(|s| s.bg(rgba(0xffffff17)).text_color(Tokens::text_1()))
-                .children(flag_el)
-                .child(div().flex_1().min_w_0().truncate().child(label))
-                .child(div().w(px(18.)).flex_none().when(selected, |d| d.child(icon("icons/check.svg", Tokens::accent(), 18.))))
-        };
         let (w, h) = self.menu_size(menu);
-        let head = |title: &'static str, path: &'static str| {
-            div()
-                .flex_none()
-                .h(px(MENU_HEAD_H))
-                .px(px(18.))
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .text_size(px(size::LG))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(Tokens::text_1())
-                .child(icon(path, Tokens::text_2(), 18.))
-                .child(title)
-        };
+        let list = |id: &'static str| div().id(id).flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).flex().flex_col();
+        let empty = |text: &'static str| div().px(px(10.)).py(px(8.)).text_size(px(size::SM)).text_color(Tokens::text_3()).child(text);
         let body = match menu {
-            Menu::Audio => {
-                let mut list = div().id("audio-only-list").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).flex().flex_col();
-                let tracks: Vec<&Track> = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).collect();
-                if tracks.is_empty() {
-                    list = list.child(div().px(px(10.)).py(px(8.)).text_size(px(size::SM)).text_color(Tokens::text_3()).child("No audio tracks yet"));
-                }
-                for t in tracks {
-                    let id = t.id;
-                    list = list.child(
-                        row(format!("ao{id}"), Some(flag(logic::flag_country(&t.lang, &t.title))), logic::track_label(t), t.selected)
-                            .on_click(cx.listener(move |this, _, _w, cx| this.select_track(TrackKind::Audio, Some(id), cx))),
-                    );
-                }
-                div().size_full().flex().flex_col().child(head("Audio language", "icons/audio-lines.svg")).child(list)
-            }
             Menu::Tracks => {
-                let mut audio = div().id("audio-list").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).flex().flex_col();
+                let mut audio = list("audio-list");
                 let tracks: Vec<&Track> = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).collect();
                 if tracks.is_empty() {
-                    audio = audio.child(div().px(px(10.)).py(px(8.)).text_size(px(size::SM)).text_color(Tokens::text_3()).child("No audio tracks"));
+                    audio = audio.child(empty("No audio tracks yet"));
                 }
                 for t in tracks {
                     let id = t.id;
                     audio = audio.child(
-                        row(format!("a{id}"), Some(flag(logic::flag_country(&t.lang, &t.title))), logic::track_label(t), t.selected)
+                        track_row(SharedString::from(format!("a{id}")), Some(ui::flag(logic::flag_country(&t.lang, &t.title))), logic::track_label(t), t.selected)
                             .on_click(cx.listener(move |this, _, _w, cx| this.select_track(TrackKind::Audio, Some(id), cx))),
                     );
                 }
                 let subs: Vec<&Track> = self.tracks.iter().filter(|t| t.kind == TrackKind::Sub).collect();
                 let off = !subs.iter().any(|t| t.selected);
-                let mut list = div().id("sub-list").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).flex().flex_col();
-                list = list.child(
-                    row("s-off".into(), Some(flag_icon("icons/captions-off.svg")), "Off".into(), off).on_click(cx.listener(|this, _, _w, cx| this.select_track(TrackKind::Sub, None, cx))),
-                );
+                let mut sub_list = list("sub-list")
+                    .child(track_row("s-off", Some(ui::flag_glyph(ph::SUBTITLES_SLASH)), "Off", off).on_click(cx.listener(|this, _, _w, cx| this.select_track(TrackKind::Sub, None, cx))));
                 for t in subs {
                     let id = t.id;
-                    list = list.child(
-                        row(format!("s{id}"), Some(flag(logic::flag_country(&t.lang, &t.title))), logic::track_label(t), t.selected)
+                    sub_list = sub_list.child(
+                        track_row(SharedString::from(format!("s{id}")), Some(ui::flag(logic::flag_country(&t.lang, &t.title))), logic::track_label(t), t.selected)
                             .on_click(cx.listener(move |this, _, _w, cx| this.select_track(TrackKind::Sub, Some(id), cx))),
                     );
                 }
@@ -1594,46 +1994,45 @@ impl PlayerView {
                 div()
                     .size_full()
                     .flex()
-                    .child(col().child(head("Audio", "icons/audio-lines.svg")).child(audio))
-                    .child(div().w(px(1.)).my(px(14.)).bg(rgba(0xffffff14)))
-                    .child(col().child(head("Subtitles", "icons/captions.svg")).child(list))
+                    .child(col().child(ui::menu_head("Audio", ph::WAVEFORM)).child(audio))
+                    .child(div().w(px(1.)).my(px(14.)).bg(Tokens::glass_border()))
+                    .child(col().child(ui::menu_head("Subtitles", glyphs::SUBTITLES)).child(sub_list))
             }
             Menu::Speed => {
-                let mut list = div().id("speed-list").flex_1().min_h_0().px(px(8.)).pb(px(8.)).flex().flex_col();
+                let mut speeds = div().id("speed-list").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).flex().flex_col();
                 for s in logic::SPEEDS {
                     let selected = (self.snap.speed - s).abs() < 0.01;
-                    let label = if s == 1.0 { "Normal".to_string() } else { format!("{s}x") };
-                    list = list.child(row(format!("sp{s}"), None, label, selected).on_click(cx.listener(move |this, _, _w, cx| this.set_speed(s, cx))));
+                    let label = if s == 1.0 { "Normal".to_string() } else { logic::format_rate(s) };
+                    speeds = speeds.child(track_row(SharedString::from(format!("sp{s}")), None, label, selected).on_click(cx.listener(move |this, _, _w, cx| this.set_speed(s, cx))));
                 }
-                div().size_full().flex().flex_col().child(head("Playback speed", "icons/gauge.svg")).child(list)
+                div().size_full().flex().flex_col().child(ui::menu_head("Playback speed", ph::GAUGE)).child(speeds)
             }
         };
-        div()
+        let panel = glass_panel()
             .id("menu")
             .absolute()
             .right(px(MENU_RIGHT))
             .bottom(px(BOTTOM_H - 18.))
             .w(px(w))
             .h(px(h))
-            .rounded(px(14.))
             .overflow_hidden()
-            .bg(rgba(0x101216f2))
-            .border_1()
-            .border_color(rgba(0xffffff17))
-            .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(body)
-            .with_animation(
-                SharedString::from(format!("menu-{}", self.menu_serial)),
-                Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
-                |el, d| el.opacity(d).mb(px((1.0 - d) * 10.0)),
-            )
+            .child(body);
+        if motion::reduced() {
+            panel.into_any_element()
+        } else {
+            panel
+                .with_animation(SharedString::from(format!("menu-{}", self.menu_serial)), Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()), |el, d| el.opacity(d).mb(px((1.0 - d) * 10.0)))
+                .into_any_element()
+        }
     }
 
+    /// Netflix-style outlined "Skip intro" pill; fills white on hover.
     fn skip_button(&self, seg: SkipSegment, o: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        use mv_ui::Interactive as _;
         let bottom = logic::skip_bottom(false) + (logic::skip_bottom(true) - logic::skip_bottom(false)) * o;
-        div()
+        let el = div()
             .id("skip")
             .absolute()
             .right(px(40.))
@@ -1644,89 +2043,191 @@ impl PlayerView {
             .items_center()
             .justify_center()
             .gap(px(10.))
-            .rounded(px(10.))
+            .rounded(px(radius::MD))
             .border_1()
-            .border_color(rgba(0xffffffa6))
-            .bg(rgba(0x0e1014d9))
-            .text_size(px(size::LG))
-            .font_weight(FontWeight::SEMIBOLD)
+            .border_color(light(0.65))
+            .bg(Tokens::glass_strong())
+            .ramp(ramp::BODY_STRONG)
             .text_color(Tokens::text_1())
+            .role(Role::Button)
             .cursor_pointer()
-            .hover(|s| s.bg(rgba(0xffffffeb)).text_color(Tokens::base()))
+            .group("skip")
+            .hover(|s| s.bg(Tokens::text_1()).text_color(Tokens::base()))
+            .active(|s| s.bg(light(0.8)).text_color(Tokens::base()))
+            .focus_ring()
+            .tooltip(mv_ui::tip_kbd(logic::skip_label(seg.kind), "s"))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(logic::skip_label(seg.kind))
-            .child(icon("icons/skip-forward.svg", Tokens::text_1(), 18.))
-            .on_click(cx.listener(|this, _, _w, cx| this.skip_now(cx)))
-            .with_animation(
+            .child(icon(ph::SKIP_FORWARD.fill(), Tokens::text_1(), icon_px::LG).group_hover("skip", |s| s.text_color(Tokens::base())))
+            .on_click(cx.listener(|this, _, _w, cx| this.skip_now(cx)));
+        if motion::reduced() {
+            el.into_any_element()
+        } else {
+            el.with_animation(
                 SharedString::from(format!("skip-{}", seg.start as i64)),
                 Animation::new(Duration::from_millis(260)).with_easing(ease_out_quint()),
                 |el, d| el.opacity(d).mr(px((1.0 - d) * -24.0)),
             )
+            .into_any_element()
+        }
     }
-}
 
-fn volume_icon(muted: bool, volume: f64) -> &'static str {
-    if muted || volume <= 0.0 {
-        "icons/volume-x.svg"
-    } else if volume < 50.0 {
-        "icons/volume-1.svg"
-    } else {
-        "icons/volume-2.svg"
+    /// Up Next: the next episode's still and name, a countdown ring when auto-play is on, a filled
+    /// Play now and Cancel. Google Cast autoplay checklist:
+    /// <https://developers.google.com/cast/docs/design_checklist/cast-autoplay>
+    fn up_next_card(&self, o: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let bottom = logic::skip_bottom(false) + (logic::skip_bottom(true) - logic::skip_bottom(false)) * o;
+        let next_ep = self.req.episode.map(|e| e + 1).unwrap_or(1);
+        let ep_label = match self.req.season {
+            Some(s) => format!("S{s} · E{next_ep}"),
+            None => format!("Episode {next_ep}"),
+        };
+        let (title, still, loading) = match &self.next_info {
+            Fetch::Done(Some(i)) => (i.title.clone(), i.still.clone().or_else(|| self.artwork.clone()), false),
+            Fetch::Done(None) | Fetch::Idle => (None, self.artwork.clone(), false),
+            Fetch::Loading => (None, None, true),
+        };
+        let countdown = self.prefs.auto_play && !self.next_busy();
+        let total = self.prefs.countdown.max(1) as f64;
+        let left = self.up_next.left.max(0.0);
+        let thumb_w = 144.0;
+        let thumb_h = 81.0;
+        let thumb = div()
+            .relative()
+            .flex_none()
+            .w(px(thumb_w))
+            .h(px(thumb_h))
+            .rounded(px(radius::MD))
+            .overflow_hidden()
+            .bg(Tokens::surface_2())
+            .map(|d| match (loading, still) {
+                (true, _) => d.child(skeleton(px(thumb_w), px(thumb_h), radius::MD)),
+                (false, Some(url)) => d.child(
+                    img(url)
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .with_loading(move || skeleton(px(thumb_w), px(thumb_h), radius::MD).into_any_element())
+                        .with_fallback(|| div().size_full().flex().items_center().justify_center().child(icon(ph::FILM_STRIP.duotone(), Tokens::text_3(), icon_px::HERO)).into_any_element()),
+                ),
+                (false, None) => d.child(div().size_full().flex().items_center().justify_center().child(icon(ph::FILM_STRIP.duotone(), Tokens::text_3(), icon_px::HERO))),
+            })
+            // Play glyph over the still, like the next-episode tiles on Netflix.
+            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().child(
+                div().size(px(36.)).rounded_full().bg(Tokens::glass()).flex().items_center().justify_center().child(icon(ph::PLAY.fill(), Tokens::text_1(), icon_px::LG)),
+            ));
+        let info = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(px(2.))
+            .child(div().ramp(ramp::CAPTION).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(format!("UP NEXT · {ep_label}")))
+            .map(|d| match (&title, loading) {
+                (Some(t), _) => d.child(div().ramp(ramp::BODY_STRONG).text_color(Tokens::text_1()).line_clamp(2).text_ellipsis().child(t.clone())),
+                (None, true) => d.child(div().mt(px(4.)).child(mv_ui::skeleton_line(relative(0.9)))).child(div().mt(px(6.)).child(mv_ui::skeleton_line(relative(0.6)))),
+                (None, false) => d.child(div().ramp(ramp::BODY_STRONG).text_color(Tokens::text_1()).child(logic::next_title(&self.req.title, next_ep - 1))),
+            });
+        let ring = countdown.then(|| {
+            div()
+                .id("up-next-ring")
+                .relative()
+                .flex_none()
+                .size(px(32.))
+                .tooltip(mv_ui::tip(format!("Plays in {} s", left.ceil() as u64)))
+                .child(progress_ring_sized((left / total) as f32, 32.))
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(size::XS))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(Tokens::text_1())
+                        .child(format!("{}", left.ceil() as u64)),
+                )
+        });
+        let card = glass_panel()
+            .id("up-next")
+            .absolute()
+            .right(px(40.))
+            .bottom(px(bottom))
+            .w(px(UP_NEXT_W))
+            .p(px(12.))
+            .gap(px(12.))
+            .role(Role::Dialog)
+            .aria_label(SharedString::from(format!("Up next: {ep_label}")))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().flex().gap(px(12.)).child(thumb).child(info))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        btn("up-next-play", "Play now", ButtonKind::Primary)
+                            .icon(ph::PLAY.fill())
+                            .kbd("n")
+                            .loading(self.next_busy())
+                            .on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.play_next(window, cx)))),
+                    )
+                    .child(btn("up-next-cancel", "Cancel", ButtonKind::Ghost).on_click(cx.listener(|this, _, _w, cx| {
+                        this.up_next.dismissed = true;
+                        this.next_wanted = false;
+                        cx.notify();
+                    })))
+                    .child(div().flex_1())
+                    .children(ring),
+            );
+        if motion::reduced() {
+            card.into_any_element()
+        } else {
+            card.with_animation("up-next-in", Animation::new(duration::SLOW).with_easing(easing::enter), |el, d| el.opacity(d).mr(px((1.0 - d) * -24.0))).into_any_element()
+        }
     }
-}
 
-/// Small flag image (flagcdn) for a country, or a neutral globe.
-fn flag(country: Option<String>) -> AnyElement {
-    match country {
-        Some(cc) => img(logic::flag_url(&cc)).flex_none().w(px(22.)).h(px(16.)).rounded(px(3.)).object_fit(ObjectFit::Cover).into_any_element(),
-        None => flag_icon("icons/globe.svg"),
-    }
-}
-
-fn flag_icon(path: &'static str) -> AnyElement {
-    div().flex_none().w(px(22.)).h(px(16.)).flex().items_center().justify_center().child(icon(path, Tokens::text_3(), 15.)).into_any_element()
-}
-
-/// White overlay control with a soft round hover.
-fn ctl(id: impl Into<ElementId>, path: &'static str, size: f32) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(size + 18.))
-        .rounded_full()
-        .cursor_pointer()
-        .hover(|s| s.bg(rgba(0xffffff1f)))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(icon(path, Tokens::text_1(), size))
-}
-
-/// Circular glass button (back arrow).
-fn round_ctl(id: impl Into<ElementId>, path: &'static str, size: f32) -> Stateful<Div> {
-    ctl(id, path, size).bg(rgba(0x00000059)).border_1().border_color(rgba(0xffffff1a))
-}
-
-/// Window frame button (minimize / maximize / close) for the overlay's own title area.
-fn frame_btn(id: &'static str, path: &'static str, close: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(46.))
-        .h(px(34.))
-        .cursor_pointer()
-        .hover(move |s| if close { s.bg(rgb(0xc42b1c)) } else { s.bg(rgba(0xffffff1f)) })
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(icon(path, Tokens::text_1(), 15.))
-}
-
-/// Rewind / forward button with the "10" inside the circular arrow.
-fn jump_ctl(id: &'static str, path: &'static str) -> Stateful<Div> {
-    ctl(id, path, 28.).relative().child(
+    /// `?`: every shortcut on one sheet with key caps (YouTube's Shift+? list).
+    fn help_sheet(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let group = |title: &'static str, rows: Vec<Div>| div().flex().flex_col().gap(px(2.)).child(div().mb(px(4.)).ramp(ramp::CAPTION).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(title)).children(rows);
+        let left = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap(px(16.))
+            .child(group(
+                "PLAYBACK",
+                vec![
+                    ui::shortcut_row("Play or pause", &["space", "k"]),
+                    ui::shortcut_row("Back 10 seconds", &["left", "j"]),
+                    ui::shortcut_row("Forward 10 seconds", &["right", "l"]),
+                    ui::shortcut_range("Jump to 0% … 90%", "0", "9"),
+                    ui::shortcut_row("Start / end", &["home", "end"]),
+                    ui::shortcut_row("Frame back / forward", &[",", "."]),
+                    ui::shortcut_row("Slower / faster", &["<", ">"]),
+                ],
+            ));
+        let right = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap(px(16.))
+            .child(group("SOUND", vec![ui::shortcut_row("Volume up / down", &["up", "down"]), ui::shortcut_row("Mute", &["m"])]))
+            .child(group(
+                "VIEW",
+                vec![
+                    ui::shortcut_row("Full screen", &["f"]),
+                    ui::shortcut_row("Subtitles on / off", &["c"]),
+                    ui::shortcut_row("Skip intro, recap or outro", &["s"]),
+                    ui::shortcut_row("Next episode", &["n"]),
+                    ui::shortcut_row("Close menu / back", &["escape"]),
+                    ui::shortcut_row("This list", &["?"]),
+                ],
+            ));
         div()
+            .id("help-scrim")
             .absolute()
             .top_0()
             .left_0()
@@ -1734,78 +2235,68 @@ fn jump_ctl(id: &'static str, path: &'static str) -> Stateful<Div> {
             .flex()
             .items_center()
             .justify_center()
-            .pt(px(1.))
-            .text_size(px(9.))
-            .font_weight(FontWeight::BOLD)
-            .text_color(Tokens::text_1())
-            .child("10"),
-    )
+            .bg(Tokens::overlay())
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _w, cx| {
+                    cx.stop_propagation();
+                    this.help = false;
+                    cx.notify();
+                }),
+            )
+            .child(appear(
+                "help-in",
+                glass_panel()
+                    .id("help")
+                    .w(px(640.))
+                    .p(px(24.))
+                    .gap(px(18.))
+                    .role(Role::Dialog)
+                    .aria_label("Keyboard shortcuts")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(icon(ph::KEYBOARD.regular(), Tokens::text_2(), icon_px::LG))
+                            .child(div().flex_1().ramp(ramp::SUBTITLE).text_color(Tokens::text_1()).child("Keyboard shortcuts"))
+                            .child(icon_button("help-close", glyphs::CLOSE, "Close").kbd("escape").on_click(cx.listener(|this, _, _w, cx| {
+                                this.help = false;
+                                cx.notify();
+                            }))),
+                    )
+                    .child(div().flex().gap(px(32.)).child(left).child(right)),
+            ))
+    }
 }
 
-/// Accent ring spinner.
-fn ring_spinner(s: f32) -> impl IntoElement {
-    div().size(px(s)).flex().items_center().justify_center().child(icon("icons/loader-circle.svg", Tokens::accent(), s).with_animation(
-        "spin",
-        Animation::new(Duration::from_millis(850)).repeat(),
-        |el, delta| el.with_transformation(Transformation::rotate(percentage(delta))),
-    ))
+/// To `~/.mangavox/logs/main.log` (the raw error the UI words for people).
+fn log_error(what: &str, e: &dyn std::fmt::Display) {
+    mv_core::logging::global().warn("player", &format!("{what}: {e:#}"));
 }
 
-/// Three softly pulsing dots.
-fn dots() -> impl IntoElement {
-    div().flex().items_end().gap(px(4.)).ml(px(6.)).pb(px(3.)).children((0..3).map(|i| {
-        div().size(px(5.)).rounded_full().bg(Tokens::text_2()).with_animation(
-            SharedString::from(format!("dot-{i}")),
-            Animation::new(Duration::from_millis(1200)).repeat(),
-            move |el, delta| {
-                let t = (delta - i as f32 * 0.18).rem_euclid(1.0);
-                let a = (t * std::f32::consts::TAU).sin() * 0.5 + 0.5;
-                el.opacity(0.2 + 0.8 * a)
-            },
-        )
-    }))
+/// Speaker glyph for the volume level.
+fn volume_glyph(muted: bool, volume: f64) -> Ph {
+    if muted || volume <= 0.0 {
+        ph::SPEAKER_X
+    } else if volume < 50.0 {
+        ph::SPEAKER_LOW
+    } else {
+        ph::SPEAKER_HIGH
+    }
 }
 
 /// Peers / speed / progress chips.
 fn stat_chips(s: TorrentStats) -> impl IntoElement {
-    let chip = |path: &'static str, text: String| {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(7.))
-            .px(px(12.))
-            .py(px(6.))
-            .rounded_full()
-            .bg(rgba(0xffffff12))
-            .border_1()
-            .border_color(rgba(0xffffff14))
-            .text_size(px(size::SM))
-            .text_color(Tokens::text_1())
-            .child(icon(path, Tokens::accent(), 14.))
-            .child(text)
-    };
     div()
         .flex()
         .gap(px(8.))
         .mt(px(6.))
-        .child(chip("icons/users.svg", format!("{} peers", s.peers)))
-        .child(chip("icons/arrow-down.svg", logic::format_speed(s.speed)))
-        .when(s.progress > 0.0, |d| d.child(chip("icons/download.svg", format!("{:.0}%", (s.progress * 100.0).min(100.0)))))
-}
-
-/// Thin progress line: determinate when `progress` is known, else a sliding shimmer.
-fn progress_line(progress: Option<f32>, w: f32) -> impl IntoElement {
-    let track = div().relative().mt(px(10.)).w(px(w)).h(px(3.)).rounded_full().overflow_hidden().bg(rgba(0xffffff1f));
-    match progress {
-        Some(p) => track.child(div().absolute().top_0().left_0().h_full().w(relative(p.clamp(0.0, 1.0))).rounded_full().bg(Tokens::accent())).into_any_element(),
-        None => track
-            .child(div().absolute().top_0().h_full().w(px(w * 0.3)).rounded_full().bg(Tokens::accent()).with_animation(
-                "shimmer",
-                Animation::new(Duration::from_millis(1400)).repeat().with_easing(ease_in_out),
-                move |el, d| el.left(px(-w * 0.3 + d * w * 1.3)),
-            ))
-            .into_any_element(),
-    }
+        .child(ui::stat_chip(ph::USERS, format!("{} peers", s.peers)))
+        .child(ui::stat_chip(ph::ARROW_DOWN, logic::format_speed(s.speed)))
+        .when(s.progress > 0.0, |d| d.child(ui::stat_chip(glyphs::DOWNLOAD, format!("{:.0}%", (s.progress * 100.0).min(100.0)))))
 }
 
 impl Drop for PlayerView {
@@ -1832,7 +2323,7 @@ impl Drop for PlayerView {
 /// (or if it cannot be created) the overlay content is drawn here instead.
 impl Render for PlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let fallback = self.overlay.is_none().then(|| self.render_overlay(window, cx));
+        let fallback = self.overlay.is_none().then(|| self.render_overlay(window, cx, false));
         div()
             .id("player-root")
             .track_focus(&self.focus)
@@ -1840,8 +2331,20 @@ impl Render for PlayerView {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x000000))
+            .bg(video_bg())
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
+            // With the overlay up, Tab stays here (see `bind_keys`). The fallback controls are
+            // drawn in this window and visible, so there Tab moves between them as usual.
+            .on_action(cx.listener(|this, _: &StayOnPlayer, window, cx| {
+                if this.overlay.is_some() {
+                    this.activity(cx);
+                    this.keep_focus(window, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            // Any click here (fallback controls) keeps the shortcuts on the player root.
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| this.keep_focus(window, cx)))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(|this, _, window, cx| {
@@ -1853,7 +2356,7 @@ impl Render for PlayerView {
     }
 }
 
-/// Root view of the transparent overlay window: renders the player's controls.
+/// Root view of the transparent overlay window: renders the player's controls and its toasts.
 struct OverlayRoot {
     player: WeakEntity<PlayerView>,
     focus: FocusHandle,
@@ -1871,11 +2374,17 @@ impl OverlayRoot {
 
 impl Render for OverlayRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let inner = self.player.upgrade().map(|p| p.update(cx, |p, cx| p.render_overlay(window, cx)));
+        let inner = self.player.upgrade().map(|p| p.update(cx, |p, cx| p.render_overlay(window, cx, true)));
         div()
             .id("overlay-root")
             .size_full()
             .track_focus(&self.focus)
+            // Every click in the overlay hands keyboard focus back to the player in the app window.
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                if let Some(p) = this.player.upgrade() {
+                    p.update(cx, |p, cx| p.with_main(cx, |p, window, cx| p.keep_focus(window, cx)));
+                }
+            }))
             // Keys only land here if the overlay ever gets focus; forward them to the player.
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
                 if let Some(p) = this.player.upgrade() {

@@ -1,5 +1,5 @@
 //! Every colour in mv-ui must come from `Tokens` so the Appearance presets reach it.
-//! Raw hex colour literals are allowed only in src/theme.rs.
+//! Raw colour literals (hex, `hsla(..)`, `black()` / `white()`) are allowed only in src/theme.rs.
 use std::fs;
 use std::path::Path;
 
@@ -19,7 +19,8 @@ fn no_raw_colour_literals_outside_theme() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files);
-    let patterns = [concat!("rgb", "(0x"), concat!("rgba", "(0x")];
+    // Hex literals and the other GPUI colour constructors (`hsla(..)`, `black()`, `white()`).
+    let patterns = [concat!("rgb", "(0x"), concat!("rgba", "(0x"), concat!("hsla", "("), concat!("black", "()"), concat!("white", "()")];
     let mut hits = Vec::new();
     for file in files.iter().filter(|f| f.file_name().is_some_and(|n| n != "theme.rs")) {
         let text = fs::read_to_string(file).expect("read source");

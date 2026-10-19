@@ -272,6 +272,19 @@ impl Brain {
         }
     }
 
+    /// Drops the story-note lines a read of chapter `label` wrote (`- [<label> p<N>] ...`),
+    /// leaving other chapters' notes and the characters alone. Returns how many lines went.
+    pub fn forget_chapter(&mut self, label: &str) -> usize {
+        let prefix = format!("- [{label} p");
+        let total = self.notes.lines().count();
+        let kept: Vec<&str> = self.notes.lines().filter(|l| !l.starts_with(&prefix)).collect();
+        let removed = total - kept.len();
+        if removed > 0 {
+            self.notes = kept.join("\n");
+        }
+        removed
+    }
+
     /// Next unused `faces/<id>_<n>.jpg` path.
     pub(crate) fn next_face_path(&self, id: &str, reserved: &[PathBuf]) -> PathBuf {
         let dir = self.faces_dir();

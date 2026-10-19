@@ -13,6 +13,12 @@ use crate::motion::{reduced, spinner};
 use crate::theme::{easing, icon as icon_px, radius, size, Tokens};
 
 pub(crate) type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+/// Handler that receives a picked index (segmented control, stepper).
+pub(crate) type IndexHandler = Rc<dyn Fn(&usize, &mut Window, &mut App)>;
+/// Handler that receives a new on/off value (disclosure).
+pub(crate) type FlagHandler = Rc<dyn Fn(&bool, &mut Window, &mut App)>;
+/// Handler with no event (menu items, toast actions, dialog buttons).
+pub(crate) type WindowHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 fn clear() -> Rgba {
     Tokens::base().alpha(0.)
@@ -121,6 +127,19 @@ fn kind_colors(kind: ButtonKind) -> KindColors {
     }
 }
 
+/// The on state of a toggle [`Btn`], whatever its kind.
+fn selected_colors() -> KindColors {
+    KindColors {
+        bg: Tokens::accent_soft(),
+        fg: Tokens::accent(),
+        border: Some(Tokens::accent_border()),
+        hover_bg: Tokens::accent_a(0.22),
+        hover_fg: Tokens::accent(),
+        hover_border: Some(Tokens::accent()),
+        pressed_bg: Tokens::accent_a(0.3),
+    }
+}
+
 /// Text button, original form. Same look as [`btn`] (which adds icons, sizes, loading and
 /// disabled-with-reason); returns the plain `Stateful<Div>` so existing call sites keep working.
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, kind: ButtonKind) -> Stateful<Div> {
@@ -141,6 +160,7 @@ pub fn btn(id: impl Into<ElementId>, label: impl Into<SharedString>, kind: Butto
         icon: None,
         trailing: None,
         loading: false,
+        selected: false,
         disabled: None,
         tooltip: None,
         kbd: None,
@@ -159,6 +179,7 @@ pub struct Btn {
     icon: Option<IconSrc>,
     trailing: Option<IconSrc>,
     loading: bool,
+    selected: bool,
     disabled: Option<SharedString>,
     tooltip: Option<SharedString>,
     kbd: Option<SharedString>,
@@ -184,6 +205,14 @@ impl Btn {
     /// Shows a spinner in place of the leading icon and ignores clicks while `on`.
     pub fn loading(mut self, on: bool) -> Self {
         self.loading = on;
+        self
+    }
+
+    /// Toggle button on state ("In library", "Following"): tonal accent container, accent label
+    /// and the icon in its fill weight, so the state never rests on colour alone.
+    /// Material 3 toggle buttons: <https://m3.material.io/components/buttons/guidelines>
+    pub fn selected(mut self, on: bool) -> Self {
+        self.selected = on;
         self
     }
 
@@ -228,9 +257,9 @@ impl Btn {
     }
 
     pub fn build(self) -> Stateful<Div> {
-        let Btn { base, style, label, kind, size: sz, icon, trailing, loading, disabled, tooltip, kbd, full_width, on_click } = self;
+        let Btn { base, style, label, kind, size: sz, icon, trailing, loading, selected, disabled, tooltip, kbd, full_width, on_click } = self;
         let enabled = disabled.is_none() && !loading;
-        let c = kind_colors(kind);
+        let c = if selected { selected_colors() } else { kind_colors(kind) };
         let (pad, text, ic, gap) = match sz {
             ControlSize::Sm => (10., size::SM, icon_px::SM, 6.),
             ControlSize::Md => (12., size::SM, icon_px::MD, 8.),
@@ -238,7 +267,13 @@ impl Btn {
         };
         let off = disabled.is_some();
         let fg = if off { Tokens::text_disabled() } else { c.fg };
-        let weight = if ic <= 14. { Weight::Bold } else { Weight::Regular };
+        let weight = if selected {
+            Weight::Fill
+        } else if ic <= 14. {
+            Weight::Bold
+        } else {
+            Weight::Regular
+        };
         let glyph_at = move |src: IconSrc| glyph(src, weight, fg, ic).when(enabled, |s| s.group_hover("mv-btn", move |s| s.text_color(c.hover_fg)));
         let tip_text = disabled.clone().filter(|r| !r.is_empty()).or(tooltip).or_else(|| kbd.as_ref().map(|_| label.clone()));
         let el = base
@@ -255,6 +290,7 @@ impl Btn {
             .whitespace_nowrap()
             .text_color(fg)
             .role(Role::Button)
+            .when(selected, |d| d.aria_toggled(Toggled::True))
             .when(full_width, |d| d.w_full())
             .map(|d| match (off, kind) {
                 (true, ButtonKind::Primary | ButtonKind::Danger) => d.bg(Tokens::active()),
@@ -733,8 +769,6 @@ pub fn segmented<I: Into<SegmentItem>>(id: impl Into<ElementId>, items: impl Int
     }
 }
 
-type IndexHandler = Rc<dyn Fn(&usize, &mut Window, &mut App)>;
-
 /// See [`segmented`].
 pub struct Segmented {
     base: Stateful<Div>,
@@ -996,4 +1030,28 @@ impl NavItem {
             });
         refine(el, &style)
     }
+}
+
+/// Selectable row for lists (chats, models, voices, history): `active` fill when selected and a
+/// hover layer that goes stronger (`active_hover`) on the selected row, so hovering never makes it
+/// look less selected. Pressed state, Tab stop and focus ring included; add children and
+/// `.on_click(..)`. Do not call `.hover(..)` on it.
+/// Material 3 lists: <https://m3.material.io/components/lists/guidelines>
+pub fn list_row(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .w_full()
+        .min_h(px(36.))
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(radius::MD))
+        .text_size(px(size::MD))
+        .text_color(if selected { Tokens::text_1() } else { Tokens::text_2() })
+        .role(Role::ListItem)
+        .aria_selected(selected)
+        .map(|d| if selected { d.bg(Tokens::active()).hover(|s| s.bg(Tokens::active_hover())) } else { d.hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1())) })
+        .pressable()
 }

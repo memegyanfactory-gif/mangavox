@@ -5396,6 +5396,7 @@ dependencies = [
  "mv-ui",
  "mv-update",
  "mv-webwall",
+ "serde_json",
  "tray-icon",
  "ui-assistant",
  "ui-manga",
@@ -5403,6 +5404,7 @@ dependencies = [
  "ui-player",
  "ui-settings",
  "ui-studio",
+ "ui-welcome",
  "windows-sys 0.60.2",
  "winresource",
 ]
@@ -9762,6 +9764,7 @@ name = "ui-assistant"
 version = "8.0.5001"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "gpui-kit",
  "mv-ai",
@@ -9802,6 +9805,7 @@ name = "ui-media"
 version = "8.0.5001"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "gpui-kit",
  "mv-core",
@@ -9872,6 +9876,22 @@ dependencies = [
  "tempfile",
  "tokio",
  "ui-assistant",
+]
+
+[[package]]
+name = "ui-welcome"
+version = "8.0.5001"
+dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "mv-core",
+ "mv-sources",
+ "mv-studio",
+ "mv-ui",
+ "serde_json",
+ "sysinfo",
+ "ui-manga",
+ "ui-media",
 ]
 
 [[package]]

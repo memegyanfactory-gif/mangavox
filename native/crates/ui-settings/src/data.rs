@@ -73,9 +73,6 @@ pub struct Snapshot {
     pub preset: String,
     pub reduce_motion: bool,
     pub mode: String,
-    /// Custom folder per `STORAGE_KINDS` entry; empty string means the default folder.
-    pub storage: Vec<String>,
-    pub cache_bytes: u64,
 }
 
 fn config() -> Config {
@@ -140,21 +137,13 @@ pub fn load_snapshot() -> Snapshot {
         _ => "entertainment".into(),
     };
 
-    let storage_cfg = object(&cfg, "storage");
-    let storage = STORAGE_KINDS
-        .iter()
-        .map(|(kind, _, _)| str_field(&storage_cfg, kind).map(|s| s.trim().to_string()).unwrap_or_default())
-        .collect();
+    Snapshot { profile, playback, preset, reduce_motion, mode }
+}
 
-    Snapshot {
-        profile,
-        playback,
-        preset,
-        reduce_motion,
-        mode,
-        storage,
-        cache_bytes: dir_size(&cache_dir()),
-    }
+/// Custom folder per `STORAGE_KINDS` entry; an empty string means the default folder.
+pub fn load_storage_folders() -> Vec<String> {
+    let storage_cfg = object(&config(), "storage");
+    STORAGE_KINDS.iter().map(|(kind, _, _)| str_field(&storage_cfg, kind).map(|s| s.trim().to_string()).unwrap_or_default()).collect()
 }
 
 pub fn save_profile(name: &str, email: &str) -> Result<()> {
@@ -194,7 +183,7 @@ pub fn studio_saved() -> bool {
 }
 
 /// Studio defaults kept in `~/.mangavox/studio/prefs.json` (shared with mv-recap, which owns the
-/// rest of the file; only these keys are touched).
+/// rest of the file; only `speed` and `resolution` are written here; `voice` is read only).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StudioPrefs {
     pub voice: String,
@@ -231,7 +220,9 @@ fn save_studio_prefs_at(path: &Path, p: &StudioPrefs) -> Result<()> {
         Some(Value::Object(m)) => m,
         _ => Map::new(),
     };
-    root.insert("voice".into(), json!(p.voice));
+    // `voice` belongs to `mv_studio::voices::set_default_voice`, which also writes the pipeline
+    // config. Writing the copy read when Settings opened would undo a narrator picked in Studio
+    // since then (prefs.json wins over the config when the default is read).
     root.insert("speed".into(), json!(p.speed));
     root.insert("resolution".into(), json!(p.resolution));
     if let Some(dir) = path.parent() {
@@ -295,18 +286,6 @@ pub fn cache_dir() -> PathBuf {
     data_dir().join("cache")
 }
 
-pub fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(md) if md.is_dir() => dir_size(&e.path()),
-            Ok(md) => md.len(),
-            Err(_) => 0,
-        })
-        .sum()
-}
-
 /// Deletes ~/.mangavox/cache and recreates it empty. Library and downloads are untouched.
 pub fn clear_cache() -> Result<()> {
     let dir = cache_dir();
@@ -330,7 +309,8 @@ mod studio_tests {
         save_studio_prefs_at(&path, &StudioPrefs { voice: "Aria".into(), speed: 1.25, resolution: "720p".into() }).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["keep"]["a"], 1);
-        assert_eq!(v["voice"], "Aria");
+        // The default voice is saved by `voices::set_default_voice`, never from a stale copy.
+        assert_eq!(v["voice"], "old");
         assert_eq!(v["speed"], 1.25);
         assert_eq!(v["resolution"], "720p");
     }

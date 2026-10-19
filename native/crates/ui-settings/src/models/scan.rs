@@ -56,15 +56,30 @@ impl Category {
         }
     }
 
-    pub fn icon(self) -> &'static str {
+    pub fn icon(self) -> mv_ui::Ph {
+        use mv_ui::{glyphs, ph};
         match self {
-            Category::Language => "icons/message-square.svg",
-            Category::Voice => "icons/audio-lines.svg",
-            Category::Transcription => "icons/captions.svg",
-            Category::Ocr => "icons/scan-text.svg",
-            Category::ImageGen => "icons/image.svg",
-            Category::Audio => "icons/activity.svg",
-            Category::Other => "icons/box.svg",
+            Category::Language => ph::CHAT_CIRCLE,
+            Category::Voice => ph::WAVEFORM,
+            Category::Transcription => glyphs::SUBTITLES,
+            Category::Ocr => glyphs::READ,
+            Category::ImageGen => glyphs::IMAGE,
+            Category::Audio => ph::EQUALIZER,
+            Category::Other => glyphs::MODEL,
+        }
+    }
+
+    /// Category colour for tiles and chips (the same in every theme preset).
+    pub fn hue(self) -> mv_ui::Hue {
+        use mv_ui::Hue;
+        match self {
+            Category::Language => Hue::Blue,
+            Category::Voice => Hue::Cyan,
+            Category::Transcription => Hue::Violet,
+            Category::Ocr => Hue::Amber,
+            Category::ImageGen => Hue::Rose,
+            Category::Audio => Hue::Orange,
+            Category::Other => Hue::Slate,
         }
     }
 }
@@ -658,21 +673,25 @@ pub fn scan_hf(hub: &Path) -> Vec<LocalModel> {
 // ── Voices, Whisper, OCR ────────────────────────────────────────────────────
 
 pub const KOKORO_FILES: [&str; 2] = ["kokoro-v1.0.onnx", "voices-v1.0.bin"];
+/// The "Kokoro v1.0 Lite" pack's model (`mv_studio::voices`), which `kokoro_tts.py` uses when the
+/// full model is missing.
+pub const KOKORO_LITE_ONNX: &str = "kokoro-v1.0.int8.onnx";
 
+/// Kokoro in `dir`: the full model, else the Lite (int8) one, with the shared voices file. Both
+/// serve the same voices, so both are model `kokoro:v1.0` (the id the Voice job looks for).
 pub fn scan_kokoro(dir: &Path) -> Option<LocalModel> {
-    let onnx = dir.join(KOKORO_FILES[0]);
-    let voices = dir.join(KOKORO_FILES[1]);
-    let onnx_len = std::fs::metadata(&onnx).ok()?.len();
-    let voices_len = std::fs::metadata(&voices).ok()?.len();
     // Same check as kokoro_tts.py: a truncated download is not a model.
-    if onnx_len <= 1_000_000 {
-        return None;
-    }
+    let size = |name: &str| std::fs::metadata(dir.join(name)).ok().map(|m| m.len()).filter(|n| *n > 1_000_000);
+    let voices_len = std::fs::metadata(dir.join(KOKORO_FILES[1])).ok()?.len();
+    let (onnx_len, lite) = match size(KOKORO_FILES[0]) {
+        Some(n) => (n, false),
+        None => (size(KOKORO_LITE_ONNX)?, true),
+    };
     Some(LocalModel {
         id: "kokoro:v1.0".into(),
         key: dir.to_string_lossy().into_owned(),
-        name: "Kokoro v1.0 voices".into(),
-        family: "Kokoro 82M".into(),
+        name: if lite { "Kokoro v1.0 Lite voices" } else { "Kokoro v1.0 voices" }.into(),
+        family: if lite { "Kokoro 82M · int8" } else { "Kokoro 82M" }.into(),
         category: Category::Voice,
         source: Source::Kokoro,
         size: onnx_len + voices_len,
@@ -870,7 +889,7 @@ pub fn ffmpeg_binary() -> Option<PathBuf> {
     which("ffmpeg")
 }
 
-/// The Python environment Studio installs voices into (`kokoro_tts.py` VENV_DIR).
+/// The Python environment voice setup installs voices into (`kokoro_tts.py` VENV_DIR).
 pub fn tts_venv() -> PathBuf {
     mv_core::paths::root().join("tts-venv")
 }
@@ -939,9 +958,9 @@ pub fn detect_engines(inp: &EngineInputs) -> Vec<Engine> {
         },
         detail: match (venv_py.is_file(), python.is_some(), inp.kokoro_ready) {
             (true, _, true) => "Voice environment and Kokoro voices are ready.".into(),
-            (true, _, false) => "Voice environment is set up; Kokoro voices are not downloaded yet.".into(),
-            (false, true, _) => "Python is installed. Studio sets up the voice environment the first time you narrate.".into(),
-            (false, false, _) => "Needs Python 3.10 or newer for narration and page reading.".into(),
+            (true, _, false) => "Voice environment is set up. Download narration voices in Settings → Audio.".into(),
+            (false, true, _) => "Python is installed. Set up a voice in Settings → Audio to create the voice environment.".into(),
+            (false, false, _) => "Not set up yet. Setting up a voice in Settings → Audio installs a private Python.".into(),
         },
         path: if venv_py.is_file() { Some(venv) } else { python },
     };
@@ -1200,6 +1219,15 @@ mod tests {
         write(&d.join("kokoro2/kokoro-v1.0.onnx"), b"tiny");
         write(&d.join("kokoro2/voices-v1.0.bin"), b"v");
         assert!(scan_kokoro(&d.join("kokoro2")).is_none());
+        // The Lite pack (int8 model only) is the same voices under the same model id.
+        write(&d.join("kokoro-lite/kokoro-v1.0.int8.onnx"), &mb);
+        write(&d.join("kokoro-lite/voices-v1.0.bin"), b"v");
+        let lite = scan_kokoro(&d.join("kokoro-lite")).expect("lite");
+        assert_eq!(lite.id, "kokoro:v1.0");
+        assert!(lite.name.contains("Lite"));
+        // With both models the full one wins, as in kokoro_tts.py.
+        write(&d.join("kokoro-lite/kokoro-v1.0.onnx"), &mb);
+        assert!(!scan_kokoro(&d.join("kokoro-lite")).unwrap().name.contains("Lite"));
 
         write(&d.join("piper/en_US/en_US-amy-medium.onnx"), b"o");
         write(&d.join("piper/en_US/en_US-amy-medium.onnx.json"), b"{}");

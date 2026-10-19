@@ -46,6 +46,40 @@ pub struct JobInfo {
     /// One-line status for the job row.
     pub status: String,
     pub logs: VecDeque<String>,
+    /// Who narrates, as the voice step reported it (its own engine or a stand-in voice).
+    pub narrator: Option<Narrator>,
+    /// Pages this job voices again (a per-page Regenerate / New take); empty for whole chapters.
+    pub regen_pages: Vec<usize>,
+}
+
+/// The engine and voice that actually narrate a chapter (`tts_bridge._announce_engine`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Narrator {
+    /// `chatterbox`, `kokoro`, `piper`, ...
+    pub engine: String,
+    /// The voice the user picked.
+    pub voice: String,
+    /// The voice that speaks (differs when a stand-in fills in).
+    pub synth_voice: String,
+    /// A stand-in speaks for the picked voice (its engine is missing or would not start).
+    pub stand_in: bool,
+}
+
+impl Narrator {
+    /// From an `info` message that names the engine (`None` for other info lines).
+    pub fn from_message(raw: &serde_json::Value) -> Option<Narrator> {
+        let s = |k: &str| raw.get(k).and_then(serde_json::Value::as_str).map(str::to_string);
+        let engine = s("engine").filter(|e| !e.is_empty())?;
+        let voice = s("voice").unwrap_or_default();
+        let synth_voice = s("synth_voice").unwrap_or_else(|| voice.clone());
+        let stand_in = raw.get("stand_in").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        Some(Narrator { engine, voice, synth_voice, stand_in })
+    }
+
+    /// "Chatterbox", "Kokoro".
+    pub fn engine_label(&self) -> &'static str {
+        mv_studio::tts::engine_label(&self.engine)
+    }
 }
 
 impl JobInfo {
@@ -109,6 +143,11 @@ pub struct NarrationRequest {
     pub stages: Option<Vec<String>>,
     /// Re-synthesize pages whose audio already exists.
     pub force_regen: bool,
+    /// Voice only these pages again (the rest are reused): a per-page Regenerate / New take.
+    pub regen_pages: Vec<usize>,
+    /// The regen pages move to their next take (a new performance). tts_bridge records the
+    /// take in `audio/takes.json` only once the new clip replaced the old one.
+    pub new_take: bool,
 }
 
 /// The pipeline job for one chapter. Text extraction is skipped when the chapter
@@ -132,6 +171,12 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
         "speed": req.speed,
         "force_regen": req.force_regen,
     });
+    if !req.regen_pages.is_empty() {
+        job.tts_config["regen_pages"] = json!(req.regen_pages);
+        if req.new_take {
+            job.tts_config["new_take"] = json!(true);
+        }
+    }
     job.video_config = json!({
         "resolution": req.resolution,
         "format": req.format,
@@ -256,6 +301,12 @@ fn apply_to(job: &mut JobInfo, ev: JobEvent) -> Option<(String, String)> {
                 job.stage = Some(stage);
             }
             "info" => {
+                if let Some(n) = Narrator::from_message(&m.raw) {
+                    // The voice step's own line (with the voices) wins over the worker's guess.
+                    if job.narrator.as_ref().is_none_or(|old| old.voice.is_empty() || !n.voice.is_empty()) {
+                        job.narrator = Some(n);
+                    }
+                }
                 if let Some(msg) = m.message {
                     job.status = msg.clone();
                     job.log(msg);
@@ -328,6 +379,8 @@ pub fn enqueue(env: &Env, req: &NarrationRequest, chapters: &[ChapterItem]) -> a
             stage_percent: 0.0,
             status: "Waiting in queue".into(),
             logs: VecDeque::new(),
+            narrator: None,
+            regen_pages: req.regen_pages.clone(),
         });
         added += 1;
     }
@@ -399,6 +452,8 @@ mod tests {
             format: mv_recap::FORMAT_REELS.into(),
             stages: None,
             force_regen: true,
+            regen_pages: vec![],
+            new_take: false,
         }
     }
 
@@ -417,6 +472,18 @@ mod tests {
         let job = build_job(&req(false), &env(OcrProvider::Local), &chapter(true));
         assert_eq!(job.stages, vec!["tts", "sync_map"]);
         assert!(job.ollama_url.is_empty() && job.ollama_vision_model.is_empty());
+        assert!(job.tts_config.get("regen_pages").is_none(), "whole chapters by default");
+
+        // A per-page Regenerate voices only that page again.
+        let one = NarrationRequest { regen_pages: vec![4], force_regen: false, stages: Some(vec!["tts".into()]), ..req(false) };
+        let job = build_job(&one, &env(OcrProvider::Gemini), &chapter(true));
+        assert_eq!(job.tts_config["regen_pages"], json!([4]));
+        assert_eq!(job.tts_config["force_regen"], false);
+        assert!(job.tts_config.get("new_take").is_none(), "Regenerate keeps the page's take");
+        assert_eq!(job.stages, vec!["tts"]);
+        // New take: the page's next take, recorded by tts_bridge once the clip is in place.
+        let take = NarrationRequest { new_take: true, ..one };
+        assert_eq!(build_job(&take, &env(OcrProvider::Gemini), &chapter(true)).tts_config["new_take"], true);
     }
 
     #[test]
@@ -449,12 +516,24 @@ mod tests {
             stage_percent: 0.0,
             status: String::new(),
             logs: VecDeque::new(),
+            narrator: None,
+            regen_pages: vec![],
         };
         apply_to(&mut job, JobEvent::Started { id: 1, key: "c1".into() });
         assert_eq!(job.state, JobView::Running);
         apply_to(&mut job, msg(json!({"type":"progress","stage":"tts","current":2,"total":4,"percent":50.0})));
         apply_to(&mut job, msg(json!({"type":"progress","stage":"tts","current":3,"total":4,"percent":75.0})));
         assert_eq!(job.status, "Narrating · 3/4");
+        // The worker names the engine first, then the voice step says who really narrates.
+        apply_to(&mut job, msg(json!({"type":"info","stage":"tts","message":"TTS engine: chatterbox","engine":"chatterbox"})));
+        assert_eq!(job.narrator.as_ref().map(|n| (n.engine.as_str(), n.stand_in)), Some(("chatterbox", false)));
+        apply_to(&mut job, msg(json!({"type":"info","stage":"tts","engine":"kokoro","voice":"cb_narrator_f","synth_voice":"af_heart","stand_in":true,
+            "message":"Chatterbox could not run (CUDA); narrating with Kokoro (af_heart) instead."})));
+        let n = job.narrator.clone().unwrap();
+        assert_eq!((n.engine_label(), n.synth_voice.as_str(), n.stand_in), ("Kokoro", "af_heart", true));
+        assert!(job.status.starts_with("Chatterbox could not run"));
+        apply_to(&mut job, msg(json!({"type":"info","message":"Loaded 3 existing audio file(s) from disk"})));
+        assert_eq!(job.narrator, Some(n), "other info lines keep the narrator");
         assert_eq!(job.progress(), 0.375);
         assert_eq!(job.logs.iter().filter(|l| l.starts_with("Narrating")).count(), 1, "progress logs once per stage");
         let done = apply_to(&mut job, msg(json!({"type":"stage_complete","stage":"tts"})));
@@ -481,6 +560,8 @@ mod tests {
             stage_percent: 0.0,
             status: String::new(),
             logs: VecDeque::new(),
+            narrator: None,
+            regen_pages: vec![],
         };
         for i in 0..(MAX_LOG_LINES + 50) {
             job.log(i.to_string());

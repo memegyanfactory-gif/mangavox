@@ -6,7 +6,7 @@ use mv_ui::toast::{self, Toast};
 use mv_ui::{
     badge, banner, btn, checkbox, confirm_dialog, confirm_inline, count_badge, cover_tile, disclosure, empty_view, error_view, external_link, favorite_star, filter_chip, icon_button,
     icon_tag, icon_toggle, inline_alert, interactive, kbd, menu_button, meter, nav_item, overflow_menu, page_title, path_chip, ph, progress_ring, section_header, section_label, segmented,
-    selected_badge, size, skeleton_card, skeleton_row, skeleton_text, status_tag, stepper, switch, tag, tip, AlertKind, ButtonKind, CheckState, CoverSource, MenuItem,
+    selected_badge, setting_row, setting_section, size, skeleton_card, list_row, muted, rating_badge, usage_bar, glyphs, Hue, skeleton_row, skeleton_text, status_tag, stepper, switch, tag, tip, AlertKind, ButtonKind, CheckState, CoverSource, MenuItem,
     StatusKind, Tokens, Tone,
 };
 
@@ -21,6 +21,7 @@ struct Kit {
     nav: usize,
     confirming: bool,
     step: usize,
+    row: usize,
 }
 
 fn section(title: &'static str) -> Div {
@@ -63,6 +64,28 @@ impl Render for Kit {
                             MenuItem::new("Delete all", |_, cx| toast::show(cx, Toast::error("Could not delete: files are in use"))).icon(ph::TRASH).danger(),
                         ],
                     )),
+            )
+            .child(section("Rows, ratings and storage"))
+            .child(
+                row()
+                    .child(btn("lib", if self.pin { "In library" } else { "Add to library" }, ButtonKind::Secondary).icon(glyphs::SAVED).selected(self.pin).on_click(cx.listener(|t, _, _, cx| {
+                        t.pin = !t.pin;
+                        cx.notify();
+                    })))
+                    .child(rating_badge(8.43, 14.))
+                    .child(rating_badge(86., 18.))
+                    .child(div().w(px(240.)).child(usage_bar(&[(40., Tokens::hue(Hue::Blue)), (25., Tokens::hue(Hue::Violet)), (10., Tokens::hue(Hue::Amber))], 100.)))
+                    .child(muted("75 of 100 GB")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(24.))
+                    .child(div().w(px(260.)).flex().flex_col().gap(px(2.)).children((0..3).map(|i| list_row(("row", i), i == self.row).child(mv_ui::icon_ph(glyphs::HISTORY, Tokens::text_2(), 16.)).child(format!("Chat {}", i + 1)).on_click(cx.listener(move |t, _, _, cx| {
+                        t.row = i;
+                        cx.notify();
+                    })))))
+                    .child(div().w(px(420.)).child(setting_section("Playback", Some("Applies to anime and movies.".into())).child(setting_row("Autoplay", "Start the next episode", switch("sw-auto", self.on))))),
             )
             .child(section("Buttons"))
             .child(
@@ -264,7 +287,7 @@ fn main() {
         gpui_kit::open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), titlebar: Some(TitlebarOptions { title: Some("MangaVox kit gallery".into()), ..Default::default() }), ..Default::default() },
             cx,
-            |_, cx| cx.new(|_| Kit { fav: true, pin: false, seg: 0, view: 0, chips: [true, false, false], check: [true, false, false], on: true, nav: 1, confirming: false, step: 2 }),
+            |_, cx| cx.new(|_| Kit { fav: true, pin: false, seg: 0, view: 0, chips: [true, false, false], check: [true, false, false], on: true, nav: 1, confirming: false, step: 2, row: 0 }),
         )
         .expect("open window");
     });

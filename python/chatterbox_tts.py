@@ -111,7 +111,18 @@ def emit(obj: dict) -> None:
 # ----------------------------------------------------------------------------- readiness (cheap)
 
 def engine_python_present() -> bool:
-    return os.path.isfile(ENGINE_PY)
+    """The engine venv's interpreter, and the Python it was made from (`home` in pyvenv.cfg,
+    a uv Python in `<data>/uv-python`), are both on disk."""
+    if not os.path.isfile(ENGINE_PY):
+        return False
+    try:
+        with open(os.path.join(ENGINE_DIR, "pyvenv.cfg"), "r", encoding="utf-8") as f:
+            home = next((l.split("=", 1)[1].strip() for l in f if l.split("=", 1)[0].strip().lower() == "home"), "")
+    except OSError:
+        return True
+    if not home:
+        return True
+    return os.path.isfile(os.path.join(home, "python.exe")) if os.name == "nt" else os.path.isdir(home)
 
 
 def engine_info() -> dict:
@@ -572,6 +583,8 @@ def _worker_env() -> dict:
     env = os.environ.copy()
     env.update({
         "HF_HOME": HF_HOME,
+        # The weights come from our own downloader; a job never fetches anything.
+        "HF_HUB_OFFLINE": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "TOKENIZERS_PARALLELISM": "false",
         "PYTHONUNBUFFERED": "1",
@@ -650,7 +663,11 @@ def serve() -> int:
             torch.cuda.manual_seed_all(seed)
         with torch.inference_mode():
             wav = model.generate(text, **kwargs)
-        return wav.squeeze().detach().float().cpu().numpy().astype(np.float32)
+        x = wav.squeeze().detach().float().cpu().numpy().astype(np.float32)
+        # Loud takes can go past full scale; the 16-bit cache would clip them flat. The chapter
+        # gain comes later, so scaling just this chunk under 0 dBFS loses nothing.
+        peak = float(np.max(np.abs(x))) if x.size else 0.0
+        return x * (0.98 / peak) if peak > 0.98 else x
 
     def synth_chunk(text, params, seed):
         """One chunk, retried once when it runs away (hallucinated tail) or comes out empty."""

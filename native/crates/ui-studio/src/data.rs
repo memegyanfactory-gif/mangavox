@@ -245,6 +245,24 @@ pub fn mark_stage_complete(chapter_id: &str, stage: &str) -> Result<()> {
     })
 }
 
+/// Clears the finished-stage marks a Studio reset made untrue (Read → text, Audio → narration,
+/// Video → video), so the library stops showing them as done.
+pub fn mark_stages_reset(chapter_id: &str, steps: &[mv_recap::Step]) -> Result<()> {
+    use mv_core::repo::chapter;
+    use mv_recap::Step;
+    with_db(|c| {
+        for s in steps {
+            match s {
+                Step::Read => chapter::update_ocr_status(c, chapter_id, "none")?,
+                Step::Audio => chapter::update_tts_status(c, chapter_id, "none")?,
+                Step::Video => chapter::update_video_status(c, chapter_id, "none")?,
+                Step::Transcript | Step::Story | Step::Music => {}
+            }
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

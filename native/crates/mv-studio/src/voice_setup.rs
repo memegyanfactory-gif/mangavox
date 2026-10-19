@@ -500,6 +500,52 @@ mod tests {
         assert_eq!(state(key), None);
     }
 
+    /// Delete models (Settings → Storage) takes everything voice setup installed: the packs,
+    /// both voice environments, and the Pythons and package cache uv downloaded for them,
+    /// without following the junctions uv makes inside `uv-python`.
+    #[test]
+    fn delete_models_removes_engines_and_uv_dirs() {
+        let root = std::env::temp_dir().join(format!("mv-voice-setup-wipe-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("mv-voice-setup-wipe-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        let gone = [
+            "models/chatterbox/t3_cfg.safetensors",
+            "models/kokoro/voices-v1.0.bin",
+            "voice-samples/af_heart_kokoro_1.0_v3.wav",
+            "tts-venv/Scripts/python.exe",
+            "engines/chatterbox/Scripts/python.exe",
+            "engines/chatterbox/mangavox-engine.json",
+            "uv-python/cpython-3.11.16-windows-x86_64-none/python.exe",
+            "uv-cache/wheels-v6/torch.whl",
+        ];
+        let kept = ["config.json", "studio/prefs.json", "bin/uv.exe", "library/manga/m/c/1.jpg"];
+        for f in gone.iter().chain(&kept) {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"x").unwrap();
+        #[cfg(windows)]
+        {
+            // uv links `cpython-3.11-...` to the full version's folder with a junction.
+            let link = root.join("uv-python").join("cpython-3.11-windows-x86_64-none");
+            let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&outside).output().map(|o| o.status.success()).unwrap_or(false);
+            assert!(made, "mklink /J");
+        }
+        mv_core::paths::wipe(&root, mv_core::paths::Part::Models).unwrap();
+        for d in ["models", "voice-samples", "tts-venv", "engines", "uv-python", "uv-cache"] {
+            assert!(!root.join(d).exists(), "{d} is left");
+        }
+        for f in kept {
+            assert!(root.join(f).is_file(), "{f} was removed");
+        }
+        assert!(outside.join("keep.txt").is_file(), "the junction was followed");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     #[test]
     fn uv_is_found_in_the_data_folder_first() {
         let root = std::env::temp_dir().join(format!("mv-voice-setup-uv-{}", std::process::id()));

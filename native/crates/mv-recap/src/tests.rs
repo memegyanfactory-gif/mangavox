@@ -201,8 +201,8 @@ fn export_formats() {
     std::fs::write(panel_path(&ch, 1, 0), b"x").unwrap();
     let story = Story {
         segments: vec![
-            StorySegment { page: 1, panel: Some(0), text: "One.".into() },
-            StorySegment { page: 1, panel: Some(5), text: "Two.".into() },
+            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None },
+            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }) },
         ],
         ..Default::default()
     };
@@ -217,6 +217,12 @@ fn export_formats() {
     assert_eq!(b[0]["page"], 0);
     assert!(b[1]["panel_image"].as_str().unwrap().ends_with("p0001_00.jpg"));
     assert!(b[2]["panel_image"].as_str().unwrap().ends_with("page2.png"));
+    // A passage without a delivery follows its scene; one with a delivery carries it (capped at 10).
+    assert!(b[1].get("kind").is_none());
+    assert_eq!((b[2]["kind"].as_str(), b[2]["intensity"].as_u64()), (Some("fight"), Some(10)));
+    // Old story files without the field still load.
+    let old: StorySegment = serde_json::from_str(r#"{"page":2,"panel":null,"text":"x"}"#).unwrap();
+    assert_eq!(old.delivery, None);
 }
 
 fn panels_for(ch: &ChapterRef) -> std::path::PathBuf {
@@ -237,26 +243,28 @@ async fn read_chapter_end_to_end_and_resume() {
     assert_eq!(read.pages[0].scene.kind, "fight");
     assert_eq!(read.pages[0].scene.intensity, 7);
     // page 2 attaches page image + face thumbnails of known characters
-    let seen = llm.seen.lock().unwrap();
-    assert_eq!(seen[0].images.len(), 1);
-    assert!(seen[1].images.len() >= 2);
-    let prompt = &seen[1].messages.last().unwrap().content;
-    assert!(prompt.contains("Image 2 = reference face of"));
-    assert!(prompt.contains("Silver-haired swordsman"));
-    assert_eq!(seen[1].workspace.as_ref().unwrap(), &chapter_dir(&ch).join("work").join("p0001"));
-    drop(seen);
+    {
+        let seen = llm.seen.lock().unwrap();
+        assert_eq!(seen[0].images.len(), 1);
+        assert!(seen[1].images.len() >= 2);
+        let prompt = &seen[1].messages.last().unwrap().content;
+        assert!(prompt.contains("Image 2 = reference face of"));
+        assert!(prompt.contains("Silver-haired swordsman"));
+        assert_eq!(seen[1].workspace.as_ref().unwrap(), &chapter_dir(&ch).join("work").join("p0001"));
+    }
     // placeholder renamed; speaker canonicalised
-    let b = brain.lock().unwrap();
-    assert!(b.find("Kaito").is_some() && b.find("Silver-haired swordsman").is_some());
-    assert_eq!(read.pages[1].panels[0].lines[0].speaker.as_deref(), Some("Kaito"));
-    let k = b.find("Kaito").unwrap();
-    assert_eq!(k.appearances, 2);
-    assert_eq!(k.first_seen, Some(("c1".into(), 0)));
-    assert_eq!(k.faces.len(), 2);
-    assert!(k.faces.iter().all(|f| f.is_file()));
-    assert!(b.notes.contains("Ruko meets the swordsman"));
-    assert!(dir.path().join("brain").join("brain.json").is_file());
-    drop(b);
+    {
+        let b = brain.lock().unwrap();
+        assert!(b.find("Kaito").is_some() && b.find("Silver-haired swordsman").is_some());
+        assert_eq!(read.pages[1].panels[0].lines[0].speaker.as_deref(), Some("Kaito"));
+        let k = b.find("Kaito").unwrap();
+        assert_eq!(k.appearances, 2);
+        assert_eq!(k.first_seen, Some(("c1".into(), 0)));
+        assert_eq!(k.faces.len(), 2);
+        assert!(k.faces.iter().all(|f| f.is_file()));
+        assert!(b.notes.contains("Ruko meets the swordsman"));
+        assert!(dir.path().join("brain").join("brain.json").is_file());
+    }
     assert!(panel_path(&ch, 0, 0).is_file());
     assert!(panel_path(&ch, 1, 0).is_file());
     assert_eq!(chapter_status(&ch).read_pages, 2);
@@ -297,13 +305,13 @@ async fn story_chunks_and_saves() {
     save_transcript(&ch, &Transcript { pages: vec![TranscriptPage { index: 0, text: "Ruko: EDITED LINE".into(), edited: true }] }).unwrap();
 
     let story = Fake::new(&[r#"{"title":"Duel","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":2,"panel":null,"text":"Kaito speaks."},{"page":9,"text":"stray"}]}"#]);
-    let out = write_story_with(&story, &model(), &[ch.clone()], &["Hard".to_string()], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    let out = write_story_with(&story, &model(), std::slice::from_ref(&ch), &["Hard".to_string()], &brain, &silent(), &CancellationToken::new()).await.unwrap();
     assert_eq!(out.len(), 1);
     let s = &out[0].1;
     assert_eq!(s.title, "Duel");
     assert_eq!(s.segments, vec![
-        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into() },
-        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into() },
+        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None },
+        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None },
     ]);
     let req = story.seen.lock().unwrap();
     let sys = &req[0].messages[0].content;

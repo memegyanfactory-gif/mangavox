@@ -136,6 +136,20 @@ pub struct StorySegment {
     pub page: usize,
     pub panel: Option<usize>,
     pub text: String,
+    /// How the narrator should deliver this passage, picked by the user. `None` follows the
+    /// page's scene (read.json). Exported on the passage's beat, where the narration reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
+}
+
+/// Narrator direction for one passage: a scene kind the emotion mapping knows
+/// (`fight`, `action`, `dialogue`, `emotional`, `comedy`, `reveal`, `calm`, `flashback`,
+/// `romance`, `horror`) and its intensity 0-10, like ElevenLabs v3 audio tags.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Delivery {
+    pub kind: String,
+    pub intensity: u8,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -816,6 +816,10 @@ def missing_message(voice: str, probe: EngineProbe | None = None) -> str | None:
             what = "the Chatterbox engine is not installed"
         elif not probe.chatterbox_models():
             what = "its voice files are not downloaded"
+        elif not (probe.kokoro() or (piper_models_ready() and probe.piper_deps())):
+            # Setup records the clip with a local Kokoro (or Piper) voice.
+            return (f'{voice} clones a reference clip that is recorded with a local voice, and none is installed. '
+                    f'In Settings → Audio, download "{KOKORO_PACK_NAME}", then press Set up on "{pack}" again.')
         else:
             what = "its reference clip is missing"
         stand_in = STUDIO_KOKORO_STAND_IN.get(voice)
@@ -1447,7 +1451,16 @@ def synthesize_piper(text: str, output_path: str, voice: str, speed: float) -> N
         raise RuntimeError(missing_message(voice) or f"Piper model missing: {onnx}")
 
     piper = PiperVoice.load(onnx, config_path=cfg)
-    chunks = list(piper.synthesize(text))
+    # Speed (the user's setting times the scene's pace) is a shorter or longer phoneme length.
+    syn = None
+    speed = float(speed or 1.0)
+    if abs(speed - 1.0) > 0.005:
+        try:
+            from piper import SynthesisConfig
+            syn = SynthesisConfig(length_scale=float(piper.config.length_scale) / max(0.25, speed))
+        except Exception:
+            syn = None
+    chunks = list(piper.synthesize(text, syn_config=syn) if syn else piper.synthesize(text))
     if not chunks:
         raise RuntimeError("Piper produced no audio")
 

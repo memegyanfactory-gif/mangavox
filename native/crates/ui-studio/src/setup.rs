@@ -464,6 +464,11 @@ pub fn latest() -> Option<Checked> {
     LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// `seq` of the newest finished check (0 before the first), without copying it.
+pub fn latest_seq() -> u64 {
+    LATEST.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |c| c.seq)
+}
+
 /// A check that started at the current voices version is running.
 pub fn checking_current() -> bool {
     let v = voices::version();
@@ -510,6 +515,11 @@ impl EnvSync {
     pub fn behind(&self) -> bool {
         let v = voices::version();
         self.tried_version != v && self.env_version != v
+    }
+
+    /// A newer check is waiting to be adopted, or one is due. Cheap enough for every tick.
+    pub fn pending(&self) -> bool {
+        latest_seq() > self.seen_seq || self.behind()
     }
 }
 
@@ -599,7 +609,7 @@ async fn check_now() -> Env {
 fn paths_match(program: &str, path: &str) -> bool {
     let p = PathBuf::from(program);
     if p.is_absolute() {
-        return p == PathBuf::from(path);
+        return p == Path::new(path);
     }
     // A bare command: resolve it the way the shell would.
     let lookup = if cfg!(windows) { "where" } else { "which" };
@@ -707,6 +717,111 @@ mod tests {
         assert!(Engines::from_status(&json!({"chatterboxReady": true})).chatterbox);
     }
 
+    /// One `voice_plan` entry as `kokoro_tts.py` prints it.
+    fn plan(ready: bool, engine: &str, fallback: Option<&str>, missing: Option<&str>) -> Value {
+        let fallback_engine = fallback.map(tts::engine_hint);
+        json!({"ready": ready, "engine": engine, "fallbackVoice": fallback, "fallbackEngine": fallback_engine, "missing": missing,
+               "message": if ready { Value::Null } else { json!("what to get") }})
+    }
+
+    /// The per-voice truth table: what `kokoro_tts.py voices-ready` reports on PCs with only
+    /// Kokoro (full or lite), only one Piper voice, nothing, and Chatterbox installed or not
+    /// (the entries are copied from real runs on fake data folders), and what Studio and
+    /// Settings → Audio make of it (both call [`voice_ready`] on the same check).
+    #[test]
+    fn readiness_truth_table() {
+        let k = |_: &str| plan(true, "kokoro", None, None);
+        let kokoro_only = json!({
+            "engines": {"kokoro": {"ready": true}}, "kokoroReady": true, "kokoroDepsReady": true,
+            "chatterboxReady": false, "chatterboxDepsReady": false,
+            "voices": {
+                "af_heart": k("af_heart"), "hf_alpha": k("hf_alpha"),
+                "en_piper_f": plan(false, "none", None, Some("model")),
+                "f5_en_female": plan(true, "kokoro", Some("af_heart"), Some("engine")),
+                "xtts_hi_storyteller": plan(true, "kokoro", Some("hf_beta"), Some("engine")),
+                "parler_en_male_narrator": plan(true, "kokoro", Some("am_adam"), Some("engine")),
+                "cb_narrator_m": plan(true, "kokoro", Some("am_michael"), Some("engine")),
+            }
+        });
+        let e = Engines::from_status(&kokoro_only);
+        assert!(e.kokoro && !e.chatterbox && !e.chatterbox_deps && !e.piper_en);
+        assert_eq!(voice_ready(&e, voice("af_heart")), VoiceReady::Ready("Kokoro"));
+        assert_eq!(voice_ready(&e, voice("hf_alpha")), VoiceReady::Ready("Kokoro"));
+        assert_eq!(voice_ready(&e, voice("en_piper_f")), VoiceReady::Missing);
+        for (v, stand_in) in [("f5_en_female", "af_heart"), ("xtts_hi_storyteller", "hf_beta"), ("parler_en_male_narrator", "am_adam"), ("cb_narrator_m", "am_michael")] {
+            assert_eq!(voice_ready(&e, voice(v)), VoiceReady::Fallback("Kokoro"), "{v}");
+            assert!(voice_ready(&e, voice(v)).usable(), "{v} can be narrated");
+            assert_eq!(stand_in_voice(&e, voice(v)).as_deref(), Some(stand_in), "{v}");
+        }
+        // Kokoro Lite reports exactly the same entries (kokoro_tts.py picks the int8 model).
+
+        let amy_only = json!({
+            "engines": {"piper": {"ready": true}}, "piperDepsReady": true, "piperEnReady": true,
+            "voices": {
+                "en_piper_f": plan(true, "piper", None, None),
+                "en_piper_m": plan(false, "none", None, Some("model")),
+                "af_heart": plan(true, "piper", Some("en_piper_f"), Some("model")),
+                "am_adam": plan(true, "piper", Some("en_piper_f"), Some("model")),
+                "hf_alpha": plan(false, "none", None, Some("model")),
+                "f5_en_female": plan(true, "piper", Some("en_piper_f"), Some("engine")),
+                "xtts_hi_storyteller": plan(false, "none", None, Some("engine")),
+                "cb_storyteller_m": plan(true, "piper", Some("en_piper_f"), Some("engine")),
+            }
+        });
+        let e = Engines::from_status(&amy_only);
+        assert!(!e.kokoro && e.piper_en && !e.piper_hi);
+        assert_eq!(voice_ready(&e, voice("en_piper_f")), VoiceReady::Ready("Piper"));
+        assert_eq!(voice_ready(&e, voice("en_piper_m")), VoiceReady::Missing);
+        assert_eq!(voice_ready(&e, voice("af_heart")), VoiceReady::Fallback("Piper"));
+        assert_eq!(voice_ready(&e, voice("f5_en_female")), VoiceReady::Fallback("Piper"));
+        assert_eq!(voice_ready(&e, voice("cb_storyteller_m")), VoiceReady::Fallback("Piper"));
+        assert_eq!(voice_ready(&e, voice("hf_alpha")), VoiceReady::Missing);
+        assert_eq!(voice_ready(&e, voice("xtts_hi_storyteller")), VoiceReady::Missing);
+
+        let nothing = json!({
+            "voices": {
+                "af_heart": plan(false, "none", None, Some("model")),
+                "en_piper_f": plan(false, "none", None, Some("model")),
+                "f5_en_female": plan(false, "none", None, Some("engine")),
+                "cb_narrator_f": plan(false, "none", None, Some("engine")),
+            }
+        });
+        let e = Engines::from_status(&nothing);
+        assert!(!e.any());
+        for v in ["af_heart", "en_piper_f", "f5_en_female", "cb_narrator_f"] {
+            assert_eq!(voice_ready(&e, voice(v)), VoiceReady::Missing, "{v}");
+            assert_eq!(e.voice_status(v).and_then(|s| s.message.as_deref()), Some("what to get"));
+        }
+
+        let cb = |_: &str| plan(true, "chatterbox", None, None);
+        let chatterbox = json!({
+            "engines": {"kokoro": {"ready": true}, "chatterbox": {"ready": true}}, "kokoroReady": true, "kokoroDepsReady": true,
+            "chatterboxReady": true, "chatterboxDepsReady": true,
+            "voices": {"cb_narrator_f": cb("cb_narrator_f"), "cb_narrator_m": cb("cb_narrator_m"), "cb_storyteller_m": cb("cb_storyteller_m"),
+                       "f5_en_female": plan(true, "kokoro", Some("af_heart"), Some("engine"))}
+        });
+        let e = Engines::from_status(&chatterbox);
+        assert!(e.chatterbox && e.chatterbox_deps && e.names()[0] == "Chatterbox");
+        for v in ["cb_narrator_f", "cb_narrator_m", "cb_storyteller_m"] {
+            assert_eq!(voice_ready(&e, voice(v)), VoiceReady::Ready("Chatterbox"), "{v}");
+            assert_eq!(stand_in_voice(&e, voice(v)), None, "{v}");
+        }
+        assert_eq!(voice_ready(&e, voice("f5_en_female")), VoiceReady::Fallback("Kokoro"));
+
+        // Chatterbox set up on a PC with neither Kokoro nor Piper: the built-in voice speaks,
+        // the two cloned voices have no reference clip.
+        let no_refs = json!({
+            "chatterboxReady": true, "chatterboxDepsReady": true,
+            "voices": {"cb_narrator_m": cb("cb_narrator_m"), "cb_narrator_f": plan(false, "none", None, Some("model")),
+                       "cb_storyteller_m": plan(false, "none", None, Some("model")), "af_heart": plan(false, "none", None, Some("model"))}
+        });
+        let e = Engines::from_status(&no_refs);
+        assert!(e.any());
+        assert_eq!(voice_ready(&e, voice("cb_narrator_m")), VoiceReady::Ready("Chatterbox"));
+        assert_eq!(voice_ready(&e, voice("cb_narrator_f")), VoiceReady::Missing);
+        assert_eq!(e.voice_status("cb_storyteller_m").and_then(|s| s.missing), Some(Missing::Model));
+    }
+
     #[test]
     fn env_sync_adopts_newer_checks_and_rechecks_after_changes() {
         let mut sync = EnvSync::default();
@@ -722,14 +837,23 @@ mod tests {
             ocr_engine: "vision".into(),
         };
         let v = voices::version();
-        *LATEST.lock().unwrap() = Some(Checked { seq: SEQ.fetch_add(1, Ordering::SeqCst) + 1, version: v, env });
+        *LATEST.lock().unwrap() = Some(Checked { seq: SEQ.fetch_add(1, Ordering::SeqCst) + 1, version: v, env: env.clone() });
+        assert!(sync.pending());
         assert!(sync.take_newer().is_some());
         assert!(sync.take_newer().is_none(), "the same check is adopted once");
+        assert!(!sync.pending(), "nothing to do once the newest check is shown");
         invalidate();
-        assert!(sync.behind() && sync.should_check(false));
+        assert!(sync.pending() && sync.behind() && sync.should_check(false));
         assert!(!sync.should_check(true));
         sync.started();
         assert!(!sync.behind() && !sync.should_check(false), "one check per change");
+        // Another view (Studio's sheet, Settings → Audio) finishes a check: this one adopts it.
+        let mut other = EnvSync::default();
+        other.started();
+        *LATEST.lock().unwrap() = Some(Checked { seq: SEQ.fetch_add(1, Ordering::SeqCst) + 1, version: voices::version(), env });
+        assert_eq!(latest_seq(), SEQ.load(Ordering::SeqCst));
+        assert!(sync.pending() && sync.take_newer().is_some() && !sync.pending());
+        assert!(other.take_newer().is_some() && !other.pending());
     }
 
     #[test]

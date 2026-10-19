@@ -76,6 +76,8 @@ impl WorkerMessage {
 }
 
 /// Result of one line of worker stdout.
+// Short-lived (one per line, moved straight on); boxing the message would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedLine {
     Message(WorkerMessage),

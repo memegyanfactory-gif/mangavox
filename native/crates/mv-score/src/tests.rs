@@ -104,3 +104,32 @@ fn muted_tracks_are_silent() {
     let (bus, _, _): (Stereo, _, _) = crate::mix::render(&score, &s, &Default::default(), &None, 1, false);
     assert!(bus.l.iter().all(|v| v.abs() < 1e-6));
 }
+
+/// mv-recap's Music reset must remove exactly what this crate writes (it cannot depend on
+/// mv-score, so it names the files itself): the score files go, the user's music choices stay
+/// and the AI's cue sheet (built from the old narration) is cleared.
+#[test]
+fn music_reset_removes_every_score_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = fake_chapter(dir.path());
+    let mut settings = MusicSettings { level: Level::Quiet, use_ai: true, ..Default::default() };
+    settings.directions.push(Direction { page: 2, style: Some(Style::Epic), ..Default::default() });
+    chapter::save_settings(&ch, &settings).unwrap();
+    chapter::build(&ch, &settings, true).unwrap();
+    let files = [chapter::score_wav(&ch), chapter::preview_wav(&ch), chapter::score_json(&ch)];
+    assert!(files.iter().all(|f| f.is_file()));
+    assert!(mv_recap::chapter_status(&ch).music);
+
+    let plan = mv_recap::reset_plan(&ch, mv_recap::Step::Music);
+    assert_eq!(plan.step_list(), vec![mv_recap::Step::Music]);
+    let report = mv_recap::reset_phase(&ch, mv_recap::Step::Music).unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    for f in &files {
+        assert!(!f.exists(), "{} should be gone", f.display());
+    }
+    assert!(!mv_recap::chapter_status(&ch).music);
+    let kept = chapter::load_settings(&ch);
+    assert_eq!((kept.level, kept.use_ai), (Level::Quiet, true), "the music choices stay");
+    assert!(kept.directions.is_empty(), "the AI cue sheet goes with the score");
+    assert!(narration(&ch).len() == 6, "the narration it was built from stays");
+}

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::controls::{btn, icon_button, ButtonKind};
+use crate::controls::{btn, icon_button, ButtonKind, WindowHandler};
 use crate::feedback::AlertKind;
 use crate::icons::{Ph, Weight};
 use crate::interact::{glyph, IconSrc};
@@ -41,8 +41,6 @@ const RESUME: Duration = Duration::from_millis(1500);
 /// Waiting toasts beyond this drop the oldest.
 const MAX_PENDING: usize = 3;
 
-type ActionHandler = Rc<dyn Fn(&mut Window, &mut App)>;
-
 /// One message. Build with [`Toast::info`], [`Toast::success`], [`Toast::warning`] or
 /// [`Toast::error`] and show with [`show`].
 #[derive(Clone)]
@@ -50,7 +48,7 @@ pub struct Toast {
     kind: ToastKind,
     message: SharedString,
     icon: Option<Ph>,
-    action: Option<(SharedString, ActionHandler)>,
+    action: Option<(SharedString, WindowHandler)>,
     duration: Option<Duration>,
     sticky: bool,
 }

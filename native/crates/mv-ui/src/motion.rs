@@ -7,6 +7,8 @@ use std::time::Duration;
 use gpui_kit::*;
 
 use crate::components::icon;
+use crate::icons::ph;
+use crate::interact::IconSrc;
 use crate::theme::Tokens;
 
 static USER_REDUCED: AtomicBool = AtomicBool::new(false);
@@ -55,7 +57,7 @@ fn smooth(k: f32) -> f32 {
 /// reads as ongoing without a fast spin.
 pub fn spinner(id: impl Into<ElementId>, color: Rgba, px_size: f32) -> impl IntoElement {
     let period = if reduced() { 2400 } else { 800 };
-    icon("icons/loader-circle.svg", color, px_size)
+    icon(IconSrc::Ph(ph::CIRCLE_NOTCH).for_size(px_size), color, px_size)
         .with_animation(id, Animation::new(Duration::from_millis(period)).repeat(), |s, t| s.with_transformation(Transformation::rotate(percentage(t))))
 }
 

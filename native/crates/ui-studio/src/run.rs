@@ -130,7 +130,9 @@ pub fn brain(manga_id: &str, title: &str) -> Arc<Mutex<Brain>> {
 /// Copy of a brain for rendering. Shared until the next change (every brain edit bumps
 /// [`version`]), so rows drawn every animation frame don't each clone the whole brain.
 pub fn brain_snapshot(manga_id: &str, title: &str) -> Arc<Brain> {
-    static SNAPS: Mutex<Option<HashMap<String, (u64, Arc<Brain>)>>> = Mutex::new(None);
+    /// Per manga: the version it was copied at, and the copy.
+    type Snapshots = HashMap<String, (u64, Arc<Brain>)>;
+    static SNAPS: Mutex<Option<Snapshots>> = Mutex::new(None);
     let v = version();
     let mut g = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
     let snaps = g.get_or_insert_with(HashMap::new);

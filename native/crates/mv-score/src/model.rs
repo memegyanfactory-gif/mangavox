@@ -273,7 +273,7 @@ impl Default for Strip {
 }
 
 /// A page-level direction from the optional AI spotting pass.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Direction {
     pub page: usize,
@@ -281,12 +281,6 @@ pub struct Direction {
     pub energy: Option<f32>,
     pub hit: bool,
     pub drop: bool,
-}
-
-impl Default for Direction {
-    fn default() -> Self {
-        Self { page: 0, style: None, energy: None, hit: false, drop: false }
-    }
 }
 
 /// The user's choices for a chapter's music (`music.json`); the score is rebuilt from these.

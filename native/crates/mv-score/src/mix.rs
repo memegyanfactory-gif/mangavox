@@ -40,9 +40,9 @@ impl Stereo {
         let a = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
         let (gl, gr) = (a.cos() * gain, a.sin() * gain);
         let n = src.len().min(self.len().saturating_sub(at));
-        for i in 0..n {
-            self.l[at + i] += src[i] * gl;
-            self.r[at + i] += src[i] * gr;
+        for (i, s) in src[..n].iter().enumerate() {
+            self.l[at + i] += s * gl;
+            self.r[at + i] += s * gr;
         }
     }
 }
@@ -506,9 +506,9 @@ pub fn render(score: &Score, settings: &MusicSettings, narration: &Narration, or
     if !narration.clips.is_empty() && settings.duck_db > 0.0 {
         let env = narration.envelope(len * 100 / SR as usize + 1);
         let duck = duck_curve(&env, len, settings.duck_db);
-        for i in 0..len {
-            bus.l[i] *= duck[i];
-            bus.r[i] *= duck[i];
+        for (i, d) in duck.iter().enumerate().take(len) {
+            bus.l[i] *= d;
+            bus.r[i] *= d;
         }
     }
     // Leave headroom for the voice: the music alone peaks at -6 dBFS.

@@ -606,6 +606,13 @@ pub fn preview_cache_path(samples_dir: &Path, voice: &str, engine: &str, speed: 
     ))
 }
 
+/// Where a preview spoken by a stand-in voice is kept (outside the cache, replaced each time):
+/// `<cache name>_standin.wav`, so it still starts with the voice's name.
+pub fn standin_preview_path(cache_path: &Path) -> PathBuf {
+    let stem = cache_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    cache_path.with_file_name(format!("{stem}_standin.wav"))
+}
+
 /// Default samples directory: `~/.mangavox/voice-samples`.
 pub fn default_samples_dir() -> PathBuf {
     crate::python::mangavox_home().join("voice-samples")
@@ -690,6 +697,18 @@ pub async fn voice_preview(
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
                 .ok_or_else(|| StudioError::Preview("Preview synthesis failed".into()))?;
+            let preview_fallback = p
+                .get("previewFallback")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // A stand-in voice spoke: that clip is not this voice's sample, so it must not sit
+            // in the cache (the voice's own engine is heard as soon as it is installed).
+            let path = if preview_fallback && path == out {
+                let standin = standin_preview_path(&out);
+                std::fs::rename(&out, &standin).map(|_| standin).unwrap_or(path)
+            } else {
+                path
+            };
             Ok(PreviewResult {
                 path,
                 engine: p
@@ -698,10 +717,7 @@ pub async fn voice_preview(
                     .unwrap_or(eng)
                     .to_string(),
                 cached: false,
-                preview_fallback: p
-                    .get("previewFallback")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                preview_fallback,
             })
         }
         other => {
@@ -1050,6 +1066,12 @@ mod tests {
         assert_eq!(p.file_name().unwrap(), "my_voice_1_kokoro_1.2_v3.wav");
         let q = preview_cache_path(Path::new("s"), "hf_alpha", "kokoro", 1.0);
         assert_eq!(q.file_name().unwrap(), "hf_alpha_kokoro_1.0_v3.wav");
+        // A stand-in's clip sits beside the cache, never in it, and keeps the voice's prefix.
+        let c = preview_cache_path(Path::new("s"), "cb_narrator_f", "kokoro", 1.0);
+        let s = standin_preview_path(&c);
+        assert_eq!(s.file_name().unwrap(), "cb_narrator_f_kokoro_1.0_v3_standin.wav");
+        assert_ne!(s, c);
+        assert_eq!(s.parent(), c.parent());
     }
 
     #[test]

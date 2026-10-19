@@ -11,13 +11,13 @@ voices it, text chunking, and the audio post-processing every engine shares.
   * Text: 1-3 sentences or <= 250 characters per chunk (Chatterbox caps at ~40 s), shouts
     on their own, silence decided here and inserted in post instead of by the model.
   * Audio: WAV in/out at the engine's native rate, silence trimming, chapter loudness
-    normalisation to about -16 LUFS (ITU-R BS.1770 K-weighting with gating), soft limiting.
+    normalisation to about -16 LUFS (ITU-R BS.1770 K-weighting with gating), peak limiting at -1 dBFS.
 
 numpy is used when it is importable (it is in the voice environment and the engine venvs);
 without it the loudness pass falls back to an unweighted, gated RMS estimate.
 
 CLI (for interpreters without numpy):
-  python narration_tts.py loudnorm <args.json>   {"files": [...], "target": -16}
+  python narration_tts.py loudnorm <args.json>   {"files": [...], "target": -16, "gain_db"?: dB, "rate"?: Hz}
   python narration_tts.py plan <output_dir>       prints the emotion plan of a chapter
 """
 from __future__ import annotations
@@ -134,7 +134,10 @@ def kokoro_speed(kind, intensity, strength: float = 1.0) -> float:
     """Kokoro/Piper have no emotion control: intensity maps to speed only, 0.92 for calm or
     emotional scenes up to 1.08 for fights."""
     kind = normalize_kind(kind)
-    i = clamp(_num(intensity, DEFAULT_INTENSITY) * clamp(_num(strength, 1.0), 0.0, 2.0), 0.0, 10.0)
+    s = clamp(_num(strength, 1.0), 0.0, 2.0)
+    if s <= 0:
+        return 1.0  # emotion strength 0: flat, the user's speed as it is
+    i = clamp(_num(intensity, DEFAULT_INTENSITY) * s, 0.0, 10.0)
     if kind in FAST_KINDS - {"comedy"}:
         base = 1.0
     elif kind in SLOW_KINDS:
@@ -167,9 +170,29 @@ PAGE_LEAD_MS = 120
 PAGE_TAIL_MS = 300
 
 
-def segment_seed(page: int, index: int, text: str) -> int:
-    """Fixed seed per segment, so a re-render of the same text sounds the same."""
-    return zlib.crc32(f"{page}:{index}:{text}".encode("utf-8")) & 0x7FFFFFFF
+def segment_seed(page: int, index: int, text: str, take: int = 0) -> int:
+    """Fixed seed per segment, so a re-render of the same text sounds the same. A page's take
+    (Studio's "New take", `audio/takes.json`) is mixed in, so asking again gives a new
+    performance and a new chunk-cache key; take 0 is the original seed."""
+    key = f"{page}:{index}:{text}"
+    if take:
+        key += f":take{int(take)}"
+    return zlib.crc32(key.encode("utf-8")) & 0x7FFFFFFF
+
+
+def load_takes(output_dir: str) -> dict:
+    """{page index: take} from `<output_dir>/audio/takes.json` (mv_studio::voices::new_take)."""
+    data = _read_json(os.path.join(output_dir, "audio", "takes.json"))
+    out: dict = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                page, take = int(k), int(v)
+            except (TypeError, ValueError):
+                continue
+            if take > 0:
+                out[page] = take
+    return out
 
 
 def cache_key(engine: str, voice: str, text: str, params: dict, seed: int, extra: str = "") -> str:
@@ -282,7 +305,9 @@ def build_plan(segments: list, output_dir: str, strength: float = 1.0) -> list:
                     "mood": str(b.get("mood") or base["mood"]),
                     "intensity": _num(b.get("intensity"), base["intensity"]),
                     "line_kind": str(b.get("line_kind") or b.get("lineKind") or "narration"),
-                    "source": "narration.studio.json",
+                    # A beat carries a kind only when the user picked the passage's delivery in
+                    # Studio (mv_recap::export_for_pipeline).
+                    "source": "delivery" if b.get("kind") else "narration.studio.json",
                 })
         elif text:
             units.append({**base, "text": text})
@@ -291,7 +316,9 @@ def build_plan(segments: list, output_dir: str, strength: float = 1.0) -> list:
     smoothed = smooth([u["intensity"] for u in flat])
     for u, s in zip(flat, smoothed):
         u["raw_intensity"] = u["intensity"]
-        u["intensity"] = s
+        # The user's own direction is said as picked ("Intense · 9" stays 9); its neighbours
+        # still ramp towards it through the smoothing.
+        u["intensity"] = round(clamp(_num(u["intensity"], s), 0.0, 10.0), 2) if u["source"] == "delivery" else s
         u["strength"] = strength
     return plan
 
@@ -630,6 +657,30 @@ def integrated_loudness(energies: list) -> float | None:
     return lk(sum(gated) / len(gated))
 
 
+def limit_peaks(x, sr: int, ceiling: float = CEILING, block_ms: float = 10.0, hold: int = 2):
+    """Look-ahead peak limiter (numpy): a smooth gain that keeps every sample at or under
+    `ceiling`. The gain each 10 ms block needs is spread to its `hold` neighbours on both
+    sides and interpolated between block centres, so it ramps down before a peak and back up
+    after it instead of bending the waveform (which `soft_limit` does)."""
+    x = np.asarray(x, dtype=np.float32)
+    a = np.abs(x)
+    if len(x) == 0 or float(a.max()) <= ceiling:
+        return x
+    b = max(1, int(sr * block_ms / 1000.0))
+    n = -(-len(x) // b)
+    padded = np.zeros(n * b, dtype=np.float32)
+    padded[: len(x)] = a
+    need = np.minimum(1.0, ceiling / np.maximum(padded.reshape(n, b).max(axis=1), 1e-9))
+    g = need.copy()
+    for k in range(1, min(hold, n - 1) + 1):
+        g[k:] = np.minimum(g[k:], need[:-k])
+        g[:-k] = np.minimum(g[:-k], need[k:])
+    # Every sample of block k lies between the centres of k and k±1; both gains are at most
+    # need[k], so the interpolated gain never lets a sample over the ceiling.
+    gain = np.interp(np.arange(len(x)), (np.arange(n) + 0.5) * b, g).astype(np.float32)
+    return x * gain
+
+
 def soft_limit(x, ceiling: float = CEILING):
     """Leaves everything under `ceiling` alone and bends the rest smoothly under 1.0."""
     if np is not None:
@@ -646,10 +697,13 @@ def soft_limit(x, ceiling: float = CEILING):
     return [v if abs(v) <= ceiling else math.copysign(ceiling + room * math.tanh((abs(v) - ceiling) / room), v) for v in x]
 
 
-def normalize_chapter(files: list, target: float = TARGET_LUFS, max_gain_db: float = 24.0) -> dict:
+def normalize_chapter(files: list, target: float = TARGET_LUFS, max_gain_db: float = 24.0,
+                      gain_db: float | None = None, rate: int | None = None) -> dict:
     """One gain for the whole chapter so its integrated loudness is about `target` LUFS
-    (pages keep their relative levels), soft-limited at -1 dBFS. Pages at another sample
-    rate than most pages are resampled to it, so ffmpeg can concatenate them."""
+    (pages keep their relative levels), peak-limited at -1 dBFS. Pages at another sample
+    rate than most pages (or than `rate`) are resampled to it, so ffmpeg can concatenate them.
+    `gain_db` applies a known gain instead of measuring (pages added to a chapter that was
+    normalised before, so they match it)."""
     pages = []
     for f in files:
         try:
@@ -662,16 +716,15 @@ def normalize_chapter(files: list, target: float = TARGET_LUFS, max_gain_db: flo
     rates: dict = {}
     for _, x, sr in pages:
         rates[sr] = rates.get(sr, 0) + len(x)
-    rate = max(rates, key=rates.get)
-    energies: list = []
-    for _, x, sr in pages:
-        energies += block_energies(x, sr)
-    before = integrated_loudness(energies)
-    if before is None:
-        gain_db = 0.0
-    else:
-        gain_db = clamp(target - before, -max_gain_db, max_gain_db)
-    g = 10 ** (gain_db / 20.0)
+    rate = int(rate) if rate else max(rates, key=rates.get)
+    before = None
+    if gain_db is None:
+        energies: list = []
+        for _, x, sr in pages:
+            energies += block_energies(x, sr)
+        before = integrated_loudness(energies)
+        gain_db = 0.0 if before is None else clamp(target - before, -max_gain_db, max_gain_db)
+    g = 10 ** (float(gain_db) / 20.0)
     limited = 0
     resampled = 0
     for f, x, sr in pages:
@@ -679,7 +732,8 @@ def normalize_chapter(files: list, target: float = TARGET_LUFS, max_gain_db: flo
             y = np.asarray(x, dtype=np.float32) * g
             if len(y) and float(np.max(np.abs(y))) > CEILING:
                 limited += 1
-            y = soft_limit(y)
+                y = limit_peaks(y, sr)
+            y = soft_limit(y)  # only float rounding is left over the ceiling here
         else:
             y = soft_limit([v * g for v in x])
         if sr != rate and np is not None:
@@ -717,7 +771,8 @@ def main() -> int:
     if cmd == "loudnorm":
         with open(sys.argv[2], "r", encoding="utf-8") as f:
             args = json.load(f)
-        print(json.dumps(normalize_chapter(args.get("files") or [], float(args.get("target", TARGET_LUFS)))), flush=True)
+        print(json.dumps(normalize_chapter(args.get("files") or [], float(args.get("target", TARGET_LUFS)),
+                                           gain_db=args.get("gain_db"), rate=args.get("rate"))), flush=True)
         return 0
     if cmd == "plan":
         out_dir = sys.argv[2]

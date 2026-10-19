@@ -531,8 +531,10 @@ fn write_json(path: &Path, m: Map<String, Value>) -> Result<(), StudioError> {
     Ok(())
 }
 
+/// A catalog voice this platform offers (the macOS system voices only on macOS, where a
+/// `config.json` from a Mac could otherwise leave a default no picker shows).
 fn valid(id: &str) -> bool {
-    tts::find_voice(id).is_some()
+    tts::find_voice(id).is_some() && (cfg!(target_os = "macos") || tts::engine_hint(id) != "say")
 }
 
 /// The narration voice new chapters use: Studio's `prefs.json` `voice`, then
@@ -639,6 +641,31 @@ pub fn set_emotion_strength(output_dir: &Path, strength: f32) -> Result<(), Stud
     write_json(&path, m)
 }
 
+// ---------------------------------------------------------------- takes
+
+/// `<chapter output dir>/audio/takes.json`: page index -> take number. `tts_bridge.run_tts`
+/// mixes a page's take into its chunk seeds (`narration_tts.segment_seed`), so a new take is a
+/// new performance with Chatterbox and a fresh chunk-cache key; take 0 (the default) is the
+/// original seed. Lives with the audio, so resetting the Audio step forgets it too.
+pub fn takes_path(output_dir: &Path) -> PathBuf {
+    output_dir.join("audio").join("takes.json")
+}
+
+/// The take a page is narrated with (0 until the user asks for a new one).
+pub fn page_take(output_dir: &Path, page: usize) -> u32 {
+    read_json(&takes_path(output_dir)).get(&page.to_string()).and_then(Value::as_u64).map(|t| t.min(u32::MAX as u64) as u32).unwrap_or(0)
+}
+
+/// Moves a page to its next take and returns it (other pages keep theirs).
+pub fn new_take(output_dir: &Path, page: usize) -> Result<u32, StudioError> {
+    let path = takes_path(output_dir);
+    let mut m = read_json(&path);
+    let next = page_take(output_dir, page).saturating_add(1);
+    m.insert(page.to_string(), json!(next));
+    write_json(&path, m)?;
+    Ok(next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +760,19 @@ mod tests {
     }
 
     #[test]
+    fn new_take_moves_one_page_and_persists() {
+        let dir = tempdir();
+        assert_eq!(page_take(&dir, 4), 0, "no file: the original take");
+        assert_eq!(new_take(&dir, 4).unwrap(), 1);
+        assert_eq!(new_take(&dir, 4).unwrap(), 2);
+        assert_eq!(new_take(&dir, 7).unwrap(), 1);
+        assert_eq!((page_take(&dir, 4), page_take(&dir, 7), page_take(&dir, 0)), (2, 1, 0));
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(takes_path(&dir)).unwrap()).unwrap();
+        assert_eq!(saved, json!({"4": 2, "7": 1}), "the format tts_bridge reads");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn default_voice_reads_prefs_then_config() {
         let dir = tempdir();
         let prefs = dir.join("studio").join("prefs.json");
@@ -747,6 +787,14 @@ mod tests {
         assert_eq!(c["pipeline"]["x"], 1);
         assert_eq!(c["other"], true);
         assert!(set_default_voice_in(&prefs, &config, "nope").is_err());
+        // A studio-grade default stays (it is narrated by its stand-in until its engine is in).
+        set_default_voice_in(&prefs, &config, "f5_en_female").unwrap();
+        assert_eq!(default_voice_in(&prefs, &config), "f5_en_female");
+        // A macOS system voice from a Mac's config.json is no default elsewhere.
+        std::fs::write(&prefs, r#"{"voice":"hi-lekha"}"#).unwrap();
+        std::fs::write(&config, r#"{"pipeline":{"tts_voice":"say-default"}}"#).unwrap();
+        let expect = if cfg!(target_os = "macos") { "hi-lekha" } else { FALLBACK_VOICE };
+        assert_eq!(default_voice_in(&prefs, &config), expect);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

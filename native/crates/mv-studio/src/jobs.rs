@@ -341,6 +341,8 @@ pub struct JobSnapshot {
 }
 
 /// Queue notifications.
+// Short-lived broadcast values; boxing the message would only add an allocation per line.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum JobEvent {
     Started {
@@ -749,13 +751,12 @@ mod tests {
 
     async fn next_finished(rx: &mut broadcast::Receiver<JobEvent>) -> (u64, JobState) {
         loop {
-            match tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            if let JobEvent::Finished { id, state, .. } = tokio::time::timeout(Duration::from_secs(60), rx.recv())
                 .await
                 .expect("queue event in time")
                 .unwrap()
             {
-                JobEvent::Finished { id, state, .. } => return (id, state),
-                _ => {}
+                return (id, state);
             }
         }
     }

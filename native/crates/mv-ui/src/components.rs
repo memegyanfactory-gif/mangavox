@@ -196,6 +196,7 @@ element_builder!(CoverCard => Stateful<Div>);
 
 impl CoverCard {
     /// Second line (chapter, year, episode count).
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(mut self, text: impl Into<SharedString>) -> Self {
         let text = text.into();
         self.sub = (!text.is_empty()).then_some(text);
@@ -447,6 +448,48 @@ impl SectionHeader {
 pub fn section_label(text: impl Into<SharedString>) -> Div {
     let text: SharedString = text.into();
     div().flex().items_center().gap(px(6.)).px(px(2.)).pb(px(4.)).text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(text.to_uppercase())
+}
+
+/// Secondary text: metadata, hints and counts in `text_3`.
+pub fn muted(text: impl Into<SharedString>) -> Div {
+    div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(text.into())
+}
+
+/// Settings group: a hairline above, a title and an optional one-line description, then its
+/// [`setting_row`]s as children. Flat (no card), so groups never nest boxes in boxes.
+/// Fluent 2 settings layout: <https://learn.microsoft.com/en-us/windows/apps/design/app-settings/guidelines-for-app-settings>
+pub fn setting_section(title: impl Into<SharedString>, desc: Option<SharedString>) -> Div {
+    let head = div()
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .pb(px(6.))
+        .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title.into()))
+        .when_some(desc, |d, t| d.child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(t)));
+    div().flex().flex_col().border_t_1().border_color(Tokens::border()).pt(px(18.)).pb(px(6.)).child(head)
+}
+
+/// One setting: label and optional hint on the left, its control (switch, select, button) on the
+/// right. Put a hairline between rows with `.border_t_1().border_color(Tokens::border())`.
+pub fn setting_row(label: impl Into<SharedString>, hint: impl Into<SharedString>, control: impl IntoElement) -> Div {
+    let hint: SharedString = hint.into();
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(24.))
+        .py(px(12.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .flex_1()
+                .min_w_0()
+                .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(label.into()))
+                .when(!hint.is_empty(), |d| d.child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(hint))),
+        )
+        .child(div().flex().flex_none().items_center().gap(px(6.)).child(control))
 }
 
 /// Horizontal list of cards that wraps.

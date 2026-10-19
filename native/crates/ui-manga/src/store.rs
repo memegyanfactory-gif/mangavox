@@ -140,6 +140,17 @@ pub fn set_read(conn: &mut Connection, ids: &[String], read: bool) -> Result<()>
     Ok(())
 }
 
+/// Put chapters back to an earlier `(id, is_read, read_progress)` state (Undo of a bulk mark).
+pub fn restore_read(conn: &mut Connection, prev: &[(String, bool, i64)]) -> Result<()> {
+    let tx = conn.transaction()?;
+    for (id, read, progress) in prev {
+        tx.execute("UPDATE chapter SET is_read = ?2, read_progress = ?3 WHERE id = ?1", rusqlite::params![id, read, progress])?;
+    }
+    tx.commit()?;
+    crate::backend::bump_data();
+    Ok(())
+}
+
 /// Persist reading progress: page, history entry, last-read, and "read" at the last page.
 pub fn save_progress(conn: &Connection, manga_id: &str, chapter_id: &str, page: usize, total: usize) -> Result<()> {
     chapter::update_read_progress(conn, chapter_id, page as i64)?;
@@ -202,6 +213,10 @@ mod tests {
         set_read(&mut conn, &[cs[0].id.clone()], false).unwrap();
         let c0 = chapter::get(&conn, &cs[0].id).unwrap().unwrap();
         assert!(!c0.is_read && c0.read_progress == 0);
+        // Undo puts back both the read flag and the saved page.
+        restore_read(&mut conn, &[(cs[0].id.clone(), true, 7)]).unwrap();
+        let c0 = chapter::get(&conn, &cs[0].id).unwrap().unwrap();
+        assert!(c0.is_read && c0.read_progress == 7);
     }
 
     #[test]

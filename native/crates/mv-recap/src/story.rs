@@ -132,7 +132,7 @@ pub(crate) fn parse_segments(v: &Value, chunk_pages: &[usize], read: &ChapterRea
         }
         let panels = read.pages.iter().find(|p| p.index == page).map(|p| p.panels.len()).unwrap_or(0);
         let panel = num_of(sv, "panel").filter(|n| *n >= 1.0).map(|n| n as usize - 1).filter(|n| *n < panels);
-        out.push(StorySegment { page, panel, text });
+        out.push(StorySegment { page, panel, text, delivery: None });
     }
     out.sort_by_key(|s| s.page); // stable: keeps the model's panel order within a page
     out
