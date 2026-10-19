@@ -4,7 +4,7 @@ members = ["app", "crates/mv-core", "crates/mv-net", "crates/mv-sources", "crate
 
 [workspace.package]
 edition = "2021"
-version = "8.0.0"
+version = "8.0.1"
 license = "Proprietary"
 
 [workspace.dependencies]
