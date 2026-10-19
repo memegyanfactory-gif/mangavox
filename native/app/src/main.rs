@@ -1,5 +1,7 @@
 mod perf;
 mod shell;
+#[cfg(windows)]
+mod tray;
 
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
@@ -43,8 +45,9 @@ fn main() {
         .run(|cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
+        ui_media::warm_up();
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-        gpui_kit::open_window(
+        let main = gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(720.), px(480.))),
@@ -55,5 +58,7 @@ fn main() {
             |window, cx| cx.new(|cx| shell::Shell::new(window, cx)),
         )
         .expect("open window");
+        #[cfg(windows)]
+        tray::install(main.0, cx);
     });
 }

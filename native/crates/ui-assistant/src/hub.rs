@@ -634,24 +634,26 @@ fn download_row(d: &HubDownload, cx: &mut Context<ModelHubPanel>) -> impl IntoEl
 
 impl Render for ModelHubPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sys = self.system.as_ref().map(|s| format!("{}{:.0} GB RAM{}", s.gpu_name.as_deref().map(|g| format!("{g} · ")).unwrap_or_default(), s.ram_gb, if s.vram_gb > 0.0 { format!(" · {:.0} GB VRAM", s.vram_gb) } else { String::new() }));
+        // Embedded in Settings → Model Library, which shows the title and the hardware line.
         div()
             .flex()
             .flex_col()
             .gap(px(12.))
             .size_full()
-            .px(px(size::PAGE_X))
-            .py(px(size::PAGE_Y))
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .gap(px(10.))
-                    .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Model Hub"))
-                    .child(muted(sys.unwrap_or_else(|| "Detecting hardware…".into())))
-                    .child(div().flex_1())
-                    .when_some(self.note.clone(), |d, n| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(n))),
-            )
+            .when_some(self.note.clone(), |d, n| {
+                d.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(7.))
+                        .rounded(px(8.))
+                        .bg(Tokens::surface())
+                        .border_1()
+                        .border_color(Tokens::border())
+                        .text_size(px(size::SM))
+                        .text_color(Tokens::text_2())
+                        .child(n),
+                )
+            })
             .child(div().flex().gap(px(14.)).flex_1().min_h_0().child(self.left(cx)).child(self.right(cx)))
     }
 }

@@ -200,7 +200,7 @@ pub fn parse_tags(props: &Value) -> Vec<Tag> {
         .filter_map(|t| {
             let url = t.get("url").and_then(Value::as_str)?;
             let name = t.get("name").and_then(Value::as_str)?;
-            (!url.is_empty() && !name.is_empty()).then(|| Tag { id: url.trim_start_matches('/').to_string(), name: name.to_string() })
+            (!url.is_empty() && !name.is_empty()).then(|| Tag::new(url.trim_start_matches('/').to_string(), name.to_string()))
         })
         .collect()
 }
@@ -253,8 +253,8 @@ impl Source for Hentai2Read {
         let tags = parse_tags(&self.props("/tags/category", false).await?);
         if tags.is_empty() {
             return Ok(vec![
-                Tag { id: "category/8-big-breasts".into(), name: "Big Breasts".into() },
-                Tag { id: "category/2-anal".into(), name: "Anal".into() },
+                Tag::new("category/8-big-breasts".into(), "Big Breasts".into()),
+                Tag::new("category/2-anal".into(), "Anal".into()),
             ]);
         }
         Ok(tags)

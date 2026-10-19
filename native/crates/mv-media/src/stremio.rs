@@ -425,6 +425,7 @@ fn parse_streams(raw: &Value) -> Vec<AnimeTorrentStream> {
                     .source
                     .or_else(|| str_field(s, "source"))
                     .or_else(|| str_field(s, "addon")),
+                addon: str_field(s, "name").and_then(|n| n.lines().next().map(|l| l.trim().to_string())).filter(|n| !n.is_empty()),
                 title,
             })
         })

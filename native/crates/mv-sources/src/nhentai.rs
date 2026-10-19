@@ -150,7 +150,7 @@ pub fn parse_tags(json: &Value) -> Vec<Tag> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|t| Some(Tag { id: t.get("id").and_then(Value::as_u64)?.to_string(), name: t.get("name").and_then(Value::as_str)?.to_string() }))
+        .filter_map(|t| Some(Tag::new(t.get("id").and_then(Value::as_u64)?.to_string(), t.get("name").and_then(Value::as_str)?.to_string())))
         .collect()
 }
 

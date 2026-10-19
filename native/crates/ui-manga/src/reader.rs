@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -27,8 +27,15 @@ const EDGE_BOTTOM: f32 = 120.0;
 enum PageState {
     Idle,
     Loading,
-    Ready(PathBuf),
+    /// The file and its width / height ratio (when the header could be read).
+    Ready(PathBuf, Option<f32>),
     Failed(String),
+}
+
+/// Width / height of an image file, read from its header only.
+fn aspect(path: &Path) -> Option<f32> {
+    let s = imagesize::size(path).ok()?;
+    (s.width > 0 && s.height > 0).then(|| s.width as f32 / s.height as f32)
 }
 
 struct PageEntry {
@@ -82,7 +89,7 @@ async fn load_chapter(chapter_id: String, at_end: bool) -> Result<Loaded> {
     let source = if ch.source_plugin.is_empty() { m.source_plugin.clone() } else { ch.source_plugin.clone() };
     let local = local_pages(&ch);
     let pages: Vec<PageEntry> = if !local.is_empty() {
-        local.into_iter().map(|p| PageEntry { url: String::new(), state: PageState::Ready(p) }).collect()
+        local.into_iter().map(|p| PageEntry { url: String::new(), state: PageState::Ready(p.clone(), aspect(&p)) }).collect()
     } else {
         let src = backend::source(&source).await?;
         let urls = src.get_page_urls(&ch.source_id).await.map_err(|e| anyhow!("{e}"))?;
@@ -245,7 +252,7 @@ impl ReaderPage {
             self.inflight += 1;
             let (url, src, generation) = (pages[i].url.clone(), self.source.clone(), self.generation);
             cx.spawn(async move |this, cx| {
-                let res = mv_ui::bg::run(backend::download_page(url, Some(src))).await.and_then(|r| r);
+                let res = mv_ui::bg::run(async move { backend::download_page(url, Some(src)).await.map(|p| { let r = aspect(&p); (p, r) }) }).await.and_then(|r| r);
                 let _ = this.update(cx, |this, cx| {
                     if this.generation != generation {
                         return;
@@ -253,7 +260,7 @@ impl ReaderPage {
                     this.inflight = this.inflight.saturating_sub(1);
                     if let Load::Ready(pages) = &mut this.pages {
                         pages[i].state = match res {
-                            Ok(p) => PageState::Ready(p),
+                            Ok((p, r)) => PageState::Ready(p, r),
                             Err(e) => PageState::Failed(format!("{e:#}")),
                         };
                     }
@@ -538,10 +545,15 @@ impl ReaderPage {
     fn page_view(&self, i: usize, fit: Fit, strip: bool, cx: &mut Context<Self>) -> AnyElement {
         let Load::Ready(pages) = &self.pages else { return div().into_any_element() };
         match &pages[i].state {
-            PageState::Ready(p) => {
+            PageState::Ready(p, ratio) => {
                 let im = img(p.clone());
                 match (strip, fit) {
-                    (true, _) | (false, Fit::Width) => im.w_full().into_any_element(),
+                    // A relative width leaves the image box at the file's own pixel height, which
+                    // shows as black gaps once the page is scaled; size the box from the ratio instead.
+                    (true, _) | (false, Fit::Width) => match ratio {
+                        Some(r) => div().w_full().aspect_ratio(*r).child(im.size_full()).into_any_element(),
+                        None => im.w_full().into_any_element(),
+                    },
                     // Fit the whole page in the window: the container has a definite size
                     // (absolutely positioned), so tall pages scale down instead of being cut off.
                     (false, Fit::Screen) => im.size_full().object_fit(ObjectFit::Contain).into_any_element(),

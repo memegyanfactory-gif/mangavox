@@ -217,6 +217,55 @@ pub fn tag(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
+/// Clickable tag pill (tag picker, genre chips). `active` gets the accent tint and a check mark.
+pub fn select_chip(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(4.))
+        .h(px(26.))
+        .px(px(10.))
+        .rounded(px(999.))
+        .border_1()
+        .cursor_pointer()
+        .text_size(px(size::XS))
+        .map(|d| {
+            if active {
+                d.bg(Tokens::accent_soft()).border_color(Tokens::accent()).text_color(Tokens::accent()).font_weight(FontWeight::MEDIUM)
+            } else {
+                d.border_color(Tokens::border()).text_color(Tokens::text_2()).hover(|s| s.bg(Tokens::hover()).border_color(Tokens::accent()).text_color(Tokens::text_1()))
+            }
+        })
+        .when(active, |d| d.child(icon("icons/check.svg", Tokens::accent(), 12.)))
+        .child(label.into())
+}
+
+/// Selected-filter pill with a remove (x) mark; the whole pill removes it.
+pub fn removable_chip(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(6.))
+        .h(px(26.))
+        .pl(px(10.))
+        .pr(px(7.))
+        .rounded(px(999.))
+        .bg(Tokens::accent_soft())
+        .border_1()
+        .border_color(Tokens::accent())
+        .cursor_pointer()
+        .text_size(px(size::XS))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(Tokens::accent())
+        .hover(|s| s.opacity(0.85))
+        .child(label.into())
+        .child(icon("icons/x.svg", Tokens::accent(), 12.))
+}
+
 // ---------------------------------------------------------------- controls
 
 /// Underlined tab (category / mode tabs). `count` renders as a muted number.

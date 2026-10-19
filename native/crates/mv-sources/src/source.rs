@@ -165,6 +165,19 @@ pub trait Source: Send + Sync {
     async fn get_manga_by_tag(&self, _tag_id: &str, _page: u32) -> Result<Vec<MangaSearchResult>> {
         Err(SourceError::Unsupported("tag browsing"))
     }
+    /// Titles carrying *all* of `tag_ids` (AND). Sources that cannot combine tags only accept one
+    /// (see [`supports_multi_tag`](Self::supports_multi_tag)).
+    async fn get_manga_by_tags(&self, tag_ids: &[String], page: u32) -> Result<Vec<MangaSearchResult>> {
+        match tag_ids {
+            [] => self.get_popular_manga(page).await,
+            [one] => self.get_manga_by_tag(one, page).await,
+            _ => Err(SourceError::Unsupported("combining tags")),
+        }
+    }
+    /// Whether [`get_manga_by_tags`](Self::get_manga_by_tags) accepts more than one tag.
+    fn supports_multi_tag(&self) -> bool {
+        false
+    }
 
     /// Headers (Referer, User-Agent, ...) to use when downloading page images.
     fn download_headers(&self) -> Vec<(String, String)> {

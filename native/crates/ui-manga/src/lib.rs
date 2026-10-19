@@ -6,6 +6,7 @@ use mv_ui::Route;
 pub mod backend;
 mod browse;
 mod detail;
+mod discover;
 mod history;
 mod library;
 pub mod logic;
@@ -13,6 +14,7 @@ mod ops;
 mod reader;
 mod sources;
 pub mod store;
+pub mod tags;
 mod ui;
 
 pub use backend::set_source_ctx;

@@ -352,10 +352,10 @@ pub fn static_tags() -> Vec<Tag> {
         ("language:japanese", "Japanese"),
     ]
     .iter()
-    .map(|(i, n)| Tag { id: i.to_string(), name: n.to_string() })
+    .map(|(i, n)| Tag::grouped(i.to_string(), n.to_string(), if i.starts_with("category:") { "Categories" } else { "Languages" }))
     .collect();
     let mut ns = |ns: &str, names: &[&str]| {
-        v.extend(names.iter().map(|n| Tag { id: format!("{ns}:{n}"), name: title_case(n) }));
+        v.extend(names.iter().map(|n| Tag::grouped(format!("{ns}:{n}"), title_case(n), &title_case(ns))));
     };
     ns("other", &["full color", "uncensored", "story arc"]);
     ns(
@@ -459,7 +459,19 @@ impl Source for EHentai {
     }
 
     async fn get_manga_by_tag(&self, tag_id: &str, page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.list_page(&format!("/?f_search={}&page={}", encode_component(&tag_query(tag_id)), page.max(1) - 1)).await
+        self.get_manga_by_tags(&[tag_id.to_string()], page).await
+    }
+
+    async fn get_manga_by_tags(&self, tag_ids: &[String], page: u32) -> Result<Vec<MangaSearchResult>> {
+        if tag_ids.is_empty() {
+            return self.get_popular_manga(page).await;
+        }
+        let q = tag_ids.iter().map(|t| tag_query(t)).collect::<Vec<_>>().join(" ");
+        self.list_page(&format!("/?f_search={}&page={}", encode_component(&q), page.max(1) - 1)).await
+    }
+
+    fn supports_multi_tag(&self) -> bool {
+        true
     }
 
     fn download_headers(&self) -> Vec<(String, String)> {

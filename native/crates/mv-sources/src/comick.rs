@@ -299,13 +299,13 @@ impl Source for Comick {
                 .filter_map(|g| {
                     let id = g.get("id").map(|v| v.to_string().trim_matches('"').to_string()).or_else(|| g.get("slug").and_then(Value::as_str).map(str::to_string))?;
                     let name = g.get("name").or_else(|| g.get("slug")).and_then(Value::as_str)?.to_string();
-                    Some(Tag { id, name })
+                    Some(Tag::new(id, name))
                 })
                 .collect()),
             Err(_) => Ok(["Action", "Adventure", "Comedy", "Drama", "Fantasy", "Horror", "Mystery", "Romance", "Sci-fi", "Slice of Life"]
                 .iter()
                 .enumerate()
-                .map(|(i, n)| Tag { id: (i + 1).to_string(), name: n.to_string() })
+                .map(|(i, n)| Tag::new((i + 1).to_string(), n.to_string()))
                 .collect()),
         }
     }

@@ -9,7 +9,7 @@ use mv_media::cinemeta::{CinemetaCatalog, CinemetaClient};
 use mv_media::types::AnimeSearchResult;
 use mv_ui::{chip, empty_state, error_state, navigate, size, Route, Tokens};
 
-use crate::common::{self, db, fetch, route_for_media, Load};
+use crate::common::{self, db, fetch, fetch_cached, route_for_media, Load, DAY};
 use crate::look::{self, netflix, RowOffsets, EDGE};
 use crate::streams::{self, PlayBase, StreamState};
 
@@ -18,6 +18,33 @@ const ROW_GENRES: &[&str] = &["Action", "Comedy", "Sci-Fi", "Thriller", "Animati
 
 pub fn cinemeta() -> Result<CinemetaClient, String> {
     CinemetaClient::new().map_err(|e| e.to_string())
+}
+
+/// Cache key + loader for one Cinemeta catalog page (shared with the startup warm-up).
+pub fn catalog_key(movie: bool, catalog: CinemetaCatalog, genre: Option<&str>) -> String {
+    format!("cinemeta:{}:{}:{}:1", if movie { "movie" } else { "series" }, catalog.as_str(), genre.unwrap_or(""))
+}
+
+pub async fn catalog(movie: bool, catalog: CinemetaCatalog, genre: Option<&'static str>) -> Result<Vec<AnimeSearchResult>, String> {
+    let c = cinemeta()?;
+    let r = if movie { c.movies_catalog(catalog, 1, genre).await } else { c.series_catalog(catalog, 1, genre).await };
+    r.map_err(|e| e.to_string())
+}
+
+/// Fill the cache for the Home tab's rows (fresh entries are only read into memory).
+pub async fn prefetch() {
+    let jobs = MoviesHome::plan(Tab::Home).into_iter().map(|(_, _, _, movie, cat, genre)| {
+        let key = catalog_key(movie, cat, genre);
+        async move {
+            match mv_core::cache::DataCache::shared().get::<Vec<AnimeSearchResult>>(&key) {
+                Some((_, age)) if age < DAY => {}
+                _ => {
+                    let _ = common::cached(key, catalog(movie, cat, genre)).await;
+                }
+            }
+        }
+    });
+    futures::future::join_all(jobs).await;
 }
 
 /// Cinemeta artwork by IMDb id, for items whose catalog entry lacks it.
@@ -178,14 +205,12 @@ impl MoviesHome {
         self.offsets.clear();
         self.rows = Self::plan(self.tab)
             .into_iter()
-            .map(|(id, title, look, movie, catalog, genre)| {
-                fetch(
+            .map(|(id, title, look, movie, cat, genre)| {
+                let load = fetch_cached(
                     cx,
-                    async move {
-                        let c = cinemeta()?;
-                        let r = if movie { c.movies_catalog(catalog, 1, genre).await } else { c.series_catalog(catalog, 1, genre).await };
-                        r.map_err(|e| e.to_string())
-                    },
+                    catalog_key(movie, cat, genre),
+                    DAY,
+                    catalog(movie, cat, genre),
                     move |v: &mut Self, l| {
                         if v.generation == generation {
                             if let Some(row) = v.rows.iter_mut().find(|r| r.id == id) {
@@ -194,7 +219,7 @@ impl MoviesHome {
                         }
                     },
                 );
-                Row { id, title, look, load: Load::Loading }
+                Row { id, title, look, load }
             })
             .collect();
         cx.notify();
@@ -270,7 +295,7 @@ impl MoviesHome {
                 look::hero_copy(96.)
                     .child(look::hero_title(&r.title, logo_of(&r)))
                     .child(meta)
-                    .child(div().text_size(px(size::LG)).line_height(px(22.)).text_color(Tokens::text_1()).line_clamp(3).child(SharedString::from(r.description.clone().unwrap_or_default())))
+                    .child(div().text_size(px(size::LG)).line_height(px(22.)).text_color(Tokens::text_1()).line_clamp(3).child(SharedString::from(r.description.as_deref().map(look::blurb).unwrap_or_default())))
                     .child(
                         div()
                             .flex()

@@ -6,66 +6,15 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::{button, size, ButtonKind, Tokens};
 
+use crate::ui::{card, divided, format_bytes, row, surface};
 use crate::{data, Notice, SettingsView};
 
-/// Bordered panel with a title and optional muted description; callers append rows.
-fn card(title: &str, desc: Option<&str>) -> Div {
-    let mut head = div().flex().flex_col().gap(px(4.)).child(
-        div()
-            .text_size(px(size::LG))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(Tokens::text_1())
-            .child(title.to_string()),
-    );
-    if let Some(d) = desc {
-        head = head.child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(d.to_string()));
-    }
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(14.))
-        .p(px(20.))
-        .rounded(px(12.))
-        .bg(Tokens::surface())
-        .border_1()
-        .border_color(Tokens::border())
-        .child(head)
+/// Input on the right of a setting row.
+fn input_box(state: &Entity<gpui_kit::component::input::InputState>) -> Div {
+    div().w(px(280.)).child(Input::new(state))
 }
 
-/// Label and muted hint on the left, control on the right.
-fn row(label: &str, hint: &str, control: impl IntoElement) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(16.))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .flex_1()
-                .min_w_0()
-                .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(label.to_string()))
-                .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(hint.to_string())),
-        )
-        .child(control)
-}
-
-/// Thin divider between rows inside a card.
-fn divided(row: Div) -> Div {
-    row.pt(px(14.)).border_t_1().border_color(Tokens::border())
-}
-
-fn field(label: &str, control: impl IntoElement) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .child(div().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_2()).child(label.to_string()))
-        .child(control)
-}
-
+/// Right-aligned primary action under a section.
 fn actions(child: impl IntoElement) -> Div {
     div().flex().justify_end().child(child)
 }
@@ -88,16 +37,16 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
-            .gap(px(20.))
+            .gap(px(16.))
             .child(
-                card("Your profile", Some("Shown across MangaVox. Stored locally in your config file."))
-                    .child(field("Display name", Input::new(&self.name)))
-                    .child(field("Email", Input::new(&self.email)))
-                    .child(actions(
-                        button("profile-save", "Save profile", ButtonKind::Primary)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_profile(cx))),
-                    )),
+                card("Profile", Some("Shown across MangaVox."))
+                    .child(row("Display name", "How MangaVox greets you", input_box(&self.name)))
+                    .child(divided(row("Email", "Optional. Never sent anywhere", input_box(&self.email)))),
             )
+            .child(actions(
+                button("profile-save", "Save changes", ButtonKind::Primary)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_profile(cx))),
+            ))
     }
 
     pub(crate) fn render_playback(&self, cx: &mut Context<Self>) -> Div {
@@ -107,7 +56,7 @@ impl SettingsView {
             .flex_col()
             .gap(px(20.))
             .child(
-                card("Playback", None)
+                card("Episodes", Some("What happens when an episode ends."))
                     .child(row(
                         "Auto-play next episode",
                         "Start the next episode when the current one ends",
@@ -158,7 +107,7 @@ impl SettingsView {
                     ))),
             )
             .child(actions(
-                button("playback-save", "Save playback settings", ButtonKind::Primary)
+                button("playback-save", "Save changes", ButtonKind::Primary)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_playback(cx))),
             ))
     }
@@ -171,7 +120,7 @@ impl SettingsView {
             grid = grid.child(
                 div()
                     .id(id)
-                    .w(px(236.))
+                    .w(px(216.))
                     .p(px(10.))
                     .rounded(px(10.))
                     .border_1()
@@ -210,7 +159,7 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap(px(20.))
-            .child(card("Theme", Some("Each preset changes the whole palette immediately.")).child(grid))
+            .child(card("Theme", Some("Each preset changes the whole palette.")).child(div().pt(px(6.)).pb(px(14.)).child(grid)))
             .child(card("Motion", None).child(row(
                 "Reduce ambient motion",
                 "Slows background animation further. The system reduced-motion setting is always respected.",
@@ -226,6 +175,7 @@ impl SettingsView {
             div()
                 .id(id)
                 .flex_1()
+                .min_w_0()
                 .p(px(18.))
                 .rounded(px(12.))
                 .bg(Tokens::surface())
@@ -252,9 +202,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap(px(20.))
-            .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(
-                "Switch at any time. Changing modes never removes your library, downloads, or settings.",
-            ))
             .child(
                 div()
                     .flex()
@@ -276,6 +223,9 @@ impl SettingsView {
                         "studio",
                     )),
             )
+            .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(
+                "Switch at any time. Changing modes never removes your library, downloads, or settings.",
+            ))
     }
 
     pub(crate) fn render_storage(&self, cx: &mut Context<Self>) -> Div {
@@ -316,6 +266,7 @@ impl SettingsView {
                 .items_center()
                 .justify_between()
                 .gap(px(16.))
+                .py(px(12.))
                 .child(
                     div()
                         .flex()
@@ -363,48 +314,65 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
-            .gap(px(20.))
+            .gap(px(16.))
             .child(
-                card("MangaVox", None)
-                    .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(format!("Version {version}")))
+                surface()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(14.))
+                    .p(px(20.))
                     .child(
                         div()
-                            .text_size(px(size::SM))
-                            .text_color(Tokens::text_2())
-                            .child("Manga-to-voice platform: browse, read, and convert manga to audio and video. Processing runs locally on your machine."),
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(px(44.))
+                            .rounded(px(12.))
+                            .bg(Tokens::accent_soft())
+                            .text_size(px(size::LG))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(Tokens::accent())
+                            .child("MV"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("MangaVox"))
+                            .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(format!("Version {version} · native")))
+                            .child(div().pt(px(4.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(
+                                "Browse, read and watch, then turn manga into narrated audio and video. Processing runs locally on your machine.",
+                            )),
                     ),
             )
             .child(
-                card("Data", None).child(row(
-                    "Data folder",
-                    &data::data_dir().display().to_string(),
-                    button("about-data", "Open folder", ButtonKind::Secondary)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_folder(data::data_dir(), cx))),
-                )),
+                card("Data", None)
+                    .child(row(
+                        "Data folder",
+                        &data::data_dir().display().to_string(),
+                        button("about-data", "Open folder", ButtonKind::Secondary)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_folder(data::data_dir(), cx))),
+                    ))
+                    .child(divided(row(
+                        "Config file",
+                        &mv_core::paths::config().display().to_string(),
+                        button("about-config", "Show", ButtonKind::Ghost).on_click(|_, _, cx| cx.reveal_path(&mv_core::paths::config())),
+                    ))),
             )
             .child(
-                card("Links", None).child(row(
-                    "Source repository",
-                    "github.com/memegyanfactory-gif/mangavox",
-                    button("about-repo", "Open", ButtonKind::Ghost).on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                        cx.open_url("https://github.com/memegyanfactory-gif/mangavox");
-                    })),
-                )),
+                card("Links", None)
+                    .child(row(
+                        "Source code",
+                        "github.com/memegyanfactory-gif/mangavox",
+                        button("about-repo", "Open", ButtonKind::Ghost).on_click(|_, _, cx| cx.open_url("https://github.com/memegyanfactory-gif/mangavox")),
+                    ))
+                    .child(divided(row(
+                        "Report a problem",
+                        "Opens the issue tracker in your browser",
+                        button("about-issues", "Open", ButtonKind::Ghost).on_click(|_, _, cx| cx.open_url(crate::HELP_URL)),
+                    ))),
             )
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }

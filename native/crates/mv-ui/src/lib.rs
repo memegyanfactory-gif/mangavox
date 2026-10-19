@@ -7,5 +7,5 @@ pub mod nav;
 pub mod theme;
 
 pub use components::*;
-pub use nav::{navigate, Route};
+pub use nav::{back_target, navigate, Route};
 pub use theme::{size, Tokens};

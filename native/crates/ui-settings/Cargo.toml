@@ -13,3 +13,9 @@ dirs = { workspace = true }
 ui-assistant = { path = "../ui-assistant" }
 ui-manga = { path = "../ui-manga" }
 ui-media = { path = "../ui-media" }
+mv-ai = { path = "../mv-ai" }
+mv-studio = { path = "../mv-studio" }
+sysinfo = "0.31"
+
+[dev-dependencies]
+tempfile = "3"

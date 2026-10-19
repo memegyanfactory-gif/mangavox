@@ -132,7 +132,7 @@ pub async fn build_response(
         Body::empty()
     } else {
         match source.open(start).await {
-            Ok(reader) => Body::from_stream(ReaderStream::with_capacity(reader.take(len), 64 * 1024)),
+            Ok(reader) => Body::from_stream(ReaderStream::with_capacity(reader.take(len), 256 * 1024)),
             Err(e) => {
                 tracing::warn!("stream open failed: {e}");
                 return plain(StatusCode::SERVICE_UNAVAILABLE, "stream unavailable");

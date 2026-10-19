@@ -1,12 +1,10 @@
 //! Minimal libmpv binding loaded at runtime (no import library needed). Video renders into a
-//! borderless owned popup positioned over the player area (GPUI composes above child HWNDs).
-//! GPUI controls drawn over the video are made visible by cutting holes in the popup's region.
+//! borderless black popup owned by the app window; the GPUI controls live in a transparent
+//! overlay window stacked above it (see `overlay.rs`), so the video is never cut or covered.
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context as _, Result};
-use gpui_kit::Window;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 type Handle = *mut c_void;
 
@@ -88,6 +86,59 @@ fn load_api() -> Result<(Api, PathBuf)> {
     Err(anyhow!("libmpv-2.dll not found (set MANGAVOX_LIBMPV)"))
 }
 
+/// mpv options, tuned for streaming over the local torrent HTTP server (range requests):
+/// start on the first decodable data, keep a big forward cache plus a back-buffer so seeking
+/// backwards (and forwards inside what is already downloaded) never touches the network.
+/// Unknown options (older libmpv builds) are skipped.
+const OPTIONS: &[(&str, &str)] = &[
+    // Output / decoding.
+    ("vo", "gpu-next,gpu"),
+    ("hwdec", "auto-safe"),
+    ("background", "color"),
+    ("background-color", "#000000"),
+    ("keepaspect", "yes"),
+    // Embedding: no mpv UI, input or window behaviour of its own.
+    ("keep-open", "yes"),
+    ("idle", "yes"),
+    ("osc", "no"),
+    ("osd-level", "0"),
+    ("input-default-bindings", "no"),
+    ("input-vo-keyboard", "no"),
+    ("input-cursor", "no"),
+    ("cursor-autohide", "no"),
+    ("window-dragging", "no"),
+    ("ytdl", "no"),
+    ("terminal", "no"),
+    ("audio-client-name", "MangaVox"),
+    ("audio-fallback-to-null", "yes"),
+    ("volume-max", "130"),
+    // Cache: start fast, seek instantly inside buffered ranges.
+    ("cache", "yes"),
+    ("cache-secs", "120"),
+    ("demuxer-max-bytes", "256MiB"),
+    ("demuxer-max-back-bytes", "128MiB"),
+    ("demuxer-readahead-secs", "30"),
+    ("demuxer-seekable-cache", "yes"),
+    ("force-seekable", "yes"),
+    ("cache-pause", "yes"),
+    ("cache-pause-initial", "no"),
+    ("cache-pause-wait", "1.5"),
+    ("stream-buffer-size", "512KiB"),
+    ("network-timeout", "90"),
+    // Exact seeks for absolute targets; scrubbing uses keyframe seeks explicitly.
+    ("hr-seek", "default"),
+    ("hr-seek-framedrop", "yes"),
+    // Subtitles: clean, readable defaults.
+    ("sub-auto", "fuzzy"),
+    ("slang", "en,eng"),
+    ("sub-font", "Segoe UI Semibold"),
+    ("sub-font-size", "46"),
+    ("sub-border-size", "2.4"),
+    ("sub-shadow-offset", "1"),
+    ("sub-shadow-color", "#80000000"),
+    ("sub-margin-y", "40"),
+];
+
 pub struct Mpv {
     api: Api,
     handle: Handle,
@@ -122,42 +173,26 @@ pub enum Event {
 }
 
 impl Mpv {
-    /// Creates the video popup over `rect` (owner-client device pixels) and an initialised mpv rendering into it.
-    pub fn create(window: &Window, rect: (i32, i32, i32, i32)) -> Result<Self> {
-        let parent = match HasWindowHandle::window_handle(window).map_err(|e| anyhow!("{e}"))?.as_raw() {
-            RawWindowHandle::Win32(h) => h.hwnd.get(),
-            _ => return Err(anyhow!("unsupported window type")),
-        };
+    /// Creates the (hidden) black video popup owned by `owner` and an initialised mpv rendering into it.
+    pub fn create(owner: isize) -> Result<Self> {
         let (api, lib_path) = load_api()?;
-        let surface = create_child(parent, rect)?;
+        let surface = create_surface(owner)?;
         unsafe {
             let handle = (api.create)();
             if handle.is_null() {
-                destroy_child(surface);
+                destroy_surface(surface);
                 return Err(anyhow!("mpv_create returned null"));
             }
             // From here Drop cleans up both mpv and the popup on any error.
             let mpv = Self { api, handle, surface, lib_path };
             mpv.set_option("wid", &surface.to_string())?;
-            for (k, v) in [
-                ("hwdec", "auto-safe"),
-                ("keep-open", "yes"),
-                ("osc", "no"),
-                ("osd-level", "0"),
-                ("input-default-bindings", "no"),
-                ("input-vo-keyboard", "no"),
-                ("input-cursor", "no"),
-                ("cursor-autohide", "3000"),
-                ("window-dragging", "no"),
-                ("ytdl", "no"),
-                ("volume-max", "130"),
-                ("cache", "yes"),
-                ("demuxer-max-bytes", "150MiB"),
-                ("sub-auto", "fuzzy"),
-                ("slang", "en,eng"),
-            ] {
+            for (k, v) in OPTIONS {
                 // Older builds may lack an option; none of these are essential.
                 let _ = mpv.set_option(k, v);
+            }
+            // Debugging aid: full mpv log to a file.
+            if let Some(path) = std::env::var_os("MANGAVOX_MPV_LOG") {
+                let _ = mpv.set_option("log-file", &path.to_string_lossy());
             }
             if (mpv.api.initialize)(mpv.handle) < 0 {
                 return Err(anyhow!("mpv_initialize failed"));
@@ -245,8 +280,20 @@ impl Mpv {
         let _ = self.set("pause", if paused { "yes" } else { "no" });
     }
 
+    /// Exact seek (frame accurate).
     pub fn seek_absolute(&self, secs: f64) {
-        let _ = self.command(&["seek", &format!("{:.3}", secs.max(0.0)), "absolute"]);
+        self.seek(secs, true);
+    }
+
+    /// `exact = false` jumps to the nearest keyframe: much cheaper, used for live scrubbing.
+    pub fn seek(&self, secs: f64, exact: bool) {
+        let flags = if exact { "absolute+exact" } else { "absolute+keyframes" };
+        let _ = self.command(&["seek", &format!("{:.3}", secs.max(0.0)), flags]);
+    }
+
+    /// Buffered (seekable without network) ranges in seconds.
+    pub fn cache_ranges(&self) -> Vec<(f64, f64)> {
+        self.get("demuxer-cache-state").map(|j| crate::logic::cache_ranges(&j)).unwrap_or_default()
     }
 
     /// Adds an external subtitle (selected only if it matches the preferred language).
@@ -306,6 +353,7 @@ impl Mpv {
         out
     }
 
+    /// The video popup's HWND.
     pub fn surface(&self) -> isize {
         self.surface
     }
@@ -313,67 +361,78 @@ impl Mpv {
     pub fn library_path(&self) -> String {
         self.lib_path.display().to_string()
     }
-
-    pub fn set_visible(&self, visible: bool) {
-        show_surface(self.surface, visible);
-    }
-
-    /// Cuts `[x, y, w, h]` rects (popup device pixels) out of the video so GPUI shows through.
-    pub fn set_holes(&self, holes: &[[i32; 4]]) {
-        set_region(self.surface, holes);
-    }
-
-    /// Screen cursor position while it is over the video (for idle detection).
-    pub fn cursor_over(&self) -> Option<(i32, i32)> {
-        cursor_over(self.surface)
-    }
-
-    /// mpv's own video window (made on mpv's thread) would swallow mouse input over the video;
-    /// disabled child windows pass it to the popup, whose HTTRANSPARENT hands it to the app.
-    pub fn pass_mouse_through(&self) {
-        disable_children(self.surface);
-    }
-
-    /// Hides the cursor until it moves, if it is over the video.
-    pub fn hide_cursor(&self) {
-        if self.cursor_over().is_some() {
-            hide_cursor();
-        }
-    }
 }
 
 impl Drop for Mpv {
     fn drop(&mut self) {
-        // Hide first so the black popup never lingers while mpv shuts down.
-        show_surface(self.surface, false);
+        // Hide first so the popup never lingers while mpv shuts down.
+        hide_surface(self.surface);
         unsafe { (self.api.terminate_destroy)(self.handle) };
-        destroy_child(self.surface);
+        destroy_surface(self.surface);
     }
 }
 
 #[cfg(windows)]
 mod win {
-    use windows_sys::Win32::Foundation::{HWND, POINT};
-    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-    /// GPUI draws with DirectComposition *above* child windows, so the video lives in a
-    /// borderless popup owned by the app window, kept over the player area in screen space.
-    /// (STATIC windows answer WM_NCHITTEST with HTTRANSPARENT, so mouse input falls through to the app.)
-    pub fn create_child(parent: isize, rect: (i32, i32, i32, i32)) -> anyhow::Result<isize> {
-        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    const CLASS: &str = "MangaVoxVideo\0";
+
+    unsafe extern "system" fn wnd_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        match msg {
+            // Never take mouse input or activation (the overlay above handles both).
+            WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+            WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+            _ => DefWindowProcW(h, msg, w, l),
+        }
+    }
+
+    fn register() -> *const u16 {
+        static NAME: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+        let mut first = false;
+        let class = NAME.get_or_init(|| {
+            first = true;
+            CLASS.encode_utf16().collect()
+        });
+        if first {
+            unsafe {
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: GetModuleHandleW(std::ptr::null()),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                // Black brush: nothing ever flashes grey before the first frame.
+                hbrBackground: GetStockObject(BLACK_BRUSH) as HBRUSH,
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class.as_ptr(),
+                hIconSm: std::ptr::null_mut(),
+            };
+            RegisterClassExW(&wc);
+            }
+        }
+        class.as_ptr()
+    }
+
+    /// A hidden borderless popup owned by the app window; the overlay positions and shows it.
+    pub fn create_surface(owner: isize) -> anyhow::Result<isize> {
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                class.as_ptr(),
+                register(),
                 std::ptr::null(),
-                WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
+                WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                 0,
                 0,
                 1,
                 1,
-                parent as HWND,
+                owner as HWND,
                 std::ptr::null_mut(),
                 GetModuleHandleW(std::ptr::null()),
                 std::ptr::null(),
@@ -382,104 +441,26 @@ mod win {
         if hwnd.is_null() {
             return Err(anyhow::anyhow!("CreateWindowExW failed"));
         }
-        move_surface(hwnd as isize, rect);
         Ok(hwnd as isize)
     }
 
-    /// `rect` is in the owner's client coordinates (device pixels).
-    pub fn move_surface(h: isize, (x, y, w, hgt): (i32, i32, i32, i32)) {
-        unsafe {
-            let owner = GetWindow(h as HWND, GW_OWNER);
-            if owner.is_null() {
-                return;
-            }
-            if IsIconic(owner) != 0 {
-                return;
-            }
-            let mut pt = POINT { x, y };
-            ClientToScreen(owner, &mut pt);
-            SetWindowPos(h as HWND, std::ptr::null_mut(), pt.x, pt.y, w.max(1), hgt.max(1), SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+    pub fn hide_surface(h: isize) {
+        unsafe { ShowWindow(h as HWND, SW_HIDE) };
     }
 
-    pub fn show_surface(h: isize, visible: bool) {
-        unsafe { ShowWindow(h as HWND, if visible { SW_SHOWNA } else { SW_HIDE }) };
-    }
-
-    pub fn destroy_child(h: isize) {
+    pub fn destroy_surface(h: isize) {
         unsafe { DestroyWindow(h as HWND) };
-    }
-
-    /// Window region = everything minus `holes`; no holes restores the full window.
-    pub fn set_region(h: isize, holes: &[[i32; 4]]) {
-        use windows_sys::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF};
-        unsafe {
-            if holes.is_empty() {
-                SetWindowRgn(h as HWND, std::ptr::null_mut(), 1);
-                return;
-            }
-            let rgn = CreateRectRgn(0, 0, 32767, 32767);
-            for &[x, y, w, hgt] in holes {
-                let cut = CreateRectRgn(x, y, x + w, y + hgt);
-                CombineRgn(rgn, rgn, cut, RGN_DIFF);
-                DeleteObject(cut);
-            }
-            // The system owns `rgn` after this call.
-            SetWindowRgn(h as HWND, rgn, 1);
-        }
-    }
-
-    pub fn cursor_over(h: isize) -> Option<(i32, i32)> {
-        use windows_sys::Win32::Foundation::RECT;
-        unsafe {
-            let (mut pt, mut r) = (POINT { x: 0, y: 0 }, RECT { left: 0, top: 0, right: 0, bottom: 0 });
-            if GetCursorPos(&mut pt) == 0 || IsWindowVisible(h as HWND) == 0 || GetWindowRect(h as HWND, &mut r) == 0 {
-                return None;
-            }
-            (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom).then_some((pt.x, pt.y))
-        }
-    }
-
-    pub fn disable_children(h: isize) {
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
-        unsafe {
-            let mut c = GetWindow(h as HWND, GW_CHILD);
-            while !c.is_null() {
-                if IsWindowEnabled(c) != 0 {
-                    EnableWindow(c, 0);
-                }
-                c = GetWindow(c, GW_HWNDNEXT);
-            }
-        }
-    }
-
-    pub fn hide_cursor() {
-        unsafe { SetCursor(std::ptr::null_mut()) };
     }
 }
 
 #[cfg(windows)]
-use win::{create_child, cursor_over, destroy_child, disable_children, hide_cursor, set_region, show_surface};
-#[cfg(windows)]
-pub use win::move_surface;
+use win::{create_surface, destroy_surface, hide_surface};
 
 #[cfg(not(windows))]
-fn create_child(_: isize, _: (i32, i32, i32, i32)) -> Result<isize> {
+fn create_surface(_: isize) -> Result<isize> {
     Err(anyhow!("the video player is Windows-only for now"))
 }
 #[cfg(not(windows))]
-pub fn move_surface(_: isize, _: (i32, i32, i32, i32)) {}
+fn hide_surface(_: isize) {}
 #[cfg(not(windows))]
-fn show_surface(_: isize, _: bool) {}
-#[cfg(not(windows))]
-fn destroy_child(_: isize) {}
-#[cfg(not(windows))]
-fn set_region(_: isize, _: &[[i32; 4]]) {}
-#[cfg(not(windows))]
-fn cursor_over(_: isize) -> Option<(i32, i32)> {
-    None
-}
-#[cfg(not(windows))]
-fn hide_cursor() {}
-#[cfg(not(windows))]
-fn disable_children(_: isize) {}
+fn destroy_surface(_: isize) {}

@@ -7,14 +7,16 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::manga;
-use mv_sources::{MangaSearchResult, SourceInfo};
+use mv_sources::{MangaSearchResult, SourceInfo, Tag};
 use mv_ui::{button, page_header, size, ButtonKind, Route, Tokens};
 
 use crate::backend;
+use crate::discover::{self, SourceTags, TagRequest, TagTarget};
 use crate::ops;
+use crate::tags;
 use crate::ui::{
-    cover_src, error_view, manga_card, note_line, search_box, skeleton_cover, skeleton_rows, spawn_cover_downloads, spinner, state_view, tab, tag, width_probe,
-    CardInfo, Grid, Load,
+    cover_src, error_view, manga_card, note_line, removable_chip, search_box, select_chip, skeleton_cover, skeleton_rows, spawn_cover_downloads, spinner,
+    state_view, tab, tag, tool_button, width_probe, CardInfo, Grid, Load,
 };
 
 /// Last source picked in Browse (restored next time).
@@ -25,6 +27,8 @@ enum Mode {
     Popular,
     Latest,
     Search(String),
+    /// Titles carrying all of these tags.
+    Tags(Vec<Tag>),
 }
 
 /// `source \u{1} source_id` -> (manga id, shown in the library).
@@ -62,6 +66,12 @@ pub struct BrowsePage {
     known: Known,
     seen_version: u64,
     width: f32,
+    /// Tag list of `tags_for` (the selected source once the panel has been opened).
+    tags: Load<SourceTags>,
+    tags_for: Option<String>,
+    tags_open: bool,
+    /// A genre clicked on a manga page is being matched to a tag.
+    resolving: Option<String>,
     _sub: Subscription,
 }
 
@@ -110,6 +120,10 @@ impl BrowsePage {
             known: HashMap::new(),
             seen_version: u64::MAX,
             width: 0.,
+            tags: Load::Loading,
+            tags_for: None,
+            tags_open: false,
+            resolving: None,
             _sub: sub,
         }
     }
@@ -134,6 +148,93 @@ impl BrowsePage {
         self.selected = Some(id);
         self.mode = Mode::Popular;
         self.fetch(cx);
+    }
+
+    fn selected_tags(&self) -> &[Tag] {
+        match &self.mode {
+            Mode::Tags(v) => v,
+            _ => &[],
+        }
+    }
+
+    /// Load (cached) tags for the selected source unless they are already there.
+    fn load_tags(&mut self, cx: &mut Context<Self>) {
+        let Some(src) = self.selected.clone() else { return };
+        if self.tags_for.as_deref() == Some(src.as_str()) {
+            return;
+        }
+        self.tags_for = Some(src.clone());
+        self.tags = Load::Loading;
+        cx.spawn(async move |this, cx| {
+            let sid = src.clone();
+            let res = mv_ui::bg::run(async move { discover::tag_list(&sid).await }).await.and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                if this.tags_for.as_deref() != Some(src.as_str()) {
+                    return;
+                }
+                this.tags = match res {
+                    Ok(t) => Load::Ready(t),
+                    Err(e) => Load::Failed(format!("{e:#}")),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Select / deselect a tag. Sources that cannot combine tags switch to the clicked one.
+    fn toggle_tag(&mut self, tag: Tag, cx: &mut Context<Self>) {
+        let multi = matches!(&self.tags, Load::Ready(st) if st.multi);
+        let mut sel = self.selected_tags().to_vec();
+        if let Some(i) = sel.iter().position(|t| t.id == tag.id) {
+            sel.remove(i);
+        } else if multi {
+            sel.push(tag);
+        } else {
+            sel = vec![tag];
+        }
+        self.set_mode(if sel.is_empty() { Mode::Popular } else { Mode::Tags(sel) }, cx);
+    }
+
+    fn remove_tag(&mut self, id: &str, cx: &mut Context<Self>) {
+        let sel: Vec<Tag> = self.selected_tags().iter().filter(|t| t.id != id).cloned().collect();
+        self.set_mode(if sel.is_empty() { Mode::Popular } else { Mode::Tags(sel) }, cx);
+    }
+
+    /// A genre chip on a manga page: find the matching tag (own source, else MangaDex) and show it.
+    fn open_tag_request(&mut self, req: TagRequest, cx: &mut Context<Self>) {
+        self.generation += 1;
+        let generation = self.generation;
+        self.resolving = Some(req.name.clone());
+        self.results = Load::Loading;
+        self.note = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let target = mv_ui::bg::run(discover::resolve_tag(req)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.resolving = None;
+                let (src, mode) = match target {
+                    Ok(TagTarget::Tag { source_id, tag }) => {
+                        this.tags_open = true;
+                        (Some(source_id), Mode::Tags(vec![tag]))
+                    }
+                    Ok(TagTarget::Search { source_id, query }) => (Some(source_id), Mode::Search(query)),
+                    Err(e) => {
+                        this.note = Some(format!("Could not open tag: {e:#}"));
+                        (None, Mode::Popular)
+                    }
+                };
+                if let Some(id) = src {
+                    backend::set_config_str(SOURCE_KEY, &id);
+                    this.selected = Some(id);
+                }
+                this.set_mode(mode, cx);
+            });
+        })
+        .detach();
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
@@ -179,6 +280,10 @@ impl BrowsePage {
                     Mode::Popular => s.get_popular_manga(page).await,
                     Mode::Latest => s.get_latest_manga(page).await,
                     Mode::Search(q) => s.search_manga(&q, page).await,
+                    Mode::Tags(t) => {
+                        let ids: Vec<String> = t.iter().map(|t| t.id.clone()).collect();
+                        s.get_manga_by_tags(&ids, page).await
+                    }
                 }
                 .map_err(|e| anyhow!("{e}"))
             })
@@ -263,6 +368,10 @@ impl BrowsePage {
         if list.is_empty() {
             let (title, body) = match &self.mode {
                 Mode::Search(q) => ("No results", format!("Nothing on this source matches \"{q}\".")),
+                Mode::Tags(t) => {
+                    let names: Vec<&str> = t.iter().map(|t| t.name.as_str()).collect();
+                    ("No titles", format!("Nothing on this source is tagged {}.", names.join(" + ")))
+                }
                 _ => ("Nothing here", "This source returned no titles.".to_string()),
             };
             return state_view("icons/search.svg", title, body).into_any_element();
@@ -320,6 +429,89 @@ impl BrowsePage {
         .track_scroll(&self.scroll)
         .size_full()
         .into_any_element()
+    }
+
+    /// Selected tags as removable chips, with Clear all.
+    fn selected_row(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let sel = self.selected_tags();
+        if sel.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .px(px(size::PAGE_X))
+                .mb(px(12.))
+                .child(div().mr(px(2.)).text_size(px(size::SM)).text_color(Tokens::text_3()).child(if sel.len() > 1 { "Tagged with all of" } else { "Tagged" }))
+                .children(sel.iter().map(|t| {
+                    let id = t.id.clone();
+                    removable_chip(SharedString::from(format!("sel-{}", t.id)), t.name.clone()).on_click(cx.listener(move |this, _, _, cx| this.remove_tag(&id, cx)))
+                }))
+                .child(
+                    div()
+                        .id("tags-clear")
+                        .ml(px(4.))
+                        .text_size(px(size::SM))
+                        .text_color(Tokens::accent())
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(Tokens::text_1()))
+                        .child("Clear all")
+                        .on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Popular, cx))),
+                ),
+        )
+    }
+
+    /// The Tags area: the source's tags in groups (Genres, Themes, ...), multi-select when the
+    /// source can combine tags.
+    fn tag_panel(&self, current: Option<&SourceInfo>, cx: &mut Context<Self>) -> Div {
+        let wrap = div().flex().flex_col().gap(px(8.)).mx(px(size::PAGE_X)).mb(px(12.)).p(px(12.)).rounded(px(10.)).bg(Tokens::surface()).border_1().border_color(Tokens::border());
+        let source_name = current.map(|s| s.name.clone()).unwrap_or_else(|| "This source".into());
+        match &self.tags {
+            Load::Loading => wrap.child(div().flex().items_center().gap(px(8.)).child(spinner("tags-spin", 14.)).child(note_line("Loading tags...", false))),
+            Load::Failed(e) => wrap.child(note_line(format!("Could not load tags: {e}"), true)).child(
+                div().flex().child(button("tags-retry", "Try again", ButtonKind::Secondary).on_click(cx.listener(|this, _, _, cx| {
+                    this.tags_for = None;
+                    this.load_tags(cx);
+                    cx.notify();
+                }))),
+            ),
+            Load::Ready(st) if st.tags.is_empty() => {
+                let fallback = discover::FALLBACK_SOURCE;
+                let can_switch = self.selected.as_deref() != Some(fallback)
+                    && matches!(&self.sources, Load::Ready(list) if list.iter().any(|s| s.id == fallback));
+                wrap.child(note_line(format!("{source_name} does not offer tag browsing."), false)).when(can_switch, |d| {
+                    d.child(div().flex().child(button("tags-md", "Browse MangaDex tags", ButtonKind::Secondary).on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_source(fallback.to_string(), cx);
+                    }))))
+                })
+            }
+            Load::Ready(st) => {
+                let selected: Vec<String> = self.selected_tags().iter().map(|t| t.id.clone()).collect();
+                let hint = if st.multi { "Pick tags to narrow the results: titles must have all of them." } else { "Pick a tag to browse it (this source filters by one tag at a time)." };
+                let groups = tags::group_tags(&st.tags);
+                let show_labels = groups.len() > 1;
+                wrap.child(note_line(hint, false)).child(
+                    div().id("tag-panel").max_h(px(216.)).overflow_y_scroll().flex().flex_col().gap(px(10.)).children(groups.into_iter().map(|(group, list)| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .when(show_labels, |d| {
+                                d.child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(group.to_uppercase()))
+                            })
+                            .child(div().flex().flex_wrap().gap(px(6.)).children(list.into_iter().map(|t| {
+                                let active = selected.contains(&t.id);
+                                let label = t.name.clone();
+                                select_chip(SharedString::from(format!("tg-{}", t.id)), label, active)
+                                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_tag(t.clone(), cx)))
+                            })))
+                    })),
+                )
+            }
+        }
     }
 
     /// Source chips: icon (or initial), name, language and an 18+ marker.
@@ -385,6 +577,15 @@ impl Render for BrowsePage {
             self.seen_version = v;
             self.reload_known(cx);
         }
+        if matches!(self.sources, Load::Ready(_)) {
+            if let Some(req) = discover::take_request() {
+                let page = cx.entity();
+                cx.defer(move |cx| page.update(cx, |this, cx| this.open_tag_request(req, cx)));
+            }
+        }
+        if self.tags_open && self.selected.is_some() && self.tags_for != self.selected {
+            self.load_tags(cx);
+        }
         let grid = Grid::new(self.width, window);
         let current = match &self.sources {
             Load::Ready(list) => list.iter().find(|s| Some(&s.id) == self.selected.as_ref()).cloned(),
@@ -431,11 +632,23 @@ impl Render for BrowsePage {
             .child(tab("m-popular", "Popular", None, self.mode == Mode::Popular).on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Popular, cx))))
             .child(tab("m-latest", "Latest", None, self.mode == Mode::Latest).on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Latest, cx))))
             .when_some(search, |d, q| d.child(tab("m-search", format!("Search: {q}"), None, true)))
+            .when(!self.selected_tags().is_empty(), |d| d.child(tab("m-tags", "Tags", Some(self.selected_tags().len()), true)))
             .child(div().flex_1())
+            .when_some(self.resolving.clone(), |d, n| d.child(div().mr(px(8.)).child(note_line(format!("Finding \"{n}\"..."), false))))
             .when(self.loading_more, |d| d.child(div().mr(px(8.)).child(spinner("more-spin", 14.))))
             .when_some(self.busy.clone(), |d, (_, t)| d.child(div().mr(px(8.)).child(note_line(format!("Opening {t}..."), false))))
             .when_some(self.note.clone(), |d, n| d.child(div().mr(px(8.)).child(note_line(n, true))))
-            .when(current.as_ref().is_some_and(|s| s.nsfw), |d| d.child(tag("18+")));
+            .when(current.as_ref().is_some_and(|s| s.nsfw), |d| d.child(tag("18+")))
+            .child(
+                div().ml(px(8.)).child(
+                    tool_button("tags-toggle", "icons/tags.svg", if self.tags_open { "Hide tags" } else { "Tags" }, self.tags_open).on_click(cx.listener(|this, _, _, cx| {
+                        this.tags_open = !this.tags_open;
+                        cx.notify();
+                    })),
+                ),
+            );
+        let selected_row = self.selected_row(cx);
+        let panel = self.tags_open.then(|| self.tag_panel(current.as_ref(), cx));
         let body: AnyElement = match &self.results {
             Load::Loading => skeleton_rows(grid, 3).into_any_element(),
             Load::Failed(e) => div()
@@ -447,6 +660,6 @@ impl Render for BrowsePage {
                 .into_any_element(),
             Load::Ready(_) => self.grid(grid, cx),
         };
-        root.child(tabs).child(div().relative().flex_1().min_h_0().child(width_probe(cx, |t: &mut Self| &mut t.width)).child(body))
+        root.child(tabs).children(panel).children(selected_row).child(div().relative().flex_1().min_h_0().child(width_probe(cx, |t: &mut Self| &mut t.width)).child(body))
     }
 }

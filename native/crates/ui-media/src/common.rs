@@ -1,14 +1,18 @@
 //! Shared helpers for the media pages: async loading, cards, rails, history/watchlist glue.
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
+use mv_core::cache::DataCache;
 use mv_core::repo::media::{self, MediaEvent, MediaTitle};
 use mv_core::repo::watchlist;
 use mv_media::addons::AddonRegistry;
 use mv_media::jikan::JikanClient;
 use mv_media::types::AnimeSearchResult;
+use mv_media::image_cache::ImageCache;
 use mv_ui::{
     bg, card_grid, cover_card, empty_state, error_state, navigate, size, skeleton_card, CoverSource, Route, Tokens,
 };
@@ -57,6 +61,84 @@ pub fn fetch<V: 'static, T: Send + 'static>(
     .detach();
 }
 
+/// Catalogs and details refresh once a day; stream links more often.
+pub const DAY: Duration = Duration::from_secs(24 * 3600);
+pub const EPISODES_TTL: Duration = Duration::from_secs(12 * 3600);
+pub const STREAMS_TTL: Duration = Duration::from_secs(8 * 3600);
+
+/// Run `fut` and store a successful result under `key`.
+pub fn cached<T: serde::Serialize + Send + 'static>(
+    key: String,
+    fut: impl Future<Output = Result<T, String>> + Send + 'static,
+) -> impl Future<Output = Result<T, String>> + Send + 'static {
+    async move {
+        let r = fut.await;
+        if let Ok(v) = &r {
+            DataCache::shared().put(&key, v);
+        }
+        r
+    }
+}
+
+/// Stale-while-revalidate `fetch`. Returns the cached value (however old) for the page to show at
+/// once; when there is none or it is older than `ttl`, `fut` runs in the background and its result
+/// is cached and handed to `apply`. A failed refresh keeps the cached value.
+pub fn fetch_cached<V: 'static, T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static>(
+    cx: &mut Context<V>,
+    key: String,
+    ttl: Duration,
+    fut: impl Future<Output = Result<T, String>> + Send + 'static,
+    apply: impl FnOnce(&mut V, Load<T>) + 'static,
+) -> Load<T> {
+    let hit = DataCache::shared().get::<T>(&key);
+    let had = hit.is_some();
+    let log = std::env::var_os("MANGAVOX_CACHE_LOG").is_some();
+    if log {
+        eprintln!("[cache] {key}: {}", hit.as_ref().map_or("miss".into(), |(_, a)| format!("hit, {} min old", a.as_secs() / 60)));
+    }
+    if hit.as_ref().is_none_or(|(_, age)| *age >= ttl) {
+        let started = std::time::Instant::now();
+        fetch(cx, cached(key.clone(), fut), move |v, l| {
+            if log {
+                eprintln!("[cache] {key}: fetched in {} ms", started.elapsed().as_millis());
+            }
+            if !(had && matches!(l, Load::Failed(_))) {
+                apply(v, l)
+            }
+        });
+    }
+    hit.map_or(Load::Loading, |(v, _)| Load::Ready(v))
+}
+
+/// Shared artwork cache (`~/.mangavox/cache/images`).
+pub fn images() -> &'static Arc<ImageCache> {
+    static C: OnceLock<Arc<ImageCache>> = OnceLock::new();
+    C.get_or_init(|| Arc::new(ImageCache::new(mv_core::paths::root().join("cache").join("images"), 6)))
+}
+
+/// Cached file for a remote image when this session found one on disk; otherwise `None` (show the
+/// URL) and the file is downloaded in the background for next time.
+pub fn local_image(url: &str) -> Option<PathBuf> {
+    let c = images();
+    let (file, first) = c.resolve(url);
+    match &file {
+        Some(p) if first => {
+            let p = p.clone();
+            bg::runtime().spawn_blocking(move || ImageCache::touch(&p));
+        }
+        None if c.claim(url) => {
+            let (c, u) = (c.clone(), url.to_string());
+            bg::runtime().spawn(async move { c.download(u).await });
+        }
+        _ => {}
+    }
+    file
+}
+
+pub fn image_source(url: &str) -> ImageSource {
+    local_image(url).map_or_else(|| url.to_string().into(), Into::into)
+}
+
 /// Blocking SQLite work against the user's database, off the UI thread.
 pub fn db<T: Send + 'static>(f: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static) -> impl Future<Output = Result<T, String>> + Send {
     let fut = bg::blocking(move || {
@@ -83,7 +165,8 @@ pub fn input(window: &mut Window, cx: &mut App, placeholder: &'static str) -> En
 // ---------- cards ----------
 
 pub fn cover_of(url: &Option<String>) -> Option<CoverSource> {
-    url.as_ref().filter(|u| !u.is_empty()).map(|u| CoverSource::Url(u.clone().into()))
+    let u = url.as_ref().filter(|u| !u.is_empty())?;
+    Some(local_image(u).map_or_else(|| CoverSource::Url(u.clone().into()), CoverSource::File))
 }
 
 /// Jikan results (numeric id) open AnimeDetail; Cinemeta/IMDb results open MovieDetail.

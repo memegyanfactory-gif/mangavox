@@ -64,6 +64,18 @@ pub async fn resolve(req: &PlayRequest) -> Result<Resolved> {
     }
 }
 
+/// Start warming a torrent source in the background so Play opens it instantly.
+/// URLs and files need no warm-up; errors are ignored (it is only a head start).
+pub fn prefetch(req: &PlayRequest) {
+    let SourceKind::Torrent(src) = logic::classify_source(&req.source) else { return };
+    let file_idx = req.file_idx;
+    mv_ui::bg::runtime().spawn(async move {
+        if let Ok(engine) = engine().await {
+            let _ = engine.prefetch(src, AddOptions { file_idx, ..Default::default() });
+        }
+    });
+}
+
 /// Release a streamed torrent (files stay in the cache for quick resume).
 pub fn release_torrent(info_hash: String) {
     if let Some(engine) = engine_if_started() {

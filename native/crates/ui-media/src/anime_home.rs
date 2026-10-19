@@ -7,7 +7,7 @@ use mv_core::repo::media::{self, PlaybackState};
 use mv_media::types::AnimeSearchResult;
 use mv_ui::{chip, empty_state, error_state, icon, navigate, size, Route, Tokens};
 
-use crate::common::{self, db, fetch, jikan, route_for_media, Load};
+use crate::common::{self, db, fetch, fetch_cached, jikan, route_for_media, Load, DAY};
 use crate::look::{self, crunchy, RowOffsets, EDGE};
 use crate::streams::{self, PlayBase, StreamState};
 
@@ -18,6 +18,46 @@ enum Feed {
     Top(Option<&'static str>),
     Upcoming,
     Genre(u32),
+}
+
+impl Feed {
+    fn key(self) -> String {
+        match self {
+            Feed::Airing => "jikan:airing:1".into(),
+            Feed::Season => "jikan:season:1".into(),
+            Feed::Top(k) => format!("jikan:top:{}:1", k.unwrap_or("")),
+            Feed::Upcoming => "jikan:upcoming:1".into(),
+            Feed::Genre(g) => genre_key(g),
+        }
+    }
+
+    async fn load(self) -> Result<Vec<AnimeSearchResult>, String> {
+        let j = jikan()?;
+        let r = match self {
+            Feed::Airing => j.airing_anime(1).await,
+            Feed::Season => j.season_anime(None, None, 1).await,
+            Feed::Top(kind) => j.top_anime(1, kind).await,
+            Feed::Upcoming => j.upcoming_anime(1).await,
+            Feed::Genre(g) => j.anime_by_genre(g, 1, None).await,
+        };
+        r.map_err(|e| e.to_string())
+    }
+}
+
+pub fn genre_key(mal_genre: u32) -> String {
+    format!("jikan:genre:{mal_genre}:1")
+}
+
+/// Fill the cache for the home rows, in display order (Jikan is rate limited).
+pub async fn prefetch() {
+    for &(_, _, feed) in ROWS {
+        match mv_core::cache::DataCache::shared().get::<Vec<AnimeSearchResult>>(&feed.key()) {
+            Some((_, age)) if age < DAY => {}
+            _ => {
+                let _ = common::cached(feed.key(), feed.load()).await;
+            }
+        }
+    }
 }
 
 /// (row id, title, feed) in display order. The first row also feeds the carousel.
@@ -59,26 +99,12 @@ impl AnimeHome {
         let rows = ROWS
             .iter()
             .map(|&(id, title, feed)| {
-                fetch(
-                    cx,
-                    async move {
-                        let j = jikan()?;
-                        let r = match feed {
-                            Feed::Airing => j.airing_anime(1).await,
-                            Feed::Season => j.season_anime(None, None, 1).await,
-                            Feed::Top(kind) => j.top_anime(1, kind).await,
-                            Feed::Upcoming => j.upcoming_anime(1).await,
-                            Feed::Genre(g) => j.anime_by_genre(g, 1, None).await,
-                        };
-                        r.map_err(|e| e.to_string())
-                    },
-                    move |v: &mut Self, l| {
-                        if let Some(row) = v.rows.iter_mut().find(|r| r.0 == id) {
-                            row.2 = l;
-                        }
-                    },
-                );
-                (id, title, Load::Loading)
+                let load = fetch_cached(cx, feed.key(), DAY, feed.load(), move |v: &mut Self, l| {
+                    if let Some(row) = v.rows.iter_mut().find(|r| r.0 == id) {
+                        row.2 = l;
+                    }
+                });
+                (id, title, load)
             })
             .collect();
         fetch(
@@ -189,7 +215,7 @@ impl AnimeHome {
                             .child(look::tag(r.anime_type.clone().unwrap_or_else(|| "TV".into())))
                             .child(div().text_size(px(size::MD)).text_color(Tokens::text_2()).child(SharedString::from(genres))),
                     )
-                    .child(div().text_size(px(size::LG)).line_height(px(22.)).text_color(Tokens::text_1()).line_clamp(3).child(SharedString::from(r.description.clone().unwrap_or_default())))
+                    .child(div().text_size(px(size::LG)).line_height(px(22.)).text_color(Tokens::text_1()).line_clamp(3).child(SharedString::from(r.description.as_deref().map(look::blurb).unwrap_or_default())))
                     .child(
                         div()
                             .flex()

@@ -44,6 +44,7 @@ fn mangadex_details() {
     assert_eq!(d.status.as_deref(), Some("ongoing"));
     let g = d.genres.unwrap();
     assert!(g.contains(&"Action".to_string()) && g.contains(&"Horror".to_string()));
+    assert_eq!(g.last().map(String::as_str), Some("Seinen"), "publication demographic is listed as a genre");
     assert!(mangadex::parse_details(&json!({"result": "error"})).is_err());
 }
 
@@ -90,7 +91,11 @@ fn mangadex_pages_and_tags() {
     let tags = mangadex::parse_tags(&fj("mangadex_tags.json"));
     assert!(tags.len() > 30);
     assert!(tags.iter().any(|t| t.name == "Action"));
-    assert!(tags.windows(2).all(|w| w[0].name <= w[1].name));
+    let rank = |t: &mv_sources::Tag| mangadex::TAG_GROUPS.iter().position(|(_, l)| Some(*l) == t.group.as_deref()).unwrap();
+    assert!(tags.windows(2).all(|w| (rank(&w[0]), &w[0].name) <= (rank(&w[1]), &w[1].name)), "grouped, then by name");
+    assert_eq!(tags.iter().find(|t| t.name == "Action").unwrap().group.as_deref(), Some("Genres"));
+    assert!(tags.iter().any(|t| t.id == "demographic:seinen" && t.group.as_deref() == Some("Demographics")));
+    assert!(tags.iter().any(|t| t.group.as_deref() == Some("Themes")) && tags.iter().any(|t| t.group.as_deref() == Some("Formats")));
 }
 
 // ── WEBTOON (curl of webtoons.com: search "tower", dailySchedule, Tower of God list + viewer ep 1)
@@ -241,7 +246,7 @@ fn hentai2read_details_chapters_pages_tags() {
 
     let t = hentai2read::parse_tags(&hentai2read::parse_props(&fx("h2r_tags.html")).unwrap());
     assert_eq!(t.len(), 10);
-    assert_eq!(t[0], Tag { id: "category/18-adult".into(), name: "Adult".into() });
+    assert_eq!(t[0], Tag::new("category/18-adult".into(), "Adult".into()));
 }
 
 #[test]
@@ -321,7 +326,7 @@ fn nhentai_search_details_pages() {
 
     let tags = nhentai::parse_tags(&fj("nhentai_tags.json"));
     assert_eq!(tags.len(), 12);
-    assert_eq!(tags[0], Tag { id: "2937".into(), name: "big breasts".into() });
+    assert_eq!(tags[0], Tag::new("2937".into(), "big breasts".into()));
 }
 
 // ── MangaFire (hand-written DOM fixtures; see header)

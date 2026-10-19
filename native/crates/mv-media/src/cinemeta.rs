@@ -121,13 +121,19 @@ fn episodes_from_meta(meta: &Value, imdb_id: &str) -> Vec<AnimeEpisode> {
                         .filter(|&n| n != 0.0)
                         .map(|n| n as u32)
                         .unwrap_or(fallback_number);
+                    let season = value_to_f64(video.get("season")).map(|s| s as u32);
                     AnimeEpisode {
                         id: str_field(video, "id")
                             .unwrap_or_else(|| format!("{imdb_id}:1:{}", index + 1)),
                         number,
                         title: str_field(video, "name").or_else(|| str_field(video, "title")),
                         air_date: str_field(video, "released"),
-                        thumbnail: str_field(video, "thumbnail"),
+                        // Each episode its own still; metahub serves them by IMDB season / episode.
+                        thumbnail: str_field(video, "thumbnail").or_else(|| {
+                            season.filter(|_| imdb_id.starts_with("tt")).map(|s| {
+                                format!("https://episodes.metahub.space/{imdb_id}/{s}/{number}/w780.jpg")
+                            })
+                        }),
                     }
                 })
                 .collect()

@@ -100,27 +100,13 @@ pub fn track_label(t: &Track) -> String {
 
 pub fn language_name(code: &str) -> String {
     let c = code.trim().to_ascii_lowercase();
-    let name = match c.as_str() {
-        "" | "und" | "unknown" => return String::new(),
-        "en" | "eng" => "English",
-        "ja" | "jpn" | "jp" => "Japanese",
-        "es" | "spa" => "Spanish",
-        "fr" | "fra" | "fre" => "French",
-        "de" | "deu" | "ger" => "German",
-        "it" | "ita" => "Italian",
-        "pt" | "por" | "pob" => "Portuguese",
-        "ru" | "rus" => "Russian",
-        "ko" | "kor" => "Korean",
-        "zh" | "zho" | "chi" => "Chinese",
-        "ar" | "ara" => "Arabic",
-        "hi" | "hin" => "Hindi",
-        "tr" | "tur" => "Turkish",
-        "id" | "ind" => "Indonesian",
-        "vi" | "vie" => "Vietnamese",
-        "th" | "tha" => "Thai",
-        _ => return code.to_string(),
-    };
-    name.to_string()
+    if matches!(c.as_str(), "" | "und" | "unknown" | "mul" | "zxx") {
+        return String::new();
+    }
+    match lang_entry(&c) {
+        Some((_, name, _)) => name.to_string(),
+        None => code.to_string(),
+    }
 }
 
 /// Stremio ids: `tt123` for movies, `tt123:S:E` for episodes; kind follows.
@@ -189,19 +175,13 @@ pub fn playable_source(hash: &str) -> String {
     }
 }
 
-// Overlay geometry (logical px). The video popup sits above GPUI, so every control area is cut
-// out of the popup's window region; these sizes are shared by the view and `holes`.
-pub const TOP_H: f32 = 80.0;
-pub const BOTTOM_H: f32 = 132.0;
+// Overlay geometry (logical px).
+pub const TOP_H: f32 = 96.0;
+pub const BOTTOM_H: f32 = 150.0;
 pub const MENU_RIGHT: f32 = 24.0;
-pub const MENU_ROW_H: f32 = 34.0;
-pub const MENU_HEAD_H: f32 = 44.0;
-pub const MENU_MAX_H: f32 = 380.0;
-pub const SKIP_W: f32 = 160.0;
-pub const SKIP_H: f32 = 46.0;
-pub const SKIP_RIGHT: f32 = 40.0;
-pub const CENTER_W: f32 = 380.0;
-pub const CENTER_H: f32 = 180.0;
+pub const MENU_ROW_H: f32 = 38.0;
+pub const MENU_HEAD_H: f32 = 48.0;
+pub const MENU_MAX_H: f32 = 420.0;
 
 pub fn menu_height(rows: usize) -> f32 {
     (MENU_HEAD_H + rows as f32 * MENU_ROW_H + 16.0).min(MENU_MAX_H)
@@ -210,39 +190,164 @@ pub fn menu_height(rows: usize) -> f32 {
 /// Bottom offset of the skip button (sits above the bar when controls show).
 pub fn skip_bottom(controls: bool) -> f32 {
     if controls {
-        BOTTOM_H + 12.0
+        BOTTOM_H + 8.0
     } else {
-        48.0
+        56.0
     }
 }
 
-/// What is drawn over the video right now.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Overlay {
-    pub controls: bool,
-    /// Open menu size (w, h).
-    pub menu: Option<(f32, f32)>,
-    pub skip: bool,
-    pub center: bool,
+/// Ease-out cubic progress (0..1) of an animation `elapsed` into `dur`.
+pub fn ease_out(elapsed: Duration, dur: Duration) -> f32 {
+    if dur.is_zero() {
+        return 1.0;
+    }
+    let t = (elapsed.as_secs_f32() / dur.as_secs_f32()).clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
 }
 
-/// Rects `[x, y, w, h]` within a `w`×`h` stage that must not be covered by the video.
-pub fn holes(w: f32, h: f32, o: &Overlay) -> Vec<[f32; 4]> {
-    let mut v = vec![];
-    if o.controls {
-        v.push([0.0, 0.0, w, TOP_H]);
-        v.push([0.0, h - BOTTOM_H, w, BOTTOM_H]);
+/// Opacity of something fading towards `shown`, `elapsed` after the change.
+pub fn fade(shown: bool, elapsed: Duration, dur: Duration) -> f32 {
+    let p = ease_out(elapsed, dur);
+    if shown {
+        p
+    } else {
+        1.0 - p
     }
-    if let Some((mw, mh)) = o.menu {
-        v.push([w - MENU_RIGHT - mw, h - BOTTOM_H - mh, mw, mh]);
+}
+
+/// Position the UI shows: the scrub handle while dragging, else a just-issued seek target
+/// until mpv reports a nearby time (so the bar never snaps back), else mpv's time.
+pub fn shown_position(scrub: Option<f64>, pending: Option<f64>, pos: f64) -> f64 {
+    scrub.or(pending).unwrap_or(pos)
+}
+
+/// A pending seek is settled once mpv is near it or it is too old.
+pub fn seek_settled(target: f64, pos: f64, age: Duration) -> bool {
+    (pos - target).abs() < 1.5 || age > Duration::from_secs(4)
+}
+
+/// `seekable-ranges` from mpv's `demuxer-cache-state` (JSON), as `(start, end)` seconds.
+pub fn cache_ranges(json: &str) -> Vec<(f64, f64)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return vec![] };
+    v.get("seekable-ranges")
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| Some((r.get("start")?.as_f64()?, r.get("end")?.as_f64()?)))
+                .filter(|(s, e)| e > s)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+type Lang = (&'static [&'static str], &'static str, &'static str);
+
+/// The language table: ISO 639-1/2 codes, English name, flag country (flagcdn code).
+const LANGS: &[Lang] = &[
+    (&["en", "eng"], "English", "gb"),
+    (&["ja", "jpn", "jp"], "Japanese", "jp"),
+    (&["es", "spa"], "Spanish", "es"),
+    (&["es-419", "es-mx", "lat"], "Latin Spanish", "mx"),
+    (&["fr", "fra", "fre"], "French", "fr"),
+    (&["de", "deu", "ger"], "German", "de"),
+    (&["it", "ita"], "Italian", "it"),
+    (&["pt", "por"], "Portuguese", "pt"),
+    (&["pt-br", "pob", "pb"], "Portuguese (BR)", "br"),
+    (&["ru", "rus"], "Russian", "ru"),
+    (&["ko", "kor"], "Korean", "kr"),
+    (&["zh", "zho", "chi", "chs", "zh-cn"], "Chinese", "cn"),
+    (&["zh-tw", "cht", "zh-hk"], "Chinese (Traditional)", "tw"),
+    (&["ar", "ara"], "Arabic", "sa"),
+    (&["hi", "hin"], "Hindi", "in"),
+    (&["ta", "tam"], "Tamil", "in"),
+    (&["te", "tel"], "Telugu", "in"),
+    (&["ml", "mal"], "Malayalam", "in"),
+    (&["mr", "mar"], "Marathi", "in"),
+    (&["kn", "kan"], "Kannada", "in"),
+    (&["bn", "ben"], "Bengali", "bd"),
+    (&["ur", "urd"], "Urdu", "pk"),
+    (&["tr", "tur"], "Turkish", "tr"),
+    (&["id", "ind"], "Indonesian", "id"),
+    (&["ms", "msa", "may"], "Malay", "my"),
+    (&["vi", "vie"], "Vietnamese", "vn"),
+    (&["th", "tha"], "Thai", "th"),
+    (&["tl", "fil", "tgl"], "Filipino", "ph"),
+    (&["nl", "nld", "dut"], "Dutch", "nl"),
+    (&["pl", "pol"], "Polish", "pl"),
+    (&["sv", "swe"], "Swedish", "se"),
+    (&["no", "nor", "nob", "nb", "nn", "nno"], "Norwegian", "no"),
+    (&["da", "dan"], "Danish", "dk"),
+    (&["fi", "fin"], "Finnish", "fi"),
+    (&["el", "ell", "gre"], "Greek", "gr"),
+    (&["he", "heb", "iw"], "Hebrew", "il"),
+    (&["cs", "ces", "cze"], "Czech", "cz"),
+    (&["sk", "slk", "slo"], "Slovak", "sk"),
+    (&["hu", "hun"], "Hungarian", "hu"),
+    (&["ro", "ron", "rum"], "Romanian", "ro"),
+    (&["uk", "ukr"], "Ukrainian", "ua"),
+    (&["bg", "bul"], "Bulgarian", "bg"),
+    (&["hr", "hrv"], "Croatian", "hr"),
+    (&["sr", "srp", "scc"], "Serbian", "rs"),
+    (&["sl", "slv"], "Slovenian", "si"),
+    (&["et", "est"], "Estonian", "ee"),
+    (&["lv", "lav"], "Latvian", "lv"),
+    (&["lt", "lit"], "Lithuanian", "lt"),
+    (&["fa", "fas", "per"], "Persian", "ir"),
+    (&["ca", "cat"], "Catalan", "es-ct"),
+    (&["eu", "eus", "baq"], "Basque", "es-pv"),
+    (&["gl", "glg"], "Galician", "es-ga"),
+    (&["is", "isl", "ice"], "Icelandic", "is"),
+    (&["ka", "kat", "geo"], "Georgian", "ge"),
+    (&["mk", "mkd", "mac"], "Macedonian", "mk"),
+    (&["sq", "sqi", "alb"], "Albanian", "al"),
+    (&["hy", "hye", "arm"], "Armenian", "am"),
+    (&["kk", "kaz"], "Kazakh", "kz"),
+    (&["si", "sin"], "Sinhala", "lk"),
+    (&["ne", "nep"], "Nepali", "np"),
+    (&["km", "khm"], "Khmer", "kh"),
+    (&["my", "mya", "bur"], "Burmese", "mm"),
+    (&["sw", "swa"], "Swahili", "ke"),
+    (&["af", "afr"], "Afrikaans", "za"),
+];
+
+fn lang_entry(code: &str) -> Option<&'static Lang> {
+    let c = code.trim().to_ascii_lowercase().replace('_', "-");
+    if c.is_empty() {
+        return None;
     }
-    if o.skip {
-        v.push([w - SKIP_RIGHT - SKIP_W, h - skip_bottom(o.controls) - SKIP_H, SKIP_W, SKIP_H]);
+    LANGS.iter().find(|(codes, _, _)| codes.contains(&c.as_str())).or_else(|| {
+        // `en-US` style tags: try the base language.
+        let base = c.split('-').next()?;
+        LANGS.iter().find(|(codes, _, _)| codes.contains(&base))
+    })
+}
+
+/// Flag country code (flagcdn.com) for a track's language, falling back to a language name
+/// at the start of the title ("English 2", "Japanese [CR]").
+pub fn flag_country(lang: &str, title: &str) -> Option<String> {
+    let c = lang.trim().to_ascii_lowercase().replace('_', "-");
+    if let Some((_, _, cc)) = LANGS.iter().find(|(codes, _, _)| codes.contains(&c.as_str())) {
+        return Some(cc.to_string());
     }
-    if o.center {
-        v.push([(w - CENTER_W) / 2.0, (h - CENTER_H) / 2.0, CENTER_W, CENTER_H]);
+    // An explicit region (`en-US`, `fr-CA`) beats the language default.
+    if let Some((base, region)) = c.split_once('-') {
+        if region.len() == 2 && region.chars().all(|ch| ch.is_ascii_alphabetic()) && base.len() <= 3 {
+            return Some(region.to_string());
+        }
     }
-    v
+    if let Some((_, _, cc)) = lang_entry(&c) {
+        return Some(cc.to_string());
+    }
+    let t = title.trim().to_ascii_lowercase();
+    LANGS
+        .iter()
+        .find(|(_, name, _)| !t.is_empty() && t.starts_with(&name.to_ascii_lowercase()))
+        .map(|(_, _, cc)| cc.to_string())
+}
+
+/// flagcdn PNG for a country code.
+pub fn flag_url(country: &str) -> String {
+    format!("https://flagcdn.com/w40/{country}.png")
 }
 
 #[derive(Clone, Debug)]
@@ -328,13 +433,7 @@ mod tests {
         assert!(controls_visible(Duration::from_secs(1), false));
         assert!(!controls_visible(Duration::from_secs(4), false));
         assert!(controls_visible(Duration::from_secs(4), true));
-        assert!(holes(800.0, 600.0, &Overlay::default()).is_empty());
-        let h = holes(800.0, 600.0, &Overlay { controls: true, skip: true, ..Default::default() });
-        assert_eq!(h[0], [0.0, 0.0, 800.0, TOP_H]);
-        assert_eq!(h[1], [0.0, 600.0 - BOTTOM_H, 800.0, BOTTOM_H]);
-        assert_eq!(h[2][1], 600.0 - BOTTOM_H - 12.0 - SKIP_H);
-        let c = holes(800.0, 600.0, &Overlay { center: true, ..Default::default() });
-        assert_eq!(c, vec![[210.0, 210.0, CENTER_W, CENTER_H]]);
+        assert_eq!(skip_bottom(true), BOTTOM_H + 8.0);
         assert_eq!(menu_height(100), MENU_MAX_H);
         assert_eq!(next_title("Show S01E03", 3), "Show S01E04");
         assert_eq!(next_title("Show, episode 9", 9), "Show, episode 10");
@@ -344,6 +443,41 @@ mod tests {
         assert_eq!(episode_label("Movie", None, None), None);
         assert_eq!(torrent_line(3, 0.0, 0.5), "3 peers · 0 KB/s · 50%");
         assert_eq!(playable_source("0123456789abcdef0123456789abcdef01234567"), "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn flags_and_languages() {
+        assert_eq!(flag_country("eng", "").as_deref(), Some("gb"));
+        assert_eq!(flag_country("jpn", "").as_deref(), Some("jp"));
+        assert_eq!(flag_country("hin", "").as_deref(), Some("in"));
+        assert_eq!(flag_country("pob", "").as_deref(), Some("br"));
+        assert_eq!(flag_country("pt-BR", "").as_deref(), Some("br"));
+        assert_eq!(flag_country("en-US", "").as_deref(), Some("us"));
+        assert_eq!(flag_country("es-419", "").as_deref(), Some("mx"));
+        assert_eq!(flag_country("fre", "").as_deref(), Some("fr"));
+        assert_eq!(flag_country("", "Spanish 2").as_deref(), Some("es"));
+        assert_eq!(flag_country("", "Track 1"), None);
+        assert_eq!(flag_country("xx", ""), None);
+        assert_eq!(language_name("ger"), "German");
+        assert_eq!(language_name("es-419"), "Latin Spanish");
+        assert_eq!(language_name("und"), "");
+        assert_eq!(flag_url("jp"), "https://flagcdn.com/w40/jp.png");
+    }
+
+    #[test]
+    fn seeking_and_cache() {
+        assert_eq!(shown_position(Some(5.0), Some(9.0), 1.0), 5.0);
+        assert_eq!(shown_position(None, Some(9.0), 1.0), 9.0);
+        assert_eq!(shown_position(None, None, 1.0), 1.0);
+        assert!(seek_settled(100.0, 99.0, Duration::ZERO));
+        assert!(!seek_settled(100.0, 20.0, Duration::from_secs(1)));
+        assert!(seek_settled(100.0, 20.0, Duration::from_secs(5)));
+        let j = r#"{"seekable-ranges":[{"start":0.0,"end":12.5},{"start":60,"end":75}],"cache-end":75}"#;
+        assert_eq!(cache_ranges(j), vec![(0.0, 12.5), (60.0, 75.0)]);
+        assert!(cache_ranges("garbage").is_empty());
+        assert_eq!(fade(true, Duration::from_millis(500), Duration::from_millis(200)), 1.0);
+        assert_eq!(fade(false, Duration::from_millis(500), Duration::from_millis(200)), 0.0);
+        assert_eq!(fade(true, Duration::ZERO, Duration::from_millis(200)), 0.0);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use gpui_kit::*;
 use mv_media::types::{AnimeEpisode, AnimeSearchResult};
 use mv_ui::{chip, empty_state, error_state, icon, navigate, size, Route, Tokens};
 
-use crate::common::{fetch, in_watchlist, media_id, media_title, muted, record_open, set_watchlist, Load};
+use crate::common::{fetch, fetch_cached, in_watchlist, media_id, media_title, muted, record_open, set_watchlist, Load, DAY, EPISODES_TTL};
 use crate::look::{self, netflix, EDGE};
 use crate::movies_home::{background_of, cinemeta, kind_of, logo_of};
 use crate::streams::{self, PlayBase, StreamState};
@@ -24,12 +24,18 @@ pub struct MovieDetail {
     auto: bool,
     /// (season, episode) whose links are shown.
     sel: Option<(u32, u32)>,
+    /// Addon chip selected in the sources panel.
+    addon_filter: Option<String>,
     scroll: ScrollHandle,
 }
 
 /// Season number from a Stremio video id (`tt123:2:5`).
 fn season_of(ep: &AnimeEpisode) -> u32 {
     ep.id.split(':').nth(1).and_then(|s| s.parse().ok()).unwrap_or(1)
+}
+
+fn first_season(eps: &[AnimeEpisode]) -> Option<u32> {
+    eps.iter().map(season_of).filter(|s| *s > 0).min().or_else(|| eps.first().map(season_of))
 }
 
 fn runtime(mins: u32) -> String {
@@ -44,13 +50,19 @@ impl MovieDetail {
     pub fn new(imdb_id: String, kind: String, title: String, cx: &mut Context<Self>) -> Self {
         let series = kind == "series";
         let (id, t, k) = (imdb_id.clone(), title.clone(), kind.clone());
-        fetch(
+        let key = format!("cinemeta:meta:{kind}:{imdb_id}");
+        let warm = mv_core::cache::DataCache::shared().age(&key).is_some();
+        let details = fetch_cached(
             cx,
+            key,
+            DAY,
             async move {
                 let c = cinemeta()?;
                 let d = if k == "series" { c.series_details(&id).await } else { c.movie_details(&id).await };
                 let d = d.map_err(|e| e.to_string())?.ok_or_else(|| "Title not found.".to_string())?;
-                let _ = record_open(media_title(&k, &id, &d, &t)).await;
+                if !warm {
+                    let _ = record_open(media_title(&k, &id, &d, &t)).await;
+                }
                 // "More like this": the top titles of the first genre, minus this one.
                 let genre = d.genres.as_ref().and_then(|g| g.first().cloned());
                 let similar = match genre {
@@ -70,31 +82,39 @@ impl MovieDetail {
                 Load::Loading => {}
             },
         );
+        let (details, similar) = match details {
+            Load::Ready((d, s)) => {
+                fetch(cx, record_open(media_title(&kind, &imdb_id, &d, &title)), |_: &mut Self, _| {});
+                (Load::Ready(d), s)
+            }
+            _ => (Load::Loading, vec![]),
+        };
         let episodes = if series {
             let id = imdb_id.clone();
-            fetch(cx, async move { cinemeta()?.series_episodes(&id).await.map_err(|e| e.to_string()) }, |v: &mut Self, l| {
+            fetch_cached(cx, format!("cinemeta:episodes:{id}"), EPISODES_TTL, async move { cinemeta()?.series_episodes(&id).await.map_err(|e| e.to_string()) }, |v: &mut Self, l| {
                 if let Load::Ready(eps) = &l {
-                    v.season = eps.iter().map(season_of).filter(|s| *s > 0).min().or_else(|| eps.first().map(season_of));
+                    v.season = v.season.or_else(|| first_season(eps));
                 }
                 v.episodes = l;
-            });
-            Load::Loading
+            })
         } else {
             Load::Ready(Vec::new())
         };
+        let season = episodes.ready().and_then(|e| first_season(e));
         fetch(cx, in_watchlist(media_id(&kind, &imdb_id)), |v: &mut Self, l| v.in_list = l.ready().copied());
         Self {
             imdb_id,
             kind,
             title,
-            details: Load::Loading,
+            details,
             episodes,
-            similar: vec![],
-            season: None,
+            similar,
+            season,
             in_list: None,
             streams: StreamState::Idle,
             auto: false,
             sel: None,
+            addon_filter: None,
             scroll: ScrollHandle::new(),
         }
     }
@@ -117,6 +137,7 @@ impl MovieDetail {
     fn lookup(&mut self, season: u32, episode: u32, autoplay: bool, window: &mut Window, cx: &mut Context<Self>) {
         let movie = self.kind != "series";
         self.sel = Some((season, episode));
+        self.addon_filter = None;
         let name = self.display_title();
         let label = if movie { name.clone() } else { format!("{name} S{season:02}E{episode:02}") };
         self.streams = StreamState::Searching(label.clone());
@@ -166,7 +187,8 @@ impl MovieDetail {
             _ => ("icons/plus.svg", "My List"),
         };
         let play_label = if series { format!("Play S{first_season} E{first_ep}") } else { "Play".to_string() };
-        let mut copy = look::hero_copy(70.).child(look::hero_title(&d.title, logo_of(d)));
+        let has_panel = !matches!(self.streams, StreamState::Idle);
+        let mut copy = look::hero_copy(70.).when(has_panel, |d| d.max_w(relative(0.5))).child(look::hero_title(&d.title, logo_of(d)));
         if matches!(self.details, Load::Loading) {
             copy = copy.child(div().w(px(280.)).h(px(16.)).rounded(px(4.)).bg(Tokens::surface_2()));
         } else {
@@ -175,7 +197,17 @@ impl MovieDetail {
         if let Load::Failed(e) = &self.details {
             copy = copy.child(muted(e.clone()));
         }
-        look::billboard("movie-hero", height, background_of(d)).child(
+        let heading = match (series, self.sel) {
+            (true, Some((s, e))) => {
+                let name = self.episodes.ready().and_then(|v| v.iter().find(|x| season_of(x) == s && x.number == e)).and_then(|x| x.title.clone());
+                format!("S{s}E{e}{}", name.map(|n| format!("  {n}")).unwrap_or_default())
+            }
+            _ => "Sources".to_string(),
+        };
+        let panel = streams::sources_panel(&self.streams, netflix(), heading, self.addon_filter.as_deref(), cx, |v: &mut Self, f| v.addon_filter = f);
+        look::billboard("movie-hero", height, background_of(d))
+            .children(panel.map(|p| div().absolute().right(px(EDGE)).top(px(24.)).bottom(px(24.)).w(px(430.)).child(p)))
+            .child(
             copy.child(
                 div()
                     .flex()
@@ -234,7 +266,7 @@ impl MovieDetail {
                 }));
                 let fallback_img = self.details.ready().and_then(background_of);
                 let sel = self.sel;
-                let rows = v.iter().filter(|e| season_of(e) == current).flat_map(|ep| {
+                let rows = v.iter().filter(|e| season_of(e) == current).map(|ep| {
                     let (n, s) = (ep.number, season_of(ep));
                     let group: SharedString = format!("ep-{s}-{n}").into();
                     let thumb = ep.thumbnail.clone().or_else(|| fallback_img.clone());
@@ -284,13 +316,13 @@ impl MovieDetail {
                                 .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).truncate().child(SharedString::from(ep.title.clone().unwrap_or_else(|| format!("Episode {n}")))))
                                 .child(muted(ep.air_date.as_deref().map(|d| d.chars().take(10).collect::<String>()).unwrap_or_default())),
                         )
-                        .on_click(cx.listener(move |this, _, w, cx| this.lookup(s, n, false, w, cx)))
-                        .into_any_element();
-                    // Links for the selected episode open right under its row.
-                    let open = matches!(&self.streams, StreamState::Searching(_) | StreamState::Failed(_)) && sel == Some((s, n))
-                        || streams::best(&self.streams, Some(s), Some(n)).is_some();
-                    let links = open.then(|| streams::sources_section(&self.streams, netflix())).flatten().map(|d| div().pl(px(64.)).pr(px(16.)).py(px(12.)).child(d).into_any_element());
-                    std::iter::once(row).chain(links)
+                        .when(sel == Some((s, n)), |d| d.bg(Tokens::surface()))
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            // Links show in the panel at the top, like Stremio.
+                            this.lookup(s, n, false, w, cx);
+                            this.scroll.set_offset(point(px(0.), px(0.)));
+                        }));
+                    row
                 });
                 div().flex().flex_col().gap(px(16.)).child(chips).child(div().flex().flex_col().children(rows))
             }
@@ -345,7 +377,7 @@ impl Render for MovieDetail {
                 _ => {}
             }
         }
-        let movie_links = (!series).then(|| streams::sources_section(&self.streams, netflix())).flatten().map(|d| div().px(px(EDGE)).mb(px(36.)).child(d));
+
         div()
             .relative()
             .size_full()
@@ -354,7 +386,6 @@ impl Render for MovieDetail {
                 mv_ui::scroll_page("movie-detail", &self.scroll)
                     .child(self.hero(cx))
                     .children(self.about())
-                    .children(movie_links)
                     .when(series, |d| d.child(self.episodes(cx)))
                     .children(self.more_like_this(width)),
             )

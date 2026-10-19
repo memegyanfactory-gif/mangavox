@@ -4,8 +4,9 @@ use mv_media::cinemeta::CinemetaCatalog;
 use mv_media::types::AnimeSearchResult;
 use mv_ui::{chip, page, page_header};
 
-use crate::common::{fetch, grid, jikan, muted, Load};
-use crate::movies_home::cinemeta;
+use crate::anime_home::genre_key;
+use crate::common::{fetch_cached, grid, jikan, muted, Load, DAY};
+use crate::movies_home::{catalog, catalog_key};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -42,7 +43,6 @@ impl Discover {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
-        self.results = Load::Loading;
         let (kind, mood) = (self.kind, self.mood);
         let (_, mal, genre) = MOODS[mood];
         let apply = move |v: &mut Self, l: Load<Vec<AnimeSearchResult>>| {
@@ -50,11 +50,11 @@ impl Discover {
                 v.results = l;
             }
         };
-        match kind {
-            Kind::Anime => fetch(cx, async move { jikan()?.anime_by_genre(mal, 1, None).await.map_err(|e| e.to_string()) }, apply),
-            Kind::Movie => fetch(cx, async move { cinemeta()?.movies_catalog(CinemetaCatalog::Top, 1, Some(genre)).await.map_err(|e| e.to_string()) }, apply),
-            Kind::Series => fetch(cx, async move { cinemeta()?.series_catalog(CinemetaCatalog::Top, 1, Some(genre)).await.map_err(|e| e.to_string()) }, apply),
-        }
+        self.results = match kind {
+            Kind::Anime => fetch_cached(cx, genre_key(mal), DAY, async move { jikan()?.anime_by_genre(mal, 1, None).await.map_err(|e| e.to_string()) }, apply),
+            Kind::Movie => fetch_cached(cx, catalog_key(true, CinemetaCatalog::Top, Some(genre)), DAY, catalog(true, CinemetaCatalog::Top, Some(genre)), apply),
+            Kind::Series => fetch_cached(cx, catalog_key(false, CinemetaCatalog::Top, Some(genre)), DAY, catalog(false, CinemetaCatalog::Top, Some(genre)), apply),
+        };
     }
 }
 

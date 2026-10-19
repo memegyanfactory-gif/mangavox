@@ -150,8 +150,8 @@ impl ProvidersPanel {
         div()
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .p(px(14.))
+            .gap(px(12.))
+            .p(px(18.))
             .rounded(px(12.))
             .border_1()
             .border_color(if current { rgba(0x2bd49a66) } else { Tokens::border() })
@@ -244,14 +244,13 @@ impl Render for ProvidersPanel {
             let s = self.shared.read(cx);
             (s.providers.clone(), s.providers_loading, s.store.prefs.provider, !s.store.prefs.model.is_empty())
         };
-        let mut root = div().flex().flex_col().gap(px(10.)).w_full().max_w(px(760.)).child(
+        // Embedded in Settings, which draws the page title; keep only the refresh control.
+        let mut root = div().flex().flex_col().gap(px(10.)).w_full().child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(10.))
-                .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("AI Providers"))
-                .child(div().flex_1())
-                .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(if loading { "Checking…" } else { "" }))
+                .child(div().flex_1().text_size(px(size::SM)).text_color(Tokens::text_3()).child(if loading { "Checking which providers are available…" } else { "Turn a provider on, add its key if it needs one, then test it." }))
                 .child(button("prov-refresh", "Refresh", ButtonKind::Ghost).h(px(28.)).on_click(cx.listener(|this, _, _, cx| this.shared.update(cx, |s, cx| s.refresh_providers(true, cx))))),
         );
         if providers.is_empty() {
@@ -262,12 +261,12 @@ impl Render for ProvidersPanel {
             if group.is_empty() {
                 continue;
             }
-            root = root.child(div().mt(px(8.)).text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(title));
+            root = root.child(div().mt(px(12.)).mb(px(2.)).text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(title.to_uppercase()));
             for st in group {
                 let current = in_use_model && st.id == prefs_provider;
                 root = root.child(self.card(st, current, window, cx));
             }
         }
-        div().id("providers-panel").size_full().overflow_y_scroll().px(px(size::PAGE_X)).py(px(size::PAGE_Y)).child(root)
+        div().id("providers-panel").w_full().child(root)
     }
 }

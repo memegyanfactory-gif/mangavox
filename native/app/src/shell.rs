@@ -2,7 +2,7 @@
 use gpui_kit::component::TitleBar;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ui::nav::set_navigator;
+use mv_ui::nav::{set_back_target, set_navigator};
 use mv_ui::{empty_state, icon, icon_button, size, Route, Tokens};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -190,7 +190,20 @@ impl Shell {
         if self.history.len() > 50 {
             self.history.remove(0);
         }
+        self.sync_back(cx);
         cx.notify();
+    }
+
+    /// Back leads to the previous page, or to the section's home page when there is none.
+    fn back_route(&self) -> Option<Route> {
+        match self.history.last() {
+            Some(e) => Some(e.route.clone()),
+            None => (self.route != self.section.home() && !is_focus(&self.route)).then(|| self.section.home()),
+        }
+    }
+
+    fn sync_back(&self, cx: &mut App) {
+        set_back_target(cx, self.back_route());
     }
 
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -206,8 +219,15 @@ impl Shell {
                 None => self.open(&prev.route, window, cx),
             };
             self.route = prev.route;
-            cx.notify();
+        } else if let Some(home) = self.back_route() {
+            // Nothing to go back to (e.g. opened right after a section switch): land on the section home.
+            self.page = self.open(&home, window, cx);
+            self.route = home;
+        } else {
+            return;
         }
+        self.sync_back(cx);
+        cx.notify();
     }
 
     /// Switching sections parks the current one (page + history) and restores the target's.
@@ -233,6 +253,7 @@ impl Shell {
                 self.page = self.open(&home, window, cx);
             }
         }
+        self.sync_back(cx);
         cx.notify();
     }
 
@@ -254,11 +275,12 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(icon_button("toggle-sidebar", "icons/panel-left.svg", true).on_click(cx.listener(|this, _, _, cx| {
+                // `occlude` keeps the title bar's drag area from swallowing these clicks.
+                .child(icon_button("toggle-sidebar", "icons/panel-left.svg", true).occlude().on_click(cx.listener(|this, _, _, cx| {
                     this.collapsed = !this.collapsed;
                     cx.notify();
                 })))
-                .child(icon_button("back", "icons/arrow-left.svg", !self.history.is_empty()).on_click(cx.listener(|this, _, w, cx| this.back(w, cx))))
+                .child(icon_button("back", "icons/arrow-left.svg", self.back_route().is_some()).occlude().on_click(cx.listener(|this, _, w, cx| this.back(w, cx))))
                 .child(
                     div()
                         .flex()
@@ -403,6 +425,8 @@ impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::first_frame();
         let focus = is_focus(&self.route);
+        // Settings brings its own navigation rail; the app sidebar would make four columns.
+        let in_settings = matches!(self.route, Route::Settings { .. });
         let dock = self.dock.clone().filter(|_| self.dock_open && !focus);
         div()
             .flex()
@@ -419,7 +443,7 @@ impl Render for Shell {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .when(!focus, |d| d.child(self.sidebar(cx)))
+                    .when(!focus && !in_settings, |d| d.child(self.sidebar(cx)))
                     .when_some(dock, |d, dock| d.child(div().flex_none().w(px(400.)).h_full().border_r_1().border_color(Tokens::border()).child(dock)))
                     .child(div().flex_1().min_w_0().h_full().overflow_hidden().child(self.page.clone())),
             )

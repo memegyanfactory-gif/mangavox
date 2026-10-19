@@ -16,6 +16,9 @@ pub struct MangaSearchResult {
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Rated erotica / pornographic by the source (MangaDex `contentRating`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adult: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -59,6 +62,19 @@ pub struct ChapterInfo {
 pub struct Tag {
     pub id: String,
     pub name: String,
+    /// Display group ("Genres", "Themes", "Formats", "Demographics", ...) when the source has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl Tag {
+    pub fn new(id: String, name: String) -> Self {
+        Self { id, name, group: None }
+    }
+
+    pub fn grouped(id: String, name: String, group: &str) -> Self {
+        Self { id, name, group: Some(group.to_string()) }
+    }
 }
 
 /// Static description of a source for pickers and settings.

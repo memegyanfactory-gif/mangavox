@@ -1,12 +1,15 @@
 //! Stream lookup (installed addons, IMDb mapping for anime) and the source picker.
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use mv_core::cache::DataCache;
 use mv_media::stream_utils::stream_resource_id;
 use mv_media::types::AnimeTorrentStream;
 use mv_ui::nav::PlayRequest;
 use mv_ui::{bg, button, navigate, size, ButtonKind, Route, Tokens};
 
-use crate::common::{fmt_size, jikan, muted, registry};
+use crate::common::{fmt_size, jikan, muted, registry, STREAMS_TTL};
 
 pub const NO_ADDONS: &str = "No stream addons are installed. Add one in Settings, Addons.";
 
@@ -71,21 +74,79 @@ async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) -> Result<(
     Ok((base, streams))
 }
 
+/// Cache key for a title's links; includes the enabled addons so installing one refetches.
+fn stream_key(base: &PlayBase, kind: &str) -> String {
+    let addons: Vec<String> = registry().stream_addons(kind).into_iter().map(|m| format!("{}@{}", m.id, m.version)).collect();
+    let id = base.imdb_id.clone().or_else(|| base.mal_id.as_ref().map(|m| format!("mal{m}"))).unwrap_or_default();
+    format!("streams:{kind}:{id}:{}:{}:{}", base.season.unwrap_or(0), base.episode.unwrap_or(0), addons.join(","))
+}
+
+/// Bumped by every lookup, so a background refresh never replaces a newer request's links.
+static LOOKUPS: AtomicU64 = AtomicU64::new(0);
+
 /// Look up sources for `base`. With `autoplay` the best-ranked source starts playing at once;
 /// otherwise the list is handed back for the page to show.
-/// The caller sets `StreamState::Searching` first; `set` receives the outcome.
+/// Links cached on disk are shown at once and refreshed in the background when older than
+/// `STREAMS_TTL`. The caller sets `StreamState::Searching` first; `set` receives the outcome.
 pub fn find<V: 'static>(cx: &mut Context<V>, window: &Window, label: String, base: PlayBase, movie: bool, autoplay: bool, set: fn(&mut V, StreamState)) {
     let kind = if movie { "movie" } else { "series" };
+    let key = stream_key(&base, kind);
+    let ticket = LOOKUPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let hit = DataCache::shared().get::<(Option<String>, Vec<AnimeTorrentStream>)>(&key).filter(|((_, s), _)| !s.is_empty());
     cx.spawn_in(window, async move |this, cx| {
-        let outcome = bg::run(lookup(base, movie, kind)).await.map_err(|e| e.to_string()).and_then(|r| r);
+        let shown = hit.is_some();
+        if let Some(((imdb, streams), age)) = hit {
+            let mut b = base.clone();
+            b.imdb_id = b.imdb_id.or(imdb);
+            let _ = this.update_in(cx, |v, window, cx| {
+                let best = request_for(&b, &streams[0]);
+                if autoplay {
+                    navigate(Route::Player { request: best }, window, cx);
+                } else {
+                    ui_player::prefetch(&best);
+                }
+                set(v, StreamState::Picking { label: label.clone(), base: b, streams });
+                cx.notify();
+            });
+            if age < STREAMS_TTL {
+                return;
+            }
+        }
+        let outcome = bg::run(async move {
+            let r = lookup(base, movie, kind).await;
+            if let Ok((b, s)) = &r {
+                DataCache::shared().put(&key, &(&b.imdb_id, s));
+            }
+            r
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+        if shown {
+            // Silent refresh: replace the cached links only with a newer, non-empty list.
+            let Some((base, streams)) = outcome.ok().filter(|(_, s)| !s.is_empty()) else { return };
+            if LOOKUPS.load(Ordering::Relaxed) == ticket {
+                let _ = this.update(cx, |v, cx| {
+                    set(v, StreamState::Picking { label, base, streams });
+                    cx.notify();
+                });
+            }
+            return;
+        }
         let state = match outcome {
             Ok((_, s)) if s.is_empty() => StreamState::Failed("No playable sources were found for this title.".into()),
             Ok((base, streams)) => StreamState::Picking { label, base, streams },
             Err(e) => StreamState::Failed(e),
         };
         let _ = this.update_in(cx, |v, window, cx| {
-            if let (true, StreamState::Picking { base, streams, .. }) = (autoplay, &state) {
-                navigate(Route::Player { request: request_for(base, &streams[0]) }, window, cx);
+            if let StreamState::Picking { base, streams, .. } = &state {
+                let best = request_for(base, &streams[0]);
+                if autoplay {
+                    navigate(Route::Player { request: best }, window, cx);
+                } else {
+                    // Warm the best link so Play starts almost instantly.
+                    ui_player::prefetch(&best);
+                }
             }
             set(v, state);
             cx.notify();
@@ -192,75 +253,148 @@ pub fn best(state: &StreamState, season: Option<u32>, episode: Option<u32>) -> O
     }
 }
 
-/// Inline "Sources" section for detail pages: loads by itself, every link plays with one click.
-pub fn sources_section(state: &StreamState, accent: Rgba) -> Option<Div> {
-    let head = |note: Option<String>| {
+/// A stream title split for display: release name lines, tag text ("Dual Audio") and
+/// country codes taken from flag emoji (Windows can't draw flag emoji, so we show images).
+struct Described {
+    names: Vec<String>,
+    tags: String,
+    flags: Vec<String>,
+}
+
+fn describe(title: &str) -> Described {
+    let (mut names, mut tags, mut flags) = (vec![], vec![], vec![]);
+    for line in title.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // The seeders / size / source line: we already have those as fields.
+        if line.contains('👤') || line.contains('💾') || line.contains('⚙') {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut rest = String::new();
+        let mut i = 0;
+        let mut had_flag = false;
+        while i < chars.len() {
+            let ri = |c: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+            if ri(chars[i]) && i + 1 < chars.len() && ri(chars[i + 1]) {
+                let cc: String = [chars[i], chars[i + 1]].iter().map(|c| (b'a' + (*c as u32 - 0x1F1E6) as u8) as char).collect();
+                if !flags.contains(&cc) {
+                    flags.push(cc);
+                }
+                had_flag = true;
+                i += 2;
+            } else {
+                rest.push(chars[i]);
+                i += 1;
+            }
+        }
+        let rest = rest.trim().trim_matches(|c: char| c == '/' || c == '|' || c.is_whitespace()).to_string();
+        let tagish = had_flag || ["Dub", "Dual", "Multi", "Sub"].iter().any(|t| rest.starts_with(t));
+        if tagish {
+            if !rest.is_empty() {
+                tags.push(rest);
+            }
+        } else if names.len() < 2 {
+            names.push(rest);
+        }
+    }
+    Described { names, tags: tags.join(" / "), flags }
+}
+
+fn flag(cc: &str) -> Img {
+    // English releases often use the UK flag code "gb"; flagcdn knows both.
+    img(SharedString::from(format!("https://flagcdn.com/w40/{cc}.png"))).w(px(20.)).h(px(14.)).rounded(px(2.)).object_fit(ObjectFit::Cover)
+}
+
+/// Stremio-style sources panel: addon + quality on the left, release name, seeders / size /
+/// source and language flags on the right; chips filter by addon. Every row plays on click.
+pub fn sources_panel<V: 'static>(
+    state: &StreamState,
+    accent: Rgba,
+    heading: String,
+    filter: Option<&str>,
+    cx: &mut Context<V>,
+    set_filter: fn(&mut V, Option<String>),
+) -> Option<Stateful<Div>> {
+    let shell = div().id("sources-panel").flex().flex_col().size_full().overflow_y_scroll().p(px(16.)).rounded(px(12.)).bg(rgba(0x0b0d10d9)).border_1().border_color(Tokens::border());
+    let head = |note: String| {
         div()
             .flex()
-            .items_baseline()
-            .gap(px(10.))
-            .mb(px(10.))
-            .child(div().text_size(px(size::XL)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child("Sources"))
-            .when_some(note, |d, n| d.child(muted(n)))
+            .flex_col()
+            .gap(px(2.))
+            .mb(px(12.))
+            .child(div().text_size(px(size::LG)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).truncate().child(SharedString::from(heading.clone())))
+            .child(muted(note))
     };
-    let shell = || div().flex().flex_col();
     match state {
         StreamState::Idle => None,
-        StreamState::Searching(label) => Some(
-            shell()
-                .child(head(Some(format!("Finding links for {label}..."))))
-                .children((0..3).map(|_| div().h(px(56.)).mb(px(6.)).rounded(px(6.)).bg(Tokens::surface()))),
+        StreamState::Searching(_) => Some(
+            shell.child(head("Finding links from your addons...".into())).children((0..5).map(|i| {
+                div().h(px(74.)).mb(px(8.)).rounded(px(8.)).bg(Tokens::surface()).opacity(1.0 - i as f32 * 0.15)
+            })),
         ),
         StreamState::Failed(msg) => {
             let no_addons = msg == NO_ADDONS;
             Some(
-                shell().child(head(None)).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .p(px(14.))
-                        .rounded(px(6.))
-                        .bg(Tokens::surface())
-                        .child(div().flex_1().text_size(px(size::MD)).text_color(Tokens::text_2()).child(SharedString::from(msg.clone())))
-                        .when(no_addons, |d| {
-                            d.child(button("open-addons", "Open addons", ButtonKind::Primary).on_click(|_, w, cx| navigate(Route::Settings { tab: Some("addons".into()) }, w, cx)))
-                        }),
-                ),
+                shell.child(head("No links".into())).child(div().text_size(px(size::MD)).text_color(Tokens::text_2()).mb(px(12.)).child(SharedString::from(msg.clone()))).when(no_addons, |d| {
+                    d.child(div().child(button("open-addons", "Open addons", ButtonKind::Primary).on_click(|_, w, cx| navigate(Route::Settings { tab: Some("addons".into()) }, w, cx))))
+                }),
             )
         }
-        StreamState::Picking { label, base, streams } => {
-            let rows = streams.iter().take(12).enumerate().map(|(i, s)| {
+        StreamState::Picking { base, streams, .. } => {
+            let mut addons: Vec<String> = streams.iter().filter_map(|s| s.addon.clone()).collect();
+            addons.dedup();
+            addons.sort();
+            addons.dedup();
+            let chips = (addons.len() > 1).then(|| {
+                let chip = |id: usize, label: String, active: bool, value: Option<String>, cx: &mut Context<V>| {
+                    div()
+                        .id(("addon", id))
+                        .px(px(10.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(999.))
+                        .text_size(px(size::XS))
+                        .cursor_pointer()
+                        .map(|d| if active { d.bg(Tokens::text_1()).text_color(rgb(0x000000)) } else { d.bg(Tokens::surface_2()).text_color(Tokens::text_2()).hover(|s| s.text_color(Tokens::text_1())) })
+                        .child(SharedString::from(label))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            set_filter(this, value.clone());
+                            cx.notify();
+                        }))
+                };
+                let mut row = div().flex().flex_wrap().gap(px(6.)).mb(px(12.)).child(chip(0, "All".into(), filter.is_none(), None, cx));
+                for (i, a) in addons.iter().enumerate() {
+                    row = row.child(chip(i + 1, a.clone(), filter == Some(a.as_str()), Some(a.clone()), cx));
+                }
+                row
+            });
+            let shown: Vec<&AnimeTorrentStream> = streams.iter().filter(|s| filter.is_none() || s.addon.as_deref() == filter).collect();
+            let rows = shown.iter().take(40).enumerate().map(|(i, s)| {
                 let req = request_for(base, s);
+                let d = describe(&s.title);
                 let quality = s.quality.clone().filter(|q| !q.is_empty()).unwrap_or_else(|| "Auto".into());
-                let meta = [s.source.clone(), s.size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
-                let group: SharedString = format!("src-{i}").into();
+                let best = i == 0 && filter.is_none();
                 div()
                     .id(("source", i))
-                    .group(group.clone())
                     .flex()
-                    .items_center()
                     .gap(px(14.))
-                    .px(px(14.))
-                    .h(px(56.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .mb(px(6.))
-                    .rounded(px(6.))
-                    .bg(Tokens::surface())
+                    .rounded(px(8.))
                     .cursor_pointer()
-                    .hover(|d| d.bg(Tokens::surface_2()))
+                    .when(best, |x| x.bg(rgba(0xffffff0f)).border_1().border_color(accent))
+                    .hover(|x| x.bg(rgba(0xffffff1a)))
                     .child(
                         div()
                             .flex_none()
-                            .w(px(64.))
-                            .h(px(24.))
+                            .w(px(84.))
                             .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.))
-                            .text_size(px(size::XS))
-                            .font_weight(FontWeight::BOLD)
-                            .map(|d| if i == 0 { d.bg(accent).text_color(rgb(0x000000)) } else { d.border_1().border_color(rgba(0xffffff40)).text_color(Tokens::text_1()) })
-                            .child(SharedString::from(quality)),
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).truncate().child(SharedString::from(s.addon.clone().unwrap_or_else(|| "Stream".into()))))
+                            .child(div().text_size(px(size::MD)).font_weight(FontWeight::BOLD).text_color(if best { accent } else { Tokens::text_2() }).child(SharedString::from(quality)))
+                            .when(best, |x| x.child(div().text_size(px(size::XS)).text_color(accent).child("Best match"))),
                     )
                     .child(
                         div()
@@ -268,39 +402,37 @@ pub fn sources_section(state: &StreamState, accent: Rgba) -> Option<Div> {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
-                            .child(div().text_size(px(size::SM)).text_color(Tokens::text_1()).truncate().child(SharedString::from(s.title.replace('\n', " "))))
-                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(SharedString::from(meta))),
-                    )
-                    .children(s.seeders.map(|n| {
-                        let c = if n >= 20 { rgb(0x46d369) } else if n >= 5 { Tokens::warning() } else { Tokens::danger() };
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap(px(5.))
-                            .text_size(px(size::XS))
-                            .text_color(Tokens::text_2())
-                            .child(div().size(px(7.)).rounded_full().bg(c))
-                            .child(SharedString::from(format!("{n} seeds")))
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(32.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .border_1()
-                            .border_color(rgba(0xffffff40))
-                            .group_hover(group, |d| d.bg(rgba(0xffffff26)))
-                            .child(mv_ui::icon("icons/play.svg", Tokens::text_1(), 14.)),
+                            .gap(px(3.))
+                            .children(d.names.into_iter().map(|n| div().text_size(px(size::SM)).text_color(Tokens::text_1()).truncate().child(SharedString::from(n))))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .text_size(px(size::XS))
+                                    .text_color(Tokens::text_2())
+                                    .children(s.seeders.map(|n| {
+                                        let c = if n >= 20 { rgb(0x46d369) } else if n >= 5 { Tokens::warning() } else { Tokens::danger() };
+                                        div().flex().items_center().gap(px(4.)).child(mv_ui::icon("icons/user.svg", c, 12.)).child(SharedString::from(n.to_string()))
+                                    }))
+                                    .children(s.size.map(|b| div().flex().items_center().gap(px(4.)).child(mv_ui::icon("icons/hard-drive.svg", Tokens::text_3(), 12.)).child(SharedString::from(fmt_size(b)))))
+                                    .children(s.source.clone().map(|src| div().flex().items_center().gap(px(4.)).min_w_0().child(mv_ui::icon("icons/globe.svg", Tokens::text_3(), 12.)).child(div().truncate().child(SharedString::from(src))))),
+                            )
+                            .when(!d.flags.is_empty() || !d.tags.is_empty(), |x| {
+                                x.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .children(d.flags.iter().take(8).map(|cc| flag(cc)))
+                                        .when(!d.tags.is_empty(), |x| x.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(SharedString::from(d.tags.clone())))),
+                                )
+                            }),
                     )
                     .on_click(move |_, w, cx| navigate(Route::Player { request: req.clone() }, w, cx))
             });
-            let count = if streams.len() == 1 { "1 link".to_string() } else { format!("{} links", streams.len()) };
-            Some(shell().child(head(Some(format!("{count} for {label}")))).children(rows))
+            let count = if shown.len() == 1 { "1 link".to_string() } else { format!("{} links", shown.len()) };
+            Some(shell.child(head(count)).children(chips).children(rows))
         }
     }
 }

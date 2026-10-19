@@ -40,8 +40,9 @@ pub fn per_row(width: f32, card: f32, gap: f32) -> usize {
 }
 
 /// Cover image that fills its box, with a quiet placeholder while loading or on failure.
+/// Served from the disk cache when the artwork was downloaded before.
 pub fn pic(url: impl Into<SharedString>) -> Img {
-    img(url.into())
+    img(crate::common::image_source(&url.into()))
         .size_full()
         .object_fit(ObjectFit::Cover)
         .with_loading(|| div().size_full().bg(Tokens::surface_2()).into_any_element())
@@ -85,7 +86,7 @@ pub fn hero_title(title: &str, logo: Option<String>) -> AnyElement {
             .h(px(110.))
             .flex()
             .items_end()
-            .child(img(SharedString::from(u)).h(px(110.)).max_w(px(460.)).object_fit(ObjectFit::Contain).with_fallback(heading.clone()).with_loading(heading))
+            .child(img(crate::common::image_source(&u)).h(px(110.)).max_w(px(460.)).object_fit(ObjectFit::Contain).with_fallback(heading.clone()).with_loading(heading))
             .into_any_element(),
         None => heading(),
     }
@@ -451,4 +452,13 @@ pub fn rotate<V: 'static>(cx: &mut Context<V>, step: fn(&mut V)) {
         }
     })
     .detach();
+}
+
+/// First paragraph of a synopsis, without source notes, for heroes and cards.
+pub fn blurb(text: &str) -> String {
+    let first = text.split("
+
+").map(str::trim).find(|p| !p.is_empty()).unwrap_or("");
+    let first = first.split("(Source:").next().unwrap_or(first).split("[Written by").next().unwrap_or(first);
+    first.split_whitespace().collect::<Vec<_>>().join(" ")
 }

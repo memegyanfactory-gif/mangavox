@@ -81,8 +81,34 @@ struct ListQuery {
     title: Option<String>,
     order: &'static str,
     page: u32,
-    tag: Option<String>,
+    /// Tag UUIDs and `demographic:<value>` pseudo tags (see [`DEMOGRAPHICS`]), combined with AND.
+    tags: Vec<String>,
     readable_only: bool,
+}
+
+/// MangaDex demographics are a field, not tags; they are offered as `demographic:<value>` tags.
+pub const DEMOGRAPHICS: [(&str, &str); 4] = [("shounen", "Shounen"), ("shoujo", "Shoujo"), ("seinen", "Seinen"), ("josei", "Josei")];
+const DEMO_PREFIX: &str = "demographic:";
+
+/// Split tag ids into (`includedTags[]` UUIDs, `publicationDemographic[]` values).
+pub fn split_tag_ids(ids: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut tags = Vec::new();
+    let mut demos = Vec::new();
+    for id in ids.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
+        match id.strip_prefix(DEMO_PREFIX) {
+            Some(d) => {
+                if !demos.iter().any(|x: &String| x == d) {
+                    demos.push(d.to_string());
+                }
+            }
+            None => {
+                if !tags.iter().any(|x: &String| x == id) {
+                    tags.push(id.to_string());
+                }
+            }
+        }
+    }
+    (tags, demos)
 }
 
 fn list_query(q: &ListQuery) -> Vec<(String, String)> {
@@ -101,9 +127,12 @@ fn list_query(q: &ListQuery) -> Vec<(String, String)> {
         v.push(("hasAvailableChapters".into(), "true".into()));
         v.push(("availableTranslatedLanguage[]".into(), "en".into()));
     }
-    if let Some(t) = &q.tag {
-        v.push(("includedTags[]".into(), t.clone()));
+    let (tags, demos) = split_tag_ids(&q.tags);
+    if !tags.is_empty() {
+        v.extend(tags.into_iter().map(|t| ("includedTags[]".to_string(), t)));
+        v.push(("includedTagsMode".into(), "AND".into()));
     }
+    v.extend(demos.into_iter().map(|d| ("publicationDemographic[]".to_string(), d)));
     v
 }
 
@@ -114,15 +143,15 @@ impl Source for MangaDex {
     }
 
     async fn search_manga(&self, query: &str, page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.manga_list(ListQuery { title: Some(query.into()), order: "relevance", page, tag: None, readable_only: false }).await
+        self.manga_list(ListQuery { title: Some(query.into()), order: "relevance", page, tags: vec![], readable_only: false }).await
     }
 
     async fn get_popular_manga(&self, page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.manga_list(ListQuery { title: None, order: "followedCount", page, tag: None, readable_only: true }).await
+        self.manga_list(ListQuery { title: None, order: "followedCount", page, tags: vec![], readable_only: true }).await
     }
 
     async fn get_latest_manga(&self, page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.manga_list(ListQuery { title: None, order: "latestUploadedChapter", page, tag: None, readable_only: true }).await
+        self.manga_list(ListQuery { title: None, order: "latestUploadedChapter", page, tags: vec![], readable_only: true }).await
     }
 
     async fn get_manga_details(&self, manga_id: &str) -> Result<MangaDetails> {
@@ -171,7 +200,15 @@ impl Source for MangaDex {
     }
 
     async fn get_manga_by_tag(&self, tag_id: &str, page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.manga_list(ListQuery { title: None, order: "followedCount", page, tag: Some(tag_id.into()), readable_only: true }).await
+        self.get_manga_by_tags(&[tag_id.to_string()], page).await
+    }
+
+    async fn get_manga_by_tags(&self, tag_ids: &[String], page: u32) -> Result<Vec<MangaSearchResult>> {
+        self.manga_list(ListQuery { title: None, order: "followedCount", page, tags: tag_ids.to_vec(), readable_only: true }).await
+    }
+
+    fn supports_multi_tag(&self) -> bool {
+        true
     }
 }
 
@@ -217,6 +254,7 @@ pub fn manga_to_result(m: &Value) -> MangaSearchResult {
         cover_url: cover_url(m),
         author: rel_name(m, "author"),
         status: str_attr(m, "status"),
+        adult: matches!(str_attr(m, "contentRating").as_deref(), Some("erotica" | "pornographic")),
     }
 }
 
@@ -242,6 +280,12 @@ pub fn parse_details(json: &Value) -> Result<MangaDetails> {
         .map(|t| local_string(t.pointer("/attributes/name").unwrap_or(&Value::Null)))
         .filter(|s| !s.is_empty())
         .collect();
+    let mut genres = genres;
+    if let Some(d) = str_attr(m, "publicationDemographic") {
+        if let Some((_, name)) = DEMOGRAPHICS.iter().find(|(v, _)| *v == d) {
+            genres.push(name.to_string());
+        }
+    }
     Ok(MangaDetails {
         source_id: m.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
         title: local_string(m.pointer("/attributes/title").unwrap_or(&Value::Null)),
@@ -332,20 +376,83 @@ pub fn parse_at_home(srv: &Value, chapter_info: Option<&Value>) -> Result<Vec<St
     Err(no_pages())
 }
 
-/// `GET /manga/tag` -> genre / theme / format tags sorted by name.
+/// Display label for a MangaDex tag group, in the order the groups are shown.
+pub const TAG_GROUPS: [(&str, &str); 5] = [("genre", "Genres"), ("theme", "Themes"), ("format", "Formats"), ("demographic", "Demographics"), ("content", "Content")];
+
+fn group_rank(label: Option<&str>) -> usize {
+    TAG_GROUPS.iter().position(|(_, l)| Some(*l) == label).unwrap_or(TAG_GROUPS.len())
+}
+
+/// `GET /manga/tag` -> tags grouped (Genres, Themes, Formats, Demographics, Content), each group
+/// sorted by name. Demographics are the `demographic:<value>` pseudo tags.
 pub fn parse_tags(json: &Value) -> Vec<Tag> {
     let mut tags: Vec<Tag> = json
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|t| matches!(t.pointer("/attributes/group").and_then(Value::as_str), Some("genre" | "theme" | "format")))
-        .map(|t| Tag {
-            id: t.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-            name: local_string(t.pointer("/attributes/name").unwrap_or(&Value::Null)),
+        .filter_map(|t| {
+            let g = t.pointer("/attributes/group").and_then(Value::as_str)?;
+            let label = TAG_GROUPS.iter().find(|(k, _)| *k == g)?.1;
+            let id = t.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let name = local_string(t.pointer("/attributes/name").unwrap_or(&Value::Null));
+            Some(Tag::grouped(id, name, label))
         })
         .filter(|t| !t.name.is_empty() && !t.id.is_empty())
         .collect();
-    tags.sort_by(|a, b| a.name.cmp(&b.name));
+    if !tags.is_empty() {
+        tags.extend(DEMOGRAPHICS.iter().map(|(v, n)| Tag::grouped(format!("{DEMO_PREFIX}{v}"), n.to_string(), "Demographics")));
+    }
+    tags.sort_by(|a, b| group_rank(a.group.as_deref()).cmp(&group_rank(b.group.as_deref())).then_with(|| a.name.cmp(&b.name)));
     tags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q(tags: &[&str]) -> Vec<(String, String)> {
+        list_query(&ListQuery { title: None, order: "followedCount", page: 2, tags: tags.iter().map(|s| s.to_string()).collect(), readable_only: false })
+    }
+
+    fn values<'a>(v: &'a [(String, String)], key: &str) -> Vec<&'a str> {
+        v.iter().filter(|(k, _)| k == key).map(|(_, x)| x.as_str()).collect()
+    }
+
+    #[test]
+    fn split_tag_ids_separates_demographics_and_dedupes() {
+        let ids: Vec<String> = ["a", "demographic:seinen", "b", "a", " ", "demographic:seinen"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(split_tag_ids(&ids), (vec!["a".to_string(), "b".to_string()], vec!["seinen".to_string()]));
+    }
+
+    #[test]
+    fn list_query_combines_tags_with_and() {
+        let v = q(&["t1", "t2", "demographic:shoujo"]);
+        assert_eq!(values(&v, "includedTags[]"), ["t1", "t2"]);
+        assert_eq!(values(&v, "includedTagsMode"), ["AND"]);
+        assert_eq!(values(&v, "publicationDemographic[]"), ["shoujo"]);
+        assert_eq!(values(&v, "offset"), ["20"]);
+        assert_eq!(values(&v, "order[followedCount]"), ["desc"]);
+        let none = q(&[]);
+        assert!(values(&none, "includedTags[]").is_empty() && values(&none, "includedTagsMode").is_empty());
+        let demo_only = q(&["demographic:josei"]);
+        assert!(values(&demo_only, "includedTagsMode").is_empty());
+        assert_eq!(values(&demo_only, "publicationDemographic[]"), ["josei"]);
+    }
+
+    #[test]
+    fn parse_tags_groups_and_skips_unknown_groups() {
+        let j = serde_json::json!({"data": [
+            {"id": "x1", "attributes": {"name": {"en": "Romance"}, "group": "genre"}},
+            {"id": "x2", "attributes": {"name": {"en": "Isekai"}, "group": "theme"}},
+            {"id": "x3", "attributes": {"name": {"en": "Action"}, "group": "genre"}},
+            {"id": "x4", "attributes": {"name": {"en": "Weird"}, "group": "mystery"}},
+            {"id": "", "attributes": {"name": {"en": "NoId"}, "group": "genre"}}
+        ]});
+        let t = parse_tags(&j);
+        let names: Vec<&str> = t.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Action", "Romance", "Isekai", "Josei", "Seinen", "Shoujo", "Shounen"]);
+        assert_eq!(t[2].group.as_deref(), Some("Themes"));
+        assert!(parse_tags(&serde_json::json!({"result": "error"})).is_empty(), "no pseudo tags without a real list");
+    }
 }

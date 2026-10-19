@@ -8,7 +8,8 @@ anyhow = "1"
 axum = "0.8"
 bytes = "1"
 futures = "0.3"
-librqbit = { version = "9.0.1", default-features = false, features = ["default-tls"] }
+# Vendored + patched for streaming latency, see vendor/librqbit/Cargo.toml.
+librqbit = { path = "vendor/librqbit", version = "9.0.1", default-features = false, features = ["default-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

@@ -1,0 +1,274 @@
+# Vendored librqbit 9.0.1 (Apache-2.0, https://github.com/ikatson/rqbit) with
+# MangaVox streaming-latency patches; every change is marked "MV-PATCH":
+#  * torrent_state/streaming.rs: stream priorities ordered by recency (newest
+#    open / seek first), file-size-based readahead window, sequential
+#    continuation to EOF, high-priority warm-up windows (container index),
+#    FileStream::set_priority / is_range_available, no blocking permit held
+#    per stream, seek pre-emption hook.
+#  * piece_tracker.rs / chunk_tracker.rs: block-level claims so the pieces at
+#    the playhead are striped across several fast peers (with short-timeout
+#    duplicates for the piece the player is blocked on), seek pre-emption that
+#    requeues in-flight pieces but keeps received chunks.
+#  * torrent_state/live/mod.rs: per-peer request queue sized to ~0.5 s of that
+#    peer's measured rate (upstream: 128 requests regardless), per-peer and
+#    swarm chunk-latency tracking (slow peers stay off the playhead), late /
+#    cancelled chunks are kept when still needed instead of discarded.
+#  * lib.rs: export FileStream; tests module and optional features that pull
+#    extra crates (postgres, http-api, webui, ...) removed.
+# Of upstream's src/tests only test_util.rs is vendored (e2e suites dropped).
+
+[package]
+edition = "2024"
+name = "librqbit"
+version = "9.0.1"
+authors = ["Igor Katson <igor.katson@gmail.com>"]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "The main library used by rqbit torrent client. The binary is just a small wrapper on top of it."
+documentation = "https://docs.rs/librqbit"
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/ikatson/rqbit"
+resolver = "2"
+
+[features]
+default = ["default-tls", "http-api-client"]
+default-tls = ["reqwest/default-tls", "sha1w/sha1-crypto-hash", "librqbit-core/sha1-crypto-hash"]
+rust-tls = ["reqwest/rustls", "sha1w/sha1-ring", "librqbit-core/sha1-ring"]
+disable-upload = []
+http-api-client = []
+_disable_disk_write_net_benchmark = []
+_disable_reconnect_test = []
+miri = []
+storage_examples = []
+timed_existence = []
+
+[lints.rust]
+unexpected_cfgs = "allow"
+
+[lib]
+name = "librqbit"
+path = "src/lib.rs"
+
+[dependencies.anyhow]
+version = "1"
+
+[dependencies.arc-swap]
+version = "1.7"
+
+[dependencies.async-compression]
+version = "0.4"
+features = [
+    "tokio",
+    "gzip",
+]
+
+[dependencies.async-stream]
+version = "0.3"
+
+[dependencies.async-trait]
+version = "0.1"
+
+[dependencies.axum-extra]
+version = "0.12"
+features = ["query"]
+
+[dependencies.backon]
+version = "1.5"
+
+[dependencies.base64]
+version = "0.23"
+
+[dependencies.bencode]
+version = "9.0.1"
+default-features = false
+package = "librqbit-bencode"
+
+[dependencies.bitvec]
+version = "1"
+
+[dependencies.buffers]
+version = "9.0.1"
+package = "librqbit-buffers"
+
+[dependencies.byteorder]
+version = "1"
+
+[dependencies.bytes]
+version = "1"
+
+[dependencies.clone_to_owned]
+version = "9.0.1"
+package = "librqbit-clone-to-owned"
+
+[dependencies.dashmap]
+version = "6"
+
+[dependencies.dht]
+version = "9.0.1"
+default-features = false
+package = "librqbit-dht"
+
+[dependencies.futures]
+version = "0.3"
+
+[dependencies.governor]
+version = "0.10"
+
+[dependencies.hex]
+version = "0.4"
+
+[dependencies.http]
+version = "1"
+
+[dependencies.intervaltree]
+version = "0.2"
+
+[dependencies.itertools]
+version = "0.15"
+
+[dependencies.librqbit-core]
+version = "9.0.1"
+default-features = false
+
+[dependencies.librqbit-dualstack-sockets]
+version = "0.7"
+features = ["axum"]
+
+[dependencies.librqbit-lsd]
+version = "9.0.1"
+default-features = false
+
+[dependencies.librqbit-upnp]
+version = "9.0.1"
+
+[dependencies.librqbit-utp]
+version = "0.7"
+features = ["export-metrics"]
+
+[dependencies.memmap2]
+version = "0.9"
+
+[dependencies.mime_guess]
+version = "2"
+default-features = false
+
+[dependencies.nix]
+version = "0.30"
+features = ["uio"]
+
+[dependencies.parking_lot]
+version = "0.12"
+
+[dependencies.peer_binary_protocol]
+version = "9.0.1"
+default-features = false
+package = "librqbit-peer-protocol"
+
+[dependencies.rand]
+version = "0.10"
+
+[dependencies.regex]
+version = "1"
+
+[dependencies.reqwest]
+version = "0.13"
+features = [
+    "json",
+    "socks",
+    "stream",
+]
+default-features = false
+
+[dependencies.rlimit]
+version = "0.11"
+
+[dependencies.serde]
+version = "1"
+features = ["rc"]
+
+[dependencies.serde_derive]
+version = "1"
+
+[dependencies.serde_json]
+version = "1"
+
+[dependencies.serde_urlencoded]
+version = "0.7"
+
+[dependencies.serde_with]
+version = "3"
+
+[dependencies.sha1w]
+version = "9.0.1"
+default-features = false
+package = "librqbit-sha1-wrapper"
+
+[dependencies.size_format]
+version = "1"
+
+[dependencies.socket2]
+version = "0.6"
+
+[dependencies.thiserror]
+version = "2"
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "macros",
+    "rt-multi-thread",
+    "fs",
+    "io-util",
+]
+
+[dependencies.tokio-socks]
+version = "0.5"
+
+[dependencies.tokio-stream]
+version = "0.1"
+
+[dependencies.tokio-util]
+version = "0.7"
+features = ["io"]
+
+[dependencies.tracing]
+version = "0.1"
+
+[dependencies.tracker_comms]
+version = "9.0.1"
+default-features = false
+package = "librqbit-tracker-comms"
+
+[dependencies.url]
+version = "2"
+features = ["serde"]
+default-features = false
+
+[dependencies.urlencoding]
+version = "2"
+
+[dependencies.uuid]
+version = "1"
+features = ["v4"]
+
+[dependencies.walkdir]
+version = "2"
+
+[dev-dependencies.pollster]
+version = "1"
+
+[dev-dependencies.tempfile]
+version = "3"
+
+[target."cfg(windows)".dependencies.windows]
+version = "0.62"
+features = [
+    "Win32",
+    "Win32_System",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+]

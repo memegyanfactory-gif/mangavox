@@ -113,7 +113,7 @@ fn object(cfg: &Config, key: &str) -> Map<String, Value> {
 }
 
 /// Read-modify-write of one object-valued key, keeping its other fields.
-fn update_object(key: &str, f: impl FnOnce(&mut Map<String, Value>)) -> Result<()> {
+pub(crate) fn update_object(key: &str, f: impl FnOnce(&mut Map<String, Value>)) -> Result<()> {
     let cfg = config();
     let mut m = object(&cfg, key);
     f(&mut m);
@@ -239,6 +239,27 @@ pub fn save_storage(kind: &str, path: &str) -> Result<String> {
         m.insert(kind.to_string(), json!(value));
     })?;
     Ok(value)
+}
+
+/// Sets the Model Hub folder (`aiAssistant.hub.modelsDir`); an empty path resets it.
+pub fn save_models_dir(dir: &str) -> Result<()> {
+    let dir = dir.trim();
+    if !dir.is_empty() {
+        std::fs::create_dir_all(dir).with_context(|| format!("Could not create folder {dir}"))?;
+    }
+    update_object("aiAssistant", |m| {
+        let hub = m.entry("hub").or_insert_with(|| json!({}));
+        if !hub.is_object() {
+            *hub = json!({});
+        }
+        if let Some(h) = hub.as_object_mut() {
+            if dir.is_empty() {
+                h.remove("modelsDir");
+            } else {
+                h.insert("modelsDir".into(), json!(dir));
+            }
+        }
+    })
 }
 
 pub fn data_dir() -> PathBuf {

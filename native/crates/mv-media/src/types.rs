@@ -138,6 +138,9 @@ pub struct AnimeTorrentStream {
     pub size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Addon that returned it, from the first line of the stream's `name` (e.g. "Torrentio").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

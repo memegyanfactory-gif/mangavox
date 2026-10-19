@@ -104,6 +104,7 @@ pub fn parse_title_cards(html: &str) -> Vec<MangaSearchResult> {
             cover_url: cover,
             author,
             status: None,
+            adult: false,
         });
     }
     out

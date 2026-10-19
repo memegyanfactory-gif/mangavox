@@ -402,7 +402,7 @@ impl Source for MangaFire {
             None => Vec::new(),
         };
         let genres: Vec<(u32, String)> = if live.is_empty() { STATIC_GENRES.iter().map(|(i, n)| (*i, n.to_string())).collect() } else { live };
-        Ok(genres.into_iter().map(|(_, n)| Tag { id: slug(&n), name: n }).collect())
+        Ok(genres.into_iter().map(|(_, n)| Tag::new(slug(&n), n)).collect())
     }
 
     async fn get_manga_by_tag(&self, tag_id: &str, page: u32) -> Result<Vec<MangaSearchResult>> {

@@ -58,3 +58,16 @@ pub fn navigate(route: Route, window: &mut Window, cx: &mut App) {
         f(route, window, cx);
     }
 }
+
+/// Where Back leads from the current page; the shell keeps it up to date so pages can
+/// label their own back control ("Back to Library").
+struct BackTarget(Option<Route>);
+impl Global for BackTarget {}
+
+pub fn set_back_target(cx: &mut App, route: Option<Route>) {
+    cx.set_global(BackTarget(route));
+}
+
+pub fn back_target(cx: &App) -> Option<Route> {
+    cx.try_global::<BackTarget>().and_then(|b| b.0.clone())
+}

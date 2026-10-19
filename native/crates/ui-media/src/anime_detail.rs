@@ -2,10 +2,15 @@
 //! show facts, then an episode grid with thumbnails. Plays via addons.
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_media::types::{AnimeEpisode, AnimeSearchResult};
-use mv_ui::{button, empty_state, error_state, icon, navigate, size, ButtonKind, Route, Tokens};
+use std::collections::HashMap;
 
-use crate::common::{fetch, in_watchlist, jikan, media_id, media_title, muted, record_open, set_watchlist, Load};
+use mv_media::episode_art;
+use mv_media::types::{AnimeEpisode, AnimeSearchResult};
+use mv_ui::{bg, button, empty_state, error_state, icon, navigate, size, ButtonKind, Route, Tokens};
+
+use mv_core::cache::DataCache;
+
+use crate::common::{cached, fetch, fetch_cached, in_watchlist, jikan, media_id, media_title, muted, record_open, set_watchlist, Load, DAY, EPISODES_TTL};
 use crate::look::{self, crunchy, EDGE};
 use crate::streams::{self, PlayBase, StreamState};
 
@@ -22,6 +27,10 @@ pub struct AnimeDetail {
     auto: bool,
     /// Episode whose links are shown.
     sel: Option<u32>,
+    /// Addon chip selected in the sources panel.
+    addon_filter: Option<String>,
+    /// Full synopsis shown under the hero.
+    synopsis_open: bool,
     scroll: ScrollHandle,
 }
 
@@ -40,29 +49,29 @@ fn airs_in(at: i64) -> String {
 impl AnimeDetail {
     pub fn new(mal_id: String, title: String, cx: &mut Context<Self>) -> Self {
         let (id, t) = (mal_id.clone(), title.clone());
-        fetch(
+        let key = format!("jikan:anime:{mal_id}");
+        let warm = DataCache::shared().age(&key).is_some();
+        let details = fetch_cached(
             cx,
+            key,
+            DAY,
             async move {
                 let d = jikan()?.anime_details(&id).await.map_err(|e| e.to_string())?;
-                let _ = record_open(media_title("anime", &id, &d, &t)).await;
+                if !warm {
+                    let _ = record_open(media_title("anime", &id, &d, &t)).await;
+                }
                 Ok(d)
             },
             |v: &mut Self, l| v.details = l,
         );
-        let id = mal_id.clone();
-        fetch(
-            cx,
-            async move { jikan()?.anime_episodes(&id, 1).await.map_err(|e| e.to_string()) },
-            |v: &mut Self, l| {
-                v.has_more = l.ready().is_some_and(|e| e.len() >= 100);
-                v.episodes = l;
-            },
-        );
+        if let Load::Ready(d) = &details {
+            fetch(cx, record_open(media_title("anime", &mal_id, d, &title)), |_: &mut Self, _| {});
+        }
         fetch(cx, in_watchlist(media_id("anime", &mal_id)), |v: &mut Self, l| v.in_list = l.ready().copied());
-        Self {
+        let mut page = Self {
             mal_id,
             title,
-            details: Load::Loading,
+            details,
             episodes: Load::Loading,
             page: 1,
             has_more: false,
@@ -70,8 +79,87 @@ impl AnimeDetail {
             streams: StreamState::Idle,
             auto: false,
             sel: None,
+            addon_filter: None,
+            synopsis_open: false,
             scroll: ScrollHandle::new(),
+        };
+        page.load_page(1, cx);
+        page
+    }
+
+    /// Fetch one page of episodes (page 1 replaces the list), then their stills.
+    fn load_page(&mut self, page: u32, cx: &mut Context<Self>) {
+        let id = self.mal_id.clone();
+        let key = format!("jikan:episodes:{id}:{page}");
+        // Page 1 comes from the cache at once; it is refetched only when stale.
+        if let Some((eps, age)) = DataCache::shared().get::<Vec<AnimeEpisode>>(&key).filter(|_| page == 1) {
+            self.has_more = eps.len() >= 100;
+            self.episodes = Load::Ready(eps);
+            self.fill_art(cx);
+            if age < EPISODES_TTL {
+                return;
+            }
         }
+        cx.spawn(async move |this, cx| {
+            let res = bg::run(cached(key, async move { jikan()?.anime_episodes(&id, page).await.map_err(|e| e.to_string()) })).await.unwrap_or_else(|e| Err(e.to_string()));
+            let _ = this.update(cx, |v, cx| {
+                let l: Load<Vec<AnimeEpisode>> = res.into();
+                if page == 1 && matches!(l, Load::Failed(_)) && v.episodes.ready().is_some() {
+                    return;
+                }
+                v.has_more = l.ready().is_some_and(|e| e.len() >= 100);
+                match (&mut v.episodes, l) {
+                    (Load::Ready(cur), Load::Ready(more)) if page > 1 => cur.extend(more),
+                    (_, l) if page == 1 => v.episodes = l,
+                    _ => {}
+                }
+                v.fill_art(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Give episodes without a still their own (Kitsu / IMDB), instead of the series banner on every card.
+    fn fill_art(&mut self, cx: &mut Context<Self>) {
+        let art_key = format!("episode-art:{}", self.mal_id);
+        let Load::Ready(eps) = &mut self.episodes else { return };
+        let known: HashMap<u32, String> = DataCache::shared().get(&art_key).map(|(m, _)| m).unwrap_or_default();
+        for e in eps.iter_mut().filter(|e| e.thumbnail.is_none()) {
+            e.thumbnail = known.get(&e.number).cloned();
+        }
+        let mut missing: Vec<AnimeEpisode> = eps.iter().filter(|e| e.thumbnail.is_none()).cloned().collect();
+        if missing.is_empty() {
+            return;
+        }
+        let finished = self.details.ready().filter(|d| d.status.as_deref().is_some_and(|s| s.to_lowercase().contains("finished")));
+        let expected = finished.and_then(|d| d.episode_count);
+        let id = self.mal_id.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(filled) = bg::run(async move {
+                episode_art::fill_thumbnails(&id, &mut missing, expected).await;
+                missing
+            })
+            .await
+            else {
+                return;
+            };
+            let art: HashMap<u32, String> = filled.into_iter().filter_map(|e| Some((e.number, e.thumbnail?))).collect();
+            if !art.is_empty() {
+                let mut all = known;
+                all.extend(art.clone());
+                let _ = bg::blocking(move || DataCache::shared().put(&art_key, &all)).await;
+            }
+            let _ = this.update(cx, |v, cx| {
+                if let Load::Ready(cur) = &mut v.episodes {
+                    for e in cur.iter_mut().filter(|e| e.thumbnail.is_none()) {
+                        e.thumbnail = art.get(&e.number).cloned();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn is_movie(&self) -> bool {
@@ -95,6 +183,7 @@ impl AnimeDetail {
     fn lookup(&mut self, episode: u32, autoplay: bool, window: &mut Window, cx: &mut Context<Self>) {
         let movie = self.is_movie();
         self.sel = Some(episode);
+        self.addon_filter = None;
         let name = self.display_title();
         let label = if movie { name.clone() } else { format!("{name}, episode {episode}") };
         self.streams = StreamState::Searching(label.clone());
@@ -112,17 +201,7 @@ impl AnimeDetail {
     fn load_more(&mut self, cx: &mut Context<Self>) {
         self.page += 1;
         self.has_more = false;
-        let (id, page) = (self.mal_id.clone(), self.page);
-        fetch(
-            cx,
-            async move { jikan()?.anime_episodes(&id, page).await.map_err(|e| e.to_string()) },
-            |v: &mut Self, l| {
-                if let (Load::Ready(cur), Load::Ready(more)) = (&mut v.episodes, l) {
-                    v.has_more = more.len() >= 100;
-                    cur.extend(more);
-                }
-            },
-        );
+        self.load_page(self.page, cx);
     }
 
     fn toggle_list(&mut self, cx: &mut Context<Self>) {
@@ -157,10 +236,19 @@ impl AnimeDetail {
             Some(true) => ("icons/bookmark-check.svg", "IN WATCHLIST"),
             _ => ("icons/bookmark-plus.svg", "ADD TO WATCHLIST"),
         };
+        let heading = match (movie, self.sel) {
+            (false, Some(e)) => {
+                let name = self.episodes.ready().and_then(|v| v.iter().find(|x| x.number == e)).and_then(|x| x.title.clone()).filter(|t| !t.is_empty());
+                format!("Episode {e}{}", name.map(|n| format!("  {n}")).unwrap_or_default())
+            }
+            _ => "Sources".to_string(),
+        };
+        let panel = streams::sources_panel(&self.streams, crunchy(), heading, self.addon_filter.as_deref(), cx, |v: &mut Self, f| v.addon_filter = f);
         look::billboard("anime-detail-hero", height, d.banner_url.clone().or_else(|| d.cover_url.clone()))
             .child(
                 look::hero_copy(56.)
                     .w(px(640.))
+                    .when(!matches!(self.streams, StreamState::Idle), |d| d.max_w(relative(0.5)))
                     .child(div().text_size(px(40.)).line_height(px(46.)).font_weight(FontWeight::BLACK).text_color(Tokens::text_1()).line_clamp(2).child(SharedString::from(d.title.clone())))
                     .child(
                         div()
@@ -174,7 +262,23 @@ impl AnimeDetail {
                             .children(tags.into_iter().flatten().map(look::tag)),
                     )
                     .child(div().text_size(px(size::MD)).text_color(Tokens::text_2()).child(SharedString::from(d.genres.clone().unwrap_or_default().join(", "))))
-                    .child(div().text_size(px(size::LG)).line_height(px(22.)).text_color(Tokens::text_1()).line_clamp(4).child(SharedString::from(d.description.clone().unwrap_or_else(|| "No synopsis available.".into()))))
+                    .child(div().text_size(px(size::LG)).line_height(px(22.)).text_color(Tokens::text_1()).line_clamp(3).child(SharedString::from(d.description.as_deref().map(look::blurb).unwrap_or_else(|| "No synopsis available.".into()))))
+                    .when(d.description.as_deref().is_some_and(|t| t.len() > look::blurb(t).len() + 40 || t.len() > 260), |c| {
+                        c.child(
+                            div()
+                                .id("synopsis-more")
+                                .text_size(px(size::SM))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Tokens::text_2())
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(crunchy()))
+                                .child(if self.synopsis_open { "LESS" } else { "MORE DETAILS" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.synopsis_open = !this.synopsis_open;
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
@@ -207,7 +311,9 @@ impl AnimeDetail {
                             ),
                     ),
             )
-            .child(
+            .map(|hero| match panel {
+                Some(p) => hero.child(div().absolute().right(px(EDGE)).top(px(24.)).bottom(px(24.)).w(px(430.)).child(p)),
+                None => hero                .child(
                 div()
                     .absolute()
                     .right(px(EDGE))
@@ -221,7 +327,14 @@ impl AnimeDetail {
                     .shadow_lg()
                     .bg(Tokens::surface_2())
                     .when_some(d.cover_url.clone(), |x, u| x.child(look::pic(u))),
-            )
+            ),
+            })
+    }
+
+    /// The whole synopsis, when "More details" is open.
+    fn synopsis(&self) -> Option<Div> {
+        let text = self.details.ready()?.description.clone().filter(|_| self.synopsis_open)?;
+        Some(div().px(px(EDGE)).mb(px(28.)).max_w(px(900.)).text_size(px(size::MD)).line_height(px(22.)).text_color(Tokens::text_2()).child(SharedString::from(text)))
     }
 
     /// Studio / next episode facts under the hero.
@@ -308,10 +421,9 @@ impl AnimeDetail {
                             .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).line_clamp(2).group_hover(group, |s| s.text_color(crunchy())).child(SharedString::from(title))),
                     )
                     .on_click(cx.listener(move |this, _, w, cx| {
+                        // Links show in the panel at the top, like Stremio.
                         this.lookup(n, false, w, cx);
-                        // The links section sits right above the episode grid.
-                        let ix = 1 + this.facts().is_some() as usize;
-                        this.scroll.scroll_to_item(ix);
+                        this.scroll.set_offset(point(px(0.), px(0.)));
                     }))
             })),
         };
@@ -349,7 +461,6 @@ impl Render for AnimeDetail {
                 self.lookup(ep, false, window, cx);
             }
         }
-        let links = streams::sources_section(&self.streams, crunchy()).map(|d| div().px(px(EDGE)).mb(px(36.)).child(d));
         div()
             .relative()
             .size_full()
@@ -357,8 +468,8 @@ impl Render for AnimeDetail {
             .child(
                 mv_ui::scroll_page("anime-detail", &self.scroll)
                     .child(self.hero(cx))
+                    .children(self.synopsis())
                     .children(self.facts())
-                    .children(links)
                     .when(!movie, |d| d.child(self.episodes(width, cx))),
             )
     }

@@ -1,20 +1,24 @@
 //! Settings page (native counterpart of src/renderer/pages/Settings.tsx).
-//! Left: grouped tab list (220 px). Right: the selected tab, centred, max 860 px.
+//! Left: grouped category rail. Right: the selected page — a title, a one-line description
+//! and section cards — or, for Model Library, its own sub-navigation and pages.
 //! Config is read and written off the UI thread through `mv_ui::bg::blocking`.
 mod data;
+pub mod models;
 mod tabs;
+mod ui;
 
 use std::collections::HashMap;
 
 use anyhow::Result;
-use gpui_kit::component::input::{InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::select::{SelectEvent, SelectState};
 use gpui_kit::component::IndexPath;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ui::{size, Route, Tokens};
+use mv_ui::{icon, size, Route, Tokens};
 
 use data::{Playback, Snapshot};
+use models::{LibraryEvent, ModelLibrary, Page};
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {
@@ -29,38 +33,43 @@ pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView>
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tab {
     Profile,
-    Playback,
-    Appearance,
     Mode,
+    Appearance,
+    Playback,
     Sources,
     Addons,
-    Storage,
     Providers,
     Models,
+    Storage,
     About,
 }
 
-/// Sidebar groups, in order.
+/// Rail groups, in order. An empty title draws no label.
 const GROUPS: &[(&str, &[Tab])] = &[
-    ("General", &[Tab::Profile, Tab::Playback, Tab::Appearance, Tab::Mode]),
-    ("Content", &[Tab::Sources, Tab::Addons, Tab::Storage]),
+    ("", &[Tab::Profile, Tab::Mode]),
+    ("Look and feel", &[Tab::Appearance, Tab::Playback]),
+    ("Content", &[Tab::Sources, Tab::Addons]),
     ("AI", &[Tab::Providers, Tab::Models]),
-    ("App", &[Tab::About]),
+    ("Projects and media", &[Tab::Storage]),
 ];
 
+const HELP_URL: &str = "https://github.com/memegyanfactory-gif/mangavox/issues";
+
 impl Tab {
-    /// Route ids (`Route::Settings { tab }`). `themes` and `mode` are the Electron ids.
+    /// Route ids (`Route::Settings { tab }`). `themes` and `mode` are the Electron ids;
+    /// `models:<page>` opens a Model Library page (e.g. `models:engines`).
     pub fn from_id(id: &str) -> Option<Tab> {
+        let id = id.split(':').next().unwrap_or(id);
         Some(match id {
-            "profile" => Tab::Profile,
+            "profile" | "general" => Tab::Profile,
             "playback" => Tab::Playback,
-            "themes" => Tab::Appearance,
+            "themes" | "appearance" => Tab::Appearance,
             "mode" => Tab::Mode,
-            "sources" => Tab::Sources,
-            "addons" => Tab::Addons,
+            "sources" | "extensions" => Tab::Sources,
+            "addons" | "streaming" => Tab::Addons,
             "storage" => Tab::Storage,
             "providers" => Tab::Providers,
-            "models" => Tab::Models,
+            "models" | "model-library" => Tab::Models,
             "about" => Tab::About,
             _ => return None,
         })
@@ -83,22 +92,52 @@ impl Tab {
 
     pub fn label(self) -> &'static str {
         match self {
-            Tab::Profile => "Profile",
+            Tab::Profile => "General",
             Tab::Playback => "Playback",
             Tab::Appearance => "Appearance",
             Tab::Mode => "App mode",
-            Tab::Sources => "Sources",
-            Tab::Addons => "Addons",
+            Tab::Sources => "Manga sources",
+            Tab::Addons => "Streaming addons",
             Tab::Storage => "Storage",
-            Tab::Providers => "AI Providers",
-            Tab::Models => "Model Hub",
+            Tab::Providers => "AI providers",
+            Tab::Models => "Model Library",
             Tab::About => "About",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Tab::Profile => "Your name and email. Stored only in your local config file.",
+            Tab::Playback => "How episodes and movies play, and which streams and subtitles are picked first.",
+            Tab::Appearance => "Colour theme and motion. Changes apply immediately.",
+            Tab::Mode => "Switch between the entertainment app and the full Manga Studio workspace.",
+            Tab::Sources => "Where manga comes from: installed sources, plugins and repositories.",
+            Tab::Addons => "Stremio-compatible addons that find streams for movies, series and anime.",
+            Tab::Storage => "Download folders and cached data.",
+            Tab::Providers => "Local and cloud AI services for the assistant, with keys and default models.",
+            Tab::Models => "Models on this PC and what MangaVox uses them for.",
+            Tab::About => "Version, data folder and links.",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Tab::Profile => "icons/user.svg",
+            Tab::Playback => "icons/play.svg",
+            Tab::Appearance => "icons/palette.svg",
+            Tab::Mode => "icons/toggle-left.svg",
+            Tab::Sources => "icons/book-open.svg",
+            Tab::Addons => "icons/puzzle.svg",
+            Tab::Storage => "icons/hard-drive.svg",
+            Tab::Providers => "icons/sparkles.svg",
+            Tab::Models => "icons/boxes.svg",
+            Tab::About => "icons/info.svg",
         }
     }
 
     /// Tabs whose body is an embedded panel from another crate.
     fn is_panel(self) -> bool {
-        matches!(self, Tab::Sources | Tab::Addons | Tab::Providers | Tab::Models)
+        matches!(self, Tab::Sources | Tab::Addons | Tab::Providers)
     }
 }
 
@@ -123,7 +162,11 @@ pub struct SettingsView {
     /// `None` while the cache size is still being measured.
     cache_bytes: Option<u64>,
     panels: HashMap<Tab, AnyView>,
+    library: Option<Entity<ModelLibrary>>,
+    /// Model Library page requested by the route (`models:<page>`).
+    library_page: Option<Page>,
     notice: Option<Notice>,
+    _subs: Vec<Subscription>,
 }
 
 fn select_state(
@@ -189,6 +232,7 @@ impl SettingsView {
         })
         .detach();
 
+        let library_page = tab.and_then(|t| t.split_once(':')).and_then(|(_, p)| Page::from_id(p));
         let mut this = Self {
             tab: tab.and_then(Tab::from_id).unwrap_or(Tab::Profile),
             name,
@@ -203,7 +247,10 @@ impl SettingsView {
             storage: vec![String::new(); data::STORAGE_KINDS.len()],
             cache_bytes: None,
             panels: HashMap::new(),
+            library: None,
+            library_page,
             notice: None,
+            _subs: vec![],
         };
         let initial = this.tab;
         this.ensure_panel(initial, window, cx);
@@ -242,14 +289,27 @@ impl SettingsView {
     }
 
     fn ensure_panel(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if tab == Tab::Models && self.library.is_none() {
+            let page = self.library_page.take();
+            let lib = cx.new(|cx| ModelLibrary::new(page, window, cx));
+            let sub = cx.subscribe_in(&lib, window, |this, _, ev: &LibraryEvent, window, cx| match ev {
+                LibraryEvent::OpenTab(id) => {
+                    if let Some(t) = Tab::from_id(id) {
+                        this.select_tab(t, window, cx);
+                    }
+                }
+            });
+            self._subs.push(sub);
+            self.library = Some(lib);
+            return;
+        }
         if !tab.is_panel() || self.panels.contains_key(&tab) {
             return;
         }
         let view = match tab {
             Tab::Sources => ui_manga::sources_panel(window, cx),
             Tab::Addons => ui_media::addons_panel(window, cx),
-            Tab::Providers => ui_assistant::providers_panel(window, cx),
-            _ => ui_assistant::model_hub_panel(window, cx),
+            _ => ui_assistant::providers_panel(window, cx),
         };
         self.panels.insert(tab, view);
     }
@@ -399,57 +459,73 @@ impl SettingsView {
         });
     }
 
+    fn rail_item(&self, id: &'static str, icon_path: &'static str, label: &'static str, active: bool) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(32.))
+            .px(px(10.))
+            .rounded(px(8.))
+            .border_1()
+            .text_size(px(size::SM))
+            .cursor_pointer()
+            .map(|d| {
+                if active {
+                    d.bg(Tokens::active()).border_color(rgba(0x2bd49a59)).text_color(Tokens::text_1()).font_weight(FontWeight::MEDIUM)
+                } else {
+                    d.border_color(transparent_black()).text_color(Tokens::text_2()).hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1()))
+                }
+            })
+            .child(icon(icon_path, if active { Tokens::accent() } else { Tokens::text_3() }, 15.))
+            .child(label)
+    }
+
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut nav = div()
-            .id("settings-nav")
-            .w(px(220.))
+        let mut groups = div().flex().flex_col().gap(px(18.));
+        for (title, tabs) in GROUPS {
+            let mut group = div().flex().flex_col().gap(px(2.));
+            if !title.is_empty() {
+                group = group.child(div().px(px(10.)).pb(px(6.)).child(ui::section_label(title)));
+            }
+            for tab in tabs.iter().copied() {
+                group = group.child(
+                    self.rail_item(tab.id(), tab.icon(), tab.label(), self.tab == tab)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.select_tab(tab, window, cx))),
+                );
+            }
+            groups = groups.child(group);
+        }
+        let bottom = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .pt(px(12.))
+            .border_t_1()
+            .border_color(Tokens::border())
+            .child(self.rail_item("help", "icons/life-buoy.svg", "Help & feedback", false).on_click(|_, _, cx| cx.open_url(HELP_URL)))
+            .child(
+                self.rail_item(Tab::About.id(), Tab::About.icon(), Tab::About.label(), self.tab == Tab::About)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.select_tab(Tab::About, window, cx))),
+            );
+
+        div()
+            .w(px(232.))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
-            .gap(px(16.))
+            .gap(px(12.))
             .px(px(12.))
-            .py(px(20.))
+            .pt(px(22.))
+            .pb(px(14.))
             .bg(Tokens::sidebar())
             .border_r_1()
             .border_color(Tokens::border())
-            .overflow_y_scroll();
-        for (title, tabs) in GROUPS {
-            let mut group = div().flex().flex_col().gap(px(2.)).child(
-                div()
-                    .px(px(10.))
-                    .pb(px(4.))
-                    .text_size(px(size::XS))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(Tokens::text_3())
-                    .child(title.to_uppercase()),
-            );
-            for tab in tabs.iter().copied() {
-                let active = self.tab == tab;
-                group = group.child(
-                    div()
-                        .id(tab.id())
-                        .h(px(30.))
-                        .px(px(10.))
-                        .rounded(px(8.))
-                        .flex()
-                        .items_center()
-                        .text_size(px(size::SM))
-                        .cursor_pointer()
-                        .map(|d| {
-                            if active {
-                                d.bg(Tokens::active()).text_color(Tokens::text_1()).font_weight(FontWeight::SEMIBOLD)
-                            } else {
-                                d.text_color(Tokens::text_2()).hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1()))
-                            }
-                        })
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.select_tab(tab, window, cx)))
-                        .child(tab.label()),
-                );
-            }
-            nav = nav.child(group);
-        }
-        nav
+            .child(div().px(px(10.)).pb(px(6.)).text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Settings"))
+            .child(div().id("settings-nav").flex_1().min_h_0().overflow_y_scroll().child(groups))
+            .child(bottom)
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -470,21 +546,24 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = self.render_body(cx);
-        let mut column = div()
-            .w_full()
-            .max_w(px(860.))
-            .mx_auto()
-            .px(px(28.))
-            .py(px(28.))
-            .flex()
-            .flex_col()
-            .gap(px(20.))
-            .child(mv_ui::page_header(self.tab.label(), None));
-        if let Some(n) = &self.notice {
-            column = column.child(tabs::notice_bar(n));
-        }
-        column = column.child(body);
+        let content: AnyElement = match (&self.library, self.tab) {
+            (Some(lib), Tab::Models) => div().flex_1().h_full().min_w_0().child(lib.clone()).into_any_element(),
+            _ => {
+                let body = self.render_body(cx);
+                let column = div()
+                    .w_full()
+                    .max_w(px(820.))
+                    .px(px(40.))
+                    .py(px(32.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(22.))
+                    .child(ui::page_title(self.tab.label(), self.tab.description()))
+                    .when_some(self.notice.as_ref(), |d, n| d.child(tabs::notice_bar(n)))
+                    .child(body);
+                div().id("settings-content").flex_1().h_full().min_w_0().overflow_y_scroll().child(column).into_any_element()
+            }
+        };
 
         div()
             .size_full()
@@ -493,14 +572,31 @@ impl Render for SettingsView {
             .text_color(Tokens::text_1())
             .text_size(px(size::MD))
             .child(self.render_nav(cx))
-            .child(
-                div()
-                    .id("settings-content")
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .overflow_y_scroll()
-                    .child(column),
-            )
+            .child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn tab_ids_round_trip_and_aliases() {
+        for (_, tabs) in GROUPS {
+            for t in tabs.iter() {
+                assert_eq!(Tab::from_id(t.id()), Some(*t));
+            }
+        }
+        assert_eq!(Tab::from_id("about"), Some(Tab::About));
+        assert_eq!(Tab::from_id("addons"), Some(Tab::Addons));
+        assert_eq!(Tab::from_id("streaming"), Some(Tab::Addons));
+        assert_eq!(Tab::from_id("extensions"), Some(Tab::Sources));
+        assert_eq!(Tab::from_id("models:engines"), Some(Tab::Models));
+        assert_eq!(Page::from_id("engines"), Some(Page::Engines));
+        assert_eq!(Tab::from_id("nope"), None);
+        // Every tab id the assistant's open_settings tool can send resolves.
+        for id in ui_assistant::tools::SETTINGS_TABS {
+            assert!(Tab::from_id(id).is_some(), "{id}");
+        }
     }
 }

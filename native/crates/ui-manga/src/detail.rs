@@ -5,17 +5,26 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::chapter::Chapter;
 use mv_core::repo::manga::{self, Manga};
-use mv_ui::{button, icon, size, ButtonKind, CoverSource, Route, Tokens};
+use mv_ui::{back_target, button, icon, size, ButtonKind, CoverSource, Route, Tokens};
+
+use mv_sources::MangaSearchResult;
 
 use crate::backend::{self, ChapterExtra};
+use crate::discover::{self, Recs};
 use crate::logic::{self, ChapterView};
 use crate::ops;
 use crate::store;
-use crate::ui::{action, error_view, icon_tip, note_line, spinner, state_view, tag, tool_button, Load};
+use crate::tags::MAX_RECS;
+use crate::ui::{
+    action, cover_src, error_view, icon_tip, manga_card, note_line, select_chip, skeleton_cover, spawn_cover_downloads, spinner, state_view, tool_button, CardInfo, Grid,
+    Load,
+};
 
 /// Fixed list rows before the chapters: the header and the chapter toolbar.
 const LEAD: usize = 2;
 const ROW_H: f32 = 58.0;
+/// Cover cards in the "You may also like" row.
+const REC_GRID: Grid = Grid { cols: MAX_RECS, card_w: 116.0 };
 
 pub struct DetailPage {
     manga_id: String,
@@ -37,6 +46,11 @@ pub struct DetailPage {
     hovered: Option<String>,
     list: ListState,
     seen_version: u64,
+    /// "You may also like" (None until the title's tags are known).
+    recs: Option<Load<Recs>>,
+    rec_covers: HashMap<String, PathBuf>,
+    /// Recommendation being opened (`source_id`).
+    rec_busy: Option<String>,
 }
 
 struct Loaded {
@@ -74,6 +88,9 @@ impl DetailPage {
             hovered: None,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             seen_version: backend::data_version(),
+            recs: None,
+            rec_covers: HashMap::new(),
+            rec_busy: None,
         };
         p.reload(cx);
         p
@@ -99,6 +116,7 @@ impl DetailPage {
                         }
                         this.in_library = !backend::browse_only().contains(&this.manga_id);
                         this.set_data(l.manga, l.chapters);
+                        this.maybe_load_recs(cx);
                         // A title without chapters has never been synced: fetch them once.
                         if empty && !this.auto_refreshed {
                             this.auto_refreshed = true;
@@ -172,6 +190,7 @@ impl DetailPage {
                         this.extras = backend::extras(&this.manga_id).unwrap_or_default();
                         this.seen_version = backend::data_version();
                         this.set_data(m, cs);
+                        this.maybe_load_recs(cx);
                     }
                     Err(e) => this.note = Some((format!("Refresh failed: {e:#}"), true)),
                 }
@@ -179,6 +198,136 @@ impl DetailPage {
             });
         })
         .detach();
+    }
+
+    /// Start the recommendations once the title has tags (fresh titles get them on refresh).
+    fn maybe_load_recs(&mut self, cx: &mut Context<Self>) {
+        if self.recs.is_some() {
+            return;
+        }
+        if matches!(&self.state, Load::Ready((m, _)) if !m.genres.is_empty()) {
+            self.load_recs(cx);
+        }
+    }
+
+    fn load_recs(&mut self, cx: &mut Context<Self>) {
+        let Load::Ready((m, _)) = &self.state else { return };
+        let (src, sid, title, genres) = (m.source_plugin.clone(), m.source_id.clone(), m.title.clone(), m.genres.clone());
+        self.recs = Some(Load::Loading);
+        self.list.remeasure_items(0..1.min(self.list.item_count()));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::run(discover::recommendations(src, sid, title, genres)).await.and_then(|r| r);
+            let covers = match &res {
+                Ok(r) => {
+                    let urls: Vec<_> = r.items.iter().filter_map(|i| i.cover_url.clone().map(|u| (u, Some(r.source_id.clone())))).collect();
+                    mv_ui::bg::blocking(move || backend::resolve_covers(urls)).await.ok()
+                }
+                Err(_) => None,
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.recs = Some(match res {
+                    Ok(r) => Load::Ready(r),
+                    Err(e) => Load::Failed(format!("{e:#}")),
+                });
+                if let Some((have, missing)) = covers {
+                    this.rec_covers.extend(have);
+                    spawn_cover_downloads(cx, missing, |t: &mut Self| &mut t.rec_covers);
+                }
+                this.list.remeasure_items(0..1.min(this.list.item_count()));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Open a recommended title (straight away when it is already in the database).
+    fn open_rec(&mut self, source_id: String, r: MangaSearchResult, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rec_busy.is_some() {
+            return;
+        }
+        self.rec_busy = Some(r.source_id.clone());
+        self.note = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let (src, rid) = (source_id.clone(), r.source_id.clone());
+            let known = mv_ui::bg::blocking(move || backend::with_db(|c| manga::find_by_source(c, &src, &rid))).await.ok().and_then(|r| r.ok()).flatten();
+            let res = match known {
+                Some(m) => Ok(m),
+                None => mv_ui::bg::run(ops::prepare_from_source(source_id.clone(), r)).await.and_then(|r| r),
+            };
+            let _ = this.update_in(cx, |this, w, cx| {
+                this.rec_busy = None;
+                match res {
+                    Ok(m) => mv_ui::navigate(Route::MangaDetail { manga_id: m.id, source_id: Some(source_id) }, w, cx),
+                    Err(e) => this.note = Some((format!("Could not open: {e:#}"), true)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "You may also like": 5-8 titles sharing this one's main tags.
+    fn recs_section(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let recs = self.recs.as_ref()?;
+        let heading = |sub: Option<String>| {
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(10.))
+                .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("You may also like"))
+                .when_some(sub, |d, s| d.child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(s)))
+        };
+        let body: AnyElement = match recs {
+            Load::Loading => div().flex().gap(px(12.)).overflow_hidden().children((0..6).map(|_| skeleton_cover(REC_GRID))).into_any_element(),
+            Load::Failed(e) => div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(note_line(format!("Could not load recommendations: {e}"), true))
+                .child(tool_button("recs-retry", "icons/refresh-cw.svg", "Try again", false).on_click(cx.listener(|this, _, _, cx| this.load_recs(cx))))
+                .into_any_element(),
+            Load::Ready(r) if r.items.is_empty() => {
+                note_line(if r.basis.is_empty() { "No similar titles: none of this title's tags can be searched." } else { "No similar titles found." }, false).into_any_element()
+            }
+            Load::Ready(r) => div()
+                .flex()
+                .flex_wrap()
+                .gap(px(12.))
+                .children(r.items.iter().map(|it| {
+                    let item = it.clone();
+                    let src = r.source_id.clone();
+                    let busy = self.rec_busy.as_deref() == Some(it.source_id.as_str());
+                    let info = CardInfo { title: it.title.clone().into(), cover: cover_src(&self.rec_covers, it.cover_url.as_deref()), ..Default::default() };
+                    manga_card(SharedString::from(format!("rec-{}", it.source_id)), info, REC_GRID)
+                        .when(busy, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(Tokens::scrim())
+                                    .child(spinner(SharedString::from(format!("rec-spin-{}", it.source_id)), 22.)),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, w, cx| this.open_rec(src.clone(), item.clone(), w, cx)))
+                }))
+                .into_any_element(),
+        };
+        let sub = match recs {
+            Load::Ready(r) if !r.basis.is_empty() => {
+                let own = matches!(&self.state, Load::Ready((m, _)) if m.source_plugin == r.source_id);
+                let from = if own { String::new() } else { format!(" on {}", r.source_name) };
+                Some(format!("Tagged {}{from}", r.basis.join(" + ")))
+            }
+            _ => None,
+        };
+        Some(div().flex().flex_col().gap(px(10.)).px(px(size::PAGE_X)).pb(px(18.)).child(heading(sub)).child(body))
     }
 
     fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
@@ -279,13 +428,14 @@ impl DetailPage {
                     .size_full()
                     .bg(linear_gradient(180., linear_color_stop(rgba(0x0b0d1066), 0.), linear_color_stop(Tokens::base(), 1.))),
             )
+            .when_some(back_label(cx), |d, label| d.child(div().relative().flex().px(px(size::PAGE_X - 10.)).pt(px(14.)).child(back_pill(label))))
             .child(
                 div()
                     .relative()
                     .flex()
                     .gap(px(24.))
                     .px(px(size::PAGE_X))
-                    .pt(px(32.))
+                    .pt(px(14.))
                     .pb(px(16.))
                     .child(
                         div()
@@ -411,9 +561,19 @@ impl DetailPage {
                         }),
                 )
             })
-            .when(!m.genres.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(6.)).children(m.genres.iter().take(16).map(|g| tag(g.clone())))));
+            .when(!m.genres.is_empty(), |d| {
+                d.child(div().flex().flex_wrap().gap(px(6.)).children(m.genres.iter().take(16).enumerate().map(|(i, g)| {
+                    let (src, name) = (m.source_plugin.clone(), g.clone());
+                    select_chip(SharedString::from(format!("genre-{i}")), g.clone(), false)
+                        .tooltip(|w, cx| gpui_kit::component::tooltip::Tooltip::new("Browse this tag").build(w, cx))
+                        .on_click(move |_, w, cx| {
+                            discover::request_tag(&src, &name);
+                            mv_ui::navigate(Route::Browse, w, cx);
+                        })
+                })))
+            });
 
-        div().flex().flex_col().child(top).child(actions).child(about)
+        div().flex().flex_col().child(top).child(actions).child(about).children(self.recs_section(cx))
     }
 
     fn toolbar(&self, cs: &[Chapter], cx: &mut Context<Self>) -> Div {
@@ -633,4 +793,37 @@ impl Render for DetailPage {
             }
         }
     }
+}
+
+/// "Back to Library" style label for wherever the user opened this manga from.
+fn back_label(cx: &App) -> Option<SharedString> {
+    let label = match back_target(cx)? {
+        Route::Browse => "Back to Browse",
+        Route::Library => "Back to Library",
+        Route::MangaHistory => "Back to History",
+        Route::Settings { .. } => "Back to Settings",
+        _ => "Back",
+    };
+    Some(label.into())
+}
+
+fn back_pill(label: SharedString) -> Stateful<Div> {
+    div()
+        .id("detail-back")
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .w_auto()
+        .flex_none()
+        .h(px(30.))
+        .px(px(10.))
+        .rounded(px(8.))
+        .cursor_pointer()
+        .text_size(px(size::SM))
+        .text_color(Tokens::text_2())
+        .bg(rgba(0x0000004d))
+        .hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1()))
+        .child(icon("icons/arrow-left.svg", Tokens::text_2(), 15.))
+        .child(label)
+        .on_click(|_, w, cx| mv_ui::navigate(Route::Back, w, cx))
 }

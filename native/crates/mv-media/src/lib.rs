@@ -4,7 +4,9 @@
 pub mod addons;
 pub mod anilist;
 pub mod cinemeta;
+pub mod episode_art;
 pub mod error;
+pub mod image_cache;
 pub mod jikan;
 pub mod skip_times;
 pub mod stremio;
