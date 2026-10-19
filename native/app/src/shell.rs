@@ -41,6 +41,7 @@ fn nav_for(section: Section) -> Vec<NavEntry> {
             NavEntry { route: Route::Browse, label: "Browse", icon: "icons/compass.svg" },
             NavEntry { route: Route::Library, label: "Library", icon: "icons/book-open.svg" },
             NavEntry { route: Route::MangaHistory, label: "History", icon: "icons/clock.svg" },
+            NavEntry { route: Route::MangaDownloads, label: "Downloads", icon: "icons/download.svg" },
         ],
         Section::Anime => vec![
             NavEntry { route: Route::AnimeHome, label: "Home", icon: "icons/monitor-play.svg" },
@@ -62,6 +63,7 @@ fn title_for(route: &Route) -> SharedString {
         Route::Browse => "Browse".into(),
         Route::Library => "Library".into(),
         Route::MangaHistory | Route::MediaHistory => "History".into(),
+        Route::MangaDownloads => "Downloads".into(),
         Route::MangaDetail { .. } => "Manga".into(),
         Route::Reader { .. } => "Reader".into(),
         Route::AnimeHome | Route::MoviesHome => "Home".into(),
@@ -115,6 +117,7 @@ pub struct Shell {
     _keys: Subscription,
     _mode: Subscription,
     _update: Subscription,
+    _downloads: Subscription,
 }
 
 impl Shell {
@@ -136,6 +139,9 @@ impl Shell {
         });
         let updater = mv_ui::update::updater(cx);
         let update = cx.observe(&updater, |_, _, cx| cx.notify());
+        // The download notification floats over every page.
+        let dl = ui_manga::downloads(cx);
+        let downloads = cx.observe(&dl, |_, _, cx| cx.notify());
         let route = Route::Library;
         let page = Self::resolve(&route, window, cx);
         Self {
@@ -152,6 +158,7 @@ impl Shell {
             _keys: keys,
             _mode: mode,
             _update: update,
+            _downloads: downloads,
         }
     }
 
@@ -518,7 +525,7 @@ impl Render for Shell {
                     .min_h_0()
                     .when(!focus && !in_settings, |d| d.child(self.sidebar(cx)))
                     .when_some(dock, |d, dock| d.child(div().flex_none().w(px(400.)).h_full().border_r_1().border_color(Tokens::border()).child(dock)))
-                    .child(div().flex_1().min_w_0().h_full().overflow_hidden().child(self.page.clone())),
+                    .child(div().relative().flex_1().min_w_0().h_full().overflow_hidden().child(self.page.clone()).when(!focus, |d| d.children(ui_manga::download_toast(cx)))),
             )
     }
 }

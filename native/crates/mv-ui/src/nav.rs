@@ -11,6 +11,7 @@ pub enum Route {
     Browse,
     Library,
     MangaHistory,
+    MangaDownloads,
     MangaDetail { manga_id: String, source_id: Option<String> },
     Reader { manga_id: String, chapter_id: String },
     // Anime / movies

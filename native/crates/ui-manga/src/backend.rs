@@ -274,6 +274,32 @@ pub async fn download_page(url: String, source_id: Option<String>) -> Result<Pat
     Ok(path)
 }
 
+/// Root of the offline chapter downloads: `~/.mangavox/downloads/<manga_id>/<chapter_id>/`.
+pub fn downloads_dir() -> PathBuf {
+    mv_core::paths::root().join("downloads")
+}
+
+/// Save page `index` of a chapter into `dir` as `0001.<ext>`, reusing the reader's page cache
+/// when the page was already viewed.
+pub async fn save_page(url: String, source_id: Option<String>, dir: PathBuf, index: usize) -> Result<PathBuf> {
+    let (clean, referer) = mv_sources::util::split_ref_hint(&url);
+    let stem = format!("{:04}", index + 1);
+    let cached = logic::find_cached(&pages_cache_dir(), &logic::page_cache_name(&clean, referer.as_deref()));
+    let (bytes, ext) = match cached {
+        Some(p) => {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_string();
+            (std::fs::read(&p)?, ext)
+        }
+        None => {
+            let (b, e) = fetch_image(&url, source_id.as_deref()).await?;
+            (b, e.to_string())
+        }
+    };
+    let path = dir.join(format!("{stem}.{ext}"));
+    write_atomic(&path, &bytes)?;
+    Ok(path)
+}
+
 /// Local file for a cover, downloading it into the shared covers cache when missing
 /// (same `md5(url).<ext>` naming the Electron app uses).
 pub async fn ensure_cover(url: String, source_id: Option<String>) -> Option<PathBuf> {

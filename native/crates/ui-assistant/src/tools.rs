@@ -52,6 +52,7 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::Browse => "browse",
         Route::Library => "library",
         Route::MangaHistory => "history",
+        Route::MangaDownloads => "downloads",
         Route::MangaDetail { .. } => "manga-detail",
         Route::Reader { .. } => "reader",
         Route::AnimeHome => "anime",
@@ -78,7 +79,7 @@ pub fn section_name(route: &Route) -> &'static str {
 
 // ── Tool table ───────────────────────────────────────────────────────────────────
 
-pub const PAGES: &[&str] = &["library", "browse", "history", "anime", "movies", "discover", "favorites", "media-history", "studio", "settings"];
+pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "settings"];
 pub const SETTINGS_TABS: &[&str] = &["providers", "models", "profile", "playback", "sources", "extensions", "addons", "streaming", "storage", "themes", "mode", "about"];
 
 fn obj(properties: Value, required: &[&str]) -> Value {
@@ -229,6 +230,7 @@ pub fn route_for_page(page: &str) -> Option<Route> {
         "library" => Route::Library,
         "browse" => Route::Browse,
         "history" => Route::MangaHistory,
+        "downloads" => Route::MangaDownloads,
         "anime" => Route::AnimeHome,
         "movies" => Route::MoviesHome,
         "discover" => Route::Discover,

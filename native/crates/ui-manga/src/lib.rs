@@ -7,6 +7,8 @@ pub mod backend;
 mod browse;
 mod detail;
 mod discover;
+mod downloads;
+mod downloads_page;
 mod history;
 mod library;
 pub mod logic;
@@ -18,12 +20,14 @@ pub mod tags;
 mod ui;
 
 pub use backend::set_source_ctx;
+pub use downloads::{downloads, toast as download_toast};
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {
         Route::Library => Some(cx.new(|cx| library::LibraryPage::new(window, cx)).into()),
         Route::Browse => Some(cx.new(|cx| browse::BrowsePage::new(window, cx)).into()),
         Route::MangaHistory => Some(cx.new(|cx| history::HistoryPage::new(window, cx)).into()),
+        Route::MangaDownloads => Some(cx.new(|cx| downloads_page::DownloadsPage::new(window, cx)).into()),
         Route::MangaDetail { manga_id, .. } => {
             let id = manga_id.clone();
             Some(cx.new(|cx| detail::DetailPage::new(id, cx)).into())

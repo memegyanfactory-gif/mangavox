@@ -110,6 +110,21 @@ pub fn continue_chapter(conn: &Connection, manga_id: &str, lang: &str) -> Result
     Ok(logic::continue_target(&cs).map(|(i, _)| cs[i].id.clone()))
 }
 
+/// Titles with at least one downloaded chapter (library and browse-only alike), most recently
+/// read first, each with its downloaded chapters ascending.
+pub fn downloaded_titles(conn: &Connection) -> Result<Vec<(Manga, Vec<Chapter>)>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT manga_id FROM chapter WHERE download_status = 'complete'")?;
+    let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    let mut out = vec![];
+    for id in ids {
+        let Some(m) = manga::get(conn, &id)? else { continue };
+        let cs: Vec<Chapter> = chapter::list(conn, &id)?.into_iter().filter(|c| c.download_status == "complete").collect();
+        out.push((m, cs));
+    }
+    out.sort_by(|a, b| b.0.last_read_at.cmp(&a.0.last_read_at).then_with(|| a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase())));
+    Ok(out)
+}
+
 /// Mark chapters read or unread (unread also resets the saved page).
 pub fn set_read(conn: &mut Connection, ids: &[String], read: bool) -> Result<()> {
     let tx = conn.transaction()?;

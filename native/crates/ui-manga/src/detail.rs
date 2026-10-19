@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui_kit::prelude::FluentBuilder as _;
@@ -11,6 +11,7 @@ use mv_sources::MangaSearchResult;
 
 use crate::backend::{self, ChapterExtra};
 use crate::discover::{self, Recs};
+use crate::downloads::{downloads, ChapterDl, Downloads, Job};
 use crate::logic::{self, ChapterView};
 use crate::ops;
 use crate::store;
@@ -23,6 +24,8 @@ use crate::ui::{
 /// Fixed list rows before the chapters: the header and the chapter toolbar.
 const LEAD: usize = 2;
 const ROW_H: f32 = 58.0;
+/// Config key for the chapter order ("1" = newest first; oldest first otherwise, like reading order).
+const SORT_KEY: &str = "chapterNewestFirst";
 /// Cover cards in the "You may also like" row.
 const REC_GRID: Grid = Grid { cols: MAX_RECS, card_w: 116.0 };
 
@@ -51,6 +54,8 @@ pub struct DetailPage {
     rec_covers: HashMap<String, PathBuf>,
     /// Recommendation being opened (`source_id`).
     rec_busy: Option<String>,
+    queue: Entity<Downloads>,
+    _watch: Subscription,
 }
 
 struct Loaded {
@@ -70,6 +75,9 @@ fn load(id: String, lang: String) -> anyhow::Result<Loaded> {
 
 impl DetailPage {
     pub fn new(manga_id: String, cx: &mut Context<Self>) -> Self {
+        let queue = downloads(cx);
+        let watch = cx.observe(&queue, |_, _, cx| cx.notify());
+        let newest_first = backend::config_str(SORT_KEY).as_deref() == Some("1");
         let mut p = Self {
             in_library: !backend::browse_only().contains(&manga_id),
             extras: backend::extras(&manga_id).unwrap_or_default(),
@@ -77,7 +85,7 @@ impl DetailPage {
             state: Load::Loading,
             cover: None,
             source_name: None,
-            view: ChapterView::default(),
+            view: ChapterView { newest_first, ..Default::default() },
             rows: vec![],
             current: None,
             lang: backend::preferred_language(),
@@ -91,6 +99,8 @@ impl DetailPage {
             recs: None,
             rec_covers: HashMap::new(),
             rec_busy: None,
+            queue,
+            _watch: watch,
         };
         p.reload(cx);
         p
@@ -291,9 +301,11 @@ impl DetailPage {
             Load::Ready(r) if r.items.is_empty() => {
                 note_line(if r.basis.is_empty() { "No similar titles: none of this title's tags can be searched." } else { "No similar titles found." }, false).into_any_element()
             }
+            // One horizontal row (scrolls sideways) so the chapters stay close to the top.
             Load::Ready(r) => div()
+                .id("recs-row")
                 .flex()
-                .flex_wrap()
+                .overflow_x_scroll()
                 .gap(px(12.))
                 .children(r.items.iter().map(|it| {
                     let item = it.clone();
@@ -371,8 +383,34 @@ impl DetailPage {
     }
 
     fn set_view(&mut self, view: ChapterView, cx: &mut Context<Self>) {
+        if view.newest_first != self.view.newest_first {
+            backend::set_config_str(SORT_KEY, if view.newest_first { "1" } else { "0" });
+        }
         self.view = view;
         self.sync_rows();
+        cx.notify();
+    }
+
+    /// Queue chapters (by id) that are not downloaded yet, in reading order.
+    fn download(&mut self, ids: HashSet<String>, cx: &mut Context<Self>) {
+        let Load::Ready((m, cs)) = &self.state else { return };
+        let jobs: Vec<Job> = cs
+            .iter()
+            .filter(|c| ids.contains(&c.id) && c.download_status != "complete")
+            .map(|c| Job { manga_id: m.id.clone(), manga_title: m.title.clone(), chapter_id: c.id.clone(), label: logic::chapter_short(c) })
+            .collect();
+        self.queue.update(cx, |d, cx| d.enqueue(jobs, cx));
+    }
+
+    fn delete_download(&mut self, chapter_id: String, cx: &mut Context<Self>) {
+        if let Load::Ready((_, cs)) = &mut self.state {
+            if let Some(c) = cs.iter_mut().find(|c| c.id == chapter_id) {
+                c.download_status = "none".into();
+            }
+        }
+        self.sync_rows();
+        let mid = self.manga_id.clone();
+        self.queue.update(cx, |d, cx| d.delete(vec![(mid, chapter_id)], cx));
         cx.notify();
     }
 
@@ -385,7 +423,7 @@ impl DetailPage {
         let Load::Ready((m, cs)) = &state else { unreachable!() };
         let el = match ix {
             0 => self.header(m, cx).into_any_element(),
-            1 => self.toolbar(cs, cx).into_any_element(),
+            1 => self.toolbar(m, cs, cx).into_any_element(),
             _ => {
                 let r = ix - LEAD;
                 match self.rows.get(r) {
@@ -396,13 +434,14 @@ impl DetailPage {
             }
         };
         self.state = state;
-        el
+        // List items size to their content unless told otherwise: stretch every row edge to edge.
+        div().w_full().child(el).into_any_element()
     }
 
     fn header(&self, m: &Manga, cx: &mut Context<Self>) -> Div {
         let cover = self.cover.clone().map(CoverSource::File);
         let backdrop = self.cover.clone().map(CoverSource::File);
-        let desc = m.description.clone().unwrap_or_default().trim().to_string();
+        let desc = logic::clean_description(m.description.as_deref().unwrap_or_default());
         let long = desc.chars().count() > 260 || desc.lines().count() > 3;
         let web = logic::web_url(&m.source_plugin, &m.source_id);
         let mut people: Vec<String> = vec![];
@@ -419,28 +458,38 @@ impl DetailPage {
             .relative()
             .w_full()
             .overflow_hidden()
-            .when_some(backdrop, |d, c| d.child(c.into_img().absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover).opacity(0.22)))
+            // Edge-to-edge backdrop: the cover stretched across the whole page width, faded into the page.
+            .when_some(backdrop, |d, c| d.child(c.into_img().absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover).opacity(0.3)))
             .child(
                 div()
                     .absolute()
                     .top_0()
                     .left_0()
                     .size_full()
-                    .bg(linear_gradient(180., linear_color_stop(rgba(0x0b0d1066), 0.), linear_color_stop(Tokens::base(), 1.))),
+                    .bg(linear_gradient(90., linear_color_stop(rgba(0x0b0d10cc), 0.), linear_color_stop(rgba(0x0b0d1033), 0.8))),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(linear_gradient(180., linear_color_stop(rgba(0x0b0d1040), 0.), linear_color_stop(Tokens::base(), 1.))),
             )
             .when_some(back_label(cx), |d, label| d.child(div().relative().flex().px(px(size::PAGE_X - 10.)).pt(px(14.)).child(back_pill(label))))
             .child(
                 div()
                     .relative()
                     .flex()
-                    .gap(px(24.))
+                    .items_end()
+                    .gap(px(28.))
                     .px(px(size::PAGE_X))
-                    .pt(px(14.))
-                    .pb(px(16.))
+                    .pt(px(20.))
+                    .pb(px(22.))
                     .child(
                         div()
-                            .w(px(150.))
-                            .h(px(225.))
+                            .w(px(168.))
+                            .h(px(252.))
                             .flex_none()
                             .rounded(px(10.))
                             .overflow_hidden()
@@ -576,21 +625,107 @@ impl DetailPage {
         div().flex().flex_col().child(top).child(actions).child(about).children(self.recs_section(cx))
     }
 
-    fn toolbar(&self, cs: &[Chapter], cx: &mut Context<Self>) -> Div {
+    /// Chapter section header: counts, the download button, then filters / order / mark all.
+    fn toolbar(&self, m: &Manga, cs: &[Chapter], cx: &mut Context<Self>) -> Div {
         let v = self.view;
         let all_read = !cs.is_empty() && cs.iter().all(|c| c.is_read);
         let unread = cs.iter().filter(|c| !c.is_read).count();
-        let count = if unread > 0 && unread < cs.len() { format!("{} chapters, {unread} unread", cs.len()) } else { format!("{} chapters", cs.len()) };
-        div()
+        let downloaded = cs.iter().filter(|c| c.download_status == "complete").count();
+        let queue = self.queue.read(cx);
+        let pending = queue.pending_for(&m.id);
+        let missing: Vec<&Chapter> = cs.iter().filter(|c| c.download_status != "complete" && queue.status(&c.id).is_none()).collect();
+        let missing_unread = missing.iter().filter(|c| !c.is_read).count();
+
+        let mut stats = vec![format!("{} chapter{}", cs.len(), if cs.len() == 1 { "" } else { "s" })];
+        if unread > 0 && unread < cs.len() {
+            stats.push(format!("{unread} unread"));
+        }
+        if downloaded > 0 {
+            stats.push(format!("{downloaded} downloaded"));
+        }
+
+        let download: AnyElement = if pending > 0 {
+            let mid = m.id.clone();
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(34.))
+                .pl(px(12.))
+                .pr(px(4.))
+                .rounded(px(9.))
+                .bg(Tokens::accent_soft())
+                .text_size(px(size::SM))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(Tokens::accent())
+                .child(spinner("dl-spin", 14.))
+                .child(format!("Downloading · {pending} left"))
+                .child(
+                    div()
+                        .id("dl-cancel-title")
+                        .px(px(8.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_color(Tokens::text_2())
+                        .hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1()))
+                        .child("Cancel")
+                        .on_click(cx.listener(move |this, _, _, cx| this.queue.update(cx, |d, cx| d.cancel_manga(&mid, cx)))),
+                )
+                .into_any_element()
+        } else if missing.is_empty() && !cs.is_empty() {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .h(px(34.))
+                .px(px(12.))
+                .rounded(px(9.))
+                .border_1()
+                .border_color(Tokens::border())
+                .text_size(px(size::SM))
+                .text_color(Tokens::text_2())
+                .child(icon("icons/circle-check.svg", Tokens::accent(), 15.))
+                .child("All chapters downloaded")
+                .into_any_element()
+        } else if missing.is_empty() {
+            div().into_any_element()
+        } else {
+            let all: HashSet<String> = missing.iter().map(|c| c.id.clone()).collect();
+            let unread_ids: HashSet<String> = missing.iter().filter(|c| !c.is_read).map(|c| c.id.clone()).collect();
+            let n = missing.len();
+            let label = if downloaded == 0 { format!("Download all {n} chapters") } else { format!("Download {n} more") };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .when(missing_unread > 0 && missing_unread < n, |d| {
+                    d.child(
+                        button("dl-unread", format!("Unread ({missing_unread})"), ButtonKind::Ghost)
+                            .tooltip(|w, cx| gpui_kit::component::tooltip::Tooltip::new("Download only unread chapters").build(w, cx))
+                            .on_click(cx.listener(move |this, _, _, cx| this.download(unread_ids.clone(), cx))),
+                    )
+                })
+                .child(
+                    button("dl-all", label, ButtonKind::Primary)
+                        .h(px(34.))
+                        .px(px(14.))
+                        .child(icon("icons/download.svg", Tokens::base(), 15.))
+                        .flex_row_reverse()
+                        .on_click(cx.listener(move |this, _, _, cx| this.download(all.clone(), cx))),
+                )
+                .into_any_element()
+        };
+
+        let filters = div()
             .flex()
             .items_center()
             .gap(px(4.))
-            .h(px(48.))
-            .mx(px(size::PAGE_X))
+            .h(px(44.))
             .border_b_1()
             .border_color(Tokens::border())
-            .child(div().flex_1().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(count))
-            .when(self.refreshing, |d| d.child(div().mr(px(6.)).child(spinner("refresh-spin", 16.))))
             .child(tool_button("f-unread", "icons/eye-off.svg", "Unread", v.unread_only).on_click(cx.listener(move |this, _, _, cx| {
                 this.set_view(ChapterView { unread_only: !v.unread_only, ..v }, cx)
             })))
@@ -604,15 +739,44 @@ impl DetailPage {
                     if v.newest_first { "Newest first" } else { "Oldest first" },
                     false,
                 )
+                .tooltip(|w, cx| gpui_kit::component::tooltip::Tooltip::new("Reverse the chapter order").build(w, cx))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_view(ChapterView { newest_first: !v.newest_first, ..v }, cx))),
             )
+            .child(div().flex_1())
+            .when(self.refreshing, |d| d.child(div().mr(px(6.)).child(spinner("refresh-spin", 16.))))
             .when(!cs.is_empty(), |d| {
                 let ids: Vec<String> = cs.iter().map(|c| c.id.clone()).collect();
                 d.child(
                     tool_button("mark-all", if all_read { "icons/rotate-ccw.svg" } else { "icons/check-check.svg" }, if all_read { "Mark all unread" } else { "Mark all read" }, false)
                         .on_click(cx.listener(move |this, _, _, cx| this.set_read(ids.clone(), !all_read, cx))),
                 )
-            })
+            });
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .px(px(size::PAGE_X))
+            .pt(px(6.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .pb(px(6.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_baseline()
+                            .gap(px(10.))
+                            .child(div().text_size(px(size::XL)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Chapters"))
+                            .child(div().truncate().text_size(px(size::SM)).text_color(Tokens::text_3()).child(stats.join("  ·  "))),
+                    )
+                    .child(download),
+            )
+            .child(filters)
     }
 
     fn empty_chapters(&self, cs: &[Chapter], cx: &mut Context<Self>) -> Div {
@@ -647,6 +811,7 @@ impl DetailPage {
         }
         let progress = (!c.is_read && c.read_progress > 0).then(|| format!("Page {}", c.read_progress + 1));
         let downloaded = c.download_status == "complete";
+        let dl = self.queue.read(cx).status(&c.id);
         let hovered = self.hovered.as_deref() == Some(c.id.as_str());
         let (hid, rid) = (c.id.clone(), c.id.clone());
         let read = c.is_read;
@@ -702,7 +867,6 @@ impl DetailPage {
                         )
                     }),
             )
-            .when(downloaded, |d| d.child(icon("icons/circle-check.svg", Tokens::text_3(), 16.)))
             .when(hovered, |d| {
                 d.child(
                     icon_tip(SharedString::from(format!("mr-{}", c.id)), if read { "icons/rotate-ccw.svg" } else { "icons/check.svg" }, if read { "Mark unread" } else { "Mark read" })
@@ -712,6 +876,56 @@ impl DetailPage {
                         })),
                 )
             })
+            .child(self.download_control(c, downloaded, dl, cx))
+    }
+
+    /// Per-chapter download state at the end of a row (Tachiyomi style): download, queued,
+    /// progress, or downloaded (click to delete).
+    fn download_control(&self, c: &Chapter, downloaded: bool, dl: Option<ChapterDl>, cx: &mut Context<Self>) -> AnyElement {
+        let id = SharedString::from(format!("dlc-{}", c.id));
+        let base = |id: SharedString| {
+            div().id(id).flex().flex_none().items_center().justify_center().gap(px(4.)).h(px(32.)).min_w(px(32.)).rounded(px(8.)).cursor_pointer().hover(|s| s.bg(Tokens::hover()))
+        };
+        match dl {
+            Some(ChapterDl::Active(f)) => div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .gap(px(6.))
+                .h(px(32.))
+                .min_w(px(32.))
+                .child(spinner(SharedString::from(format!("dls-{}", c.id)), 15.))
+                .child(div().text_size(px(size::XS)).text_color(Tokens::accent()).child(format!("{}%", (f * 100.).round())))
+                .into_any_element(),
+            Some(ChapterDl::Queued) => base(id)
+                .tooltip(|w, cx| gpui_kit::component::tooltip::Tooltip::new("Queued for download").build(w, cx))
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(icon("icons/clock.svg", Tokens::text_3(), 15.))
+                .into_any_element(),
+            None if downloaded => {
+                let cid = c.id.clone();
+                base(id)
+                    .tooltip(|w, cx| gpui_kit::component::tooltip::Tooltip::new("Downloaded · click to delete").build(w, cx))
+                    .child(icon("icons/circle-check.svg", Tokens::accent(), 16.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.delete_download(cid.clone(), cx);
+                    }))
+                    .into_any_element()
+            }
+            None => {
+                let cid = c.id.clone();
+                base(id)
+                    .tooltip(|w, cx| gpui_kit::component::tooltip::Tooltip::new("Download").build(w, cx))
+                    .child(icon("icons/arrow-down-to-line.svg", Tokens::text_3(), 16.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.download(HashSet::from([cid.clone()]), cx);
+                    }))
+                    .into_any_element()
+            }
+        }
     }
 
     /// Floating Resume / Start button (always reachable while scrolling the chapter list).
@@ -801,6 +1015,7 @@ fn back_label(cx: &App) -> Option<SharedString> {
         Route::Browse => "Back to Browse",
         Route::Library => "Back to Library",
         Route::MangaHistory => "Back to History",
+        Route::MangaDownloads => "Back to Downloads",
         Route::Settings { .. } => "Back to Settings",
         _ => "Back",
     };

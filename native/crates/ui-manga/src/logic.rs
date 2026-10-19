@@ -147,7 +147,7 @@ pub struct ChapterView {
 
 impl Default for ChapterView {
     fn default() -> Self {
-        Self { unread_only: false, downloaded_only: false, newest_first: true }
+        Self { unread_only: false, downloaded_only: false, newest_first: false }
     }
 }
 
@@ -335,6 +335,40 @@ pub fn day_label(day: NaiveDate, today: NaiveDate) -> String {
 }
 
 /// Web page for a title, when the source has a predictable URL.
+/// Source descriptions often carry markdown: `[text](url)` links become their text, and
+/// separator lines (`---`, `___`, dashes) and trailing blank lines are dropped.
+pub fn clean_description(desc: &str) -> String {
+    let mut out = String::with_capacity(desc.len());
+    let mut rest = desc;
+    while let Some(open) = rest.find('[') {
+        let Some(close) = rest[open..].find("](").map(|i| open + i) else { break };
+        let Some(end) = rest[close..].find(')').map(|i| close + i) else { break };
+        out.push_str(&rest[..open]);
+        out.push_str(&rest[open + 1..close]);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    let mut text = String::new();
+    let mut blank = false;
+    for l in out.lines().map(str::trim_end) {
+        let t = l.trim();
+        if !t.is_empty() && t.chars().all(|c| matches!(c, '-' | '_' | '*' | '=' | '—' | '–')) {
+            continue;
+        }
+        // Keep at most one blank line between paragraphs.
+        if t.is_empty() {
+            blank = true;
+            continue;
+        }
+        if !text.is_empty() {
+            text.push_str(if blank { "\n\n" } else { "\n" });
+        }
+        blank = false;
+        text.push_str(l);
+    }
+    text
+}
+
 pub fn web_url(source: &str, source_id: &str) -> Option<String> {
     if source_id.starts_with("http://") || source_id.starts_with("https://") {
         return Some(source_id.to_string());
@@ -530,7 +564,9 @@ mod tests {
     fn chapter_views_and_steps() {
         let mut cs = vec![chapter(Some(1.), true, 0), chapter(Some(2.), false, 3), chapter(Some(2.), false, 0), chapter(Some(3.), false, 0)];
         cs[3].download_status = "complete".into();
-        assert_eq!(visible_chapters(&cs, ChapterView::default()), vec![3, 2, 1, 0]);
+        assert_eq!(visible_chapters(&cs, ChapterView::default()), vec![0, 1, 2, 3]);
+        let v = ChapterView { newest_first: true, ..Default::default() };
+        assert_eq!(visible_chapters(&cs, v), vec![3, 2, 1, 0]);
         let v = ChapterView { unread_only: true, downloaded_only: false, newest_first: false };
         assert_eq!(visible_chapters(&cs, v), vec![1, 2, 3]);
         let v = ChapterView { unread_only: false, downloaded_only: true, newest_first: false };
@@ -556,6 +592,8 @@ mod tests {
         assert_eq!(day_label(NaiveDate::from_ymd_opt(2024, 5, 7).unwrap(), today), "Tuesday");
         assert_eq!(day_label(NaiveDate::from_ymd_opt(2024, 3, 2).unwrap(), today), "March 2");
         assert_eq!(day_label(NaiveDate::from_ymd_opt(2023, 3, 2).unwrap(), today), "March 2, 2023");
+        assert_eq!(clean_description("Intro\n\n---\n- [Official LN](https://x.y/z) here\n\n\n"), "Intro\n\n- Official LN here");
+        assert_eq!(clean_description("no [link"), "no [link");
         assert_eq!(web_url("mangadex", "abc").as_deref(), Some("https://mangadex.org/title/abc"));
         assert_eq!(web_url("x", "https://a/b").as_deref(), Some("https://a/b"));
         assert_eq!(web_url("x", "id"), None);
