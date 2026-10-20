@@ -264,6 +264,78 @@ pub fn start_read(reg: Arc<Registry>, model: ModelChoice, label: String, chapter
     true
 }
 
+/// How a run that Generate waited for ended.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    Done,
+    Cancelled,
+    Failed(String),
+}
+
+/// Waits until no AI run is going (one at a time, app-wide), then claims the slot. `None` when
+/// `stop` said to give up while waiting.
+async fn claim(kind: RunKind, label: &str, stop: &impl Fn() -> bool) -> Option<CancellationToken> {
+    loop {
+        if stop() {
+            return None;
+        }
+        if let Some(t) = begin(kind, label.to_string(), 1) {
+            return Some(t);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+fn outcome(res: &anyhow::Result<()>, cancel: &CancellationToken) -> Outcome {
+    match res {
+        Ok(()) => Outcome::Done,
+        Err(_) if cancel.is_cancelled() => Outcome::Cancelled,
+        Err(e) => Outcome::Failed(format!("{e:#}")),
+    }
+}
+
+/// Generate's Read step: reads one chapter (continuing where an earlier read stopped) and saves
+/// its transcript, shown in Activity like any read. Returns when it ended.
+pub async fn read_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch: ChapterRef, stop: impl Fn() -> bool) -> Outcome {
+    let Some(cancel) = claim(RunKind::Read, &label, &stop).await else { return Outcome::Cancelled };
+    update(|r| {
+        r.chapter = Some(ch.label.clone());
+        r.chapter_id = Some(ch.chapter_id.clone());
+        r.chapter_pos = (1, 1);
+        r.log(format!("Generate · {} · {} with {label}", ch.manga_title, ch.label));
+    });
+    let brain = brain(&ch.manga_id, &ch.manga_title);
+    let res = match mv_recap::read_chapter(reg, model, ch.clone(), brain, ReadOptions { force: false, pages: None }, progress_fn(), cancel.clone()).await {
+        Ok(read) => mv_recap::update_transcript(&ch, &read).map(|_| ()),
+        Err(e) => Err(e),
+    };
+    let out = outcome(&res, &cancel);
+    finish(res, &cancel);
+    out
+}
+
+/// Generate's Story step: writes and exports one chapter's narration.
+pub async fn story_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch: ChapterRef, styles: Vec<String>, stop: impl Fn() -> bool) -> Outcome {
+    let Some(cancel) = claim(RunKind::Story, &label, &stop).await else { return Outcome::Cancelled };
+    update(|r| {
+        r.chapter = Some(format!("{} · {}", ch.manga_title, ch.label));
+        r.chapter_id = Some(ch.chapter_id.clone());
+        r.chapter_pos = (1, 1);
+        r.log(format!("Generate · writing the story of {} with {label}", ch.label));
+    });
+    let brain = brain(&ch.manga_id, &ch.manga_title);
+    let res = match mv_recap::write_story(reg, model, vec![ch.clone()], styles, brain, progress_fn(), cancel.clone()).await {
+        Ok(stories) => match stories.into_iter().find(|(id, _)| *id == ch.chapter_id) {
+            Some((_, story)) => mv_recap::export_for_pipeline(&ch, &story),
+            None => Err(anyhow::anyhow!("The AI wrote no story for {}", ch.label)),
+        },
+        Err(e) => Err(e),
+    };
+    let out = outcome(&res, &cancel);
+    finish(res, &cancel);
+    out
+}
+
 /// Re-reads single pages of one chapter (e.g. after the user asks to fix a page).
 pub fn start_read_pages(reg: Arc<Registry>, model: ModelChoice, label: String, ch: ChapterRef, pages: Vec<usize>) -> bool {
     let Some(cancel) = begin(RunKind::Read, label, 1) else { return false };

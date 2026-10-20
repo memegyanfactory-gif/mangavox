@@ -192,6 +192,10 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
     if req.video && music.enabled && mv_score::is_fresh(&r, &music) {
         job.video_config["score"] = json!(mv_score::score_wav(&r).to_string_lossy());
     }
+    // The chapter's caption style (its own, else the Studio default; see `video`).
+    if req.video {
+        job.video_config["subtitles"] = crate::video::subtitle_config_for(ch);
+    }
     job.ocr_engine = env.ocr_engine.clone();
     if matches!(env.ocr, OcrProvider::Local | OcrProvider::Unavailable { .. }) {
         // Without an Ollama model the worker falls through to the local OCR engines.
@@ -351,17 +355,28 @@ fn apply_to(job: &mut JobInfo, ev: JobEvent) -> Option<(String, String)> {
 /// Queues one pipeline job per chapter, skipping chapters that already have an
 /// unfinished job. Returns how many were queued.
 pub fn enqueue(env: &Env, req: &NarrationRequest, chapters: &[ChapterItem]) -> anyhow::Result<usize> {
+    enqueue_with(env, req, chapters, None).map(|ids| ids.len())
+}
+
+/// [`enqueue`] that returns the new jobs' ids, with `video_extra` merged into each job's video
+/// settings (Generate's answers, e.g. `{"captions": false}`).
+pub fn enqueue_with(env: &Env, req: &NarrationRequest, chapters: &[ChapterItem], video_extra: Option<&serde_json::Value>) -> anyhow::Result<Vec<u64>> {
     let (Ok(python), Ok(layout)) = (&env.python, &env.scripts) else {
         anyhow::bail!("Python and the pipeline scripts are required");
     };
     let inner = ensure(python, layout);
-    let mut added = 0;
+    let mut added = vec![];
     for ch in chapters {
         let busy = lock_jobs(&inner).iter().any(|j| j.chapter_id == ch.id && !j.state.finished());
         if busy {
             continue;
         }
-        let job = build_job(req, env, ch);
+        let mut job = build_job(req, env, ch);
+        if let (Some(serde_json::Value::Object(extra)), Some(cfg)) = (video_extra, job.video_config.as_object_mut()) {
+            for (k, v) in extra {
+                cfg.insert(k.clone(), v.clone());
+            }
+        }
         let stages = job.stages.clone();
         // Hold the lock across enqueue so the pump cannot see events before the record exists.
         let mut jobs = lock_jobs(&inner);
@@ -382,10 +397,15 @@ pub fn enqueue(env: &Env, req: &NarrationRequest, chapters: &[ChapterItem]) -> a
             narrator: None,
             regen_pages: req.regen_pages.clone(),
         });
-        added += 1;
+        added.push(id);
     }
     bump();
     Ok(added)
+}
+
+/// One job by id.
+pub fn job(id: u64) -> Option<JobInfo> {
+    current().and_then(|i| lock_jobs(&i).iter().find(|j| j.id == id).cloned())
 }
 
 pub fn cancel(id: u64) -> bool {
@@ -466,6 +486,7 @@ mod tests {
         assert_eq!(job.tts_config["speed"], 1.1);
         assert_eq!(job.video_config["resolution"], "720p");
         assert_eq!(job.video_config["format"], "reels");
+        assert!(job.video_config["subtitles"].is_object(), "a render carries the chapter's caption setting");
         assert_eq!(job.output_dir, PathBuf::from("/lib/m/c1/pipeline"));
         assert!(!job.ollama_url.is_empty());
 

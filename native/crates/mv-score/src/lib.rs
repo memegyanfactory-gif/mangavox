@@ -2,13 +2,15 @@
 //! the user - nothing licensed from anyone, nothing to be claimed.
 //!
 //! SPOT (cue sheet from the Read phase's scenes and the narration timing, optionally refined by the AI)
-//! -> COMPOSE (notes on fixed DAW-style tracks: pads, keys, lead, bass, drums, hits & risers, SFX)
+//! -> COMPOSE (one genre preset per cue - phonk, epic orchestral, dark tension, horror, sad piano,
+//! lo-fi, mystery - as notes on fixed DAW-style tracks: pads, keys, lead, bass, drums, hits & risers, SFX)
 //! -> RENDER (built-in synth, or the optional orchestra SoundFont) -> MASTER (loudness set against the
 //! narration, ducked under the voice, peak-limited) -> `score.wav`, which the video stage mixes in.
 
 pub mod ai;
 pub mod chapter;
 mod compose;
+pub mod demo;
 pub mod mix;
 mod model;
 pub mod orchestra;

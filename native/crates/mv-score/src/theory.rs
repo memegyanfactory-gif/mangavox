@@ -36,19 +36,21 @@ pub fn chord(root_midi: i32, mode: &str, deg: i32, seventh: bool) -> Vec<i32> {
     v
 }
 
-/// Chord progressions (scale degrees, 0 = tonic) that suit a style, one chord per bar.
+/// Chord progressions (scale degrees, 0 = tonic) that suit a genre, one chord per bar.
 pub fn progressions(style: crate::Style) -> &'static [&'static [i32]] {
     use crate::Style::*;
     match style {
-        // i - VI - III - VII: the anime battle staple; i - iv - VI - V for drive.
-        Action | Epic => &[&[0, 5, 2, 6], &[0, 3, 5, 4], &[0, 5, 6, 4], &[5, 6, 0, 0]],
-        Tense | Mystery => &[&[0, 0, 1, 0], &[0, 5, 0, 1], &[0, 3, 0, 5]],
-        Emotional => &[&[0, 5, 2, 6], &[5, 3, 0, 4], &[0, 3, 5, 4], &[3, 4, 2, 5]],
-        Romance => &[&[0, 4, 5, 3], &[3, 4, 2, 5], &[0, 5, 3, 4]],
-        Comedy => &[&[0, 3, 4, 0], &[0, 5, 3, 4], &[0, 1, 4, 0]],
-        Calm => &[&[0, 3, 0, 4], &[0, 5, 3, 4], &[3, 0, 4, 0]],
-        Flashback => &[&[0, 5, 3, 4], &[0, 2, 5, 4]],
-        Reveal => &[&[0, 1, 0, 5], &[0, 5, 1, 0]],
+        // i - VI - III - VII: the anime / trailer staple; i - VI - iv - V for drive.
+        Epic => &[&[0, 5, 2, 6], &[0, 5, 3, 4], &[0, 5, 6, 4], &[5, 6, 0, 0]],
+        // Phonk loops sit on the tonic with a half-step neighbour (Phrygian bII) or the VI.
+        Phonk => &[&[0, 0, 1, 0], &[0, 0, 5, 1], &[0, 5, 0, 1], &[0, 0, 5, 6]],
+        Tension => &[&[0, 0, 5, 0], &[0, 5, 0, 1], &[0, 3, 0, 5]],
+        Horror => &[&[0, 0, 1, 0], &[0, 1, 0, 0]],
+        Mystery => &[&[0, 3, 0, 4], &[0, 5, 3, 4], &[0, 1, 0, 4]],
+        // i - VI - III - VII and i - iv - VI - V: the sad-piano loops.
+        Sad => &[&[0, 5, 2, 6], &[5, 3, 0, 4], &[0, 3, 5, 4], &[0, 5, 3, 4]],
+        // ii - V - I - vi style turnarounds for lo-fi 7th chords.
+        Lofi => &[&[1, 4, 0, 5], &[3, 4, 2, 5], &[0, 5, 1, 4], &[3, 2, 1, 4]],
     }
 }
 

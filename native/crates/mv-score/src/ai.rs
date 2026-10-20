@@ -15,8 +15,10 @@ use crate::model::{Direction, Style};
 const SYSTEM: &str = "You are a film composer spotting a manga recap video for its music score. \
 For each page you get its scene kind, mood, intensity (0-10) and a summary. Decide the musical arc across the whole chapter: \
 build-ups before big moments, a held breath (drop) right before a reveal, a hit where a fight or shock lands, \
-quiet beds for dialogue and calm. Styles: action, epic, tense, mystery, emotional, romance, comedy, calm, flashback, reveal. \
-Reply with JSON only: {\"pages\":[{\"page\":0,\"style\":\"calm\",\"energy\":3,\"hit\":false,\"drop\":false}, ...]} with one entry per page given. \
+quiet beds for dialogue. Styles (the genres recap channels use): phonk (fights, cocky or badass moments), \
+epic (orchestral + choir: power-ups, climaxes, big reveals), tension (dark cinematic bed: danger, schemes), horror (drones: monsters, dread), \
+sad (piano + strings: loss, romance, flashbacks), lofi (comedy, daily life), mystery (secrets, investigation, neutral narration). \
+Reply with JSON only: {\"pages\":[{\"page\":0,\"style\":\"mystery\",\"energy\":3,\"hit\":false,\"drop\":false}, ...]} with one entry per page given. \
 Use \"hit\" sparingly (a few per chapter) and \"drop\" only on the page of a reveal.";
 
 fn truncate(s: &str, max: usize) -> String {
@@ -50,11 +52,7 @@ pub fn parse_directions(v: &Value) -> Vec<Direction> {
 
 pub async fn spot(reg: Arc<Registry>, model: ModelChoice, ch: ChapterRef, cancel: CancellationToken) -> Result<Vec<Direction>> {
     let read = load_read(&ch).filter(|r| !r.pages.is_empty()).ok_or_else(|| anyhow!("Read the chapter first."))?;
-    let pages: Vec<String> = read
-        .pages
-        .iter()
-        .map(|p| format!("page {}: [{}; {}; intensity {}] {}", p.index, p.scene.kind, p.scene.mood, p.scene.intensity, truncate(&p.summary, 180)))
-        .collect();
+    let pages: Vec<String> = read.pages.iter().map(|p| format!("page {}: [{}; {}; intensity {}] {}", p.index, p.scene.kind, p.scene.mood, p.scene.intensity, truncate(&p.summary, 180))).collect();
     static N: AtomicU64 = AtomicU64::new(0);
     let req = AiStepRequest {
         request_id: format!("score-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)),
@@ -92,7 +90,7 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"pages":[{"page":0,"style":"Calm","energy":2},{"page":1,"style":"weird","energy":14,"hit":true},{"style":"epic"}]}"#).unwrap();
         let d = parse_directions(&v);
         assert_eq!(d.len(), 2);
-        assert_eq!(d[0].style, Some(Style::Calm));
+        assert_eq!(d[0].style, Some(Style::Lofi), "old style names map onto the genres");
         assert_eq!(d[1].style, None);
         assert_eq!(d[1].energy, Some(10.0));
         assert!(d[1].hit);

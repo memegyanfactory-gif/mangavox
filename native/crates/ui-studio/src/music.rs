@@ -1,12 +1,14 @@
-//! The Music step: the chapter's own score (mv-score) shown like a small DAW - cues on a timeline, the
-//! energy curve, one lane per track with mute / solo / level - with per-cue mood overrides, new
-//! variations, the optional AI spotting pass and the orchestra download.
+//! The Music step: the chapter's own score (mv-score). Up top the few choices most people need - a
+//! music style (auto from the story, or one genre with a preview of each), energy, how many sound
+//! effects, level and ducking - then the score shown like a small DAW: cues on a timeline, the energy
+//! curve, one lane per track with mute / solo / level, per-cue genre overrides and new variations,
+//! the optional AI spotting pass and the orchestra download.
 use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_score::{orchestra, Instrument, Level, MusicSettings, Role, Score, Strip, Style};
+use mv_score::{orchestra, Instrument, Level, MusicSettings, Role, Score, SfxAmount, Strip, Style};
 use mv_studio::voices::DownloadState;
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
@@ -34,9 +36,13 @@ pub(crate) struct MusicState {
     pub composing: Vec<String>,
     pub cue: Option<usize>,
     pub report: Option<String>,
+    /// The genre whose preview is being generated.
+    pub previewing: Option<Style>,
 }
 
 const DUCKS: [(&str, f32); 3] = [("Light", 5.0), ("Normal", 8.0), ("Strong", 12.0)];
+/// The energy setting's steps (0 chill .. 1 hyped; 0.5 follows the story as read).
+const ENERGY: [(&str, f32); 5] = [("Chill", 0.0), ("Calm", 0.25), ("As the story", 0.5), ("Intense", 0.75), ("Hyped", 1.0)];
 const LANE_LABEL_W: f32 = 236.;
 const LANE_H: f32 = 28.;
 
@@ -44,17 +50,19 @@ const LANE_H: f32 = 28.;
 /// timeline follows the theme's category palette instead of raw hex.
 fn style_look(s: Style) -> (Hue, Ph) {
     match s {
-        Style::Action => (Hue::Rose, ph::LIGHTNING),
+        Style::Tension => (Hue::Violet, ph::EYE),
         Style::Epic => (Hue::Orange, ph::CROWN_SIMPLE),
-        Style::Tense => (Hue::Violet, ph::HEARTBEAT),
+        Style::Phonk => (Hue::Rose, ph::FIRE),
+        Style::Sad => (Hue::Cyan, ph::MASK_SAD),
+        Style::Lofi => (Hue::Amber, ph::SMILEY),
+        Style::Horror => (Hue::Slate, ph::GHOST),
         Style::Mystery => (Hue::Blue, ph::DETECTIVE),
-        Style::Emotional => (Hue::Cyan, ph::MASK_SAD),
-        Style::Romance => (Hue::Rose, ph::HEART),
-        Style::Comedy => (Hue::Amber, ph::SMILEY),
-        Style::Calm => (Hue::Green, ph::CLOUD),
-        Style::Flashback => (Hue::Slate, ph::CLOCK_COUNTER_CLOCKWISE),
-        Style::Reveal => (Hue::Cyan, ph::EYE),
     }
+}
+
+/// Whether the genre's preview is what is playing now.
+fn preview_playing(st: Style) -> bool {
+    audio::now_playing().and_then(|p| p.file_name().map(|n| n.to_string_lossy().starts_with(&format!("mangavox-genre-{}-", st.key())))).unwrap_or(false)
 }
 
 /// Icon per mixer lane.
@@ -100,6 +108,7 @@ impl StudioPage {
             settings,
             busy: self.music.busy.take(),
             composing: std::mem::take(&mut self.music.composing),
+            previewing: self.music.previewing.take(),
             ..Default::default()
         };
     }
@@ -265,6 +274,34 @@ impl StudioPage {
         cx.notify();
     }
 
+    /// Plays a short generated demo of a genre (made on first use, then cached); stops it when it is
+    /// already playing.
+    fn preview_style(&mut self, st: Style, cx: &mut Context<Self>) {
+        if preview_playing(st) {
+            audio::stop();
+            return cx.notify();
+        }
+        if self.music.previewing.is_some() {
+            return;
+        }
+        self.music.previewing = Some(st);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::run(async move { tokio::task::spawn_blocking(move || mv_score::demo::preview_wav(st)).await }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.music.previewing = None;
+                match res {
+                    Ok(Ok(Ok(p))) => audio::play(&p),
+                    Ok(Ok(Err(e))) => this.fail(format!("Could not make the {} preview: {e:#}", st.label())),
+                    Ok(Err(e)) => this.fail(format!("Could not make the {} preview: {e}", st.label())),
+                    Err(e) => this.fail(format!("Could not make the {} preview: {e:#}", st.label())),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn download_orchestra(&mut self, cx: &mut Context<Self>) {
         mv_ui::bg::runtime().spawn(async {
             let _ = orchestra::run_download().await;
@@ -298,12 +335,15 @@ impl StudioPage {
         self.music_sync();
         let f = self.focus.as_ref().expect("focus");
         let has_audio = f.status.audio_files > 0;
+        let has_read = f.status.read_pages > 0;
         let s = self.music.settings.clone();
         // Busy only for the chapters being scored (a batch compose keeps running when the
         // focus moves on).
         let busy = self.music.busy.clone().filter(|_| self.composing_focus());
         let level_ix = Level::ALL.iter().position(|l| *l == s.level).unwrap_or(1);
         let duck_ix = DUCKS.iter().position(|(_, db)| (s.duck_db - db).abs() < 0.1).unwrap_or(1);
+        let energy_ix = ENERGY.iter().enumerate().min_by(|a, b| (a.1 .1 - s.energy).abs().total_cmp(&(b.1 .1 - s.energy).abs())).map(|(i, _)| i).unwrap_or(2);
+        let sfx_ix = SfxAmount::ALL.iter().position(|a| *a == s.sfx).unwrap_or(1);
         let row = |icon: Ph, label: &'static str, hint: &'static str, control: AnyElement| {
             div()
                 .flex()
@@ -363,7 +403,32 @@ impl StudioPage {
             .gap(px(space::SM))
             .child(head)
             .when(s.enabled, |d| {
-                d.child(row(
+                d.child(self.style_picker(&s, cx))
+                    .child(row(
+                        ph::SPEEDOMETER,
+                        "Energy",
+                        "Calmer or more intense than the story reads: tempo, drums and layers follow",
+                        segmented("music-energy", ENERGY.map(|(n, _)| n), energy_ix)
+                            .small()
+                            .on_change(cx.listener(|this, ix: &usize, _, cx| {
+                                let v = ENERGY[(*ix).min(ENERGY.len() - 1)].1;
+                                this.music_edit(cx, |s| s.energy = v)
+                            }))
+                            .into_any_element(),
+                    ))
+                    .child(row(
+                        ph::LIGHTNING,
+                        "Sound effects",
+                        "Whooshes on scene changes, impacts and a heartbeat on reveals, hits in fights, the manga's own SFX",
+                        segmented("music-sfx", SfxAmount::ALL.map(|a| a.label()), sfx_ix)
+                            .small()
+                            .on_change(cx.listener(|this, ix: &usize, _, cx| {
+                                let a = SfxAmount::ALL[(*ix).min(SfxAmount::ALL.len() - 1)];
+                                this.music_edit(cx, |s| s.sfx = a)
+                            }))
+                            .into_any_element(),
+                    ))
+                .child(row(
                     ph::GAUGE,
                     "Level",
                     "How present the music is overall",
@@ -384,17 +449,6 @@ impl StudioPage {
                         .on_change(cx.listener(|this, ix: &usize, _, cx| {
                             let db = DUCKS[(*ix).min(DUCKS.len() - 1)].1;
                             this.music_edit(cx, |s| s.duck_db = db)
-                        }))
-                        .into_any_element(),
-                ))
-                .child(row(
-                    ph::LIGHTNING,
-                    "Sound effects",
-                    "Hits, whooshes and impacts on fights and reveals",
-                    switch("music-sfx", s.sfx)
-                        .on_click(cx.listener(|this, on: &bool, _, cx| {
-                            let on = *on;
-                            this.music_edit(cx, |s| s.sfx = on)
                         }))
                         .into_any_element(),
                 ))
@@ -420,7 +474,7 @@ impl StudioPage {
                 .child(empty_view(
                     glyphs::MUSIC,
                     "No score yet",
-                    "Compose one: it follows each scene's mood and intensity, builds into fights, drops before reveals and stays under the narration. It is generated on this PC, so the music is yours.",
+                    "Compose one the way recap channels score a chapter: phonk for fights, epic orchestra for climaxes, dark beds for tension, sad piano, lo-fi for comedy. It builds into fights, drops before reveals, adds whooshes and impacts, and stays under the narration. It is generated on this PC, so the music is yours.",
                 ))
                 .into_any_element(),
         };
@@ -430,9 +484,15 @@ impl StudioPage {
             .gap(px(space::LG))
             .max_w(px(1100.))
             .when(!has_audio, |d| {
-                d.child(inline_alert(AlertKind::Warning, "Narrate the chapter first", "The score is timed to the narration.").action(
+                d.child(inline_alert(AlertKind::Warning, "Narrate the chapter first", "The score is timed to the narration, so it can only be composed once the Audio step is done.").action(
                     "Go to Audio",
                     cx.listener(|this, _: &ClickEvent, _, cx| this.set_phase(Phase::Audio, cx)),
+                ))
+            })
+            .when(has_audio && !has_read && s.enabled && s.genre.is_none(), |d| {
+                d.child(inline_alert(AlertKind::Info, "Read the chapter for music that follows the story", "Without the Read step every page counts as quiet narration, so Auto scores it all as Mystery. Read it, or pick a style below.").action(
+                    "Go to Read",
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.set_phase(Phase::Read, cx)),
                 ))
             })
             .when(stale, |d| {
@@ -446,6 +506,104 @@ impl StudioPage {
                 d.child(div().flex().items_start().gap(px(space::SM)).child(icon_ph(ph::INFO, Tokens::text_3(), icon_px::SM)).child(div().flex_1().text_size(px(size::XS)).line_height(px(16.)).text_color(Tokens::text_3()).child(r)))
             })
             .child(body)
+            .into_any_element()
+    }
+
+    /// "Music style": Auto (a genre per scene from the story) or one genre for the whole chapter, each
+    /// with a play button for a short generated demo.
+    fn style_picker(&mut self, s: &MusicSettings, cx: &mut Context<Self>) -> AnyElement {
+        let previewing = self.music.previewing;
+        let tile = |id: SharedString, icon: Ph, hue: Hue, title: &'static str, blurb: &'static str, on: bool| {
+            div()
+                .id(id)
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap(px(space::SM))
+                .p(px(space::SM))
+                .rounded(px(radius::MD))
+                .border_1()
+                .border_color(if on { Tokens::accent() } else { Tokens::border() })
+                .bg(if on { Tokens::accent_soft() } else { Tokens::surface_2() })
+                .role(gpui_kit::Role::Button)
+                .aria_selected(on)
+                .pressable()
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size(px(30.))
+                        .rounded(px(radius::MD))
+                        .bg(Tokens::hue_soft(hue))
+                        .child(ph_icon(icon, if on { Weight::Fill } else { Weight::Regular }, Tokens::hue(hue), icon_px::SM)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(1.))
+                        .child(div().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(title))
+                        .child(div().text_size(px(size::XS)).line_height(px(15.)).text_color(Tokens::text_3()).child(blurb)),
+                )
+        };
+        let auto = div().flex().items_center().w(px(268.)).child(
+            tile("music-style-auto".into(), ph::MAGIC_WAND, Hue::Green, "Auto from the story", "A genre per scene: fights, climaxes, sad and calm stretches each get their own", s.genre.is_none())
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.music_edit(cx, |s| s.genre = None))),
+        );
+        let genres = Style::ALL.map(|st| {
+            let (hue, icon) = style_look(st);
+            let playing = preview_playing(st);
+            let making = previewing == Some(st);
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .w(px(268.))
+                .child(tile(SharedString::from(format!("music-style-{}", st.key())), icon, hue, st.label(), st.blurb(), s.genre == Some(st)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.music_edit(cx, |s| s.genre = Some(st)))))
+                .child(if making {
+                    div().flex_none().size(px(28.)).flex().items_center().justify_center().child(spinner(SharedString::from(format!("music-prev-busy-{}", st.key())), Tokens::accent(), icon_px::SM)).into_any_element()
+                } else {
+                    icon_button(SharedString::from(format!("music-prev-{}", st.key())), if playing { ph::STOP } else { ph::PLAY }, if playing { format!("Stop the {} preview", st.label()) } else { format!("Hear a short {} demo", st.label()) })
+                        .small()
+                        .selected(playing)
+                        .when(previewing.is_some(), |b| b.disabled("Another preview is being made"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.preview_style(st, cx)))
+                        .into_any_element()
+                })
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::SM))
+            .py(px(space::SM))
+            .border_t_1()
+            .border_color(Tokens::border())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(space::MD))
+                    .child(icon_ph(ph::MUSIC_NOTES, Tokens::text_3(), icon_px::MD))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(2.))
+                            .child(div().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child("Music style"))
+                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(match s.genre {
+                                None => "Auto picks a genre per scene, like recap channels do. Pick one to use it for the whole chapter; press play to hear it.".to_string(),
+                                Some(g) => format!("{} for the whole chapter (single cues can still be changed on the timeline).", g.label()),
+                            })),
+                    ),
+            )
+            .child(div().flex().flex_wrap().gap(px(space::SM)).child(auto).children(genres))
             .into_any_element()
     }
 
@@ -606,7 +764,7 @@ impl StudioPage {
                             } else if c.notes.is_empty() {
                                 vec![]
                             } else {
-                                let style = score.cues.get(c.cue).map(|q| q.style).unwrap_or(Style::Calm);
+                                let style = score.cues.get(c.cue).map(|q| q.style).unwrap_or(Style::Mystery);
                                 let hue = style_look(style).0;
                                 let end = c.notes.iter().map(|n| n.t + n.dur).fold(c.start, f64::max).min(c.end);
                                 vec![div()
@@ -687,7 +845,7 @@ impl StudioPage {
         if let Some(c) = selected.and_then(|i| score.cues.get(i)).cloned() {
             card = card.child(self.cue_panel(&c, cx));
         } else {
-            card = card.child(muted("Select a cue to change its mood or try a new variation.").mt(px(space::XS)));
+            card = card.child(muted("Select a cue to change its genre or try a new variation.").mt(px(space::XS)));
         }
         card.into_any_element()
     }
@@ -707,6 +865,9 @@ impl StudioPage {
         }
         if c.riser_out {
             tags.push("Riser out");
+        }
+        if c.record_stop {
+            tags.push("Record stop in");
         }
         div()
             .mt(px(space::SM))
@@ -744,7 +905,7 @@ impl StudioPage {
                     )
                     .children(tags.into_iter().map(|t| tag(t, Tone::Neutral)))
                     .child(btn("cue-play", "Play from here", ButtonKind::Secondary).small().icon(ph::PLAY).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.play_from(start, cx))))
-                    .child(btn("cue-vary", "New variation", ButtonKind::Ghost).small().icon(ph::SHUFFLE).tooltip("Same mood, different notes").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    .child(btn("cue-vary", "New variation", ButtonKind::Ghost).small().icon(ph::SHUFFLE).tooltip("Same genre, different notes").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.music_edit(cx, |s| {
                             s.variations.insert(key, variation + 1);
                         })
@@ -760,7 +921,7 @@ impl StudioPage {
                     .flex_wrap()
                     .items_center()
                     .gap(px(6.))
-                    .child(div().flex().items_center().gap(px(6.)).mr(px(space::XS)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(icon_ph(ph::MASK_HAPPY, Tokens::text_3(), icon_px::SM)).child("Mood"))
+                    .child(div().flex().items_center().gap(px(6.)).mr(px(space::XS)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(icon_ph(ph::MASK_HAPPY, Tokens::text_3(), icon_px::SM)).child("Genre"))
                     .child(filter_chip("cue-auto", "Auto", forced.is_none()).icon(ph::MAGIC_WAND).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.music_edit(cx, |s| {
                             s.styles.remove(&key);

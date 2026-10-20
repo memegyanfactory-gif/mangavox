@@ -6,43 +6,130 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// The musical feel of a cue.
+/// The genre preset a cue is scored in: the beds manhwa / manga recap channels reach for
+/// (see `native/docs/design/music.md`). Cue styles from older `music.json` files still parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Style {
-    Action,
+    /// Dark cinematic bed: low string pulse, drones, ticking, sub swells.
+    #[serde(alias = "tense")]
+    Tension,
+    /// Epic orchestral / hybrid trailer: ostinato strings, brass, choir, taiko, braams.
+    #[serde(alias = "reveal")]
     Epic,
-    Tense,
+    /// Phonk / trap fight beat: distorted 808 with slides, trap hats with rolls, Memphis cowbell riff.
+    #[serde(alias = "action")]
+    Phonk,
+    /// Sad piano with strings swelling in.
+    #[serde(alias = "emotional", alias = "romance", alias = "flashback")]
+    Sad,
+    /// Lo-fi / light: Rhodes 7th chords, swung boom-bap, vinyl crackle; comedy and daily life.
+    #[serde(alias = "comedy", alias = "calm")]
+    Lofi,
+    /// Horror drone: dissonant clusters, tremolo, heartbeat, no clear pulse.
+    Horror,
+    /// Mystery: pizzicato ostinato, celesta motif, dark pad.
     Mystery,
-    Emotional,
-    Romance,
-    Comedy,
-    Calm,
-    Flashback,
-    Reveal,
 }
 
 impl Style {
-    pub const ALL: [Style; 10] =
-        [Style::Action, Style::Epic, Style::Tense, Style::Mystery, Style::Emotional, Style::Romance, Style::Comedy, Style::Calm, Style::Flashback, Style::Reveal];
+    pub const ALL: [Style; 7] = [Style::Tension, Style::Epic, Style::Phonk, Style::Sad, Style::Lofi, Style::Horror, Style::Mystery];
 
     pub fn label(self) -> &'static str {
         match self {
-            Style::Action => "Action",
-            Style::Epic => "Epic",
-            Style::Tense => "Tense",
+            Style::Tension => "Dark Tension",
+            Style::Epic => "Epic Orchestral",
+            Style::Phonk => "Phonk Fight",
+            Style::Sad => "Sad Piano",
+            Style::Lofi => "Lo-fi Light",
+            Style::Horror => "Horror Drone",
             Style::Mystery => "Mystery",
-            Style::Emotional => "Emotional",
-            Style::Romance => "Romance",
-            Style::Comedy => "Comedy",
-            Style::Calm => "Calm",
-            Style::Flashback => "Flashback",
-            Style::Reveal => "Reveal",
         }
     }
 
+    /// One line on what it is for.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Style::Tension => "Low pulses and drones for danger, schemes and build-ups",
+            Style::Epic => "Strings, brass, choir and taiko for power-ups and climaxes",
+            Style::Phonk => "Distorted 808, cowbell riff and trap hats for fights",
+            Style::Sad => "Piano with strings swelling in for loss and goodbyes",
+            Style::Lofi => "Rhodes, swung beat and vinyl for comedy and daily life",
+            Style::Horror => "Dissonant drones and heartbeats for monsters and dread",
+            Style::Mystery => "Pizzicato and celesta for secrets and investigation",
+        }
+    }
+
+    /// Stable lowercase key (the serialized name).
+    pub fn key(self) -> &'static str {
+        match self {
+            Style::Tension => "tension",
+            Style::Epic => "epic",
+            Style::Phonk => "phonk",
+            Style::Sad => "sad",
+            Style::Lofi => "lofi",
+            Style::Horror => "horror",
+            Style::Mystery => "mystery",
+        }
+    }
+
+    /// Accepts the key, the label, or an older style name ("action", "calm", ...).
     pub fn parse(s: &str) -> Option<Style> {
-        Style::ALL.into_iter().find(|st| st.label().eq_ignore_ascii_case(s.trim()))
+        let t = s.trim().to_lowercase();
+        if let Some(st) = Style::ALL.into_iter().find(|st| st.key() == t || st.label().to_lowercase() == t) {
+            return Some(st);
+        }
+        Some(match t.as_str() {
+            "tense" | "dark" | "suspense" | "dark tension" => Style::Tension,
+            "action" | "fight" | "trap" | "drill" => Style::Phonk,
+            "reveal" | "orchestral" | "climax" => Style::Epic,
+            "emotional" | "romance" | "flashback" | "piano" => Style::Sad,
+            "comedy" | "calm" | "lo-fi" | "light" => Style::Lofi,
+            "drone" | "scary" => Style::Horror,
+            _ => return None,
+        })
+    }
+}
+
+/// How many sound effects the score adds on top of the music.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SfxAmount {
+    Off,
+    Subtle,
+    Punchy,
+}
+
+impl SfxAmount {
+    pub const ALL: [SfxAmount; 3] = [SfxAmount::Off, SfxAmount::Subtle, SfxAmount::Punchy];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SfxAmount::Off => "Off",
+            SfxAmount::Subtle => "Subtle",
+            SfxAmount::Punchy => "Punchy",
+        }
+    }
+}
+
+/// Older `music.json` files stored `"sfx": true / false`.
+impl<'de> Deserialize<'de> for SfxAmount {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            B(bool),
+            S(String),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::B(true) => SfxAmount::Subtle,
+            Raw::B(false) => SfxAmount::Off,
+            Raw::S(s) => match s.to_lowercase().as_str() {
+                "off" => SfxAmount::Off,
+                "punchy" => SfxAmount::Punchy,
+                _ => SfxAmount::Subtle,
+            },
+        })
     }
 }
 
@@ -64,10 +151,10 @@ impl Role {
 
     pub fn label(self) -> &'static str {
         match self {
-            Role::Pads => "Pads & strings",
-            Role::Keys => "Keys",
+            Role::Pads => "Pads, strings & choir",
+            Role::Keys => "Keys & riffs",
             Role::Lead => "Lead",
-            Role::Bass => "Bass",
+            Role::Bass => "Bass & 808",
             Role::Drums => "Drums",
             Role::Fx => "Hits & risers",
             Role::Sfx => "Sound effects",
@@ -93,7 +180,10 @@ impl Role {
 #[serde(rename_all = "snake_case")]
 pub enum Instrument {
     Synth(Voice),
-    Gm { program: u8, fallback: Voice },
+    Gm {
+        program: u8,
+        fallback: Voice,
+    },
     /// One-shot drum / effect sounds, picked per note by [`Note::pitch`] (see `synth::Hit`).
     Kit,
 }
@@ -113,6 +203,20 @@ pub enum Voice {
     SubBass,
     PluckBass,
     Drone,
+    /// Seven detuned saws, the hybrid-trailer / phonk layer.
+    Supersaw,
+    /// Distorted 808 bass; follows [`Note::bend`] slides.
+    Bass808,
+    /// The Memphis / drift-phonk 808 cowbell, pitched.
+    Cowbell,
+    /// FM Rhodes-style electric piano.
+    EPiano,
+    /// Formant "aah" choir.
+    Choir,
+    /// Short filtered saw for pulsing ostinatos.
+    PulseBass,
+    /// Bowed tremolo cluster for horror.
+    Tremolo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -124,6 +228,19 @@ pub struct Note {
     pub pitch: u8,
     /// 0..1
     pub vel: f32,
+    /// Semitones the note starts away from `pitch` and slides in from (808 glides); 0 = none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bend: f32,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+impl Note {
+    pub fn new(t: f64, dur: f64, pitch: u8, vel: f32) -> Note {
+        Note { t, dur, pitch, vel, bend: 0.0 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,7 +253,7 @@ pub struct Clip {
     /// Seconds of fade at each end (0 = hard edge, e.g. into a hit).
     pub fade_in: f64,
     pub fade_out: f64,
-    /// Linear gain for this clip on top of the track level.
+    /// Linear gain for this clip relative to its track's place in the genre's mix.
     pub gain: f32,
 }
 
@@ -166,7 +283,7 @@ impl Track {
     }
 }
 
-/// A stretch of the recap scored with one feel.
+/// A stretch of the recap scored with one genre.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cue {
     pub index: usize,
@@ -181,12 +298,15 @@ pub struct Cue {
     pub mode: String,
     /// Average energy 0..10.
     pub energy: f32,
-    /// Hit (impact) on the first beat.
+    /// Impact (braam / boom) on the first beat.
     pub hit: bool,
     /// Music drops out just before this cue (a held breath before a reveal).
     pub drop_before: bool,
     /// A riser builds over the end of this cue into the next.
     pub riser_out: bool,
+    /// The music before this cue stops like a record (comedy beats).
+    #[serde(default)]
+    pub record_stop: bool,
 }
 
 impl Cue {
@@ -215,7 +335,8 @@ pub struct Score {
 }
 
 impl Score {
-    pub const VERSION: u32 = 1;
+    /// 2: genre presets (phonk, epic, ...), SFX library, per-cue mix.
+    pub const VERSION: u32 = 2;
     pub const ENERGY_STEP: f64 = 0.5;
 
     pub fn track(&self, role: Role) -> Option<&Track> {
@@ -247,7 +368,9 @@ impl Level {
         }
     }
 
-    /// Music loudness relative to the narration's, in LU, before ducking.
+    /// Music loudness relative to the narration's, in LU, before ducking. With the default 8 dB duck
+    /// "Normal" puts the bed about 15 LU under the voice while it speaks and 7 LU under in the gaps,
+    /// inside the 12-25 dB range mixing guides give for music under narration.
     pub fn offset_lu(self) -> f64 {
         match self {
             Level::Quiet => -11.0,
@@ -291,7 +414,12 @@ pub struct MusicSettings {
     pub level: Level,
     /// How far the music dips while the narrator speaks, in dB (positive).
     pub duck_db: f32,
-    pub sfx: bool,
+    /// Sound effects on transitions, reveals and fight hits.
+    pub sfx: SfxAmount,
+    /// One genre for the whole chapter; `None` = auto, picked per scene from the story.
+    pub genre: Option<Style>,
+    /// Energy bias, 0 (chill) .. 1 (hyped); 0.5 follows the story as read.
+    pub energy: f32,
     pub mixer: BTreeMap<Role, Strip>,
     /// Style forced from this page on (key = first page of the cue).
     pub styles: BTreeMap<usize, Style>,
@@ -309,7 +437,9 @@ impl Default for MusicSettings {
             enabled: true,
             level: Level::Normal,
             duck_db: 8.0,
-            sfx: true,
+            sfx: SfxAmount::Subtle,
+            genre: None,
+            energy: 0.5,
             mixer: BTreeMap::new(),
             styles: BTreeMap::new(),
             variations: BTreeMap::new(),
@@ -328,11 +458,16 @@ impl MusicSettings {
     pub fn track_gain(&self, role: Role) -> f32 {
         let any_solo = self.mixer.values().any(|s| s.solo);
         let s = self.strip(role);
-        if s.mute || (any_solo && !s.solo) || (role == Role::Sfx && !self.sfx) {
+        if s.mute || (any_solo && !s.solo) || (role == Role::Sfx && self.sfx == SfxAmount::Off) {
             0.0
         } else {
             db_to_gain(s.gain_db)
         }
+    }
+
+    /// The energy bias in energy points (-3 .. +3).
+    pub fn energy_shift(&self) -> f32 {
+        (self.energy.clamp(0.0, 1.0) - 0.5) * 6.0
     }
 }
 

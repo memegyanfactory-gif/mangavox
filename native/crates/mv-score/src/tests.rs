@@ -58,8 +58,8 @@ fn builds_a_mastered_score_that_follows_the_story() {
     let settings = MusicSettings::default();
     let (score, report) = chapter::build(&ch, &settings, true).unwrap();
     let styles: Vec<Style> = score.cues.iter().map(|c| c.style).collect();
-    assert!(styles.contains(&Style::Action) || styles.contains(&Style::Epic), "{styles:?}");
-    assert!(styles.contains(&Style::Reveal), "{styles:?}");
+    assert!(styles.contains(&Style::Phonk) || styles.contains(&Style::Epic), "{styles:?}");
+    assert!(score.cues.iter().any(|c| c.drop_before && c.hit), "the reveal drops then hits: {styles:?}");
     assert!(score.track(Role::Sfx).is_some_and(|t| !t.clips.is_empty()), "BOOM lettering became a sound effect");
     assert!(report.peak_db <= -5.9, "music leaves headroom for the voice: {report:?}");
     let (m, n) = (report.music_lufs.unwrap(), report.narration_lufs.unwrap());
@@ -132,4 +132,77 @@ fn music_reset_removes_every_score_file() {
     assert_eq!((kept.level, kept.use_ai), (Level::Quiet, true), "the music choices stay");
     assert!(kept.directions.is_empty(), "the AI cue sheet goes with the score");
     assert!(narration(&ch).len() == 6, "the narration it was built from stays");
+}
+
+/// Every genre preset renders a sane demo: audible, at the loudness asked, never over the ceiling.
+#[test]
+fn every_genre_demo_renders_clean() {
+    for style in Style::ALL {
+        let (score, bus) = crate::demo::render_demo(style, 12.0, 0.6, SfxAmount::Subtle, &None, -16.0);
+        assert!(score.cues.iter().all(|c| c.style == style));
+        assert!(bus.l.iter().chain(&bus.r).all(|v| v.is_finite()), "{style:?}");
+        let peak = bus.l.iter().chain(&bus.r).fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak <= db_to_gain(-1.0) + 1e-4, "{style:?} peak {peak}");
+        let l = crate::mix::loudness(&bus.l, &bus.r, crate::synth::SR).unwrap();
+        assert!((l + 16.0).abs() < 1.5, "{style:?} at {l} LUFS");
+    }
+}
+
+fn notes(score: &Score, role: Role) -> Vec<Note> {
+    score.track(role).map(|t| t.clips.iter().flat_map(|c| c.notes.iter().copied()).collect()).unwrap_or_default()
+}
+
+#[test]
+fn phonk_has_half_time_claps_rolls_and_808_slides() {
+    let score = crate::demo::demo_score(Style::Phonk, 40.0, 0.8, SfxAmount::Subtle);
+    let cue = &score.cues[0];
+    let beat = 60.0 / cue.bpm as f64;
+    let drums = notes(&score, Role::Drums);
+    let claps: Vec<f64> = drums.iter().filter(|n| n.pitch == crate::synth::Hit::Clap as u8 && n.t < score.cues[1].start).map(|n| ((n.t - cue.start) / beat).rem_euclid(4.0)).collect();
+    assert!(!claps.is_empty() && claps.iter().all(|b| (b - 2.0).abs() < 1e-6), "claps on beat 3 only: {claps:?}");
+    let hats: Vec<f64> = drums.iter().filter(|n| n.pitch == crate::synth::Hit::Hat as u8).map(|n| n.t).collect();
+    assert!(hats.windows(2).any(|w| w[1] - w[0] < beat / 4.5), "a hat roll faster than 16ths");
+    assert!(notes(&score, Role::Bass).iter().any(|n| n.bend != 0.0), "the 808 slides");
+    let keys = score.track(Role::Keys).unwrap();
+    assert!(keys.clips.iter().any(|c| c.instrument == Instrument::Synth(Voice::Cowbell)), "the cowbell riff");
+}
+
+#[test]
+fn epic_brings_in_the_choir_and_lofi_crackles() {
+    let epic = crate::demo::demo_score(Style::Epic, 40.0, 0.9, SfxAmount::Subtle);
+    let pads = epic.track(Role::Pads).unwrap();
+    assert!(pads.clips.iter().any(|c| matches!(c.instrument, Instrument::Gm { program: 52, .. }) && !c.notes.is_empty()), "choir at the peak");
+    assert!(notes(&epic, Role::Fx).iter().any(|n| n.pitch == crate::synth::Hit::Braam as u8), "braam on the impact");
+    let lofi = crate::demo::demo_score(Style::Lofi, 30.0, 0.5, SfxAmount::Subtle);
+    assert!(notes(&lofi, Role::Drums).iter().any(|n| n.pitch == crate::synth::Hit::Vinyl as u8));
+    assert!(notes(&lofi, Role::Fx).iter().any(|n| n.pitch == crate::synth::Hit::RecordStop as u8), "lo-fi enters with a record stop");
+}
+
+#[test]
+fn the_music_holds_its_breath_before_a_reveal() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = fake_chapter(dir.path());
+    let settings = MusicSettings { sfx: SfxAmount::Off, duck_db: 0.0, ..Default::default() };
+    let score = chapter::compose_chapter(&ch, &settings, false).unwrap();
+    let reveal = score.cues.iter().find(|c| c.drop_before).expect("a reveal cue");
+    let (bus, _, _) = crate::mix::render(&score, &settings, &Default::default(), &None, 1, false);
+    let sr = crate::synth::SR as f64;
+    let win = |a: f64, b: f64| rms(&bus.l[(a * sr) as usize..(b * sr) as usize]);
+    let gap = win(reveal.start - crate::compose::DROP_GAP + 0.35, reveal.start - 0.05);
+    let after = win(reveal.start + 0.05, reveal.start + 0.6);
+    assert!(gap < after * 0.2, "silence {gap} before the impact {after}");
+}
+
+#[test]
+fn sfx_amount_scales_the_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = fake_chapter(dir.path());
+    let count = |sfx| {
+        let s = MusicSettings { sfx, ..Default::default() };
+        let score = chapter::compose_chapter(&ch, &s, false).unwrap();
+        notes(&score, Role::Sfx).len()
+    };
+    let (off, subtle, punchy) = (count(SfxAmount::Off), count(SfxAmount::Subtle), count(SfxAmount::Punchy));
+    assert_eq!(off, 0);
+    assert!(subtle > 0 && punchy > subtle, "off {off}, subtle {subtle}, punchy {punchy}");
 }

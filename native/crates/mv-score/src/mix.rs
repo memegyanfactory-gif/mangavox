@@ -272,6 +272,7 @@ pub fn load_orchestra(path: &Path) -> Orchestra {
     SoundFont::new(&mut f).ok().map(Arc::new)
 }
 
+/// Renders one clip (fades applied, `clip.gain` not) and returns where it starts.
 fn render_clip(clip: &Clip, pan: f32, orchestra: &Orchestra, seed: u64) -> (usize, Stereo) {
     let mut rng = Rng::new(seed);
     let tail = 4.0;
@@ -281,19 +282,24 @@ fn render_clip(clip: &Clip, pan: f32, orchestra: &Orchestra, seed: u64) -> (usiz
     match (clip.instrument, orchestra) {
         (Instrument::Gm { program, .. }, Some(sf)) => render_sf2(&mut buf, clip, program, sf),
         (Instrument::Gm { fallback, .. }, None) | (Instrument::Synth(fallback), _) => {
+            // Mono low end (808, sub, bass) stays centred; the rest gets a little width.
+            let centred = matches!(fallback, Voice::Bass808 | Voice::SubBass | Voice::PluckBass | Voice::PulseBass | Voice::Drone);
             for n in &clip.notes {
-                let s = synth::voice(fallback, n.pitch as f32, n.vel, n.dur, &mut rng);
-                let jitter = (rng.f() - 0.5) * 0.2;
+                let s = synth::voice_bend(fallback, n.pitch as f32, n.vel, n.dur, n.bend, &mut rng);
+                let jitter = if centred { 0.0 } else { (rng.f() - 0.5) * 0.3 };
                 buf.add_mono(idx(n.t - clip.start), &s, 1.0, pan + jitter);
             }
         }
         (Instrument::Kit, _) => {
             for n in &clip.notes {
-                let Some(h) = Hit::from_code(n.pitch) else { continue };
+                let Some(h) = Hit::from_code(n.pitch) else {
+                    continue;
+                };
                 let s = synth::hit(h, n.vel, n.dur, &mut rng);
                 let p = match h {
                     Hit::Hat | Hit::OpenHat | Hit::Shaker => pan + 0.3,
-                    Hit::Tom => pan - 0.2,
+                    Hit::Tom | Hit::Rim => pan - 0.2,
+                    Hit::Whoosh | Hit::Slash => pan + (rng.f() - 0.5) * 0.8,
                     _ => pan,
                 };
                 buf.add_mono(idx(n.t - clip.start), &s, 1.0, p);
@@ -305,7 +311,7 @@ fn render_clip(clip: &Clip, pan: f32, orchestra: &Orchestra, seed: u64) -> (usiz
     let fo = idx(clip.fade_out).max(1);
     let stop = idx(clip.end - clip.start);
     for i in 0..len {
-        let mut g = clip.gain;
+        let mut g = 1.0;
         if i < fi {
             g *= i as f32 / fi as f32;
         }
@@ -321,7 +327,9 @@ fn render_clip(clip: &Clip, pan: f32, orchestra: &Orchestra, seed: u64) -> (usiz
 fn render_sf2(buf: &mut Stereo, clip: &Clip, program: u8, sf: &Arc<SoundFont>) {
     let mut settings = SynthesizerSettings::new(SR as i32);
     settings.enable_reverb_and_chorus = false;
-    let Ok(mut s) = Synthesizer::new(sf, &settings) else { return };
+    let Ok(mut s) = Synthesizer::new(sf, &settings) else {
+        return;
+    };
     s.process_midi_message(0, 0xC0, program as i32, 0);
     // (sample, on?, key, velocity)
     let mut ev: Vec<(usize, bool, i32, i32)> = vec![];
@@ -343,7 +351,6 @@ fn render_sf2(buf: &mut Stereo, clip: &Clip, program: u8, sf: &Arc<SoundFont>) {
         l.resize(to - from, 0.0);
         r.resize(to - from, 0.0);
         s.render(&mut l, &mut r);
-        // GM instruments run hot; bring them to the synth voices' level.
         for i in 0..(to - from) {
             buf.l[from + i] += l[i] * 0.55;
             buf.r[from + i] += r[i] * 0.55;
@@ -362,28 +369,64 @@ fn render_sf2(buf: &mut Stereo, clip: &Clip, program: u8, sf: &Arc<SoundFont>) {
     flush(&mut s, pos, end, buf);
 }
 
-/// Renders one track (without the mixer strip) over `len` samples.
+fn apply_volume(track: &Track, out: &mut Stereo) {
+    if track.volume.is_empty() {
+        return;
+    }
+    let mut pts = track.volume.clone();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let auto = Track { volume: pts, ..track.clone() };
+    let len = out.len();
+    for (b, chunk) in (0..len).step_by(512).enumerate() {
+        let g = auto.volume_at(b as f64 * 512.0 / SRF);
+        for i in chunk..(chunk + 512).min(len) {
+            out.l[i] *= g;
+            out.r[i] *= g;
+        }
+    }
+}
+
+/// Renders one track as written (clip gains, no genre balance or mixer strip) over `len` samples.
 pub fn render_track(track: &Track, len: usize, orchestra: &Orchestra, seed: u64) -> Stereo {
     let mut out = Stereo::new(len);
     for (k, clip) in track.clips.iter().enumerate() {
-        let (at, buf) = render_clip(clip, track.pan, orchestra, seed ^ (k as u64 + 1).wrapping_mul(0x2545_F491) ^ track.role as u64);
+        let (at, buf) = render_clip(clip, track.pan, orchestra, clip_seed(seed, track.role, k));
         for i in 0..buf.len().min(len.saturating_sub(at)) {
-            out.l[at + i] += buf.l[i];
-            out.r[at + i] += buf.r[i];
+            out.l[at + i] += buf.l[i] * clip.gain;
+            out.r[at + i] += buf.r[i] * clip.gain;
         }
     }
-    if !track.volume.is_empty() {
-        let mut pts = track.volume.clone();
-        pts.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let auto = Track { volume: pts, ..track.clone() };
-        for (b, chunk) in (0..len).step_by(512).enumerate() {
-            let g = auto.volume_at(b as f64 * 512.0 / SRF);
-            for i in chunk..(chunk + 512).min(len) {
-                out.l[i] *= g;
-                out.r[i] *= g;
-            }
+    apply_volume(track, &mut out);
+    out
+}
+
+fn clip_seed(seed: u64, role: Role, k: usize) -> u64 {
+    seed ^ (k as u64 + 1).wrapping_mul(0x2545_F491) ^ role as u64
+}
+
+/// Renders a track with every musical clip set to its place in its cue's genre mix (whatever plays
+/// it: SoundFont instruments and synth voices come out at very different levels). Hits and effects
+/// are balanced as a whole track instead, so a lone riser is not as loud as an impact.
+fn render_balanced(score: &Score, track: &Track, len: usize, orchestra: &Orchestra, seed: u64) -> Stereo {
+    if matches!(track.role, Role::Fx | Role::Sfx) {
+        let r = render_track(track, len, orchestra, seed);
+        let g = loudness(&r.l, &r.r, SR).map(|l| db_to_gain((role_target(track.role, Style::Epic) - l).clamp(-30.0, 36.0) as f32)).unwrap_or(1.0);
+        let mut r = r;
+        r.l.iter_mut().chain(r.r.iter_mut()).for_each(|v| *v *= g);
+        return r;
+    }
+    let mut out = Stereo::new(len);
+    for (k, clip) in track.clips.iter().enumerate() {
+        let (at, buf) = render_clip(clip, track.pan, orchestra, clip_seed(seed, track.role, k));
+        let style = score.cues.get(clip.cue).map(|c| c.style).unwrap_or(Style::Mystery);
+        let target = role_target(track.role, style) + 20.0 * (clip.gain.max(1e-6) as f64).log10();
+        let g = loudness(&buf.l, &buf.r, SR).map(|l| db_to_gain((target - l).clamp(-30.0, 36.0) as f32)).unwrap_or(clip.gain);
+        for i in 0..buf.len().min(len.saturating_sub(at)) {
+            out.l[at + i] += buf.l[i] * g;
+            out.r[at + i] += buf.r[i] * g;
         }
     }
+    apply_volume(track, &mut out);
     out
 }
 
@@ -425,10 +468,22 @@ fn duck_curve(env: &[f32], len: usize, duck_db: f32) -> Vec<f32> {
 fn limit(s: &mut Stereo, ceiling: f32) {
     let la = (SR as usize) / 200;
     let n = s.len();
-    // Gain each sample needs on its own.
+    // Gain each sample needs on its own, judged on the true (inter-sample) peak: 4x Catmull-Rom
+    // interpolation towards the next sample, so the limited output does not overshoot after a DAC
+    // or a resampler.
+    let true_peak = |x: &[f32], i: usize| {
+        let at = |k: isize| x[(i as isize + k).clamp(0, n as isize - 1) as usize];
+        let (p0, p1, p2, p3) = (at(-1), at(0), at(1), at(2));
+        let mut m = p1.abs();
+        for f in [0.25f32, 0.5, 0.75] {
+            let v = 0.5 * (2.0 * p1 + (-p0 + p2) * f + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f * f + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * f * f * f);
+            m = m.max(v.abs());
+        }
+        m
+    };
     let need: Vec<f32> = (0..n)
         .map(|i| {
-            let p = s.l[i].abs().max(s.r[i].abs());
+            let p = true_peak(&s.l, i).max(true_peak(&s.r, i));
             if p > ceiling {
                 ceiling / p
             } else {
@@ -465,24 +520,69 @@ fn limit(s: &mut Stereo, ceiling: f32) {
     }
 }
 
+/// Sets `s` to `lufs` integrated loudness, then peak-limits it to `ceiling_db` dBFS.
+pub fn master_to(s: &mut Stereo, lufs: f64, ceiling_db: f32) {
+    if let Some(l) = loudness(&s.l, &s.r, SR) {
+        let g = db_to_gain((lufs - l).clamp(-40.0, 40.0) as f32);
+        s.l.iter_mut().chain(s.r.iter_mut()).for_each(|v| *v *= g);
+    }
+    limit(s, db_to_gain(ceiling_db));
+}
+
+/// A record / tape stop over `[t, t + dur]`: the music slows to a halt (pitch and speed fall together).
+fn tape_stop(s: &mut Stereo, t: f64, dur: f64) {
+    let a = idx(t);
+    let n = idx(dur).min(s.len().saturating_sub(a));
+    if n < 2 {
+        return;
+    }
+    for ch in [&mut s.l, &mut s.r] {
+        let src: Vec<f32> = ch[a..a + n].to_vec();
+        for i in 0..n {
+            let x = i as f64;
+            let pos = x - x * x / (2.0 * n as f64);
+            let j = pos as usize;
+            let f = (pos - j as f64) as f32;
+            let v = src[j.min(n - 1)] * (1.0 - f) + src[(j + 1).min(n - 1)] * f;
+            let fade = 1.0 - (i as f32 / n as f32).powi(3);
+            ch[a + i] = v * fade;
+        }
+    }
+}
+
+/// RBJ peaking EQ coefficients in this file's [`Biquad`] form.
+fn peaking(f0: f64, q: f64, db: f64) -> Biquad {
+    let a = 10f64.powf(db / 40.0);
+    let w0 = 2.0 * std::f64::consts::PI * f0 / SRF;
+    let alpha = w0.sin() / (2.0 * q);
+    let a0 = 1.0 + alpha / a;
+    Biquad { b: [(1.0 + alpha * a) / a0, -2.0 * w0.cos() / a0, (1.0 - alpha * a) / a0], a: [-2.0 * w0.cos() / a0, (1.0 - alpha / a) / a0], z: [0.0; 2] }
+}
+
 /// Renders the whole score and masters it against the narration. Returns the music bus and,
 /// when `preview` is set, the narration + music mix for listening in the app.
 pub fn render(score: &Score, settings: &MusicSettings, narration: &Narration, orchestra: &Orchestra, seed: u64, preview: bool) -> (Stereo, Option<Stereo>, MixReport) {
     let len = idx(score.duration + 3.0);
+    // Music, the hits & risers that belong to it, and the sound effects (ducked less, so a whoosh
+    // still reads under a sentence) on their own buses.
     let mut bus = Stereo::new(len);
+    let mut fxbus = Stereo::new(len);
+    let mut sfx = Stereo::new(len);
     let mut send = Stereo::new(len);
     for t in &score.tracks {
-        let g = settings.track_gain(t.role) * base_level(t.role);
+        let g = settings.track_gain(t.role);
         if g <= 0.0 || t.clips.is_empty() {
             continue;
         }
-        let r = render_track(t, len, orchestra, seed);
-        // Loudness-match the track to its place in the arrangement, whatever plays it (SoundFont
-        // instruments and synth voices come out at very different levels).
-        let g = g * loudness(&r.l, &r.r, SR).map(|l| db_to_gain((role_target(t.role) - l).clamp(-30.0, 36.0) as f32)).unwrap_or(1.0);
+        let r = render_balanced(score, t, len, orchestra, seed);
+        let dst = match t.role {
+            Role::Fx => &mut fxbus,
+            Role::Sfx => &mut sfx,
+            _ => &mut bus,
+        };
         for i in 0..len {
-            bus.l[i] += r.l[i] * g;
-            bus.r[i] += r.r[i] * g;
+            dst.l[i] += r.l[i] * g;
+            dst.r[i] += r.r[i] * g;
             send.l[i] += r.l[i] * g * t.reverb;
             send.r[i] += r.r[i] * g * t.reverb;
         }
@@ -492,6 +592,16 @@ pub fn render(score: &Score, settings: &MusicSettings, narration: &Narration, or
         bus.l[i] += wet.l[i];
         bus.r[i] += wet.r[i];
     }
+    // Record stops slow the music to a halt before a comedy beat.
+    if let Some(fx) = score.track(Role::Fx) {
+        for n in fx.clips.iter().flat_map(|c| c.notes.iter()).filter(|n| n.pitch == Hit::RecordStop as u8) {
+            tape_stop(&mut bus, n.t, n.dur);
+        }
+    }
+    for i in 0..len {
+        bus.l[i] += fxbus.l[i];
+        bus.r[i] += fxbus.r[i];
+    }
 
     // Loudness relative to the narration (or a sensible absolute level without one).
     let narr_lufs = narration.loudness();
@@ -499,17 +609,34 @@ pub fn render(score: &Score, settings: &MusicSettings, narration: &Narration, or
     let music_lufs = loudness(&bus.l, &bus.r, SR);
     if let Some(m) = music_lufs {
         let g = db_to_gain((target - m).clamp(-30.0, 24.0) as f32);
-        bus.l.iter_mut().chain(bus.r.iter_mut()).for_each(|v| *v *= g);
+        bus.l.iter_mut().chain(bus.r.iter_mut()).chain(sfx.l.iter_mut()).chain(sfx.r.iter_mut()).for_each(|v| *v *= g);
+    } else if let Some(s) = loudness(&sfx.l, &sfx.r, SR) {
+        let g = db_to_gain((target - s).clamp(-30.0, 24.0) as f32);
+        sfx.l.iter_mut().chain(sfx.r.iter_mut()).for_each(|v| *v *= g);
     }
 
-    // Duck under the voice.
+    // Duck under the voice, and open a pocket around 2 kHz (where speech is intelligible) while it
+    // speaks; the sound effects dip half as far.
     if !narration.clips.is_empty() && settings.duck_db > 0.0 {
         let env = narration.envelope(len * 100 / SR as usize + 1);
         let duck = duck_curve(&env, len, settings.duck_db);
-        for (i, d) in duck.iter().enumerate().take(len) {
-            bus.l[i] *= d;
-            bus.r[i] *= d;
+        let sfx_duck = duck_curve(&env, len, settings.duck_db * 0.5);
+        let floor = db_to_gain(-settings.duck_db.abs());
+        let mut eq = [peaking(2000.0, 0.8, -4.0), peaking(2000.0, 0.8, -4.0)];
+        for i in 0..len {
+            let d = duck[i];
+            let k = ((1.0 - d) / (1.0 - floor).max(1e-3)).clamp(0.0, 1.0) as f64;
+            let (l, r) = (bus.l[i] as f64, bus.r[i] as f64);
+            let (el, er) = (eq[0].tick(l), eq[1].tick(r));
+            bus.l[i] = ((l * (1.0 - k) + el * k) as f32) * d;
+            bus.r[i] = ((r * (1.0 - k) + er * k) as f32) * d;
+            sfx.l[i] *= sfx_duck[i];
+            sfx.r[i] *= sfx_duck[i];
         }
+    }
+    for i in 0..len {
+        bus.l[i] += sfx.l[i];
+        bus.r[i] += sfx.r[i];
     }
     // Leave headroom for the voice: the music alone peaks at -6 dBFS.
     limit(&mut bus, db_to_gain(-6.0));
@@ -528,22 +655,49 @@ pub fn render(score: &Score, settings: &MusicSettings, narration: &Narration, or
     (bus, preview, report)
 }
 
-/// Fine trim on top of [`role_target`] (the user's mixer strip is applied on top of both).
-fn base_level(_role: Role) -> f32 {
-    1.0
-}
-
-/// Where each track sits in the arrangement (LUFS while it plays): the theme and the strings in
-/// front, keys and bass under them, drums supporting rather than leading.
-fn role_target(role: Role) -> f64 {
-    match role {
-        Role::Lead => -20.0,
-        Role::Pads => -21.0,
-        Role::Keys => -24.0,
-        Role::Bass => -25.0,
-        Role::Drums => -28.0,
-        Role::Fx => -25.0,
-        Role::Sfx => -24.0,
+/// Where each track sits in a genre's mix (LUFS while it plays). Phonk is drums and 808 first, the
+/// orchestra puts strings, choir and brass in front, sad piano leads with the piano, lo-fi with the
+/// Rhodes and the beat, the dark beds with their drones and pulses.
+fn role_target(role: Role, style: Style) -> f64 {
+    use Role::*;
+    match (style, role) {
+        (_, Fx) => -24.0,
+        (_, Sfx) => -23.0,
+        (Style::Phonk, Drums) => -19.0,
+        (Style::Phonk, Bass) => -19.5,
+        (Style::Phonk, Keys) => -22.5,
+        (Style::Phonk, Pads) => -28.0,
+        (Style::Phonk, Lead) => -26.0,
+        (Style::Epic, Pads) => -20.0,
+        (Style::Epic, Lead) => -21.0,
+        (Style::Epic, Keys) => -22.0,
+        (Style::Epic, Bass) => -24.0,
+        (Style::Epic, Drums) => -21.0,
+        (Style::Tension, Keys) => -21.0,
+        (Style::Tension, Pads) => -22.0,
+        (Style::Tension, Bass) => -23.0,
+        (Style::Tension, Drums) => -25.0,
+        (Style::Tension, Lead) => -24.0,
+        (Style::Horror, Pads) => -21.0,
+        (Style::Horror, Bass) => -22.0,
+        (Style::Horror, Keys) => -26.0,
+        (Style::Horror, Drums) => -23.0,
+        (Style::Horror, Lead) => -26.0,
+        (Style::Sad, Keys) => -20.0,
+        (Style::Sad, Lead) => -21.0,
+        (Style::Sad, Pads) => -23.0,
+        (Style::Sad, Bass) => -27.0,
+        (Style::Sad, Drums) => -29.0,
+        (Style::Lofi, Keys) => -20.5,
+        (Style::Lofi, Drums) => -21.5,
+        (Style::Lofi, Bass) => -23.0,
+        (Style::Lofi, Lead) => -24.0,
+        (Style::Lofi, Pads) => -28.0,
+        (Style::Mystery, Keys) => -21.0,
+        (Style::Mystery, Lead) => -22.5,
+        (Style::Mystery, Pads) => -23.0,
+        (Style::Mystery, Bass) => -24.0,
+        (Style::Mystery, Drums) => -27.0,
     }
 }
 

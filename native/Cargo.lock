@@ -9872,6 +9872,7 @@ dependencies = [
  "mv-ui",
  "rodio",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

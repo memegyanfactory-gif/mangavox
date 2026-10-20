@@ -120,7 +120,7 @@ impl StudioPage {
             Phase::Audio if ix == 0 => self.voice_card(window, cx),
             Phase::Audio => self.audio_row(ix - 1, cx),
             Phase::Music => self.music_card(cx),
-            Phase::Video => self.video_card(cx),
+            Phase::Video => self.video_card(window, cx),
         };
         div().px(px(space::XL)).pt(px(14.)).child(el).into_any_element()
     }
@@ -315,7 +315,8 @@ impl StudioPage {
         if let Some(j) = self.jobs.iter().find(|j| j.chapter_id == f.item.id && !j.state.finished()).filter(|_| matches!(phase, Phase::Audio | Phase::Video)) {
             head = head.child(progress_line("head-job", j.progress() as f32, j.status.clone()));
         }
-        head
+        // What stops this step for these chapters, with the fix, under the (then disabled) button.
+        head.children(self.step_issues(cx))
     }
 
     fn style_chips(&self, cx: &mut Context<Self>) -> Div {
@@ -935,7 +936,19 @@ impl StudioPage {
         }
     }
 
-    fn video_card(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn video_card(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let f = self.focus.as_ref().expect("focus");
+        // The caption studio (crate::video): preview, Watchfiwn caption templates and placement.
+        let captions = crate::video::panel(
+            crate::video::VideoContext {
+                chapter: f.item.clone(),
+                pages: f.pages.iter().map(|p| p.0.clone()).collect(),
+                passages: f.story.as_ref().map(|s| s.segments.iter().map(|g| (g.page, g.text.clone())).collect()).unwrap_or_default(),
+                reels: self.prefs.format == mv_recap::FORMAT_REELS,
+            },
+            window,
+            cx,
+        );
         let f = self.focus.as_ref().expect("focus");
         let video = f.status.video.clone();
         let meta = f.video.clone();
@@ -964,7 +977,7 @@ impl StudioPage {
             .flex()
             .flex_col()
             .gap(px(space::LG))
-            .max_w(px(900.))
+            .max_w(px(1180.))
             .child(
                 card()
                     .child(setting(ph::FRAME_CORNERS, "Format", formats.into_any_element()))
@@ -973,6 +986,7 @@ impl StudioPage {
                         d.child(muted("Reels render upright (9:16) and cut the recap into parts of about a minute, each ending at a pause in the narration."))
                     }),
             )
+            .child(captions)
             .when_some(blocker, |d, (text, action)| {
                 d.child(inline_alert(AlertKind::Warning, text, "").action(
                     action_label(action),
