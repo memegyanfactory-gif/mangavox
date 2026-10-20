@@ -7,7 +7,12 @@ use mv_ui::Route;
 
 pub mod audio;
 pub mod data;
+mod dashboard;
+mod generate;
+mod issues;
 mod music;
+mod pipeline;
+mod queue_view;
 mod page;
 mod phases;
 mod run;
@@ -15,6 +20,7 @@ pub mod service;
 pub mod setup;
 mod setup_view;
 mod side;
+pub mod video;
 mod widgets;
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {

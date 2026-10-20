@@ -7,7 +7,7 @@ use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    btn, disclosure, empty_view, glyphs, icon_button, icon_ph, icon_tag, icon_toggle, inline_alert, kbd, muted, ph, size, status_tag, AlertKind, ButtonKind, StatusKind, Tokens, Tone,
+    btn, disclosure, empty_view, glyphs, icon_button, icon_ph, icon_tag, icon_toggle, kbd, muted, ph, size, status_tag, ButtonKind, StatusKind, Tokens, Tone,
 };
 
 use crate::page::{plural, vbar, Side, StudioPage, MONO, SIDE_W};
@@ -22,10 +22,15 @@ impl StudioPage {
             self.dock = ui_assistant::dock(window, cx);
         }
         // A live dot on Activity while something runs and another tab is open.
-        let live = self.run.as_ref().is_some_and(|r| r.running()) || self.jobs.iter().any(|j| !j.state.finished());
+        let live = self.run.as_ref().is_some_and(|r| r.running()) || self.jobs.iter().any(|j| !j.state.finished()) || self.queue.active() > 0;
         let tabs = tab_bar(
             "studio-side-tabs",
-            &[(Side::Activity, "Activity", ph::PULSE, live), (Side::Brain, "Characters", ph::USERS, false), (Side::Chat, "Chat", ph::CHAT_CIRCLE_DOTS, false)],
+            &[
+                (Side::Activity, "Activity", ph::PULSE, live),
+                (Side::Issues, "Issues", ph::WARNING, !self.issues.is_empty()),
+                (Side::Brain, "Cast", ph::USERS, false),
+                (Side::Chat, "Chat", ph::CHAT_CIRCLE_DOTS, false),
+            ],
             self.side,
             cx.listener(|this, s: &Side, _, cx| {
                 this.side = *s;
@@ -35,6 +40,10 @@ impl StudioPage {
         let body: AnyElement = match self.side {
             Side::Activity => {
                 let body = self.activity(cx).size_full().track_scroll(&self.side_scroll);
+                div().relative().flex_1().min_h_0().child(body).child(vbar("side-bar", &self.side_scroll)).into_any_element()
+            }
+            Side::Issues => {
+                let body = self.issues_view(cx).size_full().track_scroll(&self.side_scroll);
                 div().relative().flex_1().min_h_0().child(body).child(vbar("side-bar", &self.side_scroll)).into_any_element()
             }
             Side::Brain => {
@@ -73,7 +82,7 @@ impl StudioPage {
         let run = self.run.clone();
         let jobs = self.jobs.clone();
         let any_finished = jobs.iter().any(|j| j.state.finished());
-        let can_read = self.focus.is_some() && self.run_blocker().is_none();
+        let can_read = self.view == crate::page::View::Editor && self.focus.is_some() && self.run_blocker().is_none();
         div()
             .id("studio-activity")
             .flex()
@@ -83,10 +92,12 @@ impl StudioPage {
             .overflow_y_scroll()
             .p(px(space::MD))
             .gap(px(space::MD))
-            .when(run.is_none() && jobs.is_empty(), |d| {
+            .children(self.issues_inline(cx))
+            .children(self.queue_card(cx))
+            .when(run.is_none() && jobs.is_empty() && self.queue.items.is_empty(), |d| {
                 d.child(
                     div().pt(px(space::XL)).child(
-                        empty_view(ph::PULSE, "Nothing running", "Read a chapter and the AI's progress, the characters it meets and every narration or render job show up here.")
+                        empty_view(ph::PULSE, "Nothing running", "Pick chapters on the Dashboard and press Generate, or work on one step here. Progress, the characters the AI meets and every audio or video job show up here.")
                             .compact()
                             .when(can_read, |e| {
                                 e.action(btn("act-empty-read", "Read this chapter", ButtonKind::Secondary).icon(glyphs::READ).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(false, cx))))
@@ -152,7 +163,11 @@ impl StudioPage {
                             d.child(div().flex().child(icon_tag(glyphs::VOICE, text, tone)))
                         })
                         .when(!j.state.finished(), |d| d.child(progress_line(&format!("job-{}", j.id), j.progress() as f32, j.status.clone())))
-                        .when_some(if let JobView::Failed(e) = &j.state { Some(e.clone()) } else { None }, |d, e| d.child(div().text_size(px(size::SM)).line_height(px(18.)).text_color(Tokens::danger()).child(e)))
+                        // A failure says what is wrong and offers the fix; the raw error is detail.
+                        .when_some(if let JobView::Failed(e) = &j.state { Some(e.clone()) } else { None }, |d, e| {
+                            let step = if video { mv_recap::Step::Video } else { mv_recap::Step::Audio };
+                            d.child(self.failure_block(&format!("job-{id}"), step, &e, Some(&j.chapter_id), cx))
+                        })
                 }))
             })
     }
@@ -190,7 +205,10 @@ impl StudioPage {
             )
             .child(div().flex().items_center().gap(px(6.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(icon_ph(glyphs::MODEL, Tokens::text_3(), icon_px::XS)).child(r.model.clone()))
             .when(r.running(), |d| d.child(progress_line("act-run", r.progress(), r.status_line())))
-            .when_some(if let RunState::Failed(e) = &r.state { Some(e.clone()) } else { None }, |d, e| d.child(inline_alert(AlertKind::Error, "The run stopped with an error", e)))
+            .when_some(if let RunState::Failed(e) = &r.state { Some(e.clone()) } else { None }, |d, e| {
+                let step = if r.kind == RunKind::Read { mv_recap::Step::Read } else { mv_recap::Step::Story };
+                d.child(self.failure_block("act-run", step, &e, r.chapter_id.as_deref(), cx))
+            })
             .when(r.state == RunState::Cancelled && r.kind == RunKind::Read, |d| {
                 let at = match (&r.chapter, r.total) {
                     (Some(c), t) if t > 0 => format!("Stopped in {c} after {} of {t} pages. Finished pages are saved.", r.done.min(t)),

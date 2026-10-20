@@ -73,6 +73,30 @@ def write_captions(segments: list[dict], output_dir: str, filename: str = "capti
     return path
 
 
+def write_styled_captions(segments: list[dict], output_dir: str, width: int, height: int,
+                          config: dict | None = None, filename: str = "captions.ass") -> str | None:
+    """Burn-in caption track in the chosen Watchfiwn caption template (caption_engine.py).
+
+    `segments` are the clips on the rendered timeline ({text, start_ms, end_ms, audio_path,
+    audio_offset_ms}); words are timed against their audio. The template, size, position and
+    colours come from `config["subtitles"]`, the chapter's subtitles.json or the Studio default.
+    Returns the .ass path, or None when captions are off or there is no text.
+    """
+    import caption_engine
+
+    settings = caption_engine.resolve_settings(config, output_dir)
+    path = os.path.join(output_dir, filename)
+    if not settings["enabled"]:
+        if os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return None
+    return caption_engine.write_ass(segments, path, width, height, settings)
+
+
+# Legacy colour themes / animations for write_ass_captions (kept for older callers).
 COLOR_THEMES = {
     "Neon Cyan":        ("&H00FFFF00", "&H0000FFFF", "&H00000000", "&H00111111"),
     "Neon Yellow":      ("&H0000FFFF", "&H000000FF", "&H00000000", "&H00000000"),

@@ -34,7 +34,7 @@ pub const MONO: &str = if cfg!(windows) {
 };
 const POLL: Duration = Duration::from_millis(300);
 const SAVE_DELAY: Duration = Duration::from_millis(700);
-pub(crate) const LIBRARY_W: f32 = 272.;
+pub(crate) const LIBRARY_W: f32 = 288.;
 pub(crate) const SIDE_W: f32 = 384.;
 
 pub(crate) enum Load<T> {
@@ -96,9 +96,22 @@ impl Phase {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Side {
     Activity,
+    Issues,
     Brain,
     Chat,
 }
+
+/// Studio's two views: the Dashboard (manga, chapter picking, Generate) and the Editor (one
+/// chapter, step by step).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum View {
+    Dashboard,
+    Editor,
+}
+
+/// Below this window width the chapter list and the side panel do not both fit beside the
+/// work: opening one closes the other.
+const NARROW: f32 = 1240.;
 
 /// Who narrated the chapter's clips (`audio/narration_params.json`, written by tts_bridge).
 #[derive(Clone, Debug, PartialEq)]
@@ -230,6 +243,8 @@ pub struct StudioPage {
     pub(crate) open_groups: HashSet<String>,
     pub(crate) selected: BTreeSet<String>,
     pub(crate) search: Entity<InputState>,
+    /// The Dashboard's own manga filter (the Editor's chapter list keeps `search`).
+    pub(crate) dash_search: Entity<InputState>,
     pub(crate) focus: Option<Focus>,
     pub(crate) focus_id: Option<String>,
     pub(crate) phase: Phase,
@@ -278,6 +293,28 @@ pub struct StudioPage {
     /// Studio's own focus, so its shortcuts work after a click anywhere on the page (kit
     /// controls do not take focus on click).
     focus_handle: FocusHandle,
+    // ---- Dashboard and Generate
+    pub(crate) view: View,
+    /// The manga whose chapters the dashboard shows (None: every manga).
+    pub(crate) dash_manga: Option<String>,
+    /// Chapters picked on the dashboard, and the last one clicked (Shift-click ranges from it).
+    pub(crate) dash_pick: BTreeSet<String>,
+    pub(crate) dash_anchor: Option<String>,
+    pub(crate) dash_filter: crate::dashboard::Filter,
+    pub(crate) dash_scroll: ScrollHandle,
+    /// The open Generate questions.
+    pub(crate) sheet: Option<crate::generate::Sheet>,
+    /// The answers Generate is running with (picks made meanwhile join with them).
+    pub(crate) gen_answers: Option<crate::generate::Answers>,
+    pub(crate) queue: crate::pipeline::Queue,
+    seen_queue: u64,
+    /// Every issue, worked out once per frame; and the ones the user dismissed.
+    pub(crate) issues: Vec<crate::issues::Issue>,
+    pub(crate) dismissed: HashSet<String>,
+    /// The chapter list is shown (the Editor's left column).
+    pub(crate) lib_open: bool,
+    /// Window width at the last render.
+    pub(crate) vw: f32,
     _subs: Vec<Subscription>,
 }
 
@@ -285,9 +322,15 @@ impl StudioPage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let setup = cx.new(SetupView::new);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Filter manga"));
+        let dash_search = cx.new(|cx| InputState::new(window, cx).placeholder("Find a manga"));
         let ask_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. \"Ruko says the second line, not Kai\""));
         let strength = cx.new(|_| SliderState::new().min(0.).max(2.).step(0.1).default_value(mv_studio::voices::EMOTION_STRENGTH_DEFAULT));
         let mut subs = vec![cx.observe(&setup, |_, _, cx| cx.notify())];
+        subs.push(cx.subscribe_in(&dash_search, window, |_, _, ev: &InputEvent, _, cx| {
+            if matches!(ev, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
         subs.push(cx.subscribe_in(&search, window, |_, _, ev: &InputEvent, _, cx| {
             if matches!(ev, InputEvent::Change) {
                 cx.notify();
@@ -331,6 +374,7 @@ impl StudioPage {
             open_groups: prefs.open_groups.iter().cloned().collect(),
             selected: prefs.selected.iter().cloned().collect(),
             search,
+            dash_search,
             focus: None,
             focus_id: None,
             phase: Phase::ALL.into_iter().find(|p| prefs.last_phase.as_deref() == Some(p.label())).unwrap_or(Phase::Read),
@@ -369,6 +413,21 @@ impl StudioPage {
             regenerating: None,
             center_w: 1000.,
             focus_handle,
+            // Studio lands on the Dashboard; the Editor keeps the last chapter open behind it.
+            view: View::Dashboard,
+            dash_manga: None,
+            dash_pick: BTreeSet::new(),
+            dash_anchor: None,
+            dash_filter: Default::default(),
+            dash_scroll: ScrollHandle::new(),
+            sheet: None,
+            gen_answers: None,
+            queue: crate::pipeline::snapshot(),
+            seen_queue: crate::pipeline::version(),
+            issues: vec![],
+            dismissed: HashSet::new(),
+            lib_open: true,
+            vw: 1400.,
             _subs: subs,
         };
         page.reload_library(cx);
@@ -532,9 +591,23 @@ impl StudioPage {
     fn poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(POLL).await;
-            let (rv, jv) = (run::version(), service::version());
+            let (rv, jv, qv) = (run::version(), service::version(), crate::pipeline::version());
             let alive = this.update(cx, |this, cx| {
                 let mut changed = false;
+                if qv != this.seen_queue {
+                    this.seen_queue = qv;
+                    let now = crate::pipeline::snapshot();
+                    if this.queue_moved(&now, cx) {
+                        this.refresh_focus(true, cx);
+                        this.reload_library(cx);
+                    }
+                    this.queue = now;
+                    changed = true;
+                }
+                // The runner reads the model and setup from here while it has work.
+                if this.queue.active() > 0 {
+                    this.sync_pipeline(cx);
+                }
                 if rv != this.seen_run {
                     this.seen_run = rv;
                     let prev = this.run.take();
@@ -633,6 +706,9 @@ impl StudioPage {
         }
         if self.jobs.iter().any(|j| j.chapter_id == chapter_id && !j.state.finished()) {
             return Some("Wait for this chapter's audio or video job to finish, or cancel it");
+        }
+        if self.queue.for_chapter(chapter_id).is_some_and(|i| i.state == crate::pipeline::ItemState::Running) {
+            return Some("Generate is working on this chapter: pause it in Activity first");
         }
         if self.music.busy.is_some() && self.music.composing.iter().any(|c| c == chapter_id) {
             return Some("Wait for the score to finish");
@@ -1257,7 +1333,15 @@ impl StudioPage {
             .map(phase_of_run)
             .or_else(|| job.filter(|j| !j.state.finished()).map(phase_of_job))
             .or_else(|| (self.music.busy.is_some() && self.music.composing.iter().any(|c| c == id)).then_some(Phase::Music.index()));
-        let failed = run.filter(|r| matches!(r.state, RunState::Failed(_))).map(phase_of_run).or_else(|| job.filter(|j| matches!(j.state, JobView::Failed(_))).map(phase_of_job));
+        // Generate's step on this chapter, running or failed.
+        let item = self.queue.for_chapter(id);
+        let item_at = |s: crate::pipeline::ItemState| item.filter(|i| i.state == s).and_then(|i| i.current);
+        let running = running.or_else(|| item_at(crate::pipeline::ItemState::Running));
+        let failed = run
+            .filter(|r| matches!(r.state, RunState::Failed(_)))
+            .map(phase_of_run)
+            .or_else(|| job.filter(|j| matches!(j.state, JobView::Failed(_))).map(phase_of_job))
+            .or_else(|| item_at(crate::pipeline::ItemState::Failed));
         (running, failed)
     }
 
@@ -1293,10 +1377,17 @@ impl StudioPage {
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let m = &k.modifiers;
+        if k.key == "escape" && !m.modified() && self.sheet.take().is_some() {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if m.alt && !m.control && !m.platform && !m.shift {
             if let Some(n) = k.key.parse::<usize>().ok().filter(|n| (1..=Phase::ALL.len()).contains(n)) {
                 if self.focus.is_some() {
+                    self.view = View::Editor;
                     self.set_phase(Phase::ALL[n - 1], cx);
+                    cx.notify();
                 }
                 cx.stop_propagation();
             }
@@ -1311,11 +1402,13 @@ impl StudioPage {
         }
     }
 
-    fn toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Room left for the steps once the side columns are drawn; narrow windows show icons
-        // only, with the names in the tooltips.
-        let center = f32::from(window.viewport_size().width) - 60. - LIBRARY_W - if self.side_open { SIDE_W } else { 0. };
-        let compact = center < 980.;
+    /// The Editor's steps, on their own row under the toolbar so their names always fit (icons
+    /// only on a very narrow centre, with the names in the tooltips).
+    fn stepper_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.view != View::Editor || self.focus_id.is_none() {
+            return None;
+        }
+        let compact = self.center_w < 6. * 104. + 40.;
         let status = self.focus.as_ref().map(|f| f.status.clone()).unwrap_or_default();
         let done: Vec<bool> = Phase::ALL.iter().map(|p| self.focus.is_some() && p.done(&status)).collect();
         let (running, failed) = self.phase_activity();
@@ -1324,6 +1417,14 @@ impl StudioPage {
             .tooltips(tips)
             .when(compact, |s| s.compact())
             .on_select(cx.listener(|this, ix: &usize, _, cx| this.set_phase(Phase::ALL[(*ix).min(5)], cx)));
+        Some(div().flex_none().h(px(48.)).flex().items_center().px(px(space::XL)).border_b_1().border_color(Tokens::border()).child(div().flex_1().min_w_0().child(steps)))
+    }
+
+    fn toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _ = window;
+        let center = self.center_w;
+        let compact = center < 760.;
+        let roomy = center >= 900.;
         let setup = self.setup.read(cx);
         let (issues, checked, checking) = (setup.issues(), setup.env.is_some(), setup.checking);
         let (pill_icon, pill_color, pill_text, pill_tip): (Option<mv_ui::Ph>, Rgba, String, String) = match (checked, issues) {
@@ -1357,21 +1458,97 @@ impl StudioPage {
                 this.show_setup = !this.show_setup;
                 cx.notify();
             }));
+        let editor = self.view == View::Editor;
+        let views = mv_ui::segmented("studio-view", [(Some(ph::SQUARES_FOUR), "Dashboard"), (Some(glyphs::EDIT), "Editor")], if editor { 1 } else { 0 }).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+            this.view = if *ix == 1 { View::Editor } else { View::Dashboard };
+            cx.notify();
+        }));
+        // Where the user is: the dashboard's manga, or the Editor's chapter.
+        let crumb = {
+            let title = if editor {
+                self.focus.as_ref().map(|f| format!("{} · {}", f.item.manga_title, f.item.label()))
+            } else {
+                self.dash_manga.as_ref().and_then(|id| match &self.library {
+                    Load::Ready(g) => g.iter().find(|g| &g.id == id).map(|g| g.title.clone()),
+                    _ => None,
+                })
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .min_w_0()
+                .text_size(px(size::SM))
+                .text_color(Tokens::text_2())
+                .child(icon_ph(glyphs::STUDIO, Tokens::text_3(), icon_px::SM))
+                .child(div().flex_none().child("Studio"))
+                .when_some(title, |d, t| d.child(icon_ph(ph::CARET_RIGHT, Tokens::text_3(), icon_px::XS)).child(div().min_w_0().truncate().text_color(Tokens::text_1()).font_weight(FontWeight::MEDIUM).child(t)))
+        };
+        let issues = self.issues.len();
+        let worst = self.issues.iter().any(|i| i.kind == AlertKind::Error);
+        let narrow = self.vw < NARROW;
         div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(space::MD))
+            .gap(px(space::SM))
             .h(px(52.))
-            .px(px(14.))
+            .px(px(space::MD))
             .border_b_1()
             .border_color(Tokens::border())
-            .child(div().flex_1().min_w_0().overflow_hidden().child(steps))
-            .child(self.usage_meter.clone())
+            .child(views)
+            .when(editor, |d| {
+                d.child(
+                    icon_button("studio-lib-toggle", ph::SIDEBAR, if self.lib_open { "Hide the chapter list" } else { "Show the chapter list" }).selected(self.lib_open).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.lib_open = !this.lib_open;
+                        // Narrow windows fit one side column: the list takes the panel's place.
+                        if this.lib_open && narrow {
+                            this.side_open = false;
+                        }
+                        cx.notify();
+                    })),
+                )
+            })
+            .child(div().w(px(1.)).h(px(20.)).mx(px(2.)).bg(Tokens::border()))
+            .child(div().flex_1().min_w_0().overflow_hidden().child(crumb))
+            .when(issues > 0, |d| {
+                let (icon, color) = if worst { (ph::WARNING_CIRCLE, Tokens::danger()) } else { (ph::WARNING, Tokens::warning()) };
+                d.child(
+                    interactive("studio-issues-pill")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(6.))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(radius::MD))
+                        .border_1()
+                        .border_color(if worst { Tokens::danger_border() } else { Tokens::warning_border() })
+                        .bg(if worst { Tokens::danger_soft() } else { Tokens::warning_soft() })
+                        .text_size(px(size::SM))
+                        .text_color(Tokens::text_1())
+                        .role(Role::Button)
+                        .tooltip(tip(format!("{issues} thing{} to fix: open Issues", plural(issues))))
+                        .child(ph_icon(icon, Weight::Fill, color, icon_px::SM))
+                        .child(if compact { format!("{issues}") } else { format!("{issues} issue{}", plural(issues)) })
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.side_open = true;
+                            this.side = Side::Issues;
+                            if this.vw < NARROW {
+                                this.lib_open = false;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(roomy, |d| d.child(self.usage_meter.clone()))
             .child(setup_pill)
-            .child(icon_button("studio-side-toggle", ph::SIDEBAR_SIMPLE, if self.side_open { "Hide the AI panel" } else { "Show the AI panel" }).selected(self.side_open).on_click(cx.listener(
-                |this, _: &ClickEvent, _, cx| {
+            .child(icon_button("studio-side-toggle", ph::SIDEBAR_SIMPLE, if self.side_open { "Hide the side panel" } else { "Show the side panel (Activity, Issues, Cast, Chat)" }).selected(self.side_open).on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| {
                     this.side_open = !this.side_open;
+                    if this.side_open && narrow {
+                        this.lib_open = false;
+                    }
                     cx.notify();
                 },
             )))
@@ -1487,7 +1664,11 @@ impl StudioPage {
         let blocker = self.run_blocker();
         let what = format!("{n} chapter{}", plural(n));
         bar.bg(Tokens::accent_soft())
-            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).text_color(Tokens::accent()).child(format!("{n} selected")))
+            .child(div().id("batch-count").flex().flex_1().min_w_0().items_center().gap(px(4.)).font_weight(FontWeight::MEDIUM).text_color(Tokens::accent()).tooltip(tip(format!("{n} chapter{} ticked", plural(n)))).child(icon_ph(ph::LIST_CHECKS, Tokens::accent(), icon_px::SM)).child(div().truncate().child(format!("{n}"))))
+            .child(icon_button("batch-generate", ph::ROCKET_LAUNCH, format!("Generate {what}: every step, in order")).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                let targets = this.targets();
+                this.open_generate(targets, cx);
+            })))
             .child(
                 icon_button("batch-read", glyphs::READ, format!("Read {what}"))
                     .small()
@@ -1595,7 +1776,8 @@ impl StudioPage {
         let st = self.statuses.get(&c.id).cloned().unwrap_or_default();
         let running = self.run.as_ref().is_some_and(|r| r.running() && r.chapter_id.as_deref() == Some(c.id.as_str()))
             || self.jobs.iter().any(|j| j.chapter_id == c.id && !j.state.finished())
-            || (self.music.busy.is_some() && self.music.composing.contains(&c.id));
+            || (self.music.busy.is_some() && self.music.composing.contains(&c.id))
+            || self.queue.for_chapter(&c.id).is_some_and(|i| i.state == crate::pipeline::ItemState::Running);
         let trail_tip = Phase::ALL.iter().map(|p| format!("{} {}", p.label(), if p.done(&st) { "✓" } else { "–" })).collect::<Vec<_>>().join(" · ");
         let blocker = self.reset_blocker(&c.id);
         let (id, item, reset_item) = (c.id.clone(), c.clone(), c.clone());
@@ -1682,9 +1864,16 @@ impl Render for StudioPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reclaim_focus(window, cx);
         self.remember();
-        self.center_w = f32::from(window.viewport_size().width) - 24. - LIBRARY_W - if self.side_open { SIDE_W } else { 0. };
-        let center = self.center(window, cx);
+        // Columns: the chapter list (Editor only) and the side panel share a narrow window by
+        // taking turns, so the work in the middle never gets squeezed below a usable width.
+        self.vw = f32::from(window.viewport_size().width);
+        let editor = self.view == View::Editor;
+        let show_lib = editor && self.lib_open && !(self.vw < NARROW && self.side_open);
+        self.center_w = self.vw - 12. - if show_lib { LIBRARY_W + 6. } else { 0. } - if self.side_open { SIDE_W + 6. } else { 0. };
+        self.issues = self.collect_issues(cx);
+        let center = if editor { self.center(window, cx) } else { self.dashboard(cx) };
         let side = self.side_open.then(|| self.side_panel(window, cx));
+        let generate = self.generate_sheet(cx);
         let sheet = self.show_setup.then(|| {
             div()
                 .id("studio-setup")
@@ -1701,6 +1890,7 @@ impl Render for StudioPage {
                 .child(self.setup.clone())
         });
         div()
+            .relative()
             .flex()
             .size_full()
             .gap(px(6.))
@@ -1718,9 +1908,10 @@ impl Render for StudioPage {
                 }),
             )
             .on_key_down(cx.listener(Self::on_key))
-            .child(self.library_panel(cx))
-            .child(div().flex().flex_col().flex_1().min_w_0().h_full().map(column).child(self.toolbar(window, cx)).children(self.notice_bar(cx)).children(sheet).child(center))
+            .when(show_lib, |d| d.child(self.library_panel(cx)))
+            .child(div().flex().flex_col().flex_1().min_w_0().h_full().map(column).child(self.toolbar(window, cx)).children(self.stepper_bar(cx)).children(self.notice_bar(cx)).children(sheet).child(center))
             .children(side)
+            .children(generate)
     }
 }
 

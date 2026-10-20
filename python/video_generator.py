@@ -184,6 +184,10 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             - format: 'landscape' (one 16:9 video) | 'reels' (9:16, also cut into
               ~1 minute reels in output_dir/reels/) (default: 'landscape')
             - reel_seconds: target reel length (default: 60)
+            - subtitles: caption setting (caption_engine.normalize_settings keys: style,
+              size, posX, posY, wordsPerLine, lines, uppercase, color, highlightColor,
+              emphasis, enabled); falls back to <output_dir>/subtitles.json, then the
+              Studio default. Words are timed against each clip's audio.
         progress_cb: function(stage, current, total)
 
     Returns:
@@ -248,6 +252,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     segment_paths = []
     # End time (seconds) of every rendered clip - where reels may be cut.
     boundaries = []
+    # The narration actually on screen, timed on the rendered timeline (captions follow it).
+    caption_segments = []
     timeline = 0.0
     total = len(render_items)
 
@@ -347,9 +353,18 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             continue
         duration = round(duration, 3)
 
+        caption_seg = {
+            "text": seg.get("text", ""),
+            "start_ms": int(round(timeline * 1000)),
+            "end_ms": int(round((timeline + duration) * 1000)),
+            "audio_path": audio_path,
+            "audio_offset_ms": int(round(audio_offset * 1000)),
+        }
+
         # Skip if already rendered
         if os.path.exists(seg_path) and os.path.getsize(seg_path) > 100:
             segment_paths.append(seg_path)
+            caption_segments.append(caption_seg)
             timeline += duration
             boundaries.append(timeline)
             continue
@@ -410,6 +425,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 print(f"[video] FFmpeg error for page {page_num}: {result.stderr[:300]}", file=sys.stderr)
                 continue
             segment_paths.append(seg_path)
+            caption_segments.append(caption_seg)
             timeline += duration
             boundaries.append(timeline)
         except subprocess.TimeoutExpired:
@@ -446,25 +462,14 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     # MangaVox's own score (mv-score): already timed to the narration, ducked and limited.
     score = config.get("score")
     
-    subtitle_theme = config.get("subtitle_theme", "Classic White")
-    subtitle_anim = config.get("subtitle_anim", "Karaoke Sweep")
-    want_captions = config.get("captions", True)
-
     ass_path = None
-    if want_captions:
-        try:
-            import captions
-            ass_path = captions.write_ass_captions(
-                render_items,
-                output_dir,
-                theme_name=subtitle_theme,
-                anim_style=subtitle_anim,
-                filename="captions.ass",
-                width=w,
-                height=h,
-            )
-        except Exception as e:
-            print(f"[video] Failed to generate ASS captions: {e}", file=sys.stderr)
+    try:
+        import captions
+        ass_path = captions.write_styled_captions(
+            caption_segments, output_dir, w, h, config=config,
+        )
+    except Exception as e:
+        print(f"[video] Failed to generate styled captions: {e}", file=sys.stderr)
 
     success = _finalize_video_with_audio_mix_and_captions(
         concat_video,
@@ -558,8 +563,8 @@ def _finalize_video_with_audio_mix_and_captions(
     # 2. Subtitle processing
     has_video_filter = False
     if ass_path and os.path.exists(ass_path):
-        esc = ass_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-        filter_complex.append(f"[0:v]subtitles='{esc}'[v]")
+        from caption_engine import subtitles_filter
+        filter_complex.append(f"[0:v]{subtitles_filter(ass_path)}[v]")
         has_video_filter = True
         
     cmd += ["-filter_complex", ";".join(filter_complex)]
