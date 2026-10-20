@@ -7,32 +7,9 @@ use anyhow::{Context as _, Result};
 use mv_core::config::Config;
 use serde_json::{json, Map, Value};
 
-pub const DEFAULT_PRESET: &str = "rust";
-
-/// Theme presets from src/shared/appearance.ts (ids, copy and the three swatch colours).
-pub struct Preset {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub description: &'static str,
-    pub base: u32,
-    pub accent: u32,
-    pub secondary: u32,
-}
-
-pub const PRESETS: &[Preset] = &[
-    Preset { id: "rust", name: "Rust", description: "Oxidized orange on warm charcoal — forged metal", base: 0x0e0907, accent: 0xc8501a, secondary: 0xf0b27a },
-    Preset { id: "watchfiwn", name: "Watchfiwn", description: "Cinematic red on true black — streaming-grade", base: 0x0b0b0c, accent: 0xe8392e, secondary: 0xff6b5f },
-    Preset { id: "mangavox-emerald", name: "MangaVox Emerald", description: "Emerald and cyan studio lighting", base: 0x07090d, accent: 0x10b981, secondary: 0x60a5fa },
-    Preset { id: "chatgpt-green", name: "ChatGPT Green", description: "Charcoal, mint, and connected signals", base: 0x080b0a, accent: 0x10a37f, secondary: 0x9ce6d1 },
-    Preset { id: "claude-warm", name: "Claude Warm", description: "Warm terracotta on deep charcoal", base: 0x0d0b0a, accent: 0xd97757, secondary: 0xe8c7a8 },
-    Preset { id: "gemini-prism", name: "Gemini Prism", description: "Blue, violet, and cyan refractions", base: 0x080a12, accent: 0x5b8def, secondary: 0xa78bfa },
-    Preset { id: "amber-terminal", name: "Amber Terminal", description: "Black glass and restrained amber data", base: 0x090806, accent: 0xf59e0b, secondary: 0xfde68a },
-    Preset { id: "cyberpunk", name: "Cyberpunk", description: "Cyan and magenta over graphite", base: 0x07090c, accent: 0x22d3ee, secondary: 0xf472b6 },
-    Preset { id: "sakura", name: "Sakura", description: "Rose highlights and drifting petals", base: 0x0d090c, accent: 0xfb7185, secondary: 0xf9a8d4 },
-    Preset { id: "ocean", name: "Ocean", description: "Deep neutral water and clear cyan", base: 0x060b0e, accent: 0x06b6d4, secondary: 0x38bdf8 },
-    Preset { id: "monochrome", name: "Monochrome", description: "Graphite, silver, and quiet motion", base: 0x090a0b, accent: 0xb8c0cc, secondary: 0x7f8ea3 },
-    Preset { id: "aurora", name: "Aurora", description: "Green, blue, and violet circular flow", base: 0x070a0c, accent: 0x2dd4bf, secondary: 0x818cf8 },
-];
+/// Theme presets (ids, copy and swatch colours) live in mv-ui next to the palettes they build,
+/// so this list and the live theme cannot disagree. The default is MangaVox Mint.
+pub use mv_ui::theme::{DEFAULT_PRESET, PRESETS};
 
 pub const QUALITIES: &[&str] = &["Any", "720p", "1080p", "4K"];
 pub const TIMERS: &[u64] = &[10, 15, 20, 30, 45, 60];
@@ -96,9 +73,6 @@ pub struct Snapshot {
     pub preset: String,
     pub reduce_motion: bool,
     pub mode: String,
-    /// Custom folder per `STORAGE_KINDS` entry; empty string means the default folder.
-    pub storage: Vec<String>,
-    pub cache_bytes: u64,
 }
 
 fn config() -> Config {
@@ -163,21 +137,13 @@ pub fn load_snapshot() -> Snapshot {
         _ => "entertainment".into(),
     };
 
-    let storage_cfg = object(&cfg, "storage");
-    let storage = STORAGE_KINDS
-        .iter()
-        .map(|(kind, _, _)| str_field(&storage_cfg, kind).map(|s| s.trim().to_string()).unwrap_or_default())
-        .collect();
+    Snapshot { profile, playback, preset, reduce_motion, mode }
+}
 
-    Snapshot {
-        profile,
-        playback,
-        preset,
-        reduce_motion,
-        mode,
-        storage,
-        cache_bytes: dir_size(&cache_dir()),
-    }
+/// Custom folder per `STORAGE_KINDS` entry; an empty string means the default folder.
+pub fn load_storage_folders() -> Vec<String> {
+    let storage_cfg = object(&config(), "storage");
+    STORAGE_KINDS.iter().map(|(kind, _, _)| str_field(&storage_cfg, kind).map(|s| s.trim().to_string()).unwrap_or_default()).collect()
 }
 
 pub fn save_profile(name: &str, email: &str) -> Result<()> {
@@ -217,7 +183,7 @@ pub fn studio_saved() -> bool {
 }
 
 /// Studio defaults kept in `~/.mangavox/studio/prefs.json` (shared with mv-recap, which owns the
-/// rest of the file; only these keys are touched).
+/// rest of the file; only `speed` and `resolution` are written here; `voice` is read only).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StudioPrefs {
     pub voice: String,
@@ -254,7 +220,9 @@ fn save_studio_prefs_at(path: &Path, p: &StudioPrefs) -> Result<()> {
         Some(Value::Object(m)) => m,
         _ => Map::new(),
     };
-    root.insert("voice".into(), json!(p.voice));
+    // `voice` belongs to `mv_studio::voices::set_default_voice`, which also writes the pipeline
+    // config. Writing the copy read when Settings opened would undo a narrator picked in Studio
+    // since then (prefs.json wins over the config when the default is read).
     root.insert("speed".into(), json!(p.speed));
     root.insert("resolution".into(), json!(p.resolution));
     if let Some(dir) = path.parent() {
@@ -318,18 +286,6 @@ pub fn cache_dir() -> PathBuf {
     data_dir().join("cache")
 }
 
-pub fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(md) if md.is_dir() => dir_size(&e.path()),
-            Ok(md) => md.len(),
-            Err(_) => 0,
-        })
-        .sum()
-}
-
 /// Deletes ~/.mangavox/cache and recreates it empty. Library and downloads are untouched.
 pub fn clear_cache() -> Result<()> {
     let dir = cache_dir();
@@ -353,7 +309,8 @@ mod studio_tests {
         save_studio_prefs_at(&path, &StudioPrefs { voice: "Aria".into(), speed: 1.25, resolution: "720p".into() }).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["keep"]["a"], 1);
-        assert_eq!(v["voice"], "Aria");
+        // The default voice is saved by `voices::set_default_voice`, never from a stale copy.
+        assert_eq!(v["voice"], "old");
         assert_eq!(v["speed"], 1.25);
         assert_eq!(v["resolution"], "720p");
     }

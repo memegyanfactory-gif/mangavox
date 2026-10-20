@@ -8,6 +8,7 @@ pub mod error;
 pub mod jobs;
 pub mod python;
 pub mod tts;
+pub mod voice_setup;
 pub mod voices;
 
 #[cfg(test)]

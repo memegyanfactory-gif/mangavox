@@ -5396,6 +5396,7 @@ dependencies = [
  "mv-ui",
  "mv-update",
  "mv-webwall",
+ "serde_json",
  "tray-icon",
  "ui-assistant",
  "ui-manga",
@@ -5403,6 +5404,7 @@ dependencies = [
  "ui-player",
  "ui-settings",
  "ui-studio",
+ "ui-welcome",
  "windows-sys 0.60.2",
  "winresource",
 ]
@@ -5750,6 +5752,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mv-score"
+version = "8.0.5001"
+dependencies = [
+ "anyhow",
+ "hound",
+ "mv-ai",
+ "mv-recap",
+ "mv-studio",
+ "rustysynth",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "mv-sources"
 version = "8.0.5001"
 dependencies = [
@@ -5807,6 +5824,7 @@ dependencies = [
  "mv-core",
  "mv-update",
  "tokio",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8166,6 +8184,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustysynth"
+version = "1.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2fafc9b46be0b8ad0a15bb17406e34b4602987c90d12509ca71710ab545b40f"
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9740,6 +9764,7 @@ name = "ui-assistant"
 version = "8.0.5001"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "gpui-kit",
  "mv-ai",
@@ -9780,6 +9805,7 @@ name = "ui-media"
 version = "8.0.5001"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "gpui-kit",
  "mv-core",
@@ -9836,10 +9862,12 @@ version = "8.0.5001"
 dependencies = [
  "anyhow",
  "gpui-kit",
+ "hound",
  "image",
  "mv-ai",
  "mv-core",
  "mv-recap",
+ "mv-score",
  "mv-studio",
  "mv-ui",
  "rodio",
@@ -9848,6 +9876,22 @@ dependencies = [
  "tempfile",
  "tokio",
  "ui-assistant",
+]
+
+[[package]]
+name = "ui-welcome"
+version = "8.0.5001"
+dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "mv-core",
+ "mv-sources",
+ "mv-studio",
+ "mv-ui",
+ "serde_json",
+ "sysinfo",
+ "ui-manga",
+ "ui-media",
 ]
 
 [[package]]

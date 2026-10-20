@@ -10,3 +10,6 @@ futures = "0.3"
 anyhow = { workspace = true }
 mv-update = { path = "../mv-update" }
 mv-core = { path = "../mv-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

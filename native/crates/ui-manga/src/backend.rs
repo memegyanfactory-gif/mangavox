@@ -181,8 +181,13 @@ pub async fn registry() -> Arc<SourceRegistry> {
 pub async fn reload_registry() -> Arc<SourceRegistry> {
     let mut reg = SourceRegistry::builtin(ctx());
     let dir = plugins_dir();
+    // Repo plugins made by an older template are regenerated offline before they load.
+    let upgraded = mv_plugins::repo::upgrade_repo_plugins(&dir);
+    if upgraded > 0 {
+        eprintln!("[ui-manga] regenerated {upgraded} repository plugin(s) from the current templates");
+    }
     for m in mv_plugins::repo::list_installed(&dir) {
-        match mv_plugins::load_plugin(dir.join(&m.id)).await {
+        match mv_plugins::load_plugin_with(dir.join(&m.id), mv_plugins::PluginOptions::default(), plugin_backend()).await {
             Ok(p) => reg.register(Arc::new(PluginSource::new(p))),
             Err(e) => eprintln!("[ui-manga] plugin {} failed to load: {e:#}", m.id),
         }
@@ -201,9 +206,132 @@ pub fn is_installed_plugin(id: &str) -> bool {
     mv_plugins::repo::list_installed(&plugins_dir()).iter().any(|m| m.id == id)
 }
 
+// ---------------------------------------------------------------- plugin network access
+
+type BoxFut<T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>;
+
+/// How plugins reach the network: the app's shared client (browser user agent, cookie jar,
+/// retries) with the WebView2 wall solver behind it, so a Cloudflare-walled site that a repo
+/// extension points at can still be read. GET requests go through [`SourceCtx::fetch`], which
+/// retries a wall with the solver's cookies and then inside the browser; `__render` and
+/// `__solve` use the solver directly. Other requests use plain reqwest.
+pub struct WallBackend {
+    ctx: SourceCtx,
+    plain: mv_plugins::ReqwestBackend,
+}
+
+impl WallBackend {
+    pub fn new(ctx: SourceCtx) -> Self {
+        Self { ctx, plain: mv_plugins::ReqwestBackend::new() }
+    }
+}
+
+fn to_fetch_response(r: mv_net::Resp) -> mv_plugins::FetchResponse {
+    let text = r.text();
+    let headers = r.headers.into_iter().collect();
+    mv_plugins::FetchResponse::from_text(r.status, text, r.url, headers)
+}
+
+impl mv_plugins::FetchBackend for WallBackend {
+    fn fetch(&self, plugin_id: &str, req: mv_plugins::FetchRequest) -> BoxFut<mv_plugins::FetchResponse> {
+        let method = req.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+        let json_body = matches!(&req.body, Some(Value::Object(_) | Value::Array(_)));
+        let no_body = matches!(&req.body, None | Some(Value::Null));
+        if !(method == "GET" && no_body) && !(method == "POST" && json_body) {
+            return self.plain.fetch(plugin_id, req);
+        }
+        let ctx = self.ctx.clone();
+        let id = plugin_id.to_string();
+        Box::pin(async move {
+            let mut opts = Opts::new().headers(req.headers.clone()).timeout(std::time::Duration::from_millis(req.timeout_ms.unwrap_or(20_000)));
+            if let Some(r) = req.referer.clone() {
+                opts = opts.referer(r);
+            }
+            let resp = if method == "GET" {
+                ctx.fetch(&id, &req.url, &opts).await.map_err(|e| e.to_string())?
+            } else {
+                ctx.http.post_json(&req.url, req.body.as_ref().unwrap_or(&Value::Null), &opts).await.map_err(|e| e.to_string())?
+            };
+            Ok(to_fetch_response(resp))
+        })
+    }
+
+    fn render(&self, _plugin_id: &str, url: String, opts: Value) -> BoxFut<mv_plugins::RenderResponse> {
+        let solver = self.ctx.solver.clone();
+        Box::pin(async move {
+            let Some(solver) = solver else {
+                return Err("This page needs the built-in browser (WebView2), which is not available".to_string());
+            };
+            let wait = opts.get("waitForSelector").and_then(Value::as_str).map(str::to_string);
+            let html = solver.fetch_html(&url, wait.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+            let wall = mv_net::detect_wall(200, "text/html", "", "", &html).is_some();
+            Ok(mv_plugins::RenderResponse { html, url, status: 200, wall })
+        })
+    }
+
+    fn solve(&self, _plugin_id: &str, url: String) -> BoxFut<bool> {
+        let ctx = self.ctx.clone();
+        Box::pin(async move {
+            let Some(solver) = ctx.solver.clone() else { return Ok(false) };
+            let cookies = solver.cookies(&url).await.map_err(|e| format!("{e:#}"))?;
+            for (n, v) in &cookies {
+                let _ = ctx.http.add_cookie(&url, &format!("{n}={v}"));
+            }
+            Ok(!cookies.is_empty())
+        })
+    }
+}
+
+static PLUGIN_BACKEND: OnceLock<Arc<dyn mv_plugins::FetchBackend>> = OnceLock::new();
+
+/// The network backend every plugin loads and installs with (see [`WallBackend`]).
+pub fn plugin_backend() -> Arc<dyn mv_plugins::FetchBackend> {
+    PLUGIN_BACKEND.get_or_init(|| Arc::new(WallBackend::new(ctx()))).clone()
+}
+
+// ---------------------------------------------------------------- repositories and plugin installs
+
+/// The repository browser and the plugin-link box from Settings › Sources, for the welcome setup.
+pub use crate::sources::{repo_label, source_avatar, trust_note, PluginLinkBox, RepoBrowser, SourcesEvent};
+
+/// Where `repos.json` lives (the data folder).
+pub fn repos_root() -> PathBuf {
+    mv_core::paths::root()
+}
+
 // ---------------------------------------------------------------- source enable/disable
 
 const DISABLED_KEY: &str = "disabledSources";
+
+/// The sources compiled into the app (MangaDex, ComicK, MangaFire, WEBTOON and the 18+ ones), in
+/// display order. Cheap: nothing is fetched.
+pub fn builtin_sources() -> Vec<SourceInfo> {
+    SourceRegistry::builtin(ctx()).list()
+}
+
+/// `disabled` after switching each of `builtin` on when it is in `enabled` and off otherwise.
+/// Entries for anything else (plugins) are kept as they are. Sorted, for a stable config file.
+pub fn with_builtins(disabled: &HashSet<String>, builtin: &[String], enabled: &HashSet<String>) -> Vec<String> {
+    let mut out: HashSet<String> = disabled.iter().filter(|id| !builtin.contains(id)).cloned().collect();
+    out.extend(builtin.iter().filter(|id| !enabled.contains(*id)).cloned());
+    let mut v: Vec<String> = out.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Switches the built-in sources in `enabled` on and every other built-in source off; plugin
+/// switches are left alone.
+pub fn set_builtins_enabled(enabled: &HashSet<String>) -> Result<()> {
+    let builtin: Vec<String> = builtin_sources().into_iter().map(|s| s.id).collect();
+    let v = with_builtins(&disabled_sources(), &builtin, enabled);
+    mv_core::config::Config::open_default().set(DISABLED_KEY, serde_json::json!(v))
+}
+
+/// A clean start: no built-in source is switched on, so Browse shows nothing until the user adds
+/// or enables a source.
+pub fn seed_clean_start() -> Result<()> {
+    set_builtins_enabled(&HashSet::new())
+}
 
 pub fn disabled_sources() -> HashSet<String> {
     mv_core::config::Config::open_default()
@@ -317,8 +445,11 @@ pub async fn ensure_cover(url: String, source_id: Option<String>) -> Option<Path
     Some(path)
 }
 
+/// Covers already on disk (`url -> file`) and the `(url, source)` pairs still to download.
+pub type CoverLookup = (std::collections::HashMap<String, PathBuf>, Vec<(String, Option<String>)>);
+
 /// Resolve every cover that is already on disk (cheap, blocking) and list the ones still missing.
-pub fn resolve_covers(urls: impl IntoIterator<Item = (String, Option<String>)>) -> (std::collections::HashMap<String, PathBuf>, Vec<(String, Option<String>)>) {
+pub fn resolve_covers(urls: impl IntoIterator<Item = (String, Option<String>)>) -> CoverLookup {
     let mut have = std::collections::HashMap::new();
     let mut missing = Vec::new();
     let mut seen = HashSet::new();
@@ -423,4 +554,32 @@ pub fn store_extras(manga_id: &str, chapters: &[ChapterInfo]) {
 
 pub fn extras(manga_id: &str) -> Option<std::collections::HashMap<String, ChapterExtra>> {
     EXTRAS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(manga_id).cloned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn clean_start_turns_every_builtin_off_and_keeps_plugin_switches() {
+        let builtin: Vec<String> = ["mangadex", "comick", "nhentai"].iter().map(|s| s.to_string()).collect();
+        // Fresh config: everything built in goes off.
+        assert_eq!(with_builtins(&HashSet::new(), &builtin, &HashSet::new()), vec!["comick", "mangadex", "nhentai"]);
+        // A chosen source stays on; a disabled plugin stays disabled; an old choice is replaced.
+        let disabled = set(&["repo-x-en", "comick"]);
+        assert_eq!(with_builtins(&disabled, &builtin, &set(&["comick"])), vec!["mangadex", "nhentai", "repo-x-en"]);
+        // Everything on.
+        assert_eq!(with_builtins(&disabled, &builtin, &set(&["mangadex", "comick", "nhentai"])), vec!["repo-x-en"]);
+    }
+
+    #[test]
+    fn the_seven_builtin_sources_are_listed() {
+        let ids: Vec<String> = builtin_sources().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 7, "{ids:?}");
+        assert!(builtin_sources().iter().filter(|s| s.nsfw).count() >= 3);
+    }
 }

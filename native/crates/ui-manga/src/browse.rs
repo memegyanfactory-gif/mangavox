@@ -4,23 +4,31 @@ use std::path::PathBuf;
 
 use anyhow::anyhow;
 use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::manga;
 use mv_sources::{MangaSearchResult, SourceInfo, Tag};
-use mv_ui::{button, page_header, size, ButtonKind, Route, Tokens};
+use mv_ui::theme::{icon as icon_px, radius};
+use mv_ui::toast::{self, Toast};
+use mv_ui::{
+    btn, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, inline_alert, muted, page_title, ph, ph_icon, section_label, shimmer_text, size, skeleton, spinner, tag, AlertKind,
+    ButtonKind, Interactive, Ph, Route, Tokens, Tone, Weight,
+};
 
 use crate::backend;
 use crate::discover::{self, SourceTags, TagRequest, TagTarget};
 use crate::ops;
+use crate::sources::source_avatar;
 use crate::tags;
-use crate::ui::{
-    cover_src, error_view, manga_card, note_line, removable_chip, search_box, select_chip, skeleton_cover, skeleton_rows, spawn_cover_downloads, spinner,
-    state_view, tab, tag, tool_button, width_probe, CardInfo, Grid, Load,
-};
+use crate::ui::{cover_src, fill_menu, manga_card, menu_trigger, removable_chip, search_box, skeleton_cover, skeleton_rows, spawn_cover_downloads, tab, width_probe, CardInfo, Entry, Grid, Load};
 
 /// Last source picked in Browse (restored next time).
 const SOURCE_KEY: &str = "browseSource";
+/// More sources than this collapse from a row of chips into a picker menu.
+const INLINE_SOURCES: usize = 5;
+/// Longest search shown in its tab before it is shortened.
+const SEARCH_TAB_CHARS: usize = 24;
 
 #[derive(Clone, PartialEq, Debug)]
 enum Mode {
@@ -45,6 +53,14 @@ fn load_known() -> anyhow::Result<Known> {
     })
 }
 
+fn short(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max - 1).collect::<String>())
+    }
+}
+
 pub struct BrowsePage {
     sources: Load<Vec<SourceInfo>>,
     selected: Option<String>,
@@ -55,13 +71,14 @@ pub struct BrowsePage {
     loading_more: bool,
     /// The source returned an empty / failing page: stop asking for more.
     exhausted: bool,
+    /// The last "load more" failed (shown as a footer with Retry).
+    more_error: Option<String>,
     scroll: UniformListScrollHandle,
     covers: HashMap<String, PathBuf>,
     input: Entity<InputState>,
     generation: u64,
     /// Result being opened (`source_id`, title).
     busy: Option<(String, String)>,
-    note: Option<String>,
     /// Titles already in the database, for the "In library" marker and instant opening.
     known: Known,
     seen_version: u64,
@@ -85,6 +102,35 @@ impl BrowsePage {
                 this.fetch(cx);
             }
         });
+        let mut p = Self {
+            sources: Load::Loading,
+            selected: None,
+            mode: Mode::Popular,
+            page: 1,
+            results: Load::Loading,
+            loading_more: false,
+            exhausted: false,
+            more_error: None,
+            scroll: UniformListScrollHandle::new(),
+            covers: HashMap::new(),
+            input,
+            generation: 0,
+            busy: None,
+            known: HashMap::new(),
+            seen_version: u64::MAX,
+            width: 0.,
+            tags: Load::Loading,
+            tags_for: None,
+            tags_open: false,
+            resolving: None,
+            _sub: sub,
+        };
+        p.load_sources(cx);
+        p
+    }
+
+    fn load_sources(&mut self, cx: &mut Context<Self>) {
+        self.sources = Load::Loading;
         cx.spawn(async move |this, cx| {
             let list = mv_ui::bg::run(async { backend::registry().await.list() }).await;
             let _ = this.update(cx, |this, cx| {
@@ -103,29 +149,6 @@ impl BrowsePage {
             });
         })
         .detach();
-        Self {
-            sources: Load::Loading,
-            selected: None,
-            mode: Mode::Popular,
-            page: 1,
-            results: Load::Loading,
-            loading_more: false,
-            exhausted: false,
-            scroll: UniformListScrollHandle::new(),
-            covers: HashMap::new(),
-            input,
-            generation: 0,
-            busy: None,
-            note: None,
-            known: HashMap::new(),
-            seen_version: u64::MAX,
-            width: 0.,
-            tags: Load::Loading,
-            tags_for: None,
-            tags_open: false,
-            resolving: None,
-            _sub: sub,
-        }
     }
 
     fn reload_known(&mut self, cx: &mut Context<Self>) {
@@ -207,9 +230,9 @@ impl BrowsePage {
         let generation = self.generation;
         self.resolving = Some(req.name.clone());
         self.results = Load::Loading;
-        self.note = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
+            let name = req.name.clone();
             let target = mv_ui::bg::run(discover::resolve_tag(req)).await;
             let _ = this.update(cx, |this, cx| {
                 if this.generation != generation {
@@ -223,7 +246,7 @@ impl BrowsePage {
                     }
                     Ok(TagTarget::Search { source_id, query }) => (Some(source_id), Mode::Search(query)),
                     Err(e) => {
-                        this.note = Some(format!("Could not open tag: {e:#}"));
+                        toast::show(cx, Toast::error(format!("Could not find the tag \u{201c}{name}\u{201d}: {e:#}")));
                         (None, Mode::Popular)
                     }
                 };
@@ -242,6 +265,12 @@ impl BrowsePage {
         self.fetch(cx);
     }
 
+    /// Leave a search: clear the field and go back to Popular.
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |s, cx| s.set_value("", window, cx));
+        self.set_mode(Mode::Popular, cx);
+    }
+
     fn fetch(&mut self, cx: &mut Context<Self>) {
         let Some(src) = self.selected.clone() else {
             self.results = Load::Ready(vec![]);
@@ -253,7 +282,7 @@ impl BrowsePage {
         self.results = Load::Loading;
         self.loading_more = false;
         self.exhausted = false;
-        self.note = None;
+        self.more_error = None;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
         self.request(src, 1, cx);
@@ -267,6 +296,13 @@ impl BrowsePage {
         let Some(src) = self.selected.clone() else { return };
         self.loading_more = true;
         self.request(src, self.page + 1, cx);
+    }
+
+    fn retry_more(&mut self, cx: &mut Context<Self>) {
+        self.more_error = None;
+        self.exhausted = false;
+        self.load_more(cx);
+        cx.notify();
     }
 
     fn request(&mut self, src: String, page: u32, cx: &mut Context<Self>) {
@@ -318,7 +354,7 @@ impl BrowsePage {
                     }
                     (Err(e), Load::Ready(_)) => {
                         this.exhausted = true;
-                        this.note = Some(format!("Could not load more: {e:#}"));
+                        this.more_error = Some(format!("{e:#}"));
                     }
                     (Err(e), _) => this.results = Load::Failed(format!("{e:#}")),
                 }
@@ -344,9 +380,9 @@ impl BrowsePage {
             return;
         }
         self.busy = Some((r.source_id.clone(), r.title.clone()));
-        self.note = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
+            let title = r.title.clone();
             let res = mv_ui::bg::run(ops::prepare_from_source(src.clone(), r)).await.and_then(|r| r);
             let _ = this.update_in(cx, |this, w, cx| {
                 this.busy = None;
@@ -355,7 +391,7 @@ impl BrowsePage {
                         this.known.insert(known_key(&m.source_plugin, &m.source_id), (m.id.clone(), false));
                         mv_ui::navigate(Route::MangaDetail { manga_id: m.id, source_id: Some(src) }, w, cx)
                     }
-                    Err(e) => this.note = Some(format!("Could not open: {e:#}")),
+                    Err(e) => toast::show(cx, Toast::error(format!("Could not open {title}: {e:#}"))),
                 }
                 cx.notify();
             });
@@ -363,25 +399,35 @@ impl BrowsePage {
         .detach();
     }
 
+    /// What to say (and offer) when a page of results comes back empty.
+    fn no_results(&self, cx: &mut Context<Self>) -> AnyElement {
+        match &self.mode {
+            Mode::Search(q) => empty_view(glyphs::SEARCH, "No results", format!("Nothing on this source matches \u{201c}{q}\u{201d}. Check the spelling or try another source."))
+                .action(btn("clear-search", "Clear search", ButtonKind::Secondary).icon(ph::X).on_click(cx.listener(|this, _, w, cx| this.clear_search(w, cx))))
+                .into_any_element(),
+            Mode::Tags(t) => {
+                let names: Vec<&str> = t.iter().map(|t| t.name.as_str()).collect();
+                empty_view(ph::FUNNEL_X, "No titles", format!("Nothing on this source is tagged {}.", names.join(" + ")))
+                    .action(btn("clear-tags", "Clear tags", ButtonKind::Secondary).icon(ph::FUNNEL_X).on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Popular, cx))))
+                    .into_any_element()
+            }
+            _ => empty_view(glyphs::BROWSE, "Nothing here", "This source returned no titles.")
+                .action(btn("retry-empty", "Try again", ButtonKind::Secondary).icon(glyphs::RETRY).on_click(cx.listener(|this, _, _, cx| this.fetch(cx))))
+                .into_any_element(),
+        }
+    }
+
     fn grid(&self, grid: Grid, cx: &mut Context<Self>) -> AnyElement {
         let Load::Ready(list) = &self.results else { return div().into_any_element() };
         if list.is_empty() {
-            let (title, body) = match &self.mode {
-                Mode::Search(q) => ("No results", format!("Nothing on this source matches \"{q}\".")),
-                Mode::Tags(t) => {
-                    let names: Vec<&str> = t.iter().map(|t| t.name.as_str()).collect();
-                    ("No titles", format!("Nothing on this source is tagged {}.", names.join(" + ")))
-                }
-                _ => ("Nothing here", "This source returned no titles.".to_string()),
-            };
-            return state_view("icons/search.svg", title, body).into_any_element();
+            return self.no_results(cx);
         }
         let rows = grid.rows(list.len());
-        // One extra row of skeletons while there may be more to load.
-        let footer = !self.exhausted;
+        // One footer row: skeletons while more may load, else the end marker or a retry.
+        // NN/g infinite scrolling: https://www.nngroup.com/articles/infinite-scrolling-tips/
         uniform_list(
             "browse-grid",
-            rows + footer as usize,
+            rows + 1,
             cx.processor(move |this: &mut Self, range: Range<usize>, _w, cx| {
                 if range.end + 2 >= rows {
                     this.load_more(cx);
@@ -392,35 +438,15 @@ impl BrowsePage {
                 range
                     .map(|r| {
                         if r >= rows {
-                            return grid.row().children((0..grid.cols).map(|_| skeleton_cover(grid)));
+                            return this.footer(grid, cx);
                         }
                         grid.row().children(list.iter().skip(r * grid.cols).take(grid.cols).map(|it| {
                             let item = it.clone();
                             let entity = entity.clone();
                             let in_library = this.known.get(&known_key(&src, &it.source_id)).is_some_and(|k| k.1);
                             let busy = this.busy.as_ref().is_some_and(|b| b.0 == it.source_id);
-                            let info = CardInfo {
-                                title: it.title.clone().into(),
-                                cover: cover_src(&this.covers, it.cover_url.as_deref()),
-                                in_library,
-                                ..Default::default()
-                            };
-                            manga_card(SharedString::from(format!("br-{}", it.source_id)), info, grid)
-                                .when(busy, |d| {
-                                    d.child(
-                                        div()
-                                            .absolute()
-                                            .top_0()
-                                            .left_0()
-                                            .size_full()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .bg(Tokens::scrim())
-                                            .child(spinner(SharedString::from(format!("spin-{}", it.source_id)), 26.)),
-                                    )
-                                })
-                                .on_click(move |_, w, cx| entity.update(cx, |t, cx| t.open_result(item.clone(), w, cx)))
+                            let info = CardInfo { title: it.title.clone().into(), cover: cover_src(&this.covers, it.cover_url.as_deref()), in_library, busy, ..Default::default() };
+                            manga_card(SharedString::from(format!("br-{}", it.source_id)), info, grid).on_click(move |_, w, cx| entity.update(cx, |t, cx| t.open_result(item.clone(), w, cx)))
                         }))
                     })
                     .collect()
@@ -429,6 +455,35 @@ impl BrowsePage {
         .track_scroll(&self.scroll)
         .size_full()
         .into_any_element()
+    }
+
+    /// The row after the last results (same height as a grid row, content at the top).
+    fn footer(&self, grid: Grid, cx: &mut Context<Self>) -> Div {
+        if !self.exhausted {
+            return grid.row().children((0..grid.cols).map(|_| skeleton_cover(grid)));
+        }
+        let inner = match &self.more_error {
+            Some(e) => inline_alert(AlertKind::Error, "Could not load more titles", e.clone()).action("Retry", cx.listener(|this, _, _, cx| this.retry_more(cx))).max_w(px(560.)).into_any_element(),
+            None => div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_size(px(size::SM))
+                .text_color(Tokens::text_3())
+                .child(icon_ph(ph::CHECK_CIRCLE, Tokens::text_3(), icon_px::SM))
+                .child("You have reached the end of this list")
+                .into_any_element(),
+        };
+        div()
+            .h(px(grid.row_h()))
+            .px(px(size::PAGE_X))
+            .pt(px(8.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(12.))
+            .child(div().w_full().h(px(1.)).bg(Tokens::border()))
+            .child(inner)
     }
 
     /// Selected tags as removable chips, with Clear all.
@@ -450,40 +505,30 @@ impl BrowsePage {
                     let id = t.id.clone();
                     removable_chip(SharedString::from(format!("sel-{}", t.id)), t.name.clone()).on_click(cx.listener(move |this, _, _, cx| this.remove_tag(&id, cx)))
                 }))
-                .child(
-                    div()
-                        .id("tags-clear")
-                        .ml(px(4.))
-                        .text_size(px(size::SM))
-                        .text_color(Tokens::accent())
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(Tokens::text_1()))
-                        .child("Clear all")
-                        .on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Popular, cx))),
-                ),
+                .child(btn("tags-clear", "Clear all", ButtonKind::Ghost).small().icon(ph::FUNNEL_X).on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Popular, cx)))),
         )
     }
 
     /// The Tags area: the source's tags in groups (Genres, Themes, ...), multi-select when the
     /// source can combine tags.
     fn tag_panel(&self, current: Option<&SourceInfo>, cx: &mut Context<Self>) -> Div {
-        let wrap = div().flex().flex_col().gap(px(8.)).mx(px(size::PAGE_X)).mb(px(12.)).p(px(12.)).rounded(px(10.)).bg(Tokens::surface()).border_1().border_color(Tokens::border());
+        let wrap = div().flex().flex_col().gap(px(10.)).mx(px(size::PAGE_X)).mb(px(12.)).p(px(12.)).rounded(px(radius::LG)).bg(Tokens::surface()).border_1().border_color(Tokens::border());
         let source_name = current.map(|s| s.name.clone()).unwrap_or_else(|| "This source".into());
         match &self.tags {
-            Load::Loading => wrap.child(div().flex().items_center().gap(px(8.)).child(spinner("tags-spin", 14.)).child(note_line("Loading tags...", false))),
-            Load::Failed(e) => wrap.child(note_line(format!("Could not load tags: {e}"), true)).child(
-                div().flex().child(button("tags-retry", "Try again", ButtonKind::Secondary).on_click(cx.listener(|this, _, _, cx| {
+            Load::Loading => wrap.child(div().flex().flex_wrap().gap(px(6.)).children([72., 96., 64., 110., 80., 70., 92., 60.].map(|w| skeleton(px(w), px(28.), radius::PILL)))),
+            Load::Failed(e) => wrap.child(inline_alert(AlertKind::Error, "Could not load tags", e.clone()).action(
+                "Try again",
+                cx.listener(|this, _, _, cx| {
                     this.tags_for = None;
                     this.load_tags(cx);
                     cx.notify();
-                }))),
-            ),
+                }),
+            )),
             Load::Ready(st) if st.tags.is_empty() => {
                 let fallback = discover::FALLBACK_SOURCE;
-                let can_switch = self.selected.as_deref() != Some(fallback)
-                    && matches!(&self.sources, Load::Ready(list) if list.iter().any(|s| s.id == fallback));
-                wrap.child(note_line(format!("{source_name} does not offer tag browsing."), false)).when(can_switch, |d| {
-                    d.child(div().flex().child(button("tags-md", "Browse MangaDex tags", ButtonKind::Secondary).on_click(cx.listener(move |this, _, _, cx| {
+                let can_switch = self.selected.as_deref() != Some(fallback) && matches!(&self.sources, Load::Ready(list) if list.iter().any(|s| s.id == fallback));
+                wrap.child(muted(format!("{source_name} does not offer tag browsing."))).when(can_switch, |d| {
+                    d.child(div().flex().child(btn("tags-md", "Browse MangaDex tags", ButtonKind::Secondary).icon(ph::TAG).on_click(cx.listener(move |this, _, _, cx| {
                         this.select_source(fallback.to_string(), cx);
                     }))))
                 })
@@ -493,80 +538,146 @@ impl BrowsePage {
                 let hint = if st.multi { "Pick tags to narrow the results: titles must have all of them." } else { "Pick a tag to browse it (this source filters by one tag at a time)." };
                 let groups = tags::group_tags(&st.tags);
                 let show_labels = groups.len() > 1;
-                wrap.child(note_line(hint, false)).child(
+                wrap.child(muted(hint)).child(
                     div().id("tag-panel").max_h(px(216.)).overflow_y_scroll().flex().flex_col().gap(px(10.)).children(groups.into_iter().map(|(group, list)| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .when(show_labels, |d| {
-                                d.child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(group.to_uppercase()))
-                            })
-                            .child(div().flex().flex_wrap().gap(px(6.)).children(list.into_iter().map(|t| {
-                                let active = selected.contains(&t.id);
-                                let label = t.name.clone();
-                                select_chip(SharedString::from(format!("tg-{}", t.id)), label, active)
-                                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_tag(t.clone(), cx)))
-                            })))
+                        div().flex().flex_col().gap(px(6.)).when(show_labels, |d| d.child(section_label(group))).child(div().flex().flex_wrap().gap(px(6.)).children(list.into_iter().map(|t| {
+                            let active = selected.contains(&t.id);
+                            filter_chip(SharedString::from(format!("tg-{}", t.id)), t.name.clone(), active).on_click(cx.listener(move |this, _, _, cx| this.toggle_tag(t.clone(), cx)))
+                        })))
                     })),
                 )
             }
         }
     }
 
-    /// Source chips: icon (or initial), name, language and an 18+ marker.
-    fn source_picker(&self, list: &[SourceInfo], cx: &mut Context<Self>) -> Div {
-        div().flex().flex_wrap().gap(px(8.)).px(px(size::PAGE_X)).mb(px(14.)).children(list.iter().map(|s| {
-            let id = s.id.clone();
-            let active = self.selected.as_deref() == Some(s.id.as_str());
-            let letter: String = s.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
-            div()
-                .id(SharedString::from(format!("src-{}", s.id)))
+    /// Few sources: a row of chips (one click to switch). Many: a picker button with a
+    /// scrolling menu, so the grid is not pushed down by a wall of chips.
+    /// Hick's law: https://lawsofux.com/hicks-law/
+    fn source_picker(&self, list: &[SourceInfo], cx: &mut Context<Self>) -> AnyElement {
+        if list.len() > INLINE_SOURCES {
+            let current = list.iter().find(|s| Some(&s.id) == self.selected.as_ref());
+            let weak = cx.entity().downgrade();
+            let entries: Vec<Entry> = std::iter::once(Entry::Heading(format!("{} sources", list.len()).into()))
+                .chain(list.iter().map(|s| {
+                    let (w, id) = (weak.clone(), s.id.clone());
+                    let mut hint = vec![];
+                    if !s.lang.is_empty() {
+                        hint.push(s.lang.to_uppercase());
+                    }
+                    if s.nsfw {
+                        hint.push("18+".into());
+                    }
+                    let e = Entry::new(s.name.clone(), move |_, cx| {
+                        let _ = w.update(cx, |t, cx| t.select_source(id.clone(), cx));
+                    })
+                    .checked(Some(&s.id) == self.selected.as_ref());
+                    if hint.is_empty() {
+                        e
+                    } else {
+                        e.hint(hint.join(" · "))
+                    }
+                }))
+                .collect();
+            let trigger = div()
+                .id("src-picker")
                 .flex()
+                .flex_none()
                 .items_center()
                 .gap(px(8.))
                 .h(px(36.))
                 .pl(px(6.))
                 .pr(px(10.))
-                .rounded(px(10.))
+                .rounded(px(radius::LG))
+                .bg(Tokens::surface())
                 .border_1()
-                .cursor_pointer()
-                .map(|d| {
-                    if active {
-                        d.bg(Tokens::accent_soft()).border_color(Tokens::accent())
-                    } else {
-                        d.bg(Tokens::surface()).border_color(Tokens::border()).hover(|s| s.bg(Tokens::hover()))
-                    }
-                })
-                .child(
-                    div()
-                        .size(px(24.))
-                        .flex_none()
-                        .rounded(px(6.))
-                        .overflow_hidden()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(if active { Tokens::accent() } else { Tokens::surface_2() })
-                        .text_size(px(size::XS))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(if active { Tokens::base() } else { Tokens::text_2() })
-                        .map(|d| match s.icon.clone().filter(|u| u.starts_with("http")) {
-                            Some(u) => d.child(img(SharedString::from(u)).size_full().object_fit(ObjectFit::Cover)),
-                            None => d.child(letter),
-                        }),
-                )
-                .child(
-                    div()
-                        .text_size(px(size::SM))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if active { Tokens::text_1() } else { Tokens::text_2() })
-                        .child(s.name.clone()),
-                )
-                .when(!s.lang.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(s.lang.to_uppercase())))
-                .when(s.nsfw, |d| d.child(div().text_size(px(size::XS)).font_weight(FontWeight::BOLD).text_color(Tokens::danger()).child("18+")))
-                .on_click(cx.listener(move |this, _, _, cx| this.select_source(id.clone(), cx)))
-        }))
+                .border_color(Tokens::border())
+                .hover(|s| s.bg(Tokens::surface_2()).border_color(Tokens::border_strong()))
+                .pressable()
+                .when_some(current, |d, s| d.child(source_avatar(s, 24., true)).child(div().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(s.name.clone())))
+                .child(ph_icon(ph::CARET_DOWN, Weight::Bold, Tokens::text_3(), icon_px::XS));
+            return div()
+                .flex()
+                .px(px(size::PAGE_X))
+                .mb(px(14.))
+                .child(menu_trigger(trigger, "Switch source").dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| fill_menu(menu.min_w(px(280.)).max_h(px(420.)).scrollable(true), &entries)))
+                .into_any_element();
+        }
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(8.))
+            .px(px(size::PAGE_X))
+            .mb(px(14.))
+            .children(list.iter().map(|s| {
+                let id = s.id.clone();
+                let active = self.selected.as_deref() == Some(s.id.as_str());
+                div()
+                    .id(SharedString::from(format!("src-{}", s.id)))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(36.))
+                    .pl(px(6.))
+                    .pr(px(10.))
+                    .rounded(px(radius::LG))
+                    .border_1()
+                    .role(Role::Tab)
+                    .aria_selected(active)
+                    .map(|d| {
+                        if active {
+                            d.bg(Tokens::accent_soft()).border_color(Tokens::accent_border()).hover(|s| s.bg(Tokens::accent_a(0.22)))
+                        } else {
+                            d.bg(Tokens::surface()).border_color(Tokens::border()).hover(|s| s.bg(Tokens::surface_2()).border_color(Tokens::border_strong()))
+                        }
+                    })
+                    .pressable()
+                    .child(source_avatar(s, 24., active))
+                    .child(div().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(if active { Tokens::text_1() } else { Tokens::text_2() }).child(s.name.clone()))
+                    .when(!s.lang.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(s.lang.to_uppercase())))
+                    .when(s.nsfw, |d| d.child(tag("18+", Tone::Danger)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_source(id.clone(), cx)))
+            }))
+            .into_any_element()
+    }
+
+    fn mode_tabs(&self, current: Option<&SourceInfo>, cx: &mut Context<Self>) -> Div {
+        let search = match &self.mode {
+            Mode::Search(q) => Some(q.clone()),
+            _ => None,
+        };
+        let mode_tab = |id: &'static str, icon: Ph, label: &'static str, mode: Mode| {
+            tab(id, Some(icon), label, None, self.mode == mode).on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode.clone(), cx)))
+        };
+        div()
+            .flex()
+            .items_center()
+            .px(px(size::PAGE_X))
+            .mb(px(14.))
+            .border_b_1()
+            .border_color(Tokens::border())
+            .child(mode_tab("m-popular", ph::FIRE, "Popular", Mode::Popular))
+            .child(mode_tab("m-latest", ph::CLOCK, "Latest", Mode::Latest))
+            .when_some(search, |d, q| {
+                d.child(tab("m-search", Some(glyphs::SEARCH), format!("\u{201c}{}\u{201d}", short(&q, SEARCH_TAB_CHARS)), None, true).mr(px(4.)).tooltip(mv_ui::tip(format!("Results for \u{201c}{q}\u{201d}"))))
+                    .child(div().mr(px(18.)).child(icon_button("m-search-close", ph::X, "Clear search").small().on_click(cx.listener(|this, _, w, cx| this.clear_search(w, cx)))))
+            })
+            .when(!self.selected_tags().is_empty(), |d| d.child(tab("m-tags", Some(ph::TAG), "Tags", Some(self.selected_tags().len()), true)))
+            .child(div().flex_1())
+            .when_some(self.resolving.clone(), |d, n| d.child(div().mr(px(10.)).text_size(px(size::SM)).child(shimmer_text(format!("Finding \u{201c}{n}\u{201d}\u{2026}")))))
+            .when(self.loading_more, |d| d.child(div().mr(px(10.)).child(spinner("more-spin", Tokens::text_3(), icon_px::SM))))
+            .when_some(self.busy.clone(), |d, (_, t)| d.child(div().mr(px(10.)).text_size(px(size::SM)).child(shimmer_text(format!("Opening {}\u{2026}", short(&t, 32))))))
+            .when(current.is_some_and(|s| s.nsfw), |d| d.child(div().mr(px(8.)).child(tag("18+", Tone::Danger))))
+            .child(
+                btn("tags-toggle", if self.tags_open { "Hide tags" } else { "Tags" }, ButtonKind::Ghost)
+                    .small()
+                    .icon(ph::TAG)
+                    .selected(self.tags_open)
+                    .tooltip("Browse this source by genre and theme")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tags_open = !this.tags_open;
+                        cx.notify();
+                    })),
+            )
     }
 }
 
@@ -591,72 +702,38 @@ impl Render for BrowsePage {
             Load::Ready(list) => list.iter().find(|s| Some(&s.id) == self.selected.as_ref()).cloned(),
             _ => None,
         };
-        let subtitle = current.as_ref().map(|s| SharedString::from(s.name.clone()));
-        let mut root = div().size_full().flex().flex_col().pt(px(size::PAGE_Y)).child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(size::PAGE_X))
-                .child(div().flex_1().min_w_0().child(page_header("Browse", subtitle)))
-                .when(current.is_some(), |d| d.child(div().mb(px(20.)).child(search_box(&self.input)))),
+        let header = div().px(px(size::PAGE_X)).child(
+            page_title("Browse")
+                .icon(glyphs::BROWSE)
+                .when_some(current.as_ref(), |h, s| h.subtitle(s.name.clone()))
+                .when(current.is_some(), |h| h.action(search_box(&self.input))),
         );
+        let mut root = div().size_full().flex().flex_col().pt(px(size::PAGE_Y)).child(header);
         match &self.sources {
             Load::Loading => return root.child(skeleton_rows(grid, 2)),
-            Load::Failed(e) => return root.child(error_view(e.clone())),
+            Load::Failed(e) => {
+                return root.child(error_view(e.clone()).title("Could not load your sources").retry(cx.listener(|this, _, _, cx| {
+                    this.load_sources(cx);
+                    cx.notify();
+                })))
+            }
             Load::Ready(list) if list.is_empty() => {
+                // Empty Browse: say why and give the one next step (NN/g empty states).
                 return root.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .child(state_view("icons/compass.svg", "No sources enabled", "Install or enable a source to start browsing."))
-                        .child(button("open-sources", "Open source settings", ButtonKind::Primary).on_click(|_, w, cx| {
-                            mv_ui::navigate(Route::Settings { tab: Some("sources".into()) }, w, cx)
-                        })),
-                )
+                    empty_view(glyphs::SOURCES, "Add a source", "Browse finds manga through sources. Add or turn one on in Settings to start exploring.")
+                        .action(btn("open-sources", "Add a source", ButtonKind::Primary).icon(ph::PLUS).on_click(|_, w, cx| mv_ui::navigate(Route::Settings { tab: Some("sources".into()) }, w, cx))),
+                );
             }
             Load::Ready(list) => root = root.child(self.source_picker(list, cx)),
         }
-        let search = match &self.mode {
-            Mode::Search(q) => Some(q.clone()),
-            _ => None,
-        };
-        let tabs = div()
-            .flex()
-            .items_center()
-            .px(px(size::PAGE_X))
-            .mb(px(14.))
-            .border_b_1()
-            .border_color(Tokens::border())
-            .child(tab("m-popular", "Popular", None, self.mode == Mode::Popular).on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Popular, cx))))
-            .child(tab("m-latest", "Latest", None, self.mode == Mode::Latest).on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Latest, cx))))
-            .when_some(search, |d, q| d.child(tab("m-search", format!("Search: {q}"), None, true)))
-            .when(!self.selected_tags().is_empty(), |d| d.child(tab("m-tags", "Tags", Some(self.selected_tags().len()), true)))
-            .child(div().flex_1())
-            .when_some(self.resolving.clone(), |d, n| d.child(div().mr(px(8.)).child(note_line(format!("Finding \"{n}\"..."), false))))
-            .when(self.loading_more, |d| d.child(div().mr(px(8.)).child(spinner("more-spin", 14.))))
-            .when_some(self.busy.clone(), |d, (_, t)| d.child(div().mr(px(8.)).child(note_line(format!("Opening {t}..."), false))))
-            .when_some(self.note.clone(), |d, n| d.child(div().mr(px(8.)).child(note_line(n, true))))
-            .when(current.as_ref().is_some_and(|s| s.nsfw), |d| d.child(tag("18+")))
-            .child(
-                div().ml(px(8.)).child(
-                    tool_button("tags-toggle", "icons/tags.svg", if self.tags_open { "Hide tags" } else { "Tags" }, self.tags_open).on_click(cx.listener(|this, _, _, cx| {
-                        this.tags_open = !this.tags_open;
-                        cx.notify();
-                    })),
-                ),
-            );
+        let tabs = self.mode_tabs(current.as_ref(), cx);
         let selected_row = self.selected_row(cx);
         let panel = self.tags_open.then(|| self.tag_panel(current.as_ref(), cx));
         let body: AnyElement = match &self.results {
             Load::Loading => skeleton_rows(grid, 3).into_any_element(),
-            Load::Failed(e) => div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .child(error_view(e.clone()))
-                .child(button("retry", "Try again", ButtonKind::Secondary).on_click(cx.listener(|this, _, _, cx| this.fetch(cx))))
+            Load::Failed(e) => error_view(e.clone())
+                .title(format!("{} did not answer", current.as_ref().map(|s| s.name.clone()).unwrap_or_else(|| "The source".into())))
+                .retry(cx.listener(|this, _, _, cx| this.fetch(cx)))
                 .into_any_element(),
             Load::Ready(_) => self.grid(grid, cx),
         };

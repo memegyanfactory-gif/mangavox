@@ -71,6 +71,13 @@ impl Prefs {
     pub fn save(&self) {
         let _ = write_json_atomic(&Self::path(), self);
     }
+    /// Changes settings on disk without overwriting keys other parts of the app saved
+    /// meanwhile (e.g. the default narrator from Settings).
+    pub fn update(f: impl FnOnce(&mut Prefs)) {
+        let mut p = Prefs::load();
+        f(&mut p);
+        p.save();
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -123,9 +130,19 @@ pub fn list_pages(pages_dir: &Path) -> Vec<PathBuf> {
 pub fn chapter_status(ch: &ChapterRef) -> PhaseStatus {
     let dir = chapter_dir(ch);
     let audio_files = std::fs::read_dir(ch.output_dir.join("audio"))
-        .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("wav"))).count())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("wav")))
+                // A take being voiced (tts_bridge writes `page_NNNN.new.wav` first) is not a clip yet.
+                .filter(|e| !e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".new.wav"))
+                .count()
+        })
         .unwrap_or(0);
     let video = ch.output_dir.join("video_final.mp4");
+    let mut reels: Vec<PathBuf> = std::fs::read_dir(ch.output_dir.join("reels"))
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4"))).collect())
+        .unwrap_or_default();
+    reels.sort();
     PhaseStatus {
         read_pages: load_read(ch).map(|r| r.pages.len()).unwrap_or(0),
         total_pages: list_pages(&ch.pages_dir).len(),
@@ -133,6 +150,8 @@ pub fn chapter_status(ch: &ChapterRef) -> PhaseStatus {
         story: dir.join("story.json").is_file(),
         audio_files,
         video: video.is_file().then_some(video),
+        reels,
+        music: ch.output_dir.join("score.wav").is_file(),
     }
 }
 

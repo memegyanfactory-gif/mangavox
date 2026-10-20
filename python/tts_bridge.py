@@ -1,9 +1,15 @@
 """
 TTS Bridge — generates per-segment audio for the pipeline.
 
+Narration follows the story: each page's scene (kind, mood, intensity) drives the delivery
+(see narration_tts.py). Chatterbox runs as one long-lived worker per job; the chapter is
+loudness-normalised to about -16 LUFS and `audio/narration_params.json` records what each
+segment was given.
+
 Engine selection cascade (first available wins):
-  1. Kokoro-82M (bundled) — open-source, local, no API. Best for Hindi on Apple
-     Silicon (hf_alpha / hm_omega). Model auto-downloads to ~/.mangavox/models/kokoro
+  1. kokoro_tts.py (bundled): the voice's own engine (F5-TTS, Parler-TTS, XTTS, Kokoro,
+     Piper) or its stand-in voice (`voice-ready`). Models come from Settings → Audio;
+     nothing is downloaded during a job.
   2. AURA VOICE tts_worker.py (kokoro / piper) if installed externally
   3. macOS `say` command — built-in fallback
   4. Fail with a clear message — no silent failures.
@@ -14,6 +20,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 
 # Path to AURA VOICE TTS worker
 TTS_WORKER = os.path.join(
@@ -142,14 +149,18 @@ def resolve_tts_engine(requested, voice=None):
     voice = voice or ""
     requested_l = (requested or "").lower()
 
+    # kokoro_tts.py knows exactly what this voice lacks; its message beats a generic one.
+    detail = None
     if os.path.isfile(KOKORO_SCRIPT):
         try:
             ready = _run_kokoro_json(["voice-ready", voice or "hf_alpha"])
             eng = ready.get("engine") if ready.get("ready") else None
-            if eng:
+            if eng and eng != "none":
                 return eng
+            detail = ready.get("message")
         except Exception as exc:
             print(f"[tts] voice-ready failed: {exc}", file=sys.stderr)
+            detail = f"The voice check failed: {exc}"
 
     if requested_l in ("say", "macos") and _say_available():
         return "say"
@@ -159,10 +170,13 @@ def resolve_tts_engine(requested, voice=None):
         return "say"
     if _aura_available():
         return "aura"
-    raise RuntimeError(
-        "No TTS engine available. Open Audio → Download all voice packs, "
-        "or use macOS system voices."
-    )
+    raise RuntimeError(detail or _NO_ENGINE_MESSAGE)
+
+
+_NO_ENGINE_MESSAGE = (
+    'No voice engine is installed. In Settings → Audio, download "Kokoro v1.0" '
+    "(recommended); its engine installs with it."
+)
 
 
 def _resolved_engine(requested, voice=None):
@@ -187,16 +201,60 @@ def _wav_is_usable(path, min_bytes=3500, min_sec=0.2):
         return False
 
 
+def _num(v, default):
+    try:
+        f = float(v)
+        return f if f == f else default
+    except (TypeError, ValueError):
+        return default
+
+
 def run_tts(text_segments, output_dir, config=None, progress_cb=None):
     """
     Generate audio for each text segment. Returns list of dicts:
       [{ "page": int, "path": str|None, "text": str, "error": str? }]
+
+    Each page is voiced with the emotion of its scene (narration_tts.build_plan: read.json
+    scenes, per-beat styles, smoothed intensity). Chatterbox gets exaggeration / cfg_weight /
+    temperature per chunk from one long-lived worker; Kokoro and Piper get a speed. The whole
+    chapter is then loudness-normalised to about -16 LUFS, and the chosen parameters are
+    written to `audio/narration_params.json`.
+
+    config: engine, voice, speed, force_regen, emotion_strength (0-2, default 1),
+            voice_reference (a WAV a Chatterbox voice clones instead of its own clip),
+            regen_pages (page indices voiced again even when their clip exists; Studio's
+            per-page Regenerate / New take, the other pages are reused).
+
+    A page's take (`audio/takes.json`) is mixed into its chunk seeds, so a new take is a new
+    performance. A page voiced again is written next to its clip and only replaces it once it
+    came out usable, so a failed take never loses the clip that was there.
     """
     config = config or {}
     requested_engine = config.get("engine", "kokoro")
     voice = config.get("voice", "af_heart")
-    speed = config.get("speed", 1.0)
+    speed = _num(config.get("speed", 1.0), 1.0) or 1.0
     force_regen = bool(config.get("force_regen", False))
+    regen = set()
+    for p in config.get("regen_pages") or []:
+        try:
+            regen.add(int(p))
+        except (TypeError, ValueError):
+            pass
+    # Studio's "New take": the regen pages move to their next take. It is only written to
+    # audio/takes.json once the new clip is in place, so a failed take leaves the page's clip
+    # and its take number as they were.
+    new_take = bool(config.get("new_take")) and bool(regen)
+    # Only these pages are voiced again; the rest of the chapter is reused as it is.
+    pages_only = bool(regen) and not force_regen
+    strength = config.get("emotion_strength")
+    if strength is None:
+        # The chapter's own setting (mv_studio::voices::set_emotion_strength).
+        try:
+            with open(os.path.join(output_dir, "narration_style.json"), "r", encoding="utf-8") as f:
+                strength = json.load(f).get("emotion_strength")
+        except Exception:
+            strength = None
+    strength = max(0.0, min(2.0, _num(strength, 1.0)))
 
     try:
         engine = resolve_tts_engine(requested_engine, voice)
@@ -209,58 +267,456 @@ def run_tts(text_segments, output_dir, config=None, progress_cb=None):
         ready_info = _run_kokoro_json(["voice-ready", voice])
     except Exception:
         ready_info = {}
-    preview_voice = ready_info.get("previewVoice")
-    if ready_info.get("previewFallback") and preview_voice and preview_voice != voice:
-        print(f"[tts] Using engine: {engine} ({voice} → installed stand-in {preview_voice})", file=sys.stderr)
+    synth_voice = ready_info.get("synthVoice") or ready_info.get("previewVoice") or voice
+    if ready_info.get("previewFallback") and synth_voice != voice:
+        print(f"[tts] Using engine: {engine} ({voice} → installed stand-in {synth_voice})", file=sys.stderr)
     else:
         print(f"[tts] Using engine: {engine} (requested: {requested_engine}, voice: {voice})", file=sys.stderr)
 
     audio_dir = os.path.join(output_dir, "audio")
     os.makedirs(audio_dir, exist_ok=True)
+    _discard_fresh(audio_dir)
 
-    audio_files = []
-    for i, segment in enumerate(text_segments):
-        if progress_cb:
-            progress_cb("tts", i + 1, len(text_segments))
+    import narration_tts as nt
+    takes = nt.load_takes(output_dir)
+    if new_take:
+        takes = {**takes, **{p: takes.get(p, 0) + 1 for p in regen}}
+    try:
+        plan = nt.build_plan(text_segments, output_dir, strength)
+    except Exception as exc:
+        print(f"[tts] emotion plan unavailable ({exc}); narrating neutrally", file=sys.stderr)
+        plan = []
+        for s in text_segments:
+            t = (s.get("text") or "").strip()
+            units = [{"text": t, "kind": "other", "mood": "", "intensity": 3.0, "raw_intensity": None,
+                      "line_kind": "narration", "source": "default"}] if t else []
+            plan.append({"page": int(s.get("page", 0) or 0), "text": t, "units": units})
 
-        text = (segment.get("text") or "").strip()
-        page = segment["page"]
-        output_path = os.path.join(audio_dir, f"page_{page:04d}.wav")
-
-        # Empty pages — emit a tiny silence file rather than skipping (so the
-        # video stage's per-page timing doesn't drift)
-        if not text:
-            try:
-                _write_silence(output_path, seconds=0.6)
-                audio_files.append({"page": page, "path": output_path, "text": "", "engine": engine})
-            except Exception as e:
-                audio_files.append({"page": page, "path": None, "text": "", "error": str(e)})
-            continue
-
-        if not force_regen and _wav_is_usable(output_path):
-            audio_files.append({"page": page, "path": output_path, "text": text, "engine": engine})
-            continue
-
+    log = {"engine": engine, "voice": voice, "synthVoice": synth_voice, "speed": speed,
+           "emotionStrength": strength, "takes": {str(k): v for k, v in takes.items()}, "pages": []}
+    if regen:
+        log["regenPages"] = sorted(regen)
+    audio_files = None
+    if engine == "chatterbox":
+        _announce_engine(engine, voice, synth_voice)
         try:
-            if engine in ("piper", "kokoro", "xtts"):
-                _synthesize_local(text, output_path, voice, speed)
-            elif engine == "aura":
-                _generate_audio_aura(text, output_path, requested_engine, voice, speed)
-            else:  # say
-                _generate_audio_say(text, output_path, voice, speed)
-            audio_files.append({"page": page, "path": output_path, "text": text, "engine": engine})
-        except Exception as e:
-            print(f"[tts] Failed for page {page}: {e}", file=sys.stderr)
-            audio_files.append({"page": page, "path": None, "text": text, "error": str(e)})
+            audio_files = _run_chatterbox(plan, audio_dir, synth_voice, speed, strength, force_regen, progress_cb, log,
+                                          config.get("voice_reference"), regen, takes)
+        except RuntimeError as exc:
+            if pages_only:
+                # Only a page or two were to be voiced again: a stand-in voice there would not
+                # match the Chatterbox pages around it, so those pages keep their clips.
+                raise RuntimeError(f"Chatterbox could not run ({str(exc)[:200]}). "
+                                   "Pages that had a clip keep it.") from exc
+            # The engine would not start: the chapter is voiced by the stand-in instead.
+            stand_in = _stand_in_for(synth_voice)
+            print(f"[tts] Chatterbox unavailable ({exc}); using {stand_in}", file=sys.stderr)
+            # A protocol line for the job's status (pipeline_worker's stdout), so the swap is seen.
+            _announce_engine("kokoro", voice, stand_in, reason=f"Chatterbox could not run ({str(exc)[:200]})")
+            log["chatterboxError"] = str(exc)
+            engine, synth_voice = "kokoro", stand_in
+            log.update(engine=engine, synthVoice=synth_voice, pages=[])
+    else:
+        _announce_engine(engine, voice, synth_voice)
+    if audio_files is None:
+        audio_files = _run_basic(plan, audio_dir, engine, requested_engine, synth_voice, speed, strength,
+                                 force_regen, progress_cb, log, regen)
 
+    # Empty pages: a short silence at the chapter's sample rate (so concatenation works and
+    # the video's per-page timing does not drift).
+    rate = _chapter_rate(audio_files, engine)
+    for a in audio_files:
+        if a.pop("_empty", False):
+            try:
+                _write_silence(a["path"], seconds=0.6, framerate=rate)
+            except Exception as e:
+                a.update(path=None, error=str(e))
+
+    spoken = [a["path"] for a in audio_files if a.get("path") and a.get("text") and os.path.isfile(a["path"])]
+    if spoken:
+        log["loudness"] = _normalize_chapter_pages(audio_dir, spoken, engine, synth_voice)
+    if new_take and engine == "chatterbox":
+        done = {a["page"] for a in audio_files if a.get("page") in regen and a.get("path") and not a.get("error")}
+        if done:
+            _save_takes(output_dir, {p: takes[p] for p in done})
+    # The takes the clips on disk were made with (a failed new take keeps its old number).
+    log["takes"] = {str(k): v for k, v in nt.load_takes(output_dir).items()}
+    _write_log(audio_dir, log)
+    if pages_only:
+        failed = [a for a in audio_files if a.get("page") in regen and a.get("error")]
+        if failed and len(failed) == len([a for a in audio_files if a.get("page") in regen]):
+            # Say so (the job fails) instead of reporting "audio ready" with the old clip.
+            first = failed[0]
+            kept = " It keeps its previous clip." if first.get("path") else ""
+            raise RuntimeError(f"Page {int(first['page']) + 1} could not be voiced ({first['error']}).{kept}")
     return audio_files
 
 
-def _write_silence(output_path, seconds=0.5):
+def _save_takes(output_dir, pages):
+    """Records the take each of `pages` ({page: take}) is now narrated with, in
+    `audio/takes.json` (the format mv_studio::voices::page_take reads)."""
+    import narration_tts as nt
+    path = os.path.join(output_dir, "audio", "takes.json")
+    merged = {str(k): v for k, v in nt.load_takes(output_dir).items()}
+    merged.update({str(k): int(v) for k, v in pages.items()})
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=1)
+        os.replace(path + ".tmp", path)
+    except OSError as exc:
+        print(f"[tts] could not save the takes: {exc}", file=sys.stderr)
+
+
+_LOUDNESS_LEDGER = ".loudness.json"
+
+
+def _file_sig(path):
+    try:
+        st = os.stat(path)
+        return f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        return None
+
+
+def _normalize_chapter_pages(audio_dir, spoken, engine, voice):
+    """Chapter loudness without normalising a page twice. `audio/.loudness.json` remembers
+    the pages this step already normalised (size and mtime) and the gain it used. Reused pages
+    stay as they are; new pages (a regenerated page, an edited one) get the chapter's earlier
+    gain when the engine and voice are the same, so they match the pages around them; a fresh
+    chapter gets one gain for all its pages."""
+    path = os.path.join(audio_dir, _LOUDNESS_LEDGER)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            ledger = json.load(f)
+        if not isinstance(ledger, dict):
+            ledger = {}
+    except Exception:
+        ledger = {}
+    known = ledger.get("files") if isinstance(ledger.get("files"), dict) else {}
+    done = [p for p in spoken if known.get(os.path.basename(p)) == _file_sig(p)]
+    fresh = [p for p in spoken if p not in done]
+    if not fresh:
+        return {"ok": True, "unchanged_pages": len(done), "gain_db": ledger.get("gain_db")}
+    same_voice = ledger.get("engine") == engine and ledger.get("voice") == voice
+    gain = ledger.get("gain_db") if done and same_voice and isinstance(ledger.get("gain_db"), (int, float)) else None
+    rate = None
+    if done:
+        import wave
+        try:
+            with wave.open(done[0], "rb") as wf:
+                rate = wf.getframerate()
+        except Exception:
+            rate = None
+    res = _normalize_files(fresh, gain_db=gain, rate=rate)
+    if res.get("ok"):
+        files = {os.path.basename(p): _file_sig(p) for p in done + fresh}
+        entry = {"engine": engine, "voice": voice, "target": res.get("target"),
+                 "gain_db": gain if gain is not None else res.get("gain_db"), "files": files}
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(entry, f, indent=1)
+            os.replace(path + ".tmp", path)
+        except Exception as exc:
+            print(f"[tts] could not write {_LOUDNESS_LEDGER}: {exc}", file=sys.stderr)
+    res["unchanged_pages"] = len(done)
+    return res
+
+
+_ENGINE_NAMES = {"chatterbox": "Chatterbox", "kokoro": "Kokoro", "piper": "Piper", "xtts": "XTTS",
+                 "aura": "AURA", "say": "macOS voices"}
+
+
+def _announce_engine(engine, voice, synth_voice, reason=None):
+    """One protocol line (pipeline_worker's stdout) saying who narrates this chapter, so the
+    job's status can show it: the voice's own engine, or a stand-in voice and why."""
+    name = _ENGINE_NAMES.get(engine, engine)
+    stand_in = bool(synth_voice and synth_voice != voice)
+    if reason:
+        message = f"{reason}; narrating with {name} ({synth_voice}) instead."
+    elif stand_in:
+        message = f"Narrating with {name}: {synth_voice} stands in for {voice}."
+    else:
+        message = f"Narrating with {name}."
+    print(json.dumps({"type": "info", "stage": "tts", "message": message, "engine": engine,
+                      "voice": voice, "synth_voice": synth_voice, "stand_in": stand_in or bool(reason)}), flush=True)
+
+
+def _fresh_path(output_path):
+    """Where a page is voiced again before it replaces its clip (`page_0004.new.wav`)."""
+    return output_path[:-4] + ".new.wav" if output_path.endswith(".wav") else output_path + ".new"
+
+
+def _discard_fresh(audio_dir):
+    """Drops half-made takes a crashed or cancelled run left behind."""
+    try:
+        for name in os.listdir(audio_dir):
+            if name.endswith(".new.wav"):
+                os.remove(os.path.join(audio_dir, name))
+    except OSError:
+        pass
+
+
+def _voice_target(output_path):
+    """The file to voice into: the clip itself, or a side file when a clip is already there
+    (it replaces the clip only once it came out usable, see `_commit`)."""
+    return _fresh_path(output_path) if os.path.isfile(output_path) else output_path
+
+
+def _commit(target, output_path):
+    """Puts a page voiced into `target` in place. False (and the old clip kept) when the new
+    file is not usable."""
+    if target == output_path:
+        return _wav_is_usable(output_path)
+    if not _wav_is_usable(target):
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        return False
+    os.replace(target, output_path)
+    return True
+
+
+def _stand_in_for(voice):
+    try:
+        from kokoro_tts import STUDIO_KOKORO_STAND_IN
+        return STUDIO_KOKORO_STAND_IN.get(voice, "af_heart")
+    except Exception:
+        return "af_heart"
+
+
+def _chapter_rate(audio_files, engine):
+    import wave
+    for a in audio_files:
+        if a.get("path") and a.get("text") and os.path.isfile(a["path"]):
+            try:
+                with wave.open(a["path"], "rb") as wf:
+                    return wf.getframerate()
+            except Exception:
+                pass
+    return 24000 if engine in ("kokoro", "chatterbox") else 22050
+
+
+def _normalize_files(paths, gain_db=None, rate=None):
+    """Loudness to about -16 LUFS with one gain for all `paths` (a chapter), or with
+    `gain_db` when given. Runs in this interpreter when it has numpy, else in the voice
+    environment's Python."""
+    import narration_tts as nt
+    if nt.np is not None:
+        try:
+            return nt.normalize_chapter(paths, gain_db=gain_db, rate=rate)
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "narration_tts.py")
+    args = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+    json.dump({"files": paths, "gain_db": gain_db, "rate": rate}, args)
+    args.close()
+    try:
+        r = subprocess.run([_tts_subprocess_python(), script, "loudnorm", args.name], capture_output=True, text=True,
+                           timeout=900, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        lines = [l for l in (r.stdout or "").splitlines() if l.strip()]
+        return json.loads(lines[-1]) if lines else {"ok": False, "message": (r.stderr or "")[-300:]}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+    finally:
+        os.unlink(args.name)
+
+
+def _write_log(audio_dir, log):
+    """Per-segment parameters next to the audio, for debugging the delivery."""
+    try:
+        path = os.path.join(audio_dir, "narration_params.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=1, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+    except Exception as exc:
+        print(f"[tts] could not write narration_params.json: {exc}", file=sys.stderr)
+
+
+def _unit_log(u):
+    return {"kind": u.get("kind"), "mood": u.get("mood"), "intensity": u.get("intensity"),
+            "rawIntensity": u.get("raw_intensity"), "lineKind": u.get("line_kind"), "source": u.get("source")}
+
+
+def _run_basic(plan, audio_dir, engine, requested_engine, voice, speed, strength, force_regen, progress_cb, log, regen=()):
+    """Kokoro / Piper / XTTS / system voices: one call per page, emotion as speed only. These
+    engines say a text the same way every time, so a page's take does not change them."""
+    import narration_tts as nt
+    audio_files = []
+    for i, p in enumerate(plan):
+        if progress_cb:
+            progress_cb("tts", i + 1, len(plan))
+        text, page = p["text"], p["page"]
+        output_path = os.path.join(audio_dir, f"page_{page:04d}.wav")
+        if not text:
+            audio_files.append({"page": page, "path": output_path, "text": "", "engine": engine, "_empty": True})
+            continue
+        style = nt.page_style(p["units"])
+        page_speed = speed
+        if engine in ("kokoro", "piper", "xtts"):
+            page_speed = round(speed * nt.kokoro_speed(style.get("kind"), style.get("intensity"), strength), 3)
+        entry = {"page": page, "engine": engine, "speed": page_speed, "units": [_unit_log(u) for u in p["units"]]}
+        if not force_regen and page not in regen and _wav_is_usable(output_path):
+            audio_files.append({"page": page, "path": output_path, "text": text, "engine": engine})
+            entry["reused"] = True
+            log["pages"].append(entry)
+            continue
+        target = _voice_target(output_path)
+        try:
+            if engine in ("piper", "kokoro", "xtts"):
+                _synthesize_local(text, target, voice, page_speed)
+            elif engine == "aura":
+                _generate_audio_aura(text, target, requested_engine, voice, page_speed)
+            else:  # say
+                _generate_audio_say(text, target, voice, page_speed)
+            if not _commit(target, output_path):
+                raise RuntimeError("the new clip came out empty")
+            audio_files.append({"page": page, "path": output_path, "text": text, "engine": engine})
+        except Exception as e:
+            print(f"[tts] Failed for page {page}: {e}", file=sys.stderr)
+            entry["error"] = str(e)
+            if target != output_path:
+                # The new take failed: the page keeps the clip it had.
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+                entry["keptPrevious"] = True
+                audio_files.append({"page": page, "path": output_path, "text": text, "engine": engine, "error": str(e)})
+            else:
+                audio_files.append({"page": page, "path": None, "text": text, "error": str(e)})
+        log["pages"].append(entry)
+    return audio_files
+
+
+def _reference_signature(path):
+    try:
+        st = os.stat(path)
+        return f"{os.path.abspath(path)}:{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return ""
+
+
+def _chatterbox_chunks(nt, cb, page, units, voice, strength, ref_sig, take=0):
+    out = []
+    for ci, c in enumerate(nt.plan_chunks(units)):
+        params = nt.chatterbox_params(c["kind"], c["intensity"], c["line_kind"], strength)
+        seed = nt.segment_seed(page, ci, c["text"], take)
+        key = nt.cache_key(f"chatterbox-{cb.CHATTERBOX_VERSION}", voice, c["synth_text"], params, seed, ref_sig)
+        out.append({"text": c["synth_text"], "params": params, "seed": seed, "key": key,
+                    "pause_before_ms": c["pause_before_ms"], "kind": c["kind"], "intensity": c["intensity"],
+                    "shout": c["shout"], "boundary": c["boundary"]})
+    return out
+
+
+def _run_chatterbox(plan, audio_dir, voice, speed, strength, force_regen, progress_cb, log, reference=None, regen=(), takes=None):
+    """Every page through ONE Chatterbox worker (the 0.5B model loads once per job), chunked,
+    seeded per chunk (and per take), cached by hash(text, style, engine, seed) in
+    audio/.tts-cache. Pages whose chunks are all cached are put together here, and the worker
+    only starts when a page needs new speech (so re-rendering an edited chapter only voices
+    what changed, and a new take only voices its page).
+    Raises RuntimeError when Chatterbox cannot start: the caller then uses the stand-in."""
+    takes = takes or {}
+    import narration_tts as nt
+    import chatterbox_tts as cb
+    reference = reference if reference and os.path.isfile(reference) else None
+    ref_path = reference or cb.reference_path(voice)
+    ref_sig = _reference_signature(ref_path) if ref_path else "builtin"
+    cache_dir = os.path.join(audio_dir, ".tts-cache", "chatterbox")
+    state = {"worker": None, "restarts": 0}
+
+    def worker():
+        w = state["worker"]
+        if w is None or not w.alive():
+            if w is not None:
+                if state["restarts"] >= 2:
+                    raise RuntimeError("Chatterbox keeps stopping")
+                state["restarts"] += 1
+                w.close()
+            w = cb.Worker()
+            state["worker"] = w
+            w.start()
+            log["worker"] = {k: w.ready_info.get(k) for k in ("device", "gpu", "sr", "load_s", "torch")}
+        return w
+
+    audio_files = []
+    t_job = time.time()
+    try:
+        for i, p in enumerate(plan):
+            if progress_cb:
+                progress_cb("tts", i + 1, len(plan))
+            text, page = p["text"], p["page"]
+            output_path = os.path.join(audio_dir, f"page_{page:04d}.wav")
+            if not text:
+                audio_files.append({"page": page, "path": output_path, "text": "", "engine": "chatterbox", "_empty": True})
+                continue
+            style = nt.page_style(p["units"])
+            tempo = round(speed * (nt.chatterbox_tempo(style.get("kind")) if strength > 0 else 1.0), 3)
+            take = takes.get(page, 0)
+            chunks = _chatterbox_chunks(nt, cb, page, p["units"], voice, strength, ref_sig, take)
+            entry = {"page": page, "engine": "chatterbox", "voice": voice, "reference": ref_path, "tempo": tempo,
+                     "take": take, "units": [_unit_log(u) for u in p["units"]],
+                     "chunks": [{k: c[k] for k in ("text", "params", "seed", "key", "pause_before_ms", "kind", "intensity", "shout")}
+                                for c in chunks]}
+            if not force_regen and page not in regen and _wav_is_usable(output_path):
+                audio_files.append({"page": page, "path": output_path, "text": text, "engine": "chatterbox"})
+                entry["reused"] = True
+                log["pages"].append(entry)
+                continue
+            request = [{k: c[k] for k in ("text", "params", "seed", "key", "pause_before_ms")} for c in chunks]
+            target = _voice_target(output_path)
+            res = None
+            try:
+                res = cb.assemble_cached(target, request, cache_dir, nt.PAGE_LEAD_MS, nt.PAGE_TAIL_MS, tempo)
+            except Exception as e:
+                print(f"[tts] cached page {page} could not be assembled ({e}); voicing it again", file=sys.stderr)
+            for _attempt in range(2):
+                if res:
+                    break
+                w = worker()
+                try:
+                    res = w.page(target, voice, request, reference=ref_path, cache_dir=cache_dir,
+                                 lead_ms=nt.PAGE_LEAD_MS, tail_ms=nt.PAGE_TAIL_MS, tempo=tempo)
+                except RuntimeError as e:
+                    entry["error"] = str(e)
+                    if w.alive():
+                        break  # this page failed; the worker is fine
+                    print(f"[tts] Chatterbox stopped on page {page} ({e}); restarting", file=sys.stderr)
+            if res and not _commit(target, output_path):
+                res, entry["error"] = None, "the new clip came out empty"
+            if res:
+                entry.pop("error", None)
+                entry["result"] = {k: res.get(k) for k in ("duration", "elapsed", "tempo", "device")}
+                for c, r in zip(entry["chunks"], res.get("chunks") or []):
+                    c.update(cached=r.get("cached"), retried=r.get("retried"), seconds=r.get("raw_seconds"), elapsed=r.get("elapsed"))
+                audio_files.append({"page": page, "path": output_path, "text": text, "engine": "chatterbox"})
+            elif target != output_path:
+                # The new take failed: the page keeps the clip it had.
+                print(f"[tts] New take failed for page {page} ({entry.get('error')}); keeping the previous clip", file=sys.stderr)
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+                entry["keptPrevious"] = True
+                audio_files.append({"page": page, "path": output_path, "text": text, "engine": "chatterbox",
+                                    "error": entry.get("error") or "Chatterbox failed"})
+            else:
+                print(f"[tts] Failed for page {page}: {entry.get('error')}", file=sys.stderr)
+                audio_files.append({"page": page, "path": None, "text": text, "error": entry.get("error") or "Chatterbox failed"})
+            log["pages"].append(entry)
+    finally:
+        if state["worker"] is not None:
+            state["worker"].close()
+    spoken = sum((e.get("result") or {}).get("duration") or 0 for e in log["pages"])
+    elapsed = time.time() - t_job
+    log["timing"] = {"seconds": round(elapsed, 1), "audioSeconds": round(spoken, 1),
+                     "rtf": round(elapsed / spoken, 3) if spoken else None}
+    return audio_files
+
+
+def _write_silence(output_path, seconds=0.5, framerate=22050):
     """Write a tiny silent WAV — pure stdlib so we don't pull deps."""
     import wave
-    import struct
-    framerate = 22050
     nframes = int(framerate * seconds)
     with wave.open(output_path, "wb") as f:
         f.setnchannels(1)
@@ -539,6 +995,9 @@ VOICE_SAMPLE_TEXT = {
     "hi-lekha": "नमस्ते, यह लेखा की आवाज़ है।",
     "hi-male": "Hello, this is the Rishi voice for your narration.",
     "say-default": "Hello, this is the default macOS system voice.",
+    "cb_narrator_f": "Long ago, in a city of bells, a girl made a promise she could never take back.",
+    "cb_narrator_m": "He had lost everything that night... but he was not finished. Not yet.",
+    "cb_storyteller_m": "Some say the old sword still hangs in that hall, waiting for a hand brave enough to lift it.",
 }
 
 
@@ -558,19 +1017,24 @@ def preview_voice(output_path, voice, speed=1.0, requested_engine=None):
         _generate_audio_say(text, output_path, voice, speed)
         return {"path": output_path, "engine": "say", "text": text}
 
+    local_error = None
     if os.path.isfile(KOKORO_SCRIPT):
         try:
             ready = _run_kokoro_json(["voice-ready", voice])
             engine = ready.get("engine") if ready.get("ready") else None
-            if not engine:
-                raise RuntimeError(
-                    "No AI voice model installed — open Audio tab and click Download AI Voice Models"
-                )
+            if not engine or engine == "none":
+                raise RuntimeError(ready.get("message") or _NO_ENGINE_MESSAGE)
             synth_voice = ready.get("previewVoice") or voice
             preview_fallback = bool(ready.get("previewFallback") and synth_voice != voice)
-            _generate_audio_kokoro(text, output_path, synth_voice, speed)
+            if engine == "chatterbox":
+                import chatterbox_tts as cb
+                cb.synthesize_one(text, output_path, synth_voice, speed, kind="other", intensity=4)
+            else:
+                _generate_audio_kokoro(text, output_path, synth_voice, speed)
             if not os.path.isfile(output_path) or os.path.getsize(output_path) < 100:
                 raise RuntimeError("Preview synthesis produced no audio")
+            # Same loudness as a narrated chapter (engines no longer peak-normalise).
+            _normalize_files([output_path])
             return {
                 "path": output_path,
                 "engine": engine,
@@ -578,8 +1042,13 @@ def preview_voice(output_path, voice, speed=1.0, requested_engine=None):
                 "previewFallback": preview_fallback,
                 "synthVoice": synth_voice,
             }
-        except Exception:
-            pass
+        except Exception as exc:
+            local_error = exc
+
+    # Only macOS `say` or an external AURA worker are left; without them the local error is
+    # the one that says what to install.
+    if local_error is not None and not (_say_available() or _aura_available()):
+        raise local_error
 
     engine = _resolved_engine(requested_engine, voice)
     if engine == "kokoro":
@@ -593,3 +1062,70 @@ def preview_voice(output_path, voice, speed=1.0, requested_engine=None):
         raise RuntimeError("Preview synthesis produced no audio")
 
     return {"path": output_path, "engine": engine, "text": text}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Voice lab: one sentence at several intensities, to hear and tune the emotion curve
+# ─────────────────────────────────────────────────────────────────────────────
+
+LAB_TEXT = {
+    "fight": "He hit the wall hard, but before the dust could settle he was already charging back in!",
+    "action": "The bridge was collapsing behind them, and there were still three hundred meters to go.",
+    "emotional": "She held the letter for a long time... and then, very quietly, she began to cry.",
+    "comedy": "And that is how the strongest swordsman in the kingdom lost a duel to a goose.",
+    "reveal": "The mask fell away, and the face beneath it belonged to the man they had buried ten years ago.",
+    "horror": "Something was breathing in the dark, slow and patient, just behind the door.",
+    "romance": "For a moment neither of them spoke, and the whole city seemed to hold its breath with them.",
+    "flashback": "Long ago, before the war, the two of them used to race each other along this very river.",
+    "calm": "Morning came slowly over the village, and for once, nobody was in a hurry.",
+    "dialogue": "You came back, she said. I told you I would, he answered.",
+    "other": "The next day, the team set out for the capital, unsure of what was waiting for them there.",
+}
+
+
+def voice_lab(voice, kind, out_dir, text=None, intensities=(2, 5, 8), mood="", strength=1.0, reference=None):
+    """Renders the same sentence for scene `kind` at each intensity with `voice`'s engine
+    (Chatterbox: exaggeration/cfg/temperature; Kokoro/Piper: speed), each sample normalised
+    to the chapter loudness. Returns {ok, voice, engine, kind, text, samples: [{intensity,
+    path, params, duration, elapsed, rtf}]}."""
+    import narration_tts as nt
+    kind = nt.normalize_kind(kind)
+    text = (text or LAB_TEXT.get(kind) or LAB_TEXT["other"]).strip()
+    os.makedirs(out_dir, exist_ok=True)
+    ready = _run_kokoro_json(["voice-ready", voice])
+    engine = ready.get("engine") if ready.get("ready") else None
+    if not engine or engine == "none":
+        raise RuntimeError(ready.get("message") or _NO_ENGINE_MESSAGE)
+    synth_voice = ready.get("synthVoice") or ready.get("previewVoice") or voice
+    safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in voice)
+    samples = []
+    if engine == "chatterbox":
+        import chatterbox_tts as cb
+        ref = reference if reference and os.path.isfile(reference) else None
+        with cb.Worker() as w:
+            for level in intensities:
+                units = [{"text": text, "kind": kind, "mood": mood, "intensity": float(level), "line_kind": "narration"}]
+                chunks = _chatterbox_chunks(nt, cb, 0, units, synth_voice, strength, "")
+                out = os.path.join(out_dir, f"lab_{safe}_{kind}_{int(level)}.wav")
+                res = w.page(out, synth_voice, [{k: c[k] for k in ("text", "params", "seed", "pause_before_ms")} for c in chunks],
+                             reference=ref, lead_ms=nt.PAGE_LEAD_MS, tail_ms=nt.PAGE_TAIL_MS,
+                             tempo=nt.chatterbox_tempo(kind) if strength > 0 else 1.0)
+                loud = _normalize_files([out])
+                dur = float(res.get("duration") or 0)
+                samples.append({"intensity": level, "path": out, "params": chunks[0]["params"] if chunks else {},
+                                "chunks": [{"text": c["text"], "params": c["params"], "pause_before_ms": c["pause_before_ms"]} for c in chunks],
+                                "tempo": res.get("tempo"), "duration": dur, "elapsed": res.get("elapsed"),
+                                "rtf": round(float(res.get("elapsed") or 0) / dur, 3) if dur else None,
+                                "device": res.get("device"), "loudness": loud})
+    else:
+        for level in intensities:
+            sp = nt.kokoro_speed(kind, level, strength)
+            out = os.path.join(out_dir, f"lab_{safe}_{kind}_{int(level)}.wav")
+            t0 = time.time()
+            _generate_audio_kokoro(text, out, synth_voice, sp)
+            elapsed = time.time() - t0
+            loud = _normalize_files([out])
+            dur = nt.wav_duration(out)
+            samples.append({"intensity": level, "path": out, "params": {"speed": sp}, "duration": round(dur, 3),
+                            "elapsed": round(elapsed, 2), "rtf": round(elapsed / dur, 3) if dur else None, "loudness": loud})
+    return {"ok": True, "voice": voice, "synthVoice": synth_voice, "engine": engine, "kind": kind, "text": text, "samples": samples}

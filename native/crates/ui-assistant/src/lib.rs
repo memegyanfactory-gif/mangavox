@@ -75,7 +75,7 @@ pub fn registry(cx: &mut App) -> std::sync::Arc<mv_ai::Registry> {
     shared::shared(cx).read(cx).registry.clone()
 }
 
-/// Display name of the assistant's current model, e.g. "Sonnet 5.5" ("Select model" when unset).
+/// Display name of the assistant's current model, e.g. "Sonnet 5.5" ("Choose a model" when unset).
 pub fn model_label(cx: &mut App) -> String {
     picker::current_label(shared::shared(cx).read(cx))
 }

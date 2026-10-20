@@ -1,0 +1,16 @@
+[package]
+name = "ui-welcome"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+mv-ui = { path = "../mv-ui" }
+mv-core = { path = "../mv-core" }
+mv-sources = { path = "../mv-sources" }
+mv-studio = { path = "../mv-studio" }
+ui-manga = { path = "../ui-manga" }
+ui-media = { path = "../ui-media" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = "0.31"

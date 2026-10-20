@@ -12,7 +12,8 @@
 //!   studio/prefs.json                     Studio settings
 //!   studio/<manga>/                       a manga's character brain (faces, notes)
 //!   studio/projects/<manga>/<chapter>/    a chapter's Studio work: read, script, audio, video
-//!   models/, voice-samples/, tts-venv/    local AI models, voice previews, the voice engine
+//!   models/, voice-samples/, tts-venv/,
+//!   engines/, uv-python/, uv-cache/       local AI models, voice previews, the voice engines
 //!   assistant/, assistant-workspace/      AI chats
 //!   addons/, plugins/                     installed extensions
 //!   cache/                                covers, pages, artwork, torrents (safe to clear)
@@ -174,7 +175,8 @@ pub enum Part {
     Studio,
     /// AI chats.
     Chats,
-    /// Local AI models, voice previews and the voice engine.
+    /// Local AI models, voice previews and the voice engines (tts-venv, engines/, and the
+    /// Pythons and package cache uv downloaded for them).
     Models,
     /// Library, reading and watch history (the database), with its downloads and Studio work.
     Library,
@@ -194,7 +196,7 @@ impl Part {
             Part::VideoDownloads => &["library/anime", "library/movies", "library/subtitles"],
             Part::Studio => &[],
             Part::Chats => &["assistant", "assistant-workspace"],
-            Part::Models => &["models", "voice-samples", "tts-venv"],
+            Part::Models => &["models", "voice-samples", "tts-venv", "engines", "uv-python", "uv-cache"],
             Part::Library => &["library/manga", "downloads", "studio/projects"],
             Part::Settings => &[],
             Part::Everything => &[],

@@ -4,7 +4,8 @@
 //!   silence for empty pages, so the page numbering and timing stay intact).
 //! * `narration.studio.json` - `{"beats": [...]}` read by `pipeline_worker.load_beats`. `sync_map` aligns
 //!   beats to audio by `min(audio page) - min(beat page)`, so there is a beat for every page (page 0
-//!   included) and numbering is 0-based like the audio files.
+//!   included) and numbering is 0-based like the audio files. A passage the user gave a delivery
+//!   carries it as the beat's `kind` / `intensity`, which the narration follows.
 
 use std::path::Path;
 
@@ -40,7 +41,14 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
                 Some((n, p)) => (json!(p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| n.to_string())), Some(abs(&p))),
                 None => (Value::Null, page_img.clone()),
             };
-            beats.push(json!({ "page": page, "panel": panel, "panel_image": image, "text": s.text.trim() }));
+            let mut beat = json!({ "page": page, "panel": panel, "panel_image": image, "text": s.text.trim() });
+            // The user's direction for this passage (narration_tts.build_plan: a beat's own
+            // kind / intensity win over the page's scene).
+            if let Some(d) = s.delivery.as_ref().filter(|d| !d.kind.is_empty()) {
+                beat["kind"] = json!(d.kind);
+                beat["intensity"] = json!(d.intensity.min(10));
+            }
+            beats.push(beat);
         }
     }
 

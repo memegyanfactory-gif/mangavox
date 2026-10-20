@@ -65,6 +65,7 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::Player { .. } => "player",
         Route::Studio => "studio",
         Route::Settings { .. } => "settings",
+        Route::Welcome => "welcome",
         Route::Back => "back",
     }
 }
@@ -159,26 +160,81 @@ fn arg<'a>(args: &'a Map<String, Value>, k: &str) -> &'a str {
     args.get(k).and_then(Value::as_str).unwrap_or("").trim()
 }
 
-/// Short human label for the step row.
+/// Short human label for the step row, in the past tense ("Opened Library").
 pub fn label(name: &str, args: &Map<String, Value>) -> String {
+    phrases(name, args).done
+}
+
+/// One tool call worded for each moment: before it runs (`ask`, imperative: "Open Library"),
+/// while it runs (`doing`: "Opening Library") and after (`done`: "Opened Library"), so an
+/// approval never claims the action already happened.
+pub struct Phrases {
+    pub ask: String,
+    pub doing: String,
+    pub done: String,
+}
+
+/// Display name for a page id ("media-history" → "Watch history").
+pub fn page_title(id: &str) -> String {
+    match id {
+        "library" => "Library",
+        "browse" => "Browse",
+        "history" => "Reading history",
+        "downloads" => "Downloads",
+        "anime" => "Anime",
+        "movies" => "Movies",
+        "discover" => "Discover",
+        "favorites" => "Favorites",
+        "media-history" => "Watch history",
+        "studio" => "Studio",
+        "settings" => "Settings",
+        "" => "the page",
+        other => return capitalize(other),
+    }
+    .to_string()
+}
+
+fn settings_tab_title(id: &str) -> String {
+    match id {
+        "providers" => "AI providers".into(),
+        "models" => "Model library".into(),
+        "addons" => "Add-ons".into(),
+        other => capitalize(other),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut cs = s.chars();
+    cs.next().map(|f| f.to_uppercase().collect::<String>() + cs.as_str()).unwrap_or_default()
+}
+
+pub fn phrases(name: &str, args: &Map<String, Value>) -> Phrases {
     let a = |k| arg(args, k);
+    let p = |verb: &str, doing: &str, done: &str, obj: &str| {
+        let join = |v: &str| if obj.is_empty() { v.to_string() } else { format!("{v} {obj}") };
+        Phrases { ask: join(verb), doing: join(doing), done: join(done) }
+    };
+    let titled = |k: &str, fallback: &str| {
+        let v = arg(args, k);
+        if v.is_empty() { fallback.to_string() } else { v.to_string() }
+    };
     match name {
-        "get_app_state" => "Checked what is on screen".into(),
-        "navigate" => format!("Opened {}", a("page")),
-        "go_back" => "Went back".into(),
-        "set_category" => format!("Switched to {}", a("category")),
-        "open_settings" => format!("Opened Settings → {}", a("tab")),
-        "list_themes" => "Listed themes".into(),
-        "set_theme" => format!("Changed theme to {}", a("id")),
-        "list_library" => "Read your library".into(),
-        "get_watch_history" => "Read your watch history".into(),
-        "search_anime" => format!("Searched anime for “{}”", a("query")),
-        "open_anime" => format!("Opened {}", if a("title").is_empty() { "anime" } else { a("title") }),
-        "search_movies" => format!("Searched movies for “{}”", a("query")),
-        "open_movie" => format!("Opened {}", a("title")),
-        "open_manga" => format!("Opened {}", a("title")),
-        "play_title" => format!("Opened {}", a("title")),
-        other => format!("Ran {other}"),
+        "get_app_state" => p("Check", "Checking", "Checked", "what is on screen"),
+        "navigate" => p("Open", "Opening", "Opened", &page_title(a("page"))),
+        "go_back" => p("Go back", "Going back", "Went back", ""),
+        "set_category" => p("Switch to", "Switching to", "Switched to", &capitalize(a("category"))),
+        "open_settings" => p("Open", "Opening", "Opened", &format!("Settings → {}", settings_tab_title(a("tab")))),
+        "list_themes" => p("List themes", "Listing themes", "Listed themes", ""),
+        "set_theme" => p("Change the theme to", "Changing the theme to", "Changed the theme to", a("id")),
+        "list_library" => p("Read", "Reading", "Read", "your library"),
+        "get_watch_history" => p("Read", "Reading", "Read", "your watch history"),
+        "search_anime" => p("Search anime for", "Searching anime for", "Searched anime for", &format!("“{}”", a("query"))),
+        "open_anime" => p("Open", "Opening", "Opened", &titled("title", "the anime")),
+        "search_movies" => p("Search movies for", "Searching movies for", "Searched movies for", &format!("“{}”", a("query"))),
+        "open_movie" => p("Open", "Opening", "Opened", &titled("title", "the movie")),
+        "open_manga" => p("Open", "Opening", "Opened", &titled("title", "the manga")),
+        "play_title" => p("Open", "Opening", "Opened", &titled("title", "the title")),
+        other => p("Run", "Running", "Ran", other),
     }
 }
 
@@ -466,5 +522,20 @@ mod tests {
         let mut a = Map::new();
         a.insert("query".into(), json!("naruto"));
         assert_eq!(label("search_anime", &a), "Searched anime for “naruto”");
+    }
+
+    #[test]
+    fn phrases_use_the_right_tense() {
+        let mut a = Map::new();
+        a.insert("page".into(), json!("media-history"));
+        let p = phrases("navigate", &a);
+        assert_eq!(p.ask, "Open Watch history");
+        assert_eq!(p.doing, "Opening Watch history");
+        assert_eq!(p.done, "Opened Watch history");
+        assert_eq!(phrases("go_back", &Map::new()).ask, "Go back");
+        let mut t = Map::new();
+        t.insert("tab".into(), json!("providers"));
+        assert_eq!(phrases("open_settings", &t).ask, "Open Settings → AI providers");
+        assert_eq!(phrases("open_anime", &Map::new()).ask, "Open the anime");
     }
 }

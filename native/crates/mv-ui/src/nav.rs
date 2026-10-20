@@ -28,6 +28,8 @@ pub enum Route {
     Studio,
     // App
     Settings { tab: Option<String> },
+    /// First-run setup (full window; also "Run welcome setup again" in Settings › About).
+    Welcome,
     Back,
 }
 

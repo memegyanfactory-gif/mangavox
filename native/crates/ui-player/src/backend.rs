@@ -174,6 +174,57 @@ pub async fn subtitles(imdb: String, season: Option<u32>, episode: Option<u32>) 
     Ok(subs)
 }
 
+/// Settings → Playback (auto-play, countdown, skip intro, pre-download, subtitle language).
+pub fn load_prefs() -> logic::PlaybackPrefs {
+    let all = mv_core::config::Config::open_default().get_all();
+    logic::PlaybackPrefs::from_config(all.get("playback"), all.get("playback.skipIntro"), all.get("playback.subtitleLanguage"))
+}
+
+/// Info hash of a torrent source before it is added, so the loader can show peer stats while
+/// metadata is still arriving. Not used to release the torrent.
+pub fn source_hash(req: &PlayRequest) -> Option<String> {
+    match logic::classify_source(&req.source) {
+        SourceKind::Torrent(src) => src.info_hash().ok(),
+        _ => None,
+    }
+}
+
+/// Backdrop for the loading screen: the metahub background for IMDb titles, the AniList / MAL
+/// banner (or cover) for anime. Apple HIG Loading: give people something meaningful to look at.
+pub async fn artwork(req: PlayRequest) -> Option<String> {
+    if let Some(id) = req.imdb_id.as_deref().filter(|s| s.starts_with("tt")) {
+        return Some(format!("https://images.metahub.space/background/medium/{id}/img"));
+    }
+    let mal = req.mal_id.filter(|m| !m.is_empty())?;
+    let a = mv_media::jikan::JikanClient::shared().ok()?.anime_details(&mal).await.ok()?;
+    a.banner_url.or(a.cover_url)
+}
+
+/// What the Up Next card shows about the following episode.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NextInfo {
+    pub title: Option<String>,
+    pub still: Option<String>,
+}
+
+/// Name and still of the episode after `req` (anime through Jikan + Kitsu stills, series
+/// through Cinemeta). `None` when nothing is known; the card then falls back to the artwork.
+pub async fn next_info(req: PlayRequest) -> Option<NextInfo> {
+    let next = req.episode? + 1;
+    if let Some(mal) = req.mal_id.clone().filter(|m| !m.is_empty()) {
+        let page = (next - 1) / 100 + 1;
+        let eps = mv_media::jikan::JikanClient::shared().ok()?.anime_episodes(&mal, page).await.unwrap_or_default();
+        let mut ep = eps.into_iter().find(|e| e.number == next).unwrap_or(mv_media::types::AnimeEpisode { number: next, ..Default::default() });
+        mv_media::episode_art::fill_thumbnails(&mal, std::slice::from_mut(&mut ep), None).await;
+        return Some(NextInfo { title: ep.title, still: ep.thumbnail });
+    }
+    let imdb = req.imdb_id.filter(|s| s.starts_with("tt"))?;
+    let season = req.season.unwrap_or(1);
+    let eps = mv_media::cinemeta::CinemetaClient::new().ok()?.series_episodes(&imdb).await.ok()?;
+    let ep = eps.into_iter().find(|e| logic::episode_from_id(&e.id) == Some((season, next)))?;
+    Some(NextInfo { title: ep.title, still: ep.thumbnail })
+}
+
 /// Whether `next_episode` can look anything up for this request.
 pub fn has_next(req: &PlayRequest) -> bool {
     req.episode.is_some() && (req.imdb_id.as_deref().is_some_and(|s| !s.is_empty()) || req.mal_id.is_some())

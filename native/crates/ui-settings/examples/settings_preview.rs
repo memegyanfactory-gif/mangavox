@@ -6,16 +6,18 @@ use gpui_kit::*;
 struct Preview(AnyView);
 
 impl Render for Preview {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.0.clone())
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Settings reports through toasts; the app shell mounts this layer, so the preview must too.
+        div().relative().size_full().child(self.0.clone()).child(mv_ui::toast::host(cx))
     }
 }
 
 fn main() {
     let tab = std::env::args().nth(1).unwrap_or_else(|| "models".into());
-    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
+    gpui_kit::application().with_assets(mv_ui::Assets).run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
+        mv_ui::theme::init(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         gpui_kit::open_window(
             WindowOptions {

@@ -7,6 +7,7 @@ version.workspace = true
 mv-core = { path = "../crates/mv-core" }
 gpui-kit = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 mv-ui = { path = "../crates/mv-ui" }
 ui-manga = { path = "../crates/ui-manga" }
 ui-media = { path = "../crates/ui-media" }
@@ -14,6 +15,7 @@ ui-player = { path = "../crates/ui-player" }
 ui-assistant = { path = "../crates/ui-assistant" }
 ui-settings = { path = "../crates/ui-settings" }
 ui-studio = { path = "../crates/ui-studio" }
+ui-welcome = { path = "../crates/ui-welcome" }
 mv-net = { path = "../crates/mv-net" }
 mv-update = { path = "../crates/mv-update" }
 mv-sources = { path = "../crates/mv-sources" }

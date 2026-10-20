@@ -7,6 +7,7 @@ use mv_ui::Route;
 
 pub mod audio;
 pub mod data;
+mod music;
 mod page;
 mod phases;
 mod run;
@@ -14,6 +15,7 @@ pub mod service;
 pub mod setup;
 mod setup_view;
 mod side;
+mod widgets;
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {

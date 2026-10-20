@@ -46,13 +46,15 @@ impl Job {
         }
     }
 
-    pub fn icon(self) -> &'static str {
+    /// The same glyph the feature uses elsewhere (`mv_ui::glyphs`), so a job is recognisable.
+    pub fn icon(self) -> mv_ui::Ph {
+        use mv_ui::glyphs;
         match self {
-            Job::Assistant => "icons/message-square.svg",
-            Job::Vision => "icons/scan-eye.svg",
-            Job::Voice => "icons/audio-lines.svg",
-            Job::Transcription => "icons/captions.svg",
-            Job::Image => "icons/image.svg",
+            Job::Assistant => glyphs::ASSISTANT,
+            Job::Vision => glyphs::READ,
+            Job::Voice => glyphs::NARRATE,
+            Job::Transcription => glyphs::SUBTITLES,
+            Job::Image => glyphs::IMAGE,
         }
     }
 
@@ -61,7 +63,7 @@ impl Job {
         match self {
             Job::Assistant => "Answers questions and runs tools in the assistant panel. Local models run through Ollama or LM Studio.",
             Job::Vision => "Studio reads speech bubbles with a vision model in Ollama before narrating a chapter.",
-            Job::Voice => "Studio narrates chapters with this voice. Kokoro and Piper run offline on this PC.",
+            Job::Voice => "Studio narrates chapters with this voice. Kokoro, Chatterbox and Piper run offline on this PC; set them up in Settings → Audio.",
             Job::Transcription => "Turns speech into text. Saved now so upcoming subtitle features can use it.",
             Job::Image => "Generates artwork through ComfyUI. Saved now so upcoming Studio features can use it.",
         }
@@ -109,7 +111,9 @@ pub const PIPER_VOICE_FILES: &[(&str, &str)] = &[
 
 fn voice_model(id: &str) -> Option<String> {
     match mv_studio::tts::engine_hint(id) {
+        // The full and the Lite pack are both `kokoro:v1.0` (see `scan::scan_kokoro`).
         "kokoro" => Some("kokoro:v1.0".into()),
+        "chatterbox" => Some("chatterbox:en".into()),
         "piper" => PIPER_VOICE_FILES.iter().find(|(v, _)| *v == id).map(|(_, stem)| format!("piper:{stem}")),
         _ => None,
     }
@@ -355,6 +359,7 @@ mod tests {
             model("gguf:a/b.gguf", "C:/b.gguf", Source::MangaVox, Category::Language, false),
             model("kokoro:v1.0", "k", Source::Kokoro, Category::Voice, false),
             model("piper:en_US-amy-medium", "en_US-amy-medium", Source::Piper, Category::Voice, false),
+            model("chatterbox:en", "c", Source::MangaVox, Category::Voice, false),
             model("comfy:loras/x", "x", Source::ComfyUi, Category::ImageGen, false),
         ]);
         let a = choices(Job::Assistant, &i);
@@ -367,6 +372,8 @@ mod tests {
         assert!(voices.iter().any(|c| c.value == "bm_george"));
         assert!(voices.iter().any(|c| c.value == "en_piper_f"));
         assert!(!voices.iter().any(|c| c.value == "en_piper_m"));
+        // Chatterbox weights make its expressive voices pickable.
+        assert!(voices.iter().any(|c| c.value == "cb_narrator_f"));
         assert!(choices(Job::Image, &i).is_empty());
     }
 

@@ -1,2 +1,5 @@
-Provider logos (all except generic.svg and star.svg) come from @lobehub/icons-static-svg 1.95.1
+Provider logos (all except generic.svg, star.svg and mangavox.svg) come from @lobehub/icons-static-svg 1.95.1
 (https://github.com/lobehub/lobe-icons), MIT License. Trademarks belong to their owners.
+
+Interface icons in assets/ph come from Phosphor Icons (@phosphor-icons/core 2.1.1, https://phosphoricons.com),
+MIT License, Copyright (c) 2023 Phosphor Icons. The full licence text is in assets/ph/LICENSE.

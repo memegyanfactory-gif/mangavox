@@ -74,7 +74,9 @@ pub fn configured_python(config: &Path) -> Option<String> {
 ///
 /// `configured` (a command such as `C:\\Py\\python.exe` or `py -3.11`) is tried
 /// alone when given. Otherwise candidates are probed in order: `python`,
-/// `python3`, `py -3` on Windows and `python3`, `python`, `py -3` elsewhere.
+/// `python3`, `py -3` on Windows and `python3`, `python`, `py -3` elsewhere, then the
+/// interpreters MangaVox set up itself in the data folder ([`managed_pythons`]), so a PC
+/// whose only Python came from the one-click voice setup still works.
 pub fn discover_python(configured: Option<&str>) -> Result<PythonInterpreter, StudioError> {
     if let Some(cfg) = configured.map(str::trim).filter(|s| !s.is_empty()) {
         let mut parts = cfg.split_whitespace().map(str::to_string);
@@ -98,9 +100,66 @@ pub fn discover_python(configured: Option<&str>) -> Result<PythonInterpreter, St
             return Ok(found);
         }
     }
+    for path in managed_pythons(&mangavox_home()) {
+        if let Some(found) = probe(&path.to_string_lossy(), &[]) {
+            return Ok(found);
+        }
+    }
     Err(StudioError::PythonNotFound(format!(
-        "no Python 3.{MIN_MINOR}+ found on PATH (tried python, python3, py -3)"
+        "no Python 3.{MIN_MINOR}+ found on PATH (tried python, python3, py -3) or in {}",
+        mangavox_home().display()
     )))
+}
+
+/// The interpreter of the managed voice environment (`<root>/tts-venv`).
+pub fn venv_python(root: &Path) -> PathBuf {
+    let venv = root.join("tts-venv");
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python3")
+    }
+}
+
+/// Interpreters MangaVox set up in its data folder, best first: the voice environment
+/// (`tts-venv`), then the Pythons uv installed there (`uv-python/cpython-3.*`), newest first.
+pub fn managed_pythons(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    let venv = venv_python(root);
+    if venv.is_file() {
+        out.push(venv);
+    }
+    let mut homes: Vec<(Vec<u32>, PathBuf)> = std::fs::read_dir(root.join("uv-python"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let version = name.strip_prefix("cpython-")?.split('-').next()?.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+            Some((version, e.path()))
+        })
+        .collect();
+    homes.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, home) in homes {
+        let exe = if cfg!(windows) { home.join("python.exe") } else { home.join("bin").join("python3") };
+        if exe.is_file() {
+            out.push(exe);
+        }
+    }
+    out
+}
+
+/// The interpreter to run the voice scripts with: the managed voice environment when it
+/// works, else [`discover_python`]. `kokoro_tts.py` prefers that environment itself, so this
+/// only saves probing interpreters that cannot be used anyway.
+pub fn voice_python() -> Result<PythonInterpreter, StudioError> {
+    let configured = configured_python(&config_path());
+    if configured.is_none() {
+        if let Some(found) = probe(&venv_python(&mangavox_home()).to_string_lossy(), &[]) {
+            return Ok(found);
+        }
+    }
+    discover_python(configured.as_deref())
 }
 
 /// Runs `<program> <prefix> -c "print(version)"` and accepts Python 3.MIN_MINOR+.
@@ -202,7 +261,7 @@ pub fn requirement_names(text: &str) -> Vec<String> {
             continue;
         }
         let end = line
-            .find(|c: char| matches!(c, '=' | '<' | '>' | '!' | '~' | '[' | ';' | ' ' | '@'))
+            .find(['=', '<', '>', '!', '~', '[', ';', ' ', '@'])
             .unwrap_or(line.len());
         let name = line[..end].trim();
         if !name.is_empty() {
@@ -316,6 +375,26 @@ mod tests {
         assert_eq!(configured_python(&cfg), None);
         assert_eq!(configured_python(&dir.join("missing.json")), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_pythons_list_the_venv_then_uv_newest_first() {
+        let root = std::env::temp_dir().join(format!("mv-studio-managed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let exe = |home: PathBuf| if cfg!(windows) { home.join("python.exe") } else { home.join("bin").join("python3") };
+        let uv = root.join("uv-python");
+        let old = exe(uv.join("cpython-3.11.9-windows-x86_64-none"));
+        let new = exe(uv.join("cpython-3.12.10-windows-x86_64-none"));
+        let ten = exe(uv.join("cpython-3.12.2-windows-x86_64-none"));
+        for p in [venv_python(&root), old.clone(), new.clone(), ten.clone()] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"").unwrap();
+        }
+        // Not an interpreter folder.
+        std::fs::create_dir_all(uv.join(".lock")).unwrap();
+        assert_eq!(managed_pythons(&root), vec![venv_python(&root), new, ten, old]);
+        assert!(managed_pythons(&root.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

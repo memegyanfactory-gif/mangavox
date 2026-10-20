@@ -107,6 +107,8 @@ pub struct ChapterRead {
     /// Sorted by `index`.
     pub pages: Vec<PageRead>,
     pub model: String,
+    /// Strip parts already read, as (first page, first row) - see `strip.rs`. Empty for ordinary pages.
+    pub strip_done: Vec<(usize, u32)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -134,6 +136,20 @@ pub struct StorySegment {
     pub page: usize,
     pub panel: Option<usize>,
     pub text: String,
+    /// How the narrator should deliver this passage, picked by the user. `None` follows the
+    /// page's scene (read.json). Exported on the passage's beat, where the narration reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
+}
+
+/// Narrator direction for one passage: a scene kind the emotion mapping knows
+/// (`fight`, `action`, `dialogue`, `emotional`, `comedy`, `reveal`, `calm`, `flashback`,
+/// `romance`, `horror`) and its intensity 0-10, like ElevenLabs v3 audio tags.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Delivery {
+    pub kind: String,
+    pub intensity: u8,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -187,7 +203,15 @@ pub struct PhaseStatus {
     pub story: bool,
     pub audio_files: usize,
     pub video: Option<PathBuf>,
+    /// `pipeline/reels/reel_NN.mp4` in order, when the last render was in the Reels format.
+    pub reels: Vec<PathBuf>,
+    /// `pipeline/score.wav` exists (the Music step's score, see mv-score).
+    pub music: bool,
 }
+
+/// Video export formats: one 16:9 video, or 9:16 cut into ~1 minute reels.
+pub const FORMAT_LANDSCAPE: &str = "landscape";
+pub const FORMAT_REELS: &str = "reels";
 
 /// Global Studio preferences (`~/.mangavox/studio/prefs.json`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -200,6 +224,8 @@ pub struct Prefs {
     pub engine: Option<String>,
     pub speed: f64,
     pub resolution: String,
+    /// [`FORMAT_LANDSCAPE`] or [`FORMAT_REELS`].
+    pub format: String,
     /// Where the user left off: the open chapter and step, ticked chapters, expanded manga.
     pub last_chapter: Option<String>,
     pub last_phase: Option<String>,
@@ -216,6 +242,7 @@ impl Default for Prefs {
             engine: None,
             speed: 1.0,
             resolution: "1080p".into(),
+            format: FORMAT_LANDSCAPE.into(),
             last_chapter: None,
             last_phase: None,
             selected: vec![],

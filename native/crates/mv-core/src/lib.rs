@@ -7,5 +7,6 @@ pub mod events;
 pub mod library;
 pub mod limits;
 pub mod logging;
+pub mod onboarding;
 pub mod paths;
 pub mod repo;

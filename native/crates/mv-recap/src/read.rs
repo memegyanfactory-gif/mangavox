@@ -13,6 +13,7 @@ use crate::brain::Brain;
 use crate::json::{bbox_of, num_of, opt_str, str_list, str_of};
 use crate::llm::{ask_json, is_cancelled, request, truncate, Llm};
 use crate::store::*;
+use crate::strip::{self, Unit};
 use crate::types::*;
 
 const MAX_FACES_PER_CHARACTER: usize = 4;
@@ -234,19 +235,23 @@ pub(crate) fn is_webtoon(w: u32, h: u32) -> bool {
 }
 
 struct Assets {
-    page: PathBuf,
-    page_index: usize,
-    panels: Vec<(usize, Bbox)>,
+    /// The image the boxes refer to: the page, or a stitched strip part.
+    image: PathBuf,
+    /// Pages whose old panel crops are stale.
+    clear: Vec<usize>,
+    /// (page, panel index on that page, box on `image`)
+    panels: Vec<(usize, usize, Bbox)>,
     faces: Vec<FaceJob>,
     panels_dir: PathBuf,
 }
 
-/// Write panel crops (replacing stale ones for this page) and face thumbnails. Returns written faces.
+/// Write panel crops (replacing stale ones) and face thumbnails. Returns written faces.
 fn write_assets(a: Assets) -> Result<Vec<(String, PathBuf)>> {
-    let prefix = format!("p{:04}_", a.page_index);
     if let Ok(rd) = std::fs::read_dir(&a.panels_dir) {
+        let prefixes: Vec<String> = a.clear.iter().map(|p| format!("p{p:04}_")).collect();
         for e in rd.flatten() {
-            if e.file_name().to_string_lossy().starts_with(&prefix) {
+            let name = e.file_name().to_string_lossy().to_string();
+            if prefixes.iter().any(|p| name.starts_with(p)) {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -254,10 +259,10 @@ fn write_assets(a: Assets) -> Result<Vec<(String, PathBuf)>> {
     if a.panels.is_empty() && a.faces.is_empty() {
         return Ok(vec![]);
     }
-    let img = image::open(&a.page).with_context(|| format!("open {}", a.page.display()))?;
-    for (n, b) in &a.panels {
+    let img = image::open(&a.image).with_context(|| format!("open {}", a.image.display()))?;
+    for (page, n, b) in &a.panels {
         if b.area() >= MIN_PANEL_AREA {
-            let _ = crop_panel(&img, *b, &a.panels_dir.join(format!("{prefix}{n:02}.jpg")));
+            let _ = crop_panel(&img, *b, &a.panels_dir.join(format!("p{page:04}_{n:02}.jpg")));
         }
     }
     let mut out = vec![];
@@ -312,26 +317,28 @@ pub(crate) struct PagePrompt<'a> {
     pub size: (u32, u32),
     pub prev_summary: &'a str,
     pub faces: &'a [(String, PathBuf)],
+    /// Last page of a stitched strip part that starts at `index` (see `strip.rs`).
+    pub strip_to: Option<usize>,
 }
 
 pub(crate) fn page_prompt(p: &PagePrompt) -> String {
     let (w, h) = p.size;
-    let layout = if is_webtoon(w, h) {
+    let layout = if p.strip_to.is_some() || is_webtoon(w, h) {
         "WEBTOON / vertical strip: read strictly top-to-bottom, left-to-right."
     } else {
         "Manga page: if this is Japanese manga read right-to-left (top-right panel first); if it is clearly left-to-right (Western comic / manhwa page) read left-to-right."
     };
-    let mut s = format!(
-        "MANGA: {}\nCHAPTER: {} - page {} of {} (file {}, {}x{} px)\nLAYOUT: {}\n",
-        if p.brain.manga_title.is_empty() { "(untitled)" } else { &p.brain.manga_title },
-        p.label,
-        p.index + 1,
-        p.total,
-        p.file,
-        w,
-        h,
-        layout
-    );
+    let title = if p.brain.manga_title.is_empty() { "(untitled)" } else { &p.brain.manga_title };
+    let mut s = match p.strip_to {
+        Some(last) => format!(
+            "MANGA: {title}\nCHAPTER: {} - part of a vertical strip covering pages {}-{} of {} ({w}x{h} px). The page files were stitched back together and cut only at gaps between panels, so every panel and balloon in this image is complete: never call anything cut off.\nLAYOUT: {layout}\n",
+            p.label,
+            p.index + 1,
+            last + 1,
+            p.total,
+        ),
+        None => format!("MANGA: {title}\nCHAPTER: {} - page {} of {} (file {}, {w}x{h} px)\nLAYOUT: {layout}\n", p.label, p.index + 1, p.total, p.file),
+    };
     let notes: String = {
         let n = p.brain.notes.trim();
         let skip = n.chars().count().saturating_sub(1200);
@@ -340,9 +347,9 @@ pub(crate) fn page_prompt(p: &PagePrompt) -> String {
     if !notes.is_empty() {
         s += &format!("\nSTORY MEMORY SO FAR (most recent last):\n{notes}\n");
     }
-    s += &format!("\nPREVIOUS PAGE: {}\n", if p.prev_summary.is_empty() { "(this is the first page read)" } else { p.prev_summary });
+    s += &format!("\nPREVIOUS {}: {}\n", if p.strip_to.is_some() { "PART" } else { "PAGE" }, if p.prev_summary.is_empty() { "(this is the first page read)" } else { p.prev_summary });
     s += &format!("\nCHARACTER BANK (reuse these exact names):\n{}\n", roster_text(p.brain, 40));
-    s += "\nATTACHED IMAGES:\nImage 1 = the page to read.";
+    s += if p.strip_to.is_some() { "\nATTACHED IMAGES:\nImage 1 = the strip part to read." } else { "\nATTACHED IMAGES:\nImage 1 = the page to read." };
     for (i, (name, path)) in p.faces.iter().enumerate() {
         let f = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
         s += &format!("\nImage {} = reference face of {} ({}).", i + 2, name, f);
@@ -395,14 +402,26 @@ pub(crate) async fn read_chapter_with(
     let mut read = load_read(ch).unwrap_or_default();
     read.chapter_id = ch.chapter_id.clone();
     read.model = model_label(model);
-    let done: Vec<usize> = read.pages.iter().map(|p| p.index).collect();
-    let mut targets: Vec<usize> = match &opts.pages {
-        Some(p) => p.iter().copied().filter(|&i| i < pages.len()).collect(),
-        None if opts.force => (0..pages.len()).collect(),
-        None => (0..pages.len()).filter(|i| !done.contains(i)).collect(),
+    // A chapter delivered as slices of one long strip is read in whole parts cut at panel gaps
+    // (see `strip.rs`), so no panel or balloon is ever split between two reads; ordinary pages go one by one.
+    let units = {
+        let p = pages.clone();
+        tokio::task::spawn_blocking(move || strip::plan(&p)).await.map_err(|e| anyhow!(e))?
     };
-    targets.sort_unstable();
-    targets.dedup();
+    if units.first().is_some_and(|u| u.stitched) {
+        progress(Progress::Log(format!("The pages are slices of one long strip: reading it as {} whole parts so nothing is cut off.", units.len())));
+    } else {
+        read.strip_done.clear();
+    }
+    let targets: Vec<Unit> = units
+        .into_iter()
+        .filter(|u| match &opts.pages {
+            Some(want) => u.spans.iter().any(|s| want.contains(&s.page)),
+            None if opts.force => true,
+            None if u.stitched => !read.strip_done.contains(&u.key()),
+            None => !read.pages.iter().any(|p| p.index == u.first()),
+        })
+        .collect();
 
     let work = chapter_dir(ch).join("work");
     std::fs::create_dir_all(&work).context("create studio work dir")?;
@@ -412,55 +431,73 @@ pub(crate) async fn read_chapter_with(
         progress(Progress::Done);
         return Ok(read);
     }
-    let total = targets.len();
+    let total: usize = targets.iter().map(|u| u.spans.len()).sum();
     let mut finished = 0;
 
-    // Pages are read a few at a time: each model call is slow (tens of seconds), and a batch
+    // Parts are read a few at a time: each model call is slow (tens of seconds), and a batch
     // still sees the brain and the summaries of everything read before it.
-    // The first page goes alone so the brain has faces before pages are read side by side.
+    // The first part goes alone so the brain has faces before parts are read side by side.
     let (first, rest) = targets.split_at(1);
     for batch in std::iter::once(first).chain(rest.chunks(PARALLEL)) {
         if cancel.is_cancelled() {
             progress(Progress::Failed("Cancelled".into()));
             return Err(anyhow!("cancelled"));
         }
-        progress(Progress::Reading { pages: batch.to_vec(), done: finished, total });
+        progress(Progress::Reading { pages: batch.iter().flat_map(Unit::pages).collect(), done: finished, total });
 
         // 1. Prepare images and prompts.
-        let mut jobs: Vec<(usize, PathBuf, String, Option<AiStepRequest>)> = vec![];
-        for &i in batch {
-            let page_path = pages[i].clone();
-            let file = page_path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-            // Each page gets its own workspace: CLI agents clear their attachments when done.
-            let ws = work.join(format!("p{i:04}"));
+        let mut jobs: Vec<(&Unit, PathBuf, Option<AiStepRequest>)> = vec![];
+        for unit in batch {
+            let i = unit.first();
+            let file = pages[i].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+            // Each read gets its own workspace: CLI agents clear their attachments when done.
+            let ws = if unit.stitched { work.join(format!("p{i:04}_{}", unit.spans[0].y0)) } else { work.join(format!("p{i:04}")) };
             std::fs::create_dir_all(&ws).context("create page workspace")?;
-            let (wp, wk) = (page_path.clone(), ws.clone());
-            let prepped = tokio::task::spawn_blocking(move || prep_page(&wp, &wk, i)).await.map_err(|e| anyhow!(e))?;
-            let (send_path, w, h) = match prepped {
+            let (all, wk, u) = (pages.clone(), ws.clone(), unit.clone());
+            let prepped = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, u32, u32)> {
+                let image = if u.stitched {
+                    let out = wk.join("strip.jpg");
+                    strip::compose(&u, &all, &out)?;
+                    out
+                } else {
+                    all[i].clone()
+                };
+                let (send, w, h) = prep_page(&image, &wk, i)?;
+                Ok((image, send, w, h))
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
+            let (image, send_path, w, h) = match prepped {
                 Ok(x) => x,
                 Err(e) => {
                     progress(Progress::Log(format!("Page {}: {e}", i + 1)));
-                    upsert(&mut read, PageRead { index: i, file, summary: format!("(unreadable image: {e})"), ..Default::default() });
-                    jobs.push((i, page_path, String::new(), None));
+                    for s in unit.spans.iter().filter(|s| s.y0 == 0) {
+                        let file = pages[s.page].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                        upsert(&mut read, PageRead { index: s.page, file, summary: format!("(unreadable image: {e})"), ..Default::default() });
+                    }
+                    jobs.push((unit, PathBuf::new(), None));
                     continue;
                 }
             };
-            let prev_summary = (0..i).rev().find_map(|p| read.pages.iter().find(|x| x.index == p)).map(|p| p.summary.clone()).unwrap_or_default();
+            // A part that starts inside page i continues the reading already stored for page i.
+            let upto = if unit.spans[0].y0 > 0 { i + 1 } else { i };
+            let prev_summary = (0..upto).rev().find_map(|p| read.pages.iter().find(|x| x.index == p && !x.summary.is_empty())).map(|p| p.summary.clone()).unwrap_or_default();
             let recent = recent_names(&read, i);
             let (prompt, faces) = {
                 let b = brain.lock().unwrap();
                 let faces = pick_faces(&b, &recent);
-                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces });
+                let strip_to = unit.stitched.then(|| unit.spans[unit.spans.len() - 1].page);
+                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces, strip_to });
                 (prompt, faces)
             };
             let mut images = vec![send_path];
             images.extend(faces.iter().map(|(_, p)| p.clone()));
             let req = request(model, vec![AiMessage::system(READ_SYSTEM), AiMessage::user(prompt)], images, Some(ws));
-            jobs.push((i, page_path, file, Some(req)));
+            jobs.push((unit, image, Some(req)));
         }
 
-        // 2. Ask the model about every page of the batch at once.
-        let answers = futures::future::join_all(jobs.iter().map(|(_, _, _, req)| async move {
+        // 2. Ask the model about every part of the batch at once.
+        let answers = futures::future::join_all(jobs.iter().map(|(_, _, req)| async move {
             match req {
                 Some(r) => Some(ask_json(llm, r.clone(), cancel).await),
                 None => None,
@@ -469,11 +506,15 @@ pub(crate) async fn read_chapter_with(
         .await;
 
         // 3. Fold the answers in, in page order.
-        for ((i, page_path, file, _), answer) in jobs.into_iter().zip(answers) {
-            finished += 1;
+        for ((unit, image, _), answer) in jobs.into_iter().zip(answers) {
+            let i = unit.first();
+            let file_of = |p: usize| pages[p].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
             let Some(answer) = answer else {
                 save_read(ch, &read)?;
-                progress(Progress::Page { done: finished, total, page: i });
+                for s in &unit.spans {
+                    finished += 1;
+                    progress(Progress::Page { done: finished, total, page: s.page });
+                }
                 continue;
             };
             let answer = match answer {
@@ -489,10 +530,10 @@ pub(crate) async fn read_chapter_with(
                 }
             };
             let mut parsed = match answer {
-                Ok(v) => parse_page(&v, i, &file),
+                Ok(v) => parse_page(&v, i, &file_of(i)),
                 Err(raw) => {
                     progress(Progress::Log(format!("Page {}: the model did not return valid JSON; stored its raw text instead.", i + 1)));
-                    Parsed { page: PageRead { index: i, file: file.clone(), summary: truncate(&raw, 600), ..Default::default() }, extras: vec![], memory: None }
+                    Parsed { page: PageRead { index: i, file: file_of(i), summary: truncate(&raw, 600), ..Default::default() }, extras: vec![], memory: None }
                 }
             };
 
@@ -503,13 +544,51 @@ pub(crate) async fn read_chapter_with(
             for (name, new) in events {
                 progress(Progress::Character { name, new });
             }
-            let assets = Assets {
-                page: page_path,
-                page_index: i,
-                panels: parsed.page.panels.iter().enumerate().filter_map(|(n, p)| p.bbox.map(|b| (n, b))).collect(),
-                faces: face_jobs,
-                panels_dir: panels_dir(ch),
-            };
+
+            // Sync the reading back onto the page files: a page the part starts at the top of is replaced,
+            // a page it continues (the part above was read before) gets the rest of its panels appended.
+            let read_part = parsed.page;
+            let mut clear = vec![];
+            let mut out: Vec<PageRead> = unit
+                .spans
+                .iter()
+                .enumerate()
+                .map(|(n, s)| {
+                    let fresh = s.y0 == 0;
+                    let mut p = match read.pages.iter().find(|x| x.index == s.page) {
+                        Some(old) if !fresh => old.clone(),
+                        _ => PageRead { index: s.page, file: file_of(s.page), ..Default::default() },
+                    };
+                    if fresh {
+                        clear.push(s.page);
+                    }
+                    if fresh || p.scene.kind.is_empty() {
+                        p.scene = read_part.scene.clone();
+                    }
+                    if n == 0 {
+                        p.summary = if p.summary.is_empty() { read_part.summary.clone() } else { format!("{} {}", p.summary, read_part.summary) };
+                    }
+                    p
+                })
+                .collect();
+            let mut crops = vec![];
+            let mut last = 0;
+            for mut panel in read_part.panels {
+                let (n, page_box) = panel.bbox.and_then(|b| unit.to_page(b)).unwrap_or((last, None));
+                last = n;
+                let part_box = panel.bbox;
+                panel.bbox = page_box;
+                for c in &mut panel.characters {
+                    c.face = c.face.and_then(|f| unit.box_on_span(n, f));
+                }
+                let page = &mut out[n];
+                if let Some(b) = part_box {
+                    crops.push((page.index, page.panels.len(), b));
+                }
+                page.panels.push(panel);
+            }
+
+            let assets = Assets { image, clear, panels: crops, faces: face_jobs, panels_dir: panels_dir(ch) };
             match tokio::task::spawn_blocking(move || write_assets(assets)).await.map_err(|e| anyhow!(e))? {
                 Ok(faces) => {
                     let mut b = brain.lock().unwrap();
@@ -525,9 +604,17 @@ pub(crate) async fn read_chapter_with(
                     progress(Progress::Log(format!("Could not save the brain: {e}")));
                 }
             }
-            upsert(&mut read, parsed.page);
+            for p in out {
+                upsert(&mut read, p);
+            }
+            if unit.stitched && !read.strip_done.contains(&unit.key()) {
+                read.strip_done.push(unit.key());
+            }
             save_read(ch, &read)?;
-            progress(Progress::Page { done: finished, total, page: i });
+            for s in &unit.spans {
+                finished += 1;
+                progress(Progress::Page { done: finished, total, page: s.page });
+            }
         }
     }
     progress(Progress::Done);

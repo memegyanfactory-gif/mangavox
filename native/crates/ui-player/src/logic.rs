@@ -120,6 +120,159 @@ pub fn stremio_subtitle_id(imdb: &str, season: Option<u32>, episode: Option<u32>
 
 pub const SPEEDS: [f64; 8] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
+/// `1.5×`, `2×`, `0.75×` (the multiplication sign, not the letter x).
+pub fn format_rate(speed: f64) -> String {
+    format!("{speed}×")
+}
+
+/// The next speed up or down from `current` in [`SPEEDS`] (YouTube's Shift+> / Shift+<).
+pub fn speed_step(current: f64, up: bool) -> f64 {
+    let (lo, hi) = (SPEEDS[0], SPEEDS[SPEEDS.len() - 1]);
+    if up {
+        SPEEDS.iter().copied().find(|s| *s > current + 0.01).unwrap_or(hi)
+    } else {
+        SPEEDS.iter().rev().copied().find(|s| *s < current - 0.01).unwrap_or(lo)
+    }
+}
+
+/// Number keys jump to that tenth of the video (`0` = start, `5` = half way), like YouTube.
+pub fn percent_target(digit: u32, duration: f64) -> Option<f64> {
+    (digit <= 9 && duration > 0.0).then(|| duration * digit as f64 / 10.0)
+}
+
+/// Where the Up Next card appears: when the credits start (a known outro in the second half of
+/// the file), else `max(countdown, 30)` seconds before the end, so the countdown can run before
+/// the episode is over. Google Cast autoplay checklist: show Up Next at least 30 s before the end
+/// or when the credits start.
+pub fn up_next_start(duration: f64, countdown_secs: u64, outro_start: Option<f64>) -> Option<f64> {
+    if !(duration.is_finite() && duration > 0.0) {
+        return None;
+    }
+    let by_time = (duration - (countdown_secs as f64).max(30.0)).max(duration * 0.5);
+    Some(match outro_start {
+        Some(s) if s >= duration * 0.5 && s < duration => s.min(by_time),
+        _ => by_time,
+    })
+}
+
+/// Start of the outro (credits) segment, if AniSkip knows one.
+pub fn outro_start(segs: &[SkipSegment]) -> Option<f64> {
+    segs.iter().filter(|s| matches!(s.kind, SkipType::Ed | SkipType::MixedEd)).map(|s| s.start).reduce(f64::min)
+}
+
+/// "Skip intro automatically" covers opening songs only (not recaps or credits).
+pub fn is_intro(kind: SkipType) -> bool {
+    matches!(kind, SkipType::Op | SkipType::MixedOp)
+}
+
+/// Settings → Playback, as stored in `config.json` (keys shared with the Settings page and the
+/// Electron app): the `playback` object plus the top-level `playback.skipIntro` and
+/// `playback.subtitleLanguage` keys.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaybackPrefs {
+    pub auto_play: bool,
+    /// Auto-play countdown, seconds.
+    pub countdown: u64,
+    pub pre_download_next: bool,
+    pub skip_intro: bool,
+    /// ISO 639-1 code of the preferred subtitle language.
+    pub subtitle_language: String,
+}
+
+impl Default for PlaybackPrefs {
+    /// The Settings page defaults (ui-settings `Playback::default`).
+    fn default() -> Self {
+        Self { auto_play: true, countdown: 20, pre_download_next: true, skip_intro: false, subtitle_language: "en".into() }
+    }
+}
+
+impl PlaybackPrefs {
+    pub fn from_config(playback: Option<&serde_json::Value>, skip_intro: Option<&serde_json::Value>, subtitle_language: Option<&serde_json::Value>) -> Self {
+        let d = Self::default();
+        let field = |k: &str| playback.and_then(|p| p.get(k));
+        Self {
+            auto_play: field("autoPlay").and_then(|v| v.as_bool()).unwrap_or(d.auto_play),
+            countdown: field("autoPlayTimer").and_then(|v| v.as_u64()).filter(|t| (5..=120).contains(t)).unwrap_or(d.countdown),
+            pre_download_next: field("preDownloadNext").and_then(|v| v.as_bool()).unwrap_or(d.pre_download_next),
+            skip_intro: skip_intro.and_then(|v| v.as_bool()).unwrap_or(d.skip_intro),
+            subtitle_language: subtitle_language.and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(d.subtitle_language),
+        }
+    }
+}
+
+/// mpv `slang` for a preferred language: every code the language goes by (`es` → `es,spa`), so
+/// embedded and external tracks match whichever tag they use.
+pub fn slang(code: &str) -> String {
+    match lang_entry(code) {
+        Some((codes, _, _)) => codes.join(","),
+        None if code.trim().is_empty() => "en,eng".into(),
+        None => code.trim().to_ascii_lowercase(),
+    }
+}
+
+/// Season and episode from a Cinemeta video id (`tt0944947:1:3`).
+pub fn episode_from_id(id: &str) -> Option<(u32, u32)> {
+    let mut parts = id.rsplitn(3, ':');
+    let e = parts.next()?.parse().ok()?;
+    let s = parts.next()?.parse().ok()?;
+    parts.next()?;
+    Some((s, e))
+}
+
+/// A playback failure in plain words, with what to do next (NN/g error-message guidelines:
+/// <https://www.nngroup.com/articles/error-message-guidelines/>). The raw error stays available
+/// under "Details".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FriendlyError {
+    pub title: &'static str,
+    pub body: &'static str,
+    /// Another source would likely help (offer "Try another source").
+    pub other_source: bool,
+}
+
+/// `local_file`: the source is a file on this PC, so there is no other source to suggest and a
+/// generic mpv "loading failed" means the file, not the network.
+pub fn friendly_error(raw: &str, local_file: bool) -> FriendlyError {
+    let e = raw.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| e.contains(w));
+    let (title, body, other_source) = if has(&["libmpv", "mpv_create", "mpv_initialize", "native window handle", "createwindowexw"]) {
+        ("The video player could not start", "MangaVox could not load its video engine. Reinstall MangaVox, then try again.", false)
+    } else if has(&["output initialization failed"]) {
+        // mpv's ao / vo init errors: the device, not the source.
+        ("The video player could not start", "Your sound or display device could not be opened. Check the audio output and graphics driver, then try again.", false)
+    } else if has(&["file not found"]) {
+        ("This file is no longer there", "It may have been moved, renamed or deleted.", false)
+    } else if has(&["metadata timeout"]) {
+        ("No one is sharing this file right now", "The torrent found no peers, so it can't start. Another source usually plays.", true)
+    } else if has(&["no files", "bad .torrent", "bad info-hash", "not a magnet", "list-only"]) {
+        ("This source is broken", "The link doesn't lead to a playable video.", true)
+    } else if has(&["unrecognized file format", "no audio or video", "demux", "codec", "unsupported"]) || (local_file && has(&["loading failed"])) {
+        ("This video can't be played", "The file is damaged or in a format the player doesn't support.", !local_file)
+    } else if has(&["loading failed"]) {
+        // mpv's generic open failure; for a stream it is nearly always a dead or expired link.
+        ("Couldn't open the stream", "The link may have expired, or your connection dropped. Another source usually plays.", true)
+    } else if has(&["http", "network", "connect", "timed out", "timeout", "dns", "403", "404", "tls", "certificate"]) {
+        ("Couldn't reach the stream", "The link may have expired, or your connection dropped.", true)
+    } else {
+        ("Couldn't play this", "Something went wrong while opening the video.", !local_file)
+    };
+    FriendlyError { title, body, other_source }
+}
+
+/// After this long without a picture, the loader suggests another source.
+pub const SLOW_TORRENT: Duration = Duration::from_secs(20);
+pub const SLOW_STREAM: Duration = Duration::from_secs(30);
+
+/// The loader has waited long enough to suggest another source: a torrent still at 0 peers after
+/// 20 s, or any other stream after 30 s.
+pub fn slow_start(elapsed: Duration, torrent: bool, peers: Option<u32>) -> bool {
+    if torrent {
+        elapsed >= SLOW_TORRENT && peers.unwrap_or(0) == 0
+    } else {
+        elapsed >= SLOW_STREAM
+    }
+}
+
 /// Controls hide after this long without input (unless pinned: paused, menu open, hovering…).
 pub const HIDE_AFTER: Duration = Duration::from_secs(3);
 
@@ -185,6 +338,20 @@ pub const MENU_MAX_H: f32 = 420.0;
 
 pub fn menu_height(rows: usize) -> f32 {
     (MENU_HEAD_H + rows as f32 * MENU_ROW_H + 16.0).min(MENU_MAX_H)
+}
+
+/// Space a bottom-bar menu keeps clear at the top: the top bar's Back / title row.
+pub const MENU_TOP_CLEAR: f32 = 66.0;
+
+/// Menu height that fits an overlay `overlay_h` tall (menus open `BOTTOM_H - 18` above the
+/// bottom and must not run under the top bar). At least the head and two rows; unchanged while
+/// the overlay size is not known yet.
+pub fn menu_fit(height: f32, overlay_h: f32) -> f32 {
+    if overlay_h <= 0.0 {
+        return height;
+    }
+    let room = overlay_h - (BOTTOM_H - 18.0) - MENU_TOP_CLEAR;
+    height.min(room.max(menu_height(2)))
 }
 
 /// Bottom offset of the skip button (sits above the bar when controls show).
@@ -435,6 +602,12 @@ mod tests {
         assert!(controls_visible(Duration::from_secs(4), true));
         assert_eq!(skip_bottom(true), BOTTOM_H + 8.0);
         assert_eq!(menu_height(100), MENU_MAX_H);
+        // A tall window keeps the full menu; the 480 px minimum window shrinks it to the room
+        // above the bar; it never drops below the head plus two rows; unknown size: unchanged.
+        assert_eq!(menu_fit(MENU_MAX_H, 900.0), MENU_MAX_H);
+        assert_eq!(menu_fit(MENU_MAX_H, 480.0), 480.0 - (BOTTOM_H - 18.0) - MENU_TOP_CLEAR);
+        assert_eq!(menu_fit(MENU_MAX_H, 200.0), menu_height(2));
+        assert_eq!(menu_fit(300.0, 0.0), 300.0);
         assert_eq!(next_title("Show S01E03", 3), "Show S01E04");
         assert_eq!(next_title("Show, episode 9", 9), "Show, episode 10");
         assert_eq!(next_title("Show", 2), "Show - Episode 3");
@@ -478,6 +651,93 @@ mod tests {
         assert_eq!(fade(true, Duration::from_millis(500), Duration::from_millis(200)), 1.0);
         assert_eq!(fade(false, Duration::from_millis(500), Duration::from_millis(200)), 0.0);
         assert_eq!(fade(true, Duration::ZERO, Duration::from_millis(200)), 0.0);
+    }
+
+    #[test]
+    fn speeds_and_jumps() {
+        assert_eq!(format_rate(1.5), "1.5×");
+        assert_eq!(format_rate(2.0), "2×");
+        assert_eq!(format_rate(0.75), "0.75×");
+        assert_eq!(speed_step(1.0, true), 1.25);
+        assert_eq!(speed_step(1.0, false), 0.75);
+        assert_eq!(speed_step(3.0, true), 3.0);
+        assert_eq!(speed_step(0.5, false), 0.5);
+        // Off-grid rates snap to the neighbouring step.
+        assert_eq!(speed_step(1.1, true), 1.25);
+        assert_eq!(speed_step(1.1, false), 1.0);
+        assert_eq!(percent_target(5, 200.0), Some(100.0));
+        assert_eq!(percent_target(0, 200.0), Some(0.0));
+        assert_eq!(percent_target(3, 0.0), None);
+    }
+
+    #[test]
+    fn up_next_timing() {
+        // 30 s before the end at least, more for a longer countdown.
+        assert_eq!(up_next_start(1440.0, 20, None), Some(1410.0));
+        assert_eq!(up_next_start(1440.0, 60, None), Some(1380.0));
+        // Credits start earlier: show it then.
+        assert_eq!(up_next_start(1440.0, 20, Some(1320.0)), Some(1320.0));
+        // An outro in the last seconds never delays it past the 30 s lead.
+        assert_eq!(up_next_start(1440.0, 20, Some(1435.0)), Some(1410.0));
+        // An "outro" in the first half is not the credits.
+        assert_eq!(up_next_start(1440.0, 20, Some(100.0)), Some(1410.0));
+        // Short files: never before the half-way point.
+        assert_eq!(up_next_start(40.0, 20, None), Some(20.0));
+        assert_eq!(up_next_start(0.0, 20, None), None);
+        let segs = [SkipSegment { kind: SkipType::Op, start: 60.0, end: 150.0 }, SkipSegment { kind: SkipType::Ed, start: 1300.0, end: 1390.0 }];
+        assert_eq!(outro_start(&segs), Some(1300.0));
+        assert_eq!(outro_start(&segs[..1]), None);
+        assert!(is_intro(SkipType::MixedOp));
+        assert!(!is_intro(SkipType::Recap));
+    }
+
+    #[test]
+    fn prefs_follow_settings_keys() {
+        assert_eq!(PlaybackPrefs::from_config(None, None, None), PlaybackPrefs::default());
+        let pb = serde_json::json!({"autoPlay": false, "autoPlayTimer": 45, "preDownloadNext": false});
+        let p = PlaybackPrefs::from_config(Some(&pb), Some(&serde_json::json!(true)), Some(&serde_json::json!("es")));
+        assert!(!p.auto_play && !p.pre_download_next && p.skip_intro);
+        assert_eq!(p.countdown, 45);
+        assert_eq!(p.subtitle_language, "es");
+        // Out-of-range timers fall back to the default.
+        let pb = serde_json::json!({"autoPlayTimer": 0});
+        assert_eq!(PlaybackPrefs::from_config(Some(&pb), None, Some(&serde_json::json!(" "))).countdown, 20);
+        assert_eq!(slang("es"), "es,spa");
+        assert_eq!(slang("ja"), "ja,jpn,jp");
+        assert_eq!(slang(""), "en,eng");
+        assert_eq!(slang("xx"), "xx");
+        assert_eq!(episode_from_id("tt0944947:2:7"), Some((2, 7)));
+        assert_eq!(episode_from_id("tt0944947"), None);
+        assert_eq!(episode_from_id("kitsu:1"), None);
+    }
+
+    #[test]
+    fn errors_in_plain_words() {
+        let e = friendly_error("torrent metadata timeout after 90s", false);
+        assert_eq!(e.title, "No one is sharing this file right now");
+        assert!(e.other_source);
+        assert!(!friendly_error("libmpv-2.dll not found (set MANGAVOX_LIBMPV)", false).other_source);
+        assert!(!friendly_error("File not found: D:/a.mkv", true).other_source);
+        assert_eq!(friendly_error("unrecognized file format", false).title, "This video can't be played");
+        assert_eq!(friendly_error("HTTP error 404", false).title, "Couldn't reach the stream");
+        assert_eq!(friendly_error("???", false).title, "Couldn't play this");
+        assert!(!friendly_error("???", true).other_source);
+        // mpv's generic "loading failed": a dead link for a stream, the file itself when local.
+        let e = friendly_error("loading failed", false);
+        assert_eq!(e.title, "Couldn't open the stream");
+        assert!(e.other_source);
+        let e = friendly_error("loading failed", true);
+        assert_eq!(e.title, "This video can't be played");
+        assert!(!e.other_source);
+        // Audio / video device failures are not the source's fault.
+        let e = friendly_error("audio output initialization failed", false);
+        assert_eq!(e.title, "The video player could not start");
+        assert!(!e.other_source);
+        assert!(!slow_start(Duration::from_secs(10), true, None));
+        assert!(slow_start(Duration::from_secs(21), true, Some(0)));
+        assert!(!slow_start(Duration::from_secs(21), true, Some(4)));
+        assert!(!slow_start(Duration::from_secs(21), false, None));
+        assert!(slow_start(Duration::from_secs(31), false, None));
     }
 
     #[test]
