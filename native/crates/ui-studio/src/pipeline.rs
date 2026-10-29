@@ -598,8 +598,14 @@ pub fn pause(id: u64) {
     }
 }
 
+/// Resumes or retries one chapter. Asked for by the user, so it runs now even when the whole
+/// queue was held.
 pub fn resume(id: u64) {
-    edit(|q| q.resume(id));
+    edit(|q| {
+        q.resume(id);
+        q.paused = false;
+        q.interrupted = false;
+    });
     ensure_runner();
 }
 
