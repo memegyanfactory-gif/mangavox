@@ -306,6 +306,11 @@ pub struct StudioPage {
     pub(crate) sheet: Option<crate::generate::Sheet>,
     /// The answers Generate is running with (picks made meanwhile join with them).
     pub(crate) gen_answers: Option<crate::generate::Answers>,
+    /// The open "Music & subtitles" sheet.
+    pub(crate) restyle: Option<crate::restyle::Restyle>,
+    /// The dashboard Video section's export choices, and its join / export in flight.
+    pub(crate) export_prefs: crate::export::ExportPrefs,
+    pub(crate) export_job: Option<crate::export::Job>,
     pub(crate) queue: crate::pipeline::Queue,
     seen_queue: u64,
     /// Every issue, worked out once per frame; and the ones the user dismissed.
@@ -422,6 +427,9 @@ impl StudioPage {
             dash_scroll: ScrollHandle::new(),
             sheet: None,
             gen_answers: None,
+            restyle: None,
+            export_prefs: Default::default(),
+            export_job: None,
             queue: crate::pipeline::snapshot(),
             seen_queue: crate::pipeline::version(),
             issues: vec![],
@@ -1377,7 +1385,7 @@ impl StudioPage {
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let m = &k.modifiers;
-        if k.key == "escape" && !m.modified() && self.sheet.take().is_some() {
+        if k.key == "escape" && !m.modified() && (self.sheet.take().is_some() || self.restyle.take().is_some()) {
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1874,6 +1882,7 @@ impl Render for StudioPage {
         let center = if editor { self.center(window, cx) } else { self.dashboard(cx) };
         let side = self.side_open.then(|| self.side_panel(window, cx));
         let generate = self.generate_sheet(cx);
+        let restyle = self.restyle_sheet(cx);
         let sheet = self.show_setup.then(|| {
             div()
                 .id("studio-setup")
@@ -1912,6 +1921,7 @@ impl Render for StudioPage {
             .child(div().flex().flex_col().flex_1().min_w_0().h_full().map(column).child(self.toolbar(window, cx)).children(self.stepper_bar(cx)).children(self.notice_bar(cx)).children(sheet).child(center))
             .children(side)
             .children(generate)
+            .children(restyle)
     }
 }
 

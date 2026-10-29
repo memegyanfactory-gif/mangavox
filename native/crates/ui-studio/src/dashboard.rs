@@ -428,12 +428,28 @@ impl StudioPage {
                     )))
                     .child(div().w(px(260.)).child(progress_bar("dash-manga-progress", p, false))),
             )
-            .child(
-                div().flex().gap(px(space::SM)).child(btn("dash-back", "All manga", ButtonKind::Ghost).icon(glyphs::BACK).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.dash_manga = None;
-                    cx.notify();
-                }))),
-            );
+            .child({
+                let made_items: Vec<ChapterItem> = self.made_videos(g).into_iter().map(|(c, _)| c).collect();
+                let made_n = made_items.len();
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(space::SM))
+                    .child(
+                        btn("dash-restyle-all", "Music & subtitles", ButtonKind::Secondary)
+                            .icon(glyphs::MUSIC)
+                            .tooltip("Change the music (new, quieter, or muted) and the subtitles of every made chapter, then re-make their videos")
+                            .when(made_n == 0, |b| b.disabled("No chapter has a video yet"))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                let scope = format!("all {made_n} made chapter{}", plural(made_n));
+                                this.open_restyle(made_items.clone(), scope, true, cx);
+                            })),
+                    )
+                    .child(btn("dash-back", "All manga", ButtonKind::Ghost).icon(glyphs::BACK).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.dash_manga = None;
+                        cx.notify();
+                    })))
+            });
 
         let all_ids: Vec<String> = order.clone();
         let none_ids: Vec<String> = g.chapters.iter().map(|c| c.id.clone()).collect();
@@ -502,6 +518,7 @@ impl StudioPage {
             .p(px(space::XL))
             .pr(px(space::XXL))
             .child(head)
+            .child(self.video_section(g, cx))
             .child(tools)
             .child(body)
             .child(legend)
@@ -643,6 +660,13 @@ impl StudioPage {
             )
             .when_some(single, |d, id| {
                 d.child(btn("dash-open", "Open in editor", ButtonKind::Ghost).small().icon(glyphs::EDIT).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(&id, None, cx))))
+            })
+            .when(made > 0, |d| {
+                let items: Vec<ChapterItem> = picked.to_vec();
+                let scope = if n == 1 { picked[0].label() } else { format!("{n} chapters") };
+                d.child(btn("dash-restyle", "Music & subtitles", ButtonKind::Secondary).small().icon(glyphs::MUSIC).tooltip("Change the music and subtitles of the picked chapters and re-make their videos").on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| this.open_restyle(items.clone(), scope.clone(), false, cx),
+                )))
             })
             .child(icon_button("dash-clear", ph::X, "Clear the picks").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.dash_pick.clear();

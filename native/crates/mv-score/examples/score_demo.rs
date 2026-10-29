@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
         println!("{:6.1}-{:6.1}s  {}  energy {:.1}{}{}{}", c.start, c.end, c.label(), c.energy, if c.hit { " HIT" } else { "" }, if c.drop_before { " DROP" } else { "" }, if c.riser_out { " RISER" } else { "" });
     }
     let tracks = mv_score_compose(&cues, &energy, &pages, &spans, &settings, t);
-    let score = Score { version: Score::VERSION, duration: t, cues, tracks, energy, narration_sig: 0, orchestra: orchestra.is_some(), settings_sig: 0 };
+    let score = Score { version: Score::VERSION, duration: t, cues, tracks, energy, narration_sig: 0, orchestra: orchestra.is_some(), settings_sig: 0, library: vec![] };
 
     // Stand-in narration: sentence-like bursts in each page.
     let narr_dir = out.join("narration");

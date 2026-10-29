@@ -5758,6 +5758,7 @@ dependencies = [
  "anyhow",
  "hound",
  "mv-ai",
+ "mv-core",
  "mv-recap",
  "mv-studio",
  "rustysynth",

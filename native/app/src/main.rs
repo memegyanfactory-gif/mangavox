@@ -41,22 +41,25 @@ fn init_sources() {
     }
 }
 
-/// Blocks until process `pid` has exited (at most 30 s).
-fn wait_for_exit(pid: u32) {
+/// Blocks until process `pid` has exited (at most 60 s). False when it is still running.
+fn wait_for_exit(pid: u32) -> bool {
     #[cfg(windows)]
     unsafe {
-        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
         let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-        if !h.is_null() {
-            WaitForSingleObject(h, 30_000);
-            CloseHandle(h);
+        if h.is_null() {
+            return true;
         }
+        let r = WaitForSingleObject(h, 60_000);
+        CloseHandle(h);
+        r != WAIT_TIMEOUT
     }
     #[cfg(not(windows))]
     {
         let _ = pid;
         std::thread::sleep(std::time::Duration::from_secs(2));
+        true
     }
 }
 
@@ -70,17 +73,20 @@ fn main() {
     }
     perf::mark_start();
     // Settings restarts the app with `--after-pid <old pid>`: let the old instance let go of the files first.
+    let mut old_running = false;
     if let Some(pid) = std::env::args().skip_while(|a| a != "--after-pid").nth(1).and_then(|p| p.parse::<u32>().ok()) {
-        wait_for_exit(pid);
+        old_running = !wait_for_exit(pid);
     }
     // Before anything opens the data folder: finish a queued move or reset, update old layouts.
-    for line in mv_core::paths::prepare() {
+    // A move waits while the old instance still holds the files.
+    for line in mv_core::paths::prepare(old_running) {
         eprintln!("[data] {line}");
     }
     // First run or not, decided once before anything below creates files in the data folder
     // (`MANGAVOX_WELCOME=1|0` or `--welcome` force it; see mv_core::onboarding).
     let welcome = mv_core::onboarding::init().shows_welcome();
     // Child processes (the Python voice and video scripts) save under the same data folder.
+    // Not MANGAVOX_HOME: that would pin the folder for MangaVox itself when it restarts.
     std::env::set_var("MANGAVOX_DATA", mv_core::paths::root());
     // Files an update moved aside; the previous process may still be exiting, so wait a bit.
     std::thread::spawn(|| {

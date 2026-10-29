@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 mv-ai = { path = "../mv-ai" }
+mv-core = { path = "../mv-core" }
 mv-recap = { path = "../mv-recap" }
 mv-studio = { path = "../mv-studio" }
 anyhow = "1"

@@ -79,6 +79,15 @@ pub fn format_speed(bytes_per_sec: f64) -> String {
     }
 }
 
+/// MangaVox recaps with background music carry two audio tracks, "Narration + music" and
+/// "Narration only": their ids as (with music, narration only), so the music can be switched off.
+pub fn music_tracks(tracks: &[Track]) -> Option<(i64, i64)> {
+    let audio: Vec<&Track> = tracks.iter().filter(|t| t.kind == crate::mpv::TrackKind::Audio).collect();
+    let solo = audio.iter().find(|t| t.title.trim().eq_ignore_ascii_case("Narration only"))?.id;
+    let full = audio.iter().find(|t| t.id != solo)?.id;
+    Some((full, solo))
+}
+
 /// Human label for an mpv track: title, language, "external" hint.
 pub fn track_label(t: &Track) -> String {
     let lang = language_name(&t.lang);
@@ -583,6 +592,14 @@ mod tests {
         assert!(active_segment(&segs, 100.0).is_some());
         assert!(active_segment(&segs, 149.8).is_none());
         assert_eq!(skip_label(SkipType::MixedEd), "Skip outro");
+    }
+
+    #[test]
+    fn recap_music_tracks_pair_up() {
+        let audio = |id: i64, title: &str| Track { id, kind: TrackKind::Audio, lang: String::new(), title: title.into(), selected: id == 1, external: false };
+        assert_eq!(music_tracks(&[audio(1, "Narration + music"), audio(2, "Narration only")]), Some((1, 2)));
+        assert_eq!(music_tracks(&[audio(1, "English"), audio(2, "Japanese")]), None);
+        assert_eq!(music_tracks(&[audio(1, "Narration only")]), None);
     }
 
     #[test]

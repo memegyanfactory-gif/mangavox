@@ -120,7 +120,7 @@ pub fn demo_score(style: Style, secs: f64, energy: f32, sfx: SfxAmount) -> Score
     let cues = vec![a, b];
     let settings = MusicSettings { sfx, ..Default::default() };
     let tracks = compose(&cues, &curve, &infos, &spans, &settings, hash_str(style.key()), secs);
-    Score { version: Score::VERSION, duration: secs, cues, tracks, energy: curve, narration_sig: 0, orchestra: false, settings_sig: 0 }
+    Score { version: Score::VERSION, duration: secs, cues, tracks, energy: curve, narration_sig: 0, orchestra: false, settings_sig: 0, library: vec![] }
 }
 
 /// Renders a demo (music only, mastered to `lufs` with a -1 dBFS ceiling).

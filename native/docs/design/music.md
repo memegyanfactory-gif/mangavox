@@ -102,7 +102,9 @@ No samples; everything is generated.
 - **Per-clip balance:** every musical clip is loudness-matched to its role's place in its genre's mix. Phonk puts drums and 808 at -19 LUFS and pads at -28; Sad puts the piano at -20; and so on. Energy moves a cue ±3 dB.
 - **Hits & risers** are balanced as a whole track.
 - **SFX** are on their own bus and duck half as far as the music, so a whoosh still reads under a sentence.
-- **Ducking:** the bus is set 7 LU under the narration (Normal) and ducks 8 dB while the voice speaks, which puts it about 15 LU under during speech. While ducked it also opens a 4 dB pocket at 2 kHz.
+- **Leveler:** before the loudness match, any swell more than 3 dB over the bus's average is ridden down 3:1 (400 ms windows, 200 ms look-ahead, 1.5 s release), so impacts and crescendos stay in the background.
+- **Ducking:** the bus is set under the narration by the Level (Quiet -18, Normal -14, Bold -10 LU) and ducks 10 dB while the voice speaks, which puts Normal about 24 LU under during speech and 14 LU under in the gaps. While ducked it also opens a 4 dB pocket at 2 kHz. (It was -7 LU / 8 dB, which users found too loud.)
+- **Shared master:** `mix::master` does the leveler, loudness, ducking and limiter for both the synth score and the library.
 - **Limiter:** true-peak aware (4x interpolation), with a -6 dBFS stem ceiling.
 - **Final mix:** the video stage still applies `loudnorm=I=-14` to the full mix. No Python change was needed.
 
@@ -115,6 +117,38 @@ No samples; everything is generated.
   - Track gain is -4 dB.
 - **Punchy:** fight hits from intensity 6 (one per 4 s), whooshes on page turns in intense stretches (one per 8 s), full gain.
 - **Spacing:** never two effects within 1.2 s; the more important one wins.
+
+### Studio library (`library.rs`, the default source)
+Users said the synth score sounded bad and sometimes too loud. The default source is now produced
+music: 42 tracks by Kevin MacLeod (incompetech.com), licensed CC BY 4.0, six per preset. They were
+chosen to sit under a voice: instrumental, no busy leads. `MusicSettings.source` switches between
+`Library` ("Studio library") and `Compose` ("Synth score").
+
+| Preset | Tracks (calmest first) |
+|---|---|
+| Dark Tension | Long Note Four, Dark Fog, Lightless Dawn, Gathering Darkness, Interloper, Nerves |
+| Epic Orchestral | Impact Prelude, Prelude and Action, Heroic Age, Crusade, Five Armies, Strength of the Titans |
+| Phonk Fight | Ice Flow, Hitman, Killers, Movement Proposition, Volatile Reaction, Aggressor |
+| Sad Piano | Dreamer, Lasting Hope, Heartbreaking, Sad Trio, Wounded, Despair and Triumph |
+| Lo-fi Light | Lobby Time, Local Forecast, Easy Lemon, Wallpaper, Daily Beetle, Carefree |
+| Horror Drone | Ossuary 6 - Air, Oppressive Gloom, Darkest Child, Ghost Story, Anguish, Unseen Horrors |
+| Mystery | Night Vigil, Comfortable Mystery, Echoes of Time, Teller of the Tales, Investigations, Spy Glass |
+
+- **Download:** on first use, from `https://incompetech.com/music/royalty-free/mp3-royaltyfree/<Title>.mp3`.
+  - Files go to `<data>/music/library/<safe title>.mp3` (via `ffmpeg`, or `curl` if that fails) and are kept.
+  - The server gives each file about 300 KB/s, so a chapter's missing tracks download in parallel (about 30-60 s the first time).
+  - Decoding is `ffmpeg -f f32le -ac 2 -ar 44100`.
+- **Sections:** the spotting cue sheet with same-genre neighbours merged. Sections under 40 s join the one before, so the music does not change every page.
+- **Picks:** each section gets one of the four tracks of its genre closest to its energy, chosen from (chapter, section). `MusicSettings.take` ("regenerate music") rotates the pick, so every new take changes it. The same track never plays twice in a row.
+- **Playback:** each track is set to -20 LUFS. A quiet intro (up to 8 s) and the ring-out are skipped. When a section outlasts the track, it loops with a 3 s equal-power crossfade.
+- **Transitions:** sections crossfade over 3 s (equal power). The music fades in over 1.5 s and fades out over 3 s, ending 2 s after the narration.
+- **Mastering:** the shared master. No sound effects are added.
+- **Credits:** the titles are stored in `score.json` (`library`). `music_credits.txt` beside `score.wav` holds the CC BY lines, and `mv_score::credits(ch)` returns them.
+- **Offline:** when a track can't be downloaded or decoded, the build logs to stderr and uses the synth score. Such a score is never "fresh", so the next build tries the library again.
+- **Measured** (`examples/library_build.rs`, a real 16 min chapter, Normal): narration -13.3 LUFS, music -37.1 LUFS integrated. Short-term (3 s) music levels relative to the narration:
+  - Under speech: median -24.5 LU, max -19.0.
+  - In gaps: median -23.2 LU, max -17.0.
+  - Stem peak: -13.5 dBFS.
 
 ## Music step UI (music.rs)
 
