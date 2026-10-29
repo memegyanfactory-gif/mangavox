@@ -263,6 +263,39 @@ pub fn mark_stages_reset(chapter_id: &str, steps: &[mv_recap::Step]) -> Result<(
     })
 }
 
+/// Every chapter of a manga with the pages folder the database stores for it (downloaded or not).
+pub fn manga_chapters(conn: &Connection, manga_id: &str) -> Result<Vec<(String, Option<PathBuf>)>> {
+    let mut stmt = conn.prepare("SELECT id, pages_dir FROM chapter WHERE manga_id = ?1")?;
+    let rows = stmt.query_map([manga_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    let mut out = vec![];
+    for row in rows {
+        let (id, dir) = row?;
+        out.push((id, dir.filter(|d| !d.trim().is_empty()).map(PathBuf::from)));
+    }
+    Ok(out)
+}
+
+/// Marks every chapter of a manga as not downloaded and not made (its files were deleted), and
+/// drops its pipeline job rows. The manga and its chapter list stay in the library.
+pub fn forget_manga_rows(conn: &Connection, manga_id: &str) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE chapter SET download_status = 'none', pages_dir = NULL, ocr_status = 'none', tts_status = 'none', video_status = 'none' WHERE manga_id = ?1",
+        [manga_id],
+    )?;
+    conn.execute("DELETE FROM pipeline_job WHERE manga_id = ?1 OR chapter_id IN (SELECT id FROM chapter WHERE manga_id = ?1)", [manga_id])?;
+    Ok(n)
+}
+
+/// [`manga_chapters`] on Studio's connection (blocking).
+pub fn chapters_of(manga_id: &str) -> Result<Vec<(String, Option<PathBuf>)>> {
+    with_db(|c| manga_chapters(c, manga_id))
+}
+
+/// [`forget_manga_rows`] on Studio's connection (blocking).
+pub fn forget_manga(manga_id: &str) -> Result<usize> {
+    with_db(|c| forget_manga_rows(c, manga_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +440,16 @@ mod tests {
         assert_eq!(groups[0].chapters.iter().map(|c| c.number).collect::<Vec<_>>(), vec![Some(1.0), Some(2.0)]);
         // The Studio folder is picked (and old work adopted) in `load`, keyed by ids.
         assert_eq!(groups[0].chapters[0].pages_dir, PathBuf::from(format!("/lib/{}/pages", ids[2])));
+
+        // Deleting Alpha from Studio: it leaves Studio, its chapters stay in the library.
+        chapter::update_tts_status(&conn, &ids[2], "complete").unwrap();
+        assert_eq!(manga_chapters(&conn, &a.id).unwrap().iter().filter(|(_, d)| d.is_some()).count(), 2);
+        assert_eq!(forget_manga_rows(&conn, &a.id).unwrap(), 3);
+        let groups = query_chapters(&conn).unwrap();
+        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Beta"]);
+        let left = manga_chapters(&conn, &a.id).unwrap();
+        assert!(left.len() == 3 && left.iter().all(|(_, d)| d.is_none()));
+        let ch = chapter::get(&conn, &ids[2]).unwrap().unwrap();
+        assert_eq!((ch.download_status.as_str(), ch.tts_status.as_str()), ("none", "none"));
     }
 }

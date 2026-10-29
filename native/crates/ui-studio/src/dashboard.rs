@@ -9,8 +9,8 @@ use mv_recap::{PhaseStatus, Step};
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::Interactive as _;
 use mv_ui::{
-    btn, cover_tile, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, ph, ph_icon, progress_bar, progress_ring_sized, selected_badge, size, skeleton, skeleton_line, spinner, status_tag,
-    tip, ButtonKind, CoverSource, MenuItem, Ph, Route, StatusKind, Tokens, Weight,
+    btn, checkbox, cover_tile, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, overflow_menu, ph, ph_icon, progress_bar, progress_ring_sized, selected_badge, size, skeleton, skeleton_line,
+    spinner, status_tag, tip, ButtonKind, CheckState, CoverSource, MenuItem, Ph, Route, StatusKind, Tokens, Weight,
 };
 
 use crate::data::{ChapterItem, MangaGroup};
@@ -304,7 +304,32 @@ impl StudioPage {
                         plural(made)
                     ))),
             )
-            .child(div().w(px(240.)).child(gpui_kit::component::input::Input::new(&self.dash_search).prefix(icon_ph(glyphs::SEARCH, Tokens::text_3(), icon_px::SM))));
+            .child(div().w(px(240.)).child(gpui_kit::component::input::Input::new(&self.dash_search).prefix(icon_ph(glyphs::SEARCH, Tokens::text_3(), icon_px::SM))))
+            .map(|d| {
+                if !self.deleting.is_empty() {
+                    let n = self.deleting.len();
+                    d.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(space::SM))
+                            .h(px(32.))
+                            .text_size(px(size::SM))
+                            .text_color(Tokens::text_2())
+                            .child(spinner("dash-deleting", Tokens::accent(), icon_px::SM))
+                            .child(format!("Deleting {n} manga…")),
+                    )
+                } else if self.dash_select.is_none() {
+                    d.child(btn("dash-select", "Select", ButtonKind::Secondary).icon(ph::CHECK_SQUARE).tooltip("Pick manga to delete from Studio").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.dash_select = Some(Default::default());
+                        cx.notify();
+                    })))
+                } else {
+                    d
+                }
+            });
+        let shown_ids: Vec<String> = shown.iter().map(|g| g.id.clone()).collect();
+        let select_bar = self.dash_select.as_ref().map(|picked| self.select_bar(&shown_ids, picked, cx));
         let cards = div().flex().flex_wrap().gap(px(space::LG)).children(shown.iter().enumerate().map(|(i, g)| self.manga_card(i, g, cx)));
         div()
             .flex()
@@ -313,6 +338,7 @@ impl StudioPage {
             .p(px(space::XL))
             .pr(px(space::XXL))
             .child(header)
+            .children(select_bar)
             .map(|d| {
                 if shown.is_empty() {
                     d.child(empty_view(glyphs::SEARCH, "No manga match", format!("Nothing downloaded matches \"{filter}\".")).compact())
@@ -338,11 +364,29 @@ impl StudioPage {
             (_, f) if f > 0 => Some(format!("{f} failed")),
             _ => None,
         };
+        // In Select mode a click ticks the manga instead of opening it.
+        let ticked = self.dash_select.as_ref().map(|s| s.contains(&g.id));
+        let toggle = {
+            let id = g.id.clone();
+            move |this: &mut StudioPage, cx: &mut Context<StudioPage>| {
+                if let Some(s) = this.dash_select.as_mut() {
+                    if !s.remove(&id) {
+                        s.insert(id.clone());
+                    }
+                }
+                cx.notify();
+            }
+        };
+        let on_tile = toggle.clone();
         let mut tile = cover_tile(("dash-manga", i), g.title.clone())
             .sub(format!("{n} chapter{}", plural(n)))
             .cover(g.cover.clone().map(CoverSource::File))
             .width(160.)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if this.dash_select.is_some() {
+                    on_tile(this, cx);
+                    return;
+                }
                 this.dash_manga = Some(id.clone());
                 this.dash_filter = Default::default();
                 this.dash_anchor = None;
@@ -356,7 +400,20 @@ impl StudioPage {
             (_, d) if d == n => (Tokens::success(), "All made".to_string()),
             _ => (Tokens::text_2(), format!("{done}/{n} made")),
         };
+        let more = (ticked.is_none() && self.deleting.is_empty()).then(|| {
+            let (weak, ids) = (cx.entity().downgrade(), vec![g.id.clone()]);
+            overflow_menu(
+                ("dash-manga-more", i),
+                vec![MenuItem::new("Delete from Studio…", move |w: &mut Window, cx: &mut App| {
+                    let _ = weak.update(cx, |this, cx| this.confirm_delete_manga(ids.clone(), w, cx));
+                })
+                .icon(glyphs::DELETE)
+                .danger()],
+            )
+            .small()
+        });
         div()
+            .relative()
             .flex()
             .flex_col()
             .w(px(160.))
@@ -364,15 +421,77 @@ impl StudioPage {
             .child(tile)
             .child(
                 div()
-                    .id(("dash-manga-stats", i))
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .tooltip(tip(format!("{:.0}% of the steps made across {n} chapter{}", p * 100., plural(n))))
-                    .child(progress_ring_sized(p, 16.))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(size::XS)).text_color(color).child(line))
-                    .when(working > 0, |d| d.child(spinner(("dash-manga-spin", i), Tokens::accent(), icon_px::XS))),
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .id(("dash-manga-stats", i))
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap(px(6.))
+                            .tooltip(tip(format!("{:.0}% of the steps made across {n} chapter{}", p * 100., plural(n))))
+                            .child(progress_ring_sized(p, 16.))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(size::XS)).text_color(color).child(line))
+                            .when(working > 0, |d| d.child(spinner(("dash-manga-spin", i), Tokens::accent(), icon_px::XS))),
+                    )
+                    .children(more),
             )
+            .when_some(ticked, |d, on| {
+                d.child(
+                    checkbox(("dash-manga-check", i), on)
+                        .absolute()
+                        .top(px(6.))
+                        .left(px(6.))
+                        .bg(Tokens::glass())
+                        .aria_label(SharedString::from(format!("Select {}", g.title)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| toggle(this, cx))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Select mode's bar: Select all over the manga shown, how many are ticked, Delete, Cancel.
+    fn select_bar(&self, shown: &[String], picked: &std::collections::BTreeSet<String>, cx: &mut Context<Self>) -> AnyElement {
+        let n = picked.len();
+        let state = crate::delete::all_state(shown, picked);
+        let shown = shown.to_vec();
+        let ids: Vec<String> = picked.iter().cloned().collect();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(space::SM))
+            .p(px(space::MD))
+            .rounded(px(radius::LG))
+            .border_1()
+            .border_color(if n > 0 { Tokens::accent_border() } else { Tokens::border() })
+            .bg(if n > 0 { Tokens::accent_soft() } else { Tokens::surface() })
+            .child(checkbox("dash-select-all", state).child("Select all").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if let Some(s) = this.dash_select.as_mut() {
+                    if state == CheckState::Checked {
+                        for id in &shown {
+                            s.remove(id);
+                        }
+                    } else {
+                        s.extend(shown.iter().cloned());
+                    }
+                }
+                cx.notify();
+            })))
+            .child(div().flex_1().min_w(px(160.)).text_size(px(size::SM)).text_color(if n > 0 { Tokens::text_1() } else { Tokens::text_3() }).child(crate::delete::selected_text(n)))
+            .child(
+                btn("dash-select-delete", "Delete", ButtonKind::DangerGhost)
+                    .icon(glyphs::DELETE)
+                    .when(n == 0, |b| b.disabled("Pick the manga to delete first"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.confirm_delete_manga(ids.clone(), window, cx))),
+            )
+            .child(btn("dash-select-cancel", "Cancel", ButtonKind::Ghost).tooltip("Leave Select mode (Esc)").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.dash_select = None;
+                cx.notify();
+            })))
             .into_any_element()
     }
 
@@ -449,6 +568,12 @@ impl StudioPage {
                         this.dash_manga = None;
                         cx.notify();
                     })))
+                    .child({
+                        let ids = vec![g.id.clone()];
+                        icon_button("dash-delete-manga", glyphs::DELETE, "Delete this manga from Studio…")
+                            .when(!self.deleting.is_empty(), |b| b.disabled("Deleting…"))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.confirm_delete_manga(ids.clone(), window, cx)))
+                    })
             });
 
         let all_ids: Vec<String> = order.clone();

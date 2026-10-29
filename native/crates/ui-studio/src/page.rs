@@ -297,6 +297,10 @@ pub struct StudioPage {
     pub(crate) view: View,
     /// The manga whose chapters the dashboard shows (None: every manga).
     pub(crate) dash_manga: Option<String>,
+    /// The manga grid's Select mode (Some while on) and the manga ticked in it.
+    pub(crate) dash_select: Option<BTreeSet<String>>,
+    /// Manga whose files are being deleted.
+    pub(crate) deleting: Vec<String>,
     /// Chapters picked on the dashboard, and the last one clicked (Shift-click ranges from it).
     pub(crate) dash_pick: BTreeSet<String>,
     pub(crate) dash_anchor: Option<String>,
@@ -425,6 +429,8 @@ impl StudioPage {
             // Studio lands on the Dashboard; the Editor keeps the last chapter open behind it.
             view: View::Dashboard,
             dash_manga: None,
+            dash_select: None,
+            deleting: vec![],
             dash_pick: BTreeSet::new(),
             dash_anchor: None,
             dash_filter: Default::default(),
@@ -1163,7 +1169,7 @@ impl StudioPage {
 
     /// Drops the in-memory work a reset is about to delete, so nothing writes it back. True when
     /// it stopped the player (the reset then waits for it to let go of the file).
-    fn forget_open_work(&mut self, chapter_id: &str, output_dir: &std::path::Path) -> bool {
+    pub(crate) fn forget_open_work(&mut self, chapter_id: &str, output_dir: &std::path::Path) -> bool {
         // A clip or score of this chapter may be open in the player (the file goes); a clip of
         // another chapter keeps playing.
         let playing = crate::audio::now_playing();
@@ -1392,6 +1398,12 @@ impl StudioPage {
         let k = &ev.keystroke;
         let m = &k.modifiers;
         if k.key == "escape" && !m.modified() && (self.sheet.take().is_some() || self.restyle.take().is_some()) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // Then the dashboard's Select mode.
+        if k.key == "escape" && !m.modified() && self.view == View::Dashboard && self.dash_select.take().is_some() {
             cx.stop_propagation();
             cx.notify();
             return;

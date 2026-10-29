@@ -153,6 +153,14 @@ pub fn edit_brain(manga_id: &str, title: &str, f: impl FnOnce(&mut Brain)) {
     bump();
 }
 
+/// Drops a manga's brain from memory before its files are deleted, so nothing saves it back.
+pub fn forget_brain(manga_id: &str) {
+    if let Some(m) = BRAINS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.remove(manga_id);
+    }
+    bump();
+}
+
 fn begin(kind: RunKind, model: String, chapters: usize) -> Option<CancellationToken> {
     let mut run = RUN.lock().unwrap_or_else(|e| e.into_inner());
     if run.as_ref().is_some_and(|r| r.running()) {

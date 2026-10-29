@@ -9,6 +9,7 @@ pub mod audio;
 pub use export::join_full_recap;
 pub mod data;
 mod dashboard;
+mod delete;
 mod export;
 mod generate;
 mod issues;
