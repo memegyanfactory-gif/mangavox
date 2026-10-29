@@ -28,13 +28,17 @@ pub(crate) struct Answers {
     pub captions: bool,
     /// Caption template id (`video::styles`); `None` keeps the Studio default.
     pub subtitle_style: Option<String>,
+    /// Where subtitles sit (`restyle::PLACES` index; 0 = the template's own place).
+    pub subtitle_place: usize,
+    /// Subtitle size multiplier.
+    pub subtitle_size: f32,
     /// Compose a score for every chapter.
     pub music: bool,
 }
 
 impl Default for Answers {
     fn default() -> Self {
-        Self { voice: None, format: mv_recap::FORMAT_LANDSCAPE.into(), captions: true, subtitle_style: None, music: true }
+        Self { voice: None, format: mv_recap::FORMAT_LANDSCAPE.into(), captions: true, subtitle_style: None, subtitle_place: 0, subtitle_size: 1.0, music: true }
     }
 }
 
@@ -89,6 +93,8 @@ impl StudioPage {
         // Subtitles follow the caption setting the Video step saved (the Studio default).
         let subs = crate::video::default_setting();
         answers.captions = subs.enabled;
+        answers.subtitle_place = crate::restyle::place_index(subs.pos);
+        answers.subtitle_size = subs.size;
         answers.subtitle_style = Some(subs.style);
         let lang = crate::page::lang_of(&voice);
         self.sheet = Some(Sheet { chapters, answers: Answers { voice: Some(voice), ..answers }, lang, all_voices: false });
@@ -122,7 +128,10 @@ impl StudioPage {
     /// [`pipeline::enqueue`] reports.
     pub(crate) fn generate_chapters(&mut self, chapters: &[ChapterItem], a: &Answers, start: bool, cx: &mut Context<Self>) -> (usize, usize, usize) {
         let default = self.prefs.voice.clone().unwrap_or_default();
-        for c in chapters {
+        // A made video whose subtitles or music change is made again (otherwise it is "done").
+        let subs_before: Vec<crate::video::SubtitleSetting> = chapters.iter().map(crate::video::subtitle_setting_for).collect();
+        let mut remake: Vec<bool> = vec![false; chapters.len()];
+        for (i, c) in chapters.iter().enumerate() {
             if let Some(v) = &a.voice {
                 if let Err(e) = mv_studio::voices::set_chapter_voice(&c.id, (*v != default).then_some(v.as_str())) {
                     self.fail(format!("Could not save the voice for {}: {e}", c.label()));
@@ -133,11 +142,26 @@ impl StudioPage {
             if m.enabled != a.music {
                 m.enabled = a.music;
                 let _ = mv_score::save_settings(&r, &m);
+                remake[i] = true;
             }
         }
         apply_subtitles(chapters, a);
         self.sync_pipeline(cx);
-        pipeline::enqueue(chapters, Step::Video, None, &a.format, Some(a.captions), start)
+        let (mut redo, mut rest) = (vec![], vec![]);
+        for (i, c) in chapters.iter().enumerate() {
+            let made = self.statuses.get(&c.id).is_some_and(|s| s.video.is_some());
+            if made && (remake[i] || crate::video::subtitle_setting_for(c) != subs_before[i]) {
+                redo.push(c.clone());
+            } else {
+                rest.push(c.clone());
+            }
+        }
+        let mut n = pipeline::enqueue(&rest, Step::Video, None, &a.format, Some(a.captions), start);
+        if !redo.is_empty() {
+            let m = pipeline::enqueue(&redo, Step::Video, Some(Step::Video), &a.format, Some(a.captions), start);
+            n = (n.0 + m.0, n.1 + m.1, n.2 + m.2);
+        }
+        n
     }
 
     /// Hands the pipeline what it needs from the page (registry, model, setup, speed).
@@ -211,10 +235,24 @@ impl StudioPage {
             }))
         }));
         let summary = crate::video::find_style(&current).summary();
+        let (place, sz) = self.sheet.as_ref().map(|s| (s.answers.subtitle_place, s.answers.subtitle_size)).unwrap_or((0, 1.0));
+        let place_seg = segmented("gen-sub-place", crate::restyle::PLACES.iter().map(|p| (None, p.0)), place.min(3)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+            if let Some(s) = this.sheet.as_mut() {
+                s.answers.subtitle_place = *ix;
+            }
+            cx.notify();
+        }));
+        let size_seg = segmented("gen-sub-size", crate::restyle::SIZES.iter().map(|s| (None, s.0)), crate::restyle::size_index(sz)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+            if let Some(s) = this.sheet.as_mut() {
+                s.answers.subtitle_size = crate::restyle::SIZES[*ix].1;
+            }
+            cx.notify();
+        }));
+        let tune = div().flex().flex_wrap().items_center().gap(px(space::SM)).child(muted("Place")).child(place_seg).child(muted("Size")).child(size_seg);
         question(
             ph::SUBTITLES,
             "Subtitles",
-            "Words appear on screen in time with the narration. Fine-tune size, place and colours on the Video step.",
+            "Words appear on screen in time with the narration. Drag them anywhere or change colours on the Video step.",
             div()
                 .flex()
                 .flex_col()
@@ -232,7 +270,7 @@ impl StudioPage {
                         })))
                         .child(muted(if on { format!("Burned into the video · {summary}") } else { "No subtitles".to_string() })),
                 )
-                .when(on, |d| d.child(chips))
+                .when(on, |d| d.child(chips).child(tune))
                 .into_any_element(),
         )
     }
@@ -614,7 +652,7 @@ impl StudioPage {
 }
 
 /// One question: icon, title, why it is asked, and its control.
-fn question(icon: Ph, title: &'static str, why: &'static str, control: AnyElement) -> AnyElement {
+pub(crate) fn question(icon: Ph, title: &'static str, why: &'static str, control: AnyElement) -> AnyElement {
     div()
         .flex()
         .gap(px(space::MD))
@@ -649,6 +687,8 @@ fn apply_subtitles(chapters: &[ChapterItem], a: &Answers) {
         if let Some(st) = &style {
             s.style = st.clone();
         }
+        crate::restyle::set_place(s, a.subtitle_place);
+        crate::restyle::set_size(s, a.subtitle_size);
     };
     set(&mut d);
     crate::video::save_default(&d);

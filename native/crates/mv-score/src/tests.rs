@@ -55,7 +55,7 @@ fn builds_a_mastered_score_that_follows_the_story() {
     let ch = fake_chapter(dir.path());
     assert_eq!(narration(&ch).len(), 6);
 
-    let settings = MusicSettings::default();
+    let settings = MusicSettings { source: Source::Compose, ..Default::default() };
     let (score, report) = chapter::build(&ch, &settings, true).unwrap();
     let styles: Vec<Style> = score.cues.iter().map(|c| c.style).collect();
     assert!(styles.contains(&Style::Phonk) || styles.contains(&Style::Epic), "{styles:?}");
@@ -112,7 +112,7 @@ fn muted_tracks_are_silent() {
 fn music_reset_removes_every_score_file() {
     let dir = tempfile::tempdir().unwrap();
     let ch = fake_chapter(dir.path());
-    let mut settings = MusicSettings { level: Level::Quiet, use_ai: true, ..Default::default() };
+    let mut settings = MusicSettings { source: Source::Compose, level: Level::Quiet, use_ai: true, ..Default::default() };
     settings.directions.push(Direction { page: 2, style: Some(Style::Epic), ..Default::default() });
     chapter::save_settings(&ch, &settings).unwrap();
     chapter::build(&ch, &settings, true).unwrap();
@@ -205,4 +205,29 @@ fn sfx_amount_scales_the_effects() {
     let (off, subtle, punchy) = (count(SfxAmount::Off), count(SfxAmount::Subtle), count(SfxAmount::Punchy));
     assert_eq!(off, 0);
     assert!(subtle > 0 && punchy > subtle, "off {off}, subtle {subtle}, punchy {punchy}");
+}
+
+#[test]
+fn source_and_take_are_settings_and_old_files_still_load() {
+    let old: MusicSettings = serde_json::from_str(r#"{"enabled":true,"level":"quiet","duck_db":8.0}"#).unwrap();
+    assert_eq!((old.source, old.take, old.level), (Source::Library, 0, Level::Quiet));
+    let s: MusicSettings = serde_json::from_str(r#"{"source":"compose","take":3}"#).unwrap();
+    assert_eq!((s.source, s.take), (Source::Compose, 3));
+    assert!(serde_json::to_string(&s).unwrap().contains(r#""source":"compose""#));
+
+    let dir = tempfile::tempdir().unwrap();
+    let ch = fake_chapter(dir.path());
+    let settings = MusicSettings { source: Source::Compose, ..Default::default() };
+    chapter::build(&ch, &settings, false).unwrap();
+    assert!(chapter::is_fresh(&ch, &settings));
+    assert!(chapter::credits(&ch).is_empty(), "the synth score needs no credits");
+    assert!(!chapter::credits_txt(&ch).exists());
+    assert!(!chapter::is_fresh(&ch, &MusicSettings { take: 1, ..settings.clone() }), "a new take rebuilds");
+    assert!(!chapter::is_fresh(&ch, &MusicSettings { source: Source::Library, ..settings }), "a new source rebuilds");
+}
+
+#[test]
+fn levels_sit_well_under_the_voice() {
+    assert_eq!(Level::ALL.map(|l| l.offset_lu()), [-18.0, -14.0, -10.0]);
+    assert_eq!(MusicSettings::default().duck_db, 10.0);
 }

@@ -124,7 +124,8 @@ def studio_default(output_dir: str | None):
             p = parent
             if os.path.basename(p).lower() == "studio":
                 candidates.append(os.path.join(p, "subtitles.json"))
-    home = os.environ.get("MANGAVOX_HOME") or os.path.join(os.path.expanduser("~"), ".mangavox")
+    # MANGAVOX_DATA is the folder the app uses (set for every child; follows a moved data folder).
+    home = os.environ.get("MANGAVOX_DATA") or os.environ.get("MANGAVOX_HOME") or os.path.join(os.path.expanduser("~"), ".mangavox")
     candidates.append(os.path.join(home, "studio", "subtitles.json"))
     for c in candidates:
         data = _read_json(c)

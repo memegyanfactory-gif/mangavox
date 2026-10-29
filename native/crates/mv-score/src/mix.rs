@@ -602,6 +602,57 @@ pub fn render(score: &Score, settings: &MusicSettings, narration: &Narration, or
         bus.l[i] += fxbus.l[i];
         bus.r[i] += fxbus.r[i];
     }
+    master(bus, sfx, settings, narration, preview)
+}
+
+/// Rides the music's gain down wherever it swells more than `over_db` above its average level
+/// (3:1 above that, 400 ms windows, 200 ms look-ahead, 1.5 s release), so a crescendo or an impact
+/// never jumps out of the background.
+pub fn level(s: &mut Stereo, over_db: f32) {
+    let hop = SR as usize / 20;
+    let frames = s.len() / hop + 1;
+    let db: Vec<f32> = (0..frames)
+        .map(|f| {
+            let (a, b) = ((f * hop).saturating_sub(4 * hop), (f * hop + 4 * hop).min(s.len()));
+            let e = (a..b).map(|i| s.l[i] * s.l[i] + s.r[i] * s.r[i]).sum::<f32>() / (b - a).max(1) as f32;
+            10.0 * e.max(1e-12).log10()
+        })
+        .collect();
+    let loud: Vec<f32> = db.iter().copied().filter(|&d| d > -60.0).collect();
+    if loud.is_empty() {
+        return;
+    }
+    let avg = 10.0 * (loud.iter().map(|d| 10f32.powf(d / 10.0)).sum::<f32>() / loud.len() as f32).log10();
+    let thresh = avg + over_db;
+    let (att, rel) = (1.0 - (-1.0f32 / 4.0).exp(), 1.0 - (-1.0f32 / 30.0).exp());
+    let mut g = 0f32;
+    let gains: Vec<f32> = (0..frames)
+        .map(|f| {
+            let peak = db[f..(f + 4).min(frames)].iter().fold(f32::MIN, |m, &d| m.max(d));
+            let want = -(peak - thresh).max(0.0) * (1.0 - 1.0 / 3.0);
+            g += (want - g) * if want < g { att } else { rel };
+            g
+        })
+        .collect();
+    for i in 0..s.len() {
+        let x = i as f32 / hop as f32;
+        let f = x as usize;
+        let k = x - f as f32;
+        let gd = gains[f.min(frames - 1)] * (1.0 - k) + gains[(f + 1).min(frames - 1)] * k;
+        let v = db_to_gain(gd);
+        s.l[i] *= v;
+        s.r[i] *= v;
+    }
+}
+
+/// Masters a music bus (and its sound-effect bus, same length, may be silent) against the
+/// narration: evened out, set to the chosen level under the voice, ducked while it speaks with a
+/// pocket around 2 kHz, and peak-limited. Returns the bus, the optional preview mix, and the report.
+pub fn master(mut bus: Stereo, mut sfx: Stereo, settings: &MusicSettings, narration: &Narration, preview: bool) -> (Stereo, Option<Stereo>, MixReport) {
+    let len = bus.len();
+    sfx.l.resize(len, 0.0);
+    sfx.r.resize(len, 0.0);
+    level(&mut bus, 3.0);
 
     // Loudness relative to the narration (or a sensible absolute level without one).
     let narr_lufs = narration.loudness();

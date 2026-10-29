@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -388,6 +388,10 @@ impl SubtitleSetting {
     fn user_words(&self) -> bool {
         self.words_per_line > 0 || self.lines > 0
     }
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -877,6 +881,9 @@ pub(crate) struct VideoStudio {
     tick: usize,
     ticking: bool,
     shown_at: Rc<Cell<Instant>>,
+    /// When the default and chapter files were last read or written here: a newer file (saved by
+    /// Generate or the dashboard) is read again instead of being overwritten by a stale copy.
+    seen: (Option<SystemTime>, Option<SystemTime>),
     _subs: Vec<Subscription>,
 }
 
@@ -930,6 +937,7 @@ impl VideoStudio {
             tick: 0,
             ticking: false,
             shown_at: Rc::new(Cell::new(Instant::now())),
+            seen: (modified(&defaults_file()), None),
             _subs: subs,
         }
     }
@@ -946,7 +954,32 @@ impl VideoStudio {
             self.page = ctx.passages.first().map(|p| p.0).unwrap_or(0).min(ctx.pages.len().saturating_sub(1));
         }
         self.ctx = Some(ctx);
+        self.seen = self.stamps();
         cx.notify();
+    }
+
+    fn stamps(&self) -> (Option<SystemTime>, Option<SystemTime>) {
+        (modified(&defaults_file()), self.ctx.as_ref().and_then(|c| modified(&chapter_file(&c.chapter.output_dir))))
+    }
+
+    /// Reads the settings again when something else saved them since (never mid-drag).
+    fn refresh(&mut self) {
+        if self.dragging || self.slider_drag {
+            return;
+        }
+        let now = self.stamps();
+        if now == self.seen {
+            return;
+        }
+        self.seen = now;
+        self.default = default_setting();
+        if let Some(c) = &self.ctx {
+            let own = chapter_setting(&c.chapter.output_dir);
+            if own.is_some() != self.own.is_some() {
+                self.chapter_scope = own.is_some();
+            }
+            self.own = own;
+        }
     }
 
     /// The setting being edited (and previewed).
@@ -970,7 +1003,7 @@ impl VideoStudio {
         cx.notify();
     }
 
-    fn persist(&self) {
+    fn persist(&mut self) {
         if self.chapter_scope {
             if let (Some(c), Some(s)) = (&self.ctx, &self.own) {
                 save_chapter_setting(&c.chapter.output_dir, Some(s));
@@ -978,6 +1011,7 @@ impl VideoStudio {
         } else {
             save_default(&self.default);
         }
+        self.seen = self.stamps();
     }
 
     fn set_scope(&mut self, chapter: bool, cx: &mut Context<Self>) {
@@ -1438,6 +1472,7 @@ impl Render for VideoStudio {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         ensure_fonts(cx);
         let Some(ctx) = self.ctx.clone() else { return div() };
+        self.refresh();
         self.ensure_ticking(cx);
         let s = self.current().clone();
         if !self.slider_drag {

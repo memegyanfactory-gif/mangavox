@@ -332,6 +332,9 @@ pub struct Score {
     pub orchestra: bool,
     /// Fingerprint of the settings (and orchestra) it was built with.
     pub settings_sig: u64,
+    /// Library tracks `score.wav` was cut from, in order of first use (empty = synth score).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library: Vec<String>,
 }
 
 impl Score {
@@ -368,14 +371,36 @@ impl Level {
         }
     }
 
-    /// Music loudness relative to the narration's, in LU, before ducking. With the default 8 dB duck
-    /// "Normal" puts the bed about 15 LU under the voice while it speaks and 7 LU under in the gaps,
-    /// inside the 12-25 dB range mixing guides give for music under narration.
+    /// Music loudness relative to the narration's, in LU, before ducking. With the default 10 dB duck
+    /// "Normal" puts the bed about 24 LU under the voice while it speaks and 14 LU under in the gaps:
+    /// background music, inside the 12-25 dB range mixing guides give for music under narration.
     pub fn offset_lu(self) -> f64 {
         match self {
-            Level::Quiet => -11.0,
-            Level::Normal => -7.0,
-            Level::Bold => -4.0,
+            Level::Quiet => -18.0,
+            Level::Normal => -14.0,
+            Level::Bold => -10.0,
+        }
+    }
+}
+
+/// Where the chapter's music comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// Produced tracks from the studio library (see `library.rs`), cut to the cue sheet.
+    #[default]
+    Library,
+    /// The built-in synth score (compose + synth).
+    Compose,
+}
+
+impl Source {
+    pub const ALL: [Source; 2] = [Source::Library, Source::Compose];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Library => "Studio library",
+            Source::Compose => "Synth score",
         }
     }
 }
@@ -411,6 +436,10 @@ pub struct Direction {
 #[serde(default)]
 pub struct MusicSettings {
     pub enabled: bool,
+    /// Library tracks or the synth score.
+    pub source: Source,
+    /// Bumped by "regenerate music": a new pick of library tracks.
+    pub take: u32,
     pub level: Level,
     /// How far the music dips while the narrator speaks, in dB (positive).
     pub duck_db: f32,
@@ -435,8 +464,10 @@ impl Default for MusicSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            source: Source::Library,
+            take: 0,
             level: Level::Normal,
-            duck_db: 8.0,
+            duck_db: 10.0,
             sfx: SfxAmount::Subtle,
             genre: None,
             energy: 0.5,

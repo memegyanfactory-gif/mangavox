@@ -1050,6 +1050,14 @@ impl PlayerView {
         }
     }
 
+    /// Recaps: background music off (the "Narration only" track) or back on.
+    fn toggle_music(&mut self, cx: &mut Context<Self>) {
+        let Some((full, solo)) = logic::music_tracks(&self.tracks) else { return };
+        let off = self.tracks.iter().any(|t| t.id == solo && t.kind == TrackKind::Audio && t.selected);
+        self.select_track(TrackKind::Audio, Some(if off { full } else { solo }), cx);
+        self.flash(Some(ph::MUSIC_NOTES.fill()), if off { "Music on" } else { "Music off · narration only" });
+    }
+
     fn set_speed(&mut self, s: f64, cx: &mut Context<Self>) {
         if let Some(m) = &self.mpv {
             let _ = m.set("speed", &format!("{s}"));
@@ -1788,6 +1796,14 @@ impl PlayerView {
                 } else {
                     ctl("next", ph::SKIP_FORWARD.fill(), BAR_PX, "Next episode", Some("n")).on_click(cx.listener(|this, _, _w, cx| this.with_main(cx, |this, window, cx| this.play_next(window, cx))))
                 })
+            })
+            .when_some(logic::music_tracks(&self.tracks), |d, (_, solo)| {
+                let off = self.tracks.iter().any(|t| t.id == solo && t.kind == TrackKind::Audio && t.selected);
+                d.child(
+                    ctl("music", if off { ph::MUSIC_NOTES.regular() } else { ph::MUSIC_NOTES.fill() }, BAR_PX, if off { "Turn the music on" } else { "Turn the music off (narration only)" }, None)
+                        .when(off, |c| c.opacity(0.55))
+                        .on_click(cx.listener(|this, _, _w, cx| this.toggle_music(cx))),
+                )
             })
             .child(
                 ctl_shell("tracks", ctl_box(BAR_PX), "Audio & subtitles", None, menu == Some(Menu::Tracks))

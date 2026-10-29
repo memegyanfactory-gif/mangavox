@@ -1,7 +1,12 @@
 """
 Video Generator for MangaVox
-Combines manga page images + TTS audio into a narrated video with transitions.
-Requires: ffmpeg (brew install ffmpeg)
+Combines manga panels/pages + TTS narration into a narrated recap video: every panel sits
+centred (with a soft shadow), fully visible, on a still, zoomed-in, blurred copy of itself; only
+the panel moves, with a slow eased sub-pixel Ken Burns, and it crossfades into the next clip
+exactly when that clip's narration starts.
+Narration is assembled sample-accurately, mixed with the score and loudness-normalised
+in two passes.
+Requires: ffmpeg, Pillow
 """
 import os
 import sys
@@ -9,8 +14,42 @@ import json
 import subprocess
 import shutil
 import wave
-import tempfile
 import math
+import re
+
+FPS = 30
+AUDIO_RATE = 48000
+# Clips per intermediate xfade pass (keeps the number of open decoders bounded).
+CHUNK_CLIPS = 14
+# Panel inset from the frame edge (fraction of the frame) when the blurred fill is used.
+FG_MARGIN = 0.05
+# Ken Burns: push-in / pull-out amount and the fixed zoom used while panning.
+FG_PUSH = 0.05
+FG_PAN_ZOOM = 1.04
+# The still blurred background is the panel zoomed in this much past "cover".
+BG_ZOOM = 1.15
+# Transition into the next beat of the same page, and the rotation used on a page change.
+SAME_PAGE_TRANSITION = ("fade", 0.35)
+PAGE_TRANSITIONS = ["smoothleft", "fade", "smoothup", "fadeblack"]
+# Loudness target for the final mix (LUFS / dBTP).
+LOUD_I = -16.0
+LOUD_TP = -1.5
+
+FG_MOTIONS = {
+    "tall": ["push", "pan_down", "pull", "pan_up"],
+    "wide": ["push", "pan_right", "pull", "pan_left"],
+    "even": ["push", "pull", "pan_right", "push", "pull", "pan_down"],
+}
+# Where the visible window sits in the slack left by the zoom (0..1 per axis; "e" is the
+# eased 0..1 progress) for each panel move.
+FG_WINDOW = {
+    "push": ("0.5", "0.5"), "pull": ("0.5", "0.5"), "still": ("0.5", "0.5"),
+    "pan_down": ("0.5", "{e}"), "pan_up": ("0.5", "(1-{e})"),
+    "pan_right": ("{e}", "0.5"), "pan_left": ("(1-{e})", "0.5"),
+}
+# Bumped whenever the look of a rendered clip changes, so cached clips are not reused.
+CLIP_VERSION = 3
+
 
 def check_ffmpeg():
     """Verify ffmpeg is available."""
@@ -89,20 +128,6 @@ def plan_reel_cuts(boundaries, total, target=REEL_TARGET_SEC, snap=REEL_SNAP_SEC
     return [(round(a, 3), round(b, 3)) for a, b in zip(edges, edges[1:])]
 
 
-def fit_filter(w, h, fill):
-    """Filter that fits any image inside w x h: black bars, or ("blur") a blurred,
-    darkened copy of the same image filling the frame behind it (the usual look
-    for upright reels). Either way it is one chain that more filters can follow."""
-    if fill == "blur":
-        return (
-            "split[mvbg][mvfg];"
-            f"[mvbg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=24:2,eq=brightness=-0.08[mvb];"
-            f"[mvfg]scale={w}:{h}:force_original_aspect_ratio=decrease[mvf];"
-            "[mvb][mvf]overlay=(W-w)/2:(H-h)/2"
-        )
-    return f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
-
-
 def split_reels(final_video, cuts, reels_dir):
     """Cut `final_video` into reels_dir/reel_01.mp4 ... at `cuts` (re-encoded so every
     cut is frame-exact). Writes reels.json and returns the reel paths."""
@@ -120,6 +145,8 @@ def split_reels(final_video, cuts, reels_dir):
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-ss", f"{start:.3f}", "-i", final_video, "-t", f"{dur:.3f}",
+            # Every audio track (with music, "Narration only" rides along).
+            "-map", "0:v:0", "-map", "0:a",
             "-af", f"afade=t=in:d=0.03,afade=t=out:st={max(0.0, dur - fade):.3f}:d={fade:.3f}",
             "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "160k",
@@ -135,19 +162,6 @@ def split_reels(final_video, cuts, reels_dir):
         json.dump({"reels": manifest}, f, indent=2)
     return out
 
-
-ZOOMPAN_PRESETS = [
-    "zoompan=z='min(zoom+0.0003\\,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-    "zoompan=z='max(1.08-0.0003*on\\,1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-    "zoompan=z='1.06':x='(iw-iw/zoom)*(on/duration)':y='ih/2-(ih/zoom/2)'",
-    "zoompan=z='1.06':x='(iw-iw/zoom)*(1-on/duration)':y='ih/2-(ih/zoom/2)'",
-    "zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(on/duration)'",
-    "zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/duration)'",
-    "zoompan=z='1.08':x='(iw-iw/zoom)*(on/duration)':y='(ih-ih/zoom)*(on/duration)'",
-    "zoompan=z='1.08':x='(iw-iw/zoom)*(1-on/duration)':y='(ih-ih/zoom)*(1-on/duration)'",
-    "zoompan=z='1.04+0.04*sin(2*3.14159*on/90)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-    "zoompan=z='1.0+min(0.08\\,0.08*(on/15))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-]
 
 def combine_audio_files(audio_paths, output_path):
     """Concatenate WAV files into a single WAV using ffmpeg."""
@@ -168,6 +182,371 @@ def combine_audio_files(audio_paths, output_path):
 
     os.unlink(list_file)
 
+
+# ── Timeline planning (pure helpers) ──
+
+def plan_transitions(durations, pages, kind="crossfade", base=0.5):
+    """Plan crossfades between clips of `durations` seconds without moving the narration.
+
+    Returns (starts, trans): starts[k] is when clip k's narration begins (running sum)
+    and trans[k] = (xfade transition, seconds) for the change into clip k (trans[0] is
+    None). Each clip's video runs on for trans[k + 1] seconds past its narration, so the
+    fade into clip k begins exactly at starts[k] and the total stays sum(durations).
+    Same-page beats dissolve quickly, page changes rotate through PAGE_TRANSITIONS, short
+    clips get shorter fades, and kind "none" gives one-frame (hard) cuts.
+    """
+    starts = []
+    t = 0.0
+    for d in durations:
+        starts.append(t)
+        t += d
+    frame = 1.0 / FPS
+    trans = [None]
+    turn = 0
+    for k in range(1, len(durations)):
+        if kind == "none":
+            name, dur = "fade", frame
+        elif pages[k] == pages[k - 1]:
+            name, dur = SAME_PAGE_TRANSITION[0], min(SAME_PAGE_TRANSITION[1], base)
+        else:
+            name, dur = PAGE_TRANSITIONS[turn % len(PAGE_TRANSITIONS)], base
+            turn += 1
+        dur = max(frame, min(dur, 0.45 * durations[k - 1], 0.45 * durations[k]))
+        trans.append((name, round(dur, 3)))
+    return starts, trans
+
+
+def plan_chunks(n, size=CHUNK_CLIPS):
+    """Split n clips into consecutive [first, end) runs of at most `size` clips."""
+    return [(i, min(n, i + size)) for i in range(0, n, size)]
+
+
+def clip_frames(starts, trans, k, last_duration):
+    """Frames clip k must render: up to the next clip's start plus that fade's tail (and a
+    spare frame), or its own duration for the last clip."""
+    first = round(starts[k] * FPS)
+    if k + 1 < len(starts):
+        return round(starts[k + 1] * FPS) - first + math.ceil(trans[k + 1][1] * FPS) + 1
+    return math.ceil(last_duration * FPS) + 1
+
+
+def xfade_chain(labels, starts, trans, out):
+    """Filtergraph that chains video `labels` with xfade so labels[k] first appears at
+    starts[k] (seconds, snapped to the frame grid, relative to starts[0]); trans[k] is
+    the (transition, seconds) into labels[k]. The result is labelled `out`."""
+    if len(labels) == 1:
+        return f"[{labels[0]}]null[{out}]"
+    base = round(starts[0] * FPS)
+    parts = []
+    prev = labels[0]
+    for k in range(1, len(labels)):
+        name, dur = trans[k]
+        # A hair before the frame, so xfade (which starts at the first frame with
+        # pts >= offset) never slips a frame through decimal rounding.
+        offset = max(0.0, (round(starts[k] * FPS) - base) / FPS - 0.001)
+        nxt = out if k == len(labels) - 1 else f"{out}_{k}"
+        parts.append(
+            f"[{prev}][{labels[k]}]xfade=transition={name}:duration={dur:.3f}:offset={offset:.6f}[{nxt}]"
+        )
+        prev = nxt
+    return ";".join(parts)
+
+
+def pick_motion(aspect, box_aspect, turn, prev):
+    """Ken Burns move for a panel of `aspect` (w/h) in a box of `box_aspect`: tall panels pan
+    vertically, wide ones horizontally, all push/pull; never the same move twice running."""
+    if aspect < box_aspect * 0.75:
+        options = FG_MOTIONS["tall"]
+    elif aspect > box_aspect * 1.33:
+        options = FG_MOTIONS["wide"]
+    else:
+        options = FG_MOTIONS["even"]
+    motion = options[turn % len(options)]
+    if motion == prev:
+        motion = options[(turn + 1) % len(options)]
+    return motion
+
+
+def _ease(var, frames):
+    """Cosine ease 0..1 over `frames` frames, as an ffmpeg expression of frame counter `var`."""
+    return f"(0.5-0.5*cos(PI*{var}/{max(1, frames - 1)}))"
+
+
+def _motion_zoom(motion, amount, pan_zoom):
+    """Zoom expression (of the eased progress {e}) for a Ken Burns move."""
+    if motion == "push":
+        return f"1+{amount}*{{e}}"
+    if motion == "pull":
+        return f"{1 + amount:.4f}-{amount}*{{e}}"
+    if motion in ("pan_down", "pan_up", "pan_right", "pan_left"):
+        return f"{pan_zoom}"
+    return "1"
+
+
+def _warp(window, zoom, frames, interp):
+    """One still held for `frames` frames with an eased move: each frame shows the
+    sub-rectangle 1/zoom the size of the image, placed by the `window` fractions, stretched
+    over the whole frame. perspective resamples with subpixel precision, so slow moves glide
+    (zoompan rounds its crop to whole, chroma-aligned pixels and visibly steps)."""
+    e = _ease("on", frames)
+    z = "(" + zoom.format(e=e) + ")"
+    px, py = (v.format(e=e) for v in window)
+    cw, ch = f"W/{z}", f"H/{z}"
+    x, y = f"(W-{cw})*{px}", f"(H-{ch})*{py}"
+    return (
+        f"loop=loop={max(0, frames - 1)}:size=1:start=0,setpts=N/{FPS}/TB,"
+        f"perspective=x0='{x}':y0='{y}':x1='{x}+{cw}':y1='{y}':"
+        f"x2='{x}':y2='{y}+{ch}':x3='{x}+{cw}':y3='{y}+{ch}':"
+        f"interpolation={interp}:eval=frame"
+    )
+
+
+# ── Per-clip images ──
+
+def _crop_to_focus(page_image, focus_point, aspect, out_path):
+    """Crop `page_image` around a 0..1000 focus box (15% margin, widened to `aspect`)."""
+    from PIL import Image
+    img = Image.open(page_image)
+    img_w, img_h = img.size
+
+    ymin, xmin, ymax, xmax = focus_point
+    y_min = int(ymin * img_h / 1000)
+    x_min = int(xmin * img_w / 1000)
+    y_max = int(ymax * img_h / 1000)
+    x_max = int(xmax * img_w / 1000)
+
+    pad_w = int((x_max - x_min) * 0.15)
+    pad_h = int((y_max - y_min) * 0.15)
+    x_min = max(0, x_min - pad_w)
+    y_min = max(0, y_min - pad_h)
+    x_max = min(img_w, x_max + pad_w)
+    y_max = min(img_h, y_max + pad_h)
+
+    box_w = x_max - x_min
+    box_h = y_max - y_min
+    if box_w <= 0 or box_h <= 0:
+        return page_image
+    if box_w / box_h > aspect:
+        new_h = int(box_w / aspect)
+        center_y = (y_min + y_max) // 2
+        y_min = max(0, center_y - new_h // 2)
+        y_max = min(img_h, y_min + new_h)
+        if y_max - y_min < new_h:
+            y_min = max(0, y_max - new_h)
+    else:
+        new_w = int(box_h * aspect)
+        center_x = (x_min + x_max) // 2
+        x_min = max(0, center_x - new_w // 2)
+        x_max = min(img_w, x_min + new_w)
+        if x_max - x_min < new_w:
+            x_min = max(0, x_max - new_w)
+    img.convert("RGB").crop((x_min, y_min, x_max, y_max)).save(out_path, "JPEG", quality=95)
+    return out_path
+
+
+def _prepare_clip_images(src, idx, w, h, fill, work_dir):
+    """Write this clip's stills: the upscaled panel and the frame-sized background it sits on.
+    For the blurred fill the background is the panel zoomed in past "cover", blurred, darkened
+    and desaturated, with the panel's soft drop shadow baked in; otherwise black. The
+    background never moves, so it is composed once here. Returns where everything goes."""
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+
+    img = Image.open(src)
+    img.load()
+    img = img.convert("RGB")
+    iw, ih = img.size
+    blur = fill == "blur"
+    mx, my = (round(w * FG_MARGIN), round(h * FG_MARGIN)) if blur else (0, 0)
+    bw, bh = w - 2 * mx, h - 2 * my
+    scale = min(bw / iw, bh / ih)
+    fw = max(2, int(iw * scale) // 2 * 2)
+    fh = max(2, int(ih * scale) // 2 * 2)
+    fx = (w - fw) // 4 * 2
+    fy = (h - fh) // 4 * 2
+
+    fg_path = os.path.join(work_dir, f"fg_{idx:04d}.jpg")
+    img.resize((fw, fh), Image.LANCZOS).save(fg_path, "JPEG", quality=95)
+
+    bg_path = os.path.join(work_dir, f"bg_{idx:04d}.jpg")
+    if blur:
+        # Blur at 1/8 size (much cheaper, and smoother once scaled back up).
+        sw, sh = max(16, w // 8), max(16, h // 8)
+        cover = max(sw / iw, sh / ih) * BG_ZOOM
+        small = img.resize((max(sw, round(iw * cover)), max(sh, round(ih * cover))), Image.BOX)
+        left = (small.width - sw) // 2
+        top = (small.height - sh) // 2
+        small = small.crop((left, top, left + sw, top + sh))
+        small = small.filter(ImageFilter.GaussianBlur(radius=max(2.0, sw * 0.03)))
+        small = ImageEnhance.Color(small).enhance(0.6)
+        small = ImageEnhance.Brightness(small).enhance(0.55)
+        bg = small.resize((w, h), Image.BICUBIC).filter(ImageFilter.GaussianBlur(radius=max(2, w // 400)))
+        # Soft drop shadow where the panel sits.
+        pad = max(8, round(min(w, h) * 0.04))
+        mask = Image.new("L", (fw + 2 * pad, fh + 2 * pad), 0)
+        ImageDraw.Draw(mask).rectangle([pad, pad, pad + fw - 1, pad + fh - 1], fill=210)
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=pad / 2.5))
+        bg.paste((0, 0, 0), (fx - pad, fy - pad + max(2, round(h * 0.008))), mask)
+    else:
+        bg = Image.new("RGB", (w, h), (0, 0, 0))
+    bg.save(bg_path, "JPEG", quality=92)
+
+    return {
+        "fg": fg_path, "fg_pos": (fx, fy), "bg": bg_path,
+        "aspect": iw / ih, "box_aspect": bw / bh,
+    }
+
+
+def clip_key(src, focus, motion, frames, w, h, fill):
+    """Short hash naming a rendered clip, so a re-run (after Pause / Resume) reuses the clips
+    it already made and renders only what changed."""
+    import hashlib
+    try:
+        st = os.stat(src)
+        ident = [os.path.abspath(src), st.st_size, int(st.st_mtime)]
+    except OSError:
+        ident = [src]
+    raw = json.dumps([CLIP_VERSION, ident, focus, motion, frames, w, h, fill], default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _render_clip(clip, frames, w, h, out_path):
+    """Render one clip's video (no audio): the still background with the Ken Burns panel on it."""
+    imgs = clip["images"]
+    motion = clip["motion"]
+    # Short clips move proportionally less, so a half-second beat never lurches.
+    k = min(1.0, frames / (3.0 * FPS))
+    fg_zoom = _motion_zoom(motion, round(FG_PUSH * k, 4), round(1 + (FG_PAN_ZOOM - 1) * k, 4))
+    fx, fy = imgs["fg_pos"]
+    graph = [
+        f"[0:v]format=yuv420p,setsar=1,loop=loop={max(0, frames - 1)}:size=1:start=0,setpts=N/{FPS}/TB[bg]",
+        f"[1:v]{_warp(FG_WINDOW[motion], fg_zoom, frames, 'cubic')},format=yuv420p,setsar=1[fg]",
+        f"[bg][fg]overlay={fx}:{fy},format=yuv420p[v]",
+    ]
+    tmp = out_path + ".part.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", imgs["bg"], "-i", imgs["fg"],
+        "-filter_complex", ";".join(graph),
+        "-map", "[v]", "-frames:v", str(frames), "-r", str(FPS),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-an", tmp,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0 or not os.path.exists(tmp):
+        raise RuntimeError(f"clip render failed: {result.stderr[:300]}")
+    os.replace(tmp, out_path)
+
+
+def run_ffmpeg_progress(cmd, seconds, on_fraction=None, timeout=7200):
+    """Run an ffmpeg command, calling on_fraction(0..1) as its output advances through
+    `seconds` of media (from ffmpeg's -progress report). Returns (returncode, stderr)."""
+    import tempfile
+    import threading
+    cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+    err = tempfile.TemporaryFile()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
+    timer = threading.Timer(timeout, proc.kill)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            key, _, value = line.strip().partition("=")
+            if key == "out_time_us" and on_fraction and seconds > 0:
+                try:
+                    on_fraction(min(1.0, max(0.0, int(value) / 1e6 / seconds)))
+                except ValueError:
+                    pass
+        proc.wait()
+    finally:
+        timer.cancel()
+    err.seek(0)
+    stderr = err.read().decode("utf-8", "replace")
+    err.close()
+    return proc.returncode, stderr
+
+
+def _render_chunk(paths, starts, trans, out_path, seconds=0.0, on_fraction=None):
+    """Crossfade a run of clips into one intermediate video."""
+    inputs = []
+    graph = []
+    labels = []
+    for i, p in enumerate(paths):
+        inputs += ["-i", p]
+        graph.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[c{i}]")
+        labels.append(f"c{i}")
+    graph.append(xfade_chain(labels, starts, trans, "v"))
+    tmp = out_path + ".part.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        *inputs,
+        "-filter_complex", ";".join(graph),
+        "-map", "[v]", "-r", str(FPS),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-an", tmp,
+    ]
+    code, stderr = run_ffmpeg_progress(cmd, seconds, on_fraction, timeout=3600)
+    if code != 0 or not os.path.exists(tmp):
+        raise RuntimeError(f"Failed to join clips: {stderr[:300]}")
+    os.replace(tmp, out_path)
+
+
+def _build_narration(clips, work_dir, out_path):
+    """Sample-exact narration track (48 kHz mono PCM): each clip's slice of its audio file,
+    silence-padded if the file runs short, laid end to end on the rendered timeline."""
+    sources = list(dict.fromkeys(c["audio_path"] for c in clips))
+    converted = {src: os.path.join(work_dir, f"narr_{i:04d}.wav") for i, src in enumerate(sources)}
+    # Convert every source to 48 kHz mono PCM, a batch of files per ffmpeg call.
+    for b in range(0, len(sources), 24):
+        batch = sources[b:b + 24]
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        for src in batch:
+            cmd += ["-i", src]
+        for i, src in enumerate(batch):
+            cmd += ["-map", f"{i}:a:0", "-ac", "1", "-ar", str(AUDIO_RATE), "-c:a", "pcm_s16le", converted[src]]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+    with wave.open(out_path, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(AUDIO_RATE)
+        for c in clips:
+            src = c["audio_path"]
+            count = round((c["start"] + c["duration"]) * AUDIO_RATE) - round(c["start"] * AUDIO_RATE)
+            with wave.open(converted[src], "rb") as wf:
+                pos = min(wf.getnframes(), round(c["offset"] * AUDIO_RATE))
+                wf.setpos(pos)
+                data = wf.readframes(count)
+            out.writeframes(data + b"\0\0" * (count - len(data) // 2))
+
+
+# Share of the video step's progress bar each stage takes (they add up to 1).
+PROGRESS_SPLIT = {"prepare": 0.05, "clips": 0.55, "chunks": 0.15, "finalize": 0.25}
+
+
+class _Progress:
+    """Maps stage-local 0..1 fractions onto one 0..1000 bar for progress_cb("video", ...)."""
+
+    def __init__(self, cb, has_chunks):
+        self.cb = cb
+        split = dict(PROGRESS_SPLIT)
+        if not has_chunks:
+            split["clips"] += split.pop("chunks")
+        self.split = split
+        self.last = -1
+
+    def __call__(self, stage, fraction):
+        if not self.cb:
+            return
+        done = 0.0
+        for name, share in self.split.items():
+            if name == stage:
+                done += share * min(1.0, max(0.0, fraction))
+                break
+            done += share
+        value = min(1000, int(done * 1000))
+        if value > self.last:
+            self.last = value
+            self.cb("video", value, 1000)
+
+
 def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=None):
     """
     Generate a narrated manga video.
@@ -177,18 +556,28 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         sync_map: dict with 'segments' (page→timing) from sync_map.json
         output_dir: pipeline output directory
         config: dict with options:
-            - transition: 'fade' | 'crossfade' | 'none' (default: 'fade')
+            - transition: 'fade' | 'crossfade' | 'none' (default: 'fade'). Anything but
+              'none'/'cut' crossfades consecutive clips without shifting the narration.
             - resolution: '720p' | '1080p' | '1440p' (default: '1080p')
-            - transition_duration: float seconds (default: 0.5)
+            - transition_duration: page-change transition seconds (default: 0.5)
             - effect: 'ken_burns' | 'none' (default: 'ken_burns')
+            - fill: 'blur' (still blurred copy of the panel behind it) | 'black' (default: 'blur')
             - format: 'landscape' (one 16:9 video) | 'reels' (9:16, also cut into
               ~1 minute reels in output_dir/reels/) (default: 'landscape')
             - reel_seconds: target reel length (default: 60)
+            - score / bg_music / bg_music_volume / bg_music_loop / narration_volume
+            - music_volume: linear multiplier on the score / music (default: 1.0, 0 mutes)
             - subtitles: caption setting (caption_engine.normalize_settings keys: style,
               size, posX, posY, wordsPerLine, lines, uppercase, color, highlightColor,
               emphasis, enabled); falls back to <output_dir>/subtitles.json, then the
               Studio default. Words are timed against each clip's audio.
         progress_cb: function(stage, current, total)
+
+    With music the video carries two audio tracks: "Narration + music" (the default) and
+    "Narration only", so a player or an export can drop the music without a re-render.
+    Rendered clips are kept (named by their content) until the video is finished, so a
+    re-run after a pause or a crash only renders what is missing. The narration boundaries
+    are saved next to the video in video_timeline.json (exports cut there).
 
     Returns:
         path to final video file
@@ -198,22 +587,18 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
 
     transition = config.get("transition", "fade")
     resolution = config.get("resolution", "1080p")
-    trans_dur = config.get("transition_duration", 0.5)
+    try:
+        trans_dur = min(1.5, max(0.2, float(config.get("transition_duration", 0.5))))
+    except (TypeError, ValueError):
+        trans_dur = 0.5
     effect = config.get("effect", "ken_burns")
-    if transition == "cut":
-        transition = "none"
     if transition == "zoom-punch":
-        transition = "fade"
         effect = "ken_burns"
-    if transition == "crossfade":
-        # Narrated manga must keep page starts exactly aligned to audio starts.
-        # Real crossfades overlap clips and shorten the timeline, so treat this
-        # as a per-page visual fade instead of overlapping audio/video.
-        transition = "fade"
+    trans_kind = "none" if transition in ("none", "cut") else "crossfade"
     force_rerender = config.get("force_rerender", False)
     fmt = "reels" if config.get("format") == "reels" else "landscape"
     w, h = get_resolution(resolution, fmt)
-    fill = config.get("fill") or ("blur" if fmt == "reels" else "black")
+    fill = "black" if config.get("fill") == "black" else "blur"
     reels_dir = os.path.join(output_dir, "reels")
 
     video_dir = os.path.join(output_dir, "video_parts")
@@ -231,35 +616,35 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
 
     audio_dir = os.path.join(output_dir, "audio")
     final_video = os.path.join(output_dir, "video_final.mp4")
+    timeline_file = os.path.join(output_dir, "video_timeline.json")
 
-    # Allow re-render when user explicitly requests it
+    # A forced re-render replaces the video; clips already rendered for the same content
+    # (kept in video_parts by an interrupted run) are reused.
     if force_rerender:
         if os.path.exists(final_video):
             try:
                 os.unlink(final_video)
             except OSError:
                 pass
-        if os.path.isdir(video_dir):
-            try:
-                shutil.rmtree(video_dir)
-                os.makedirs(video_dir, exist_ok=True)
-            except OSError:
-                pass
     elif os.path.exists(final_video) and os.path.getsize(final_video) > 1000 and (fmt == "reels") == os.path.isdir(reels_dir):
         return final_video
 
-    # ── Step 1: Create per-panel (or per-page) video segments ──
-    segment_paths = []
+    report = _Progress(progress_cb, False)
+
+    # ── Step 1: Resolve every clip (image, audio slice, timing) and prepare its stills ──
+    clips = []
     # End time (seconds) of every rendered clip - where reels may be cut.
     boundaries = []
     # The narration actually on screen, timed on the rendered timeline (captions follow it).
     caption_segments = []
     timeline = 0.0
     total = len(render_items)
+    box_aspect = (w - 2 * round(w * FG_MARGIN)) / (h - 2 * round(h * FG_MARGIN)) if fill == "blur" else w / h
+    turn = 0
+    prev_motion = None
 
     for idx, seg in enumerate(render_items):
-        if progress_cb:
-            progress_cb("video", idx + 1, total * 3)  # 3 phases: segments, concat, finalise
+        report("prepare", idx / total)
 
         page_num = seg["page"]
         audio_file = seg.get("audio_file", f"page_{page_num:04d}.wav")
@@ -283,63 +668,20 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             page_image = page_files[page_num]
         if not page_image:
             continue
+        source_image = page_image
 
-        # Crop to focus point if present (aspect ratio matched to eliminate black margins)
+        # Crop to focus point if present (aspect matched to the panel box)
         focus_point = seg.get("focus_point")
         if focus_point and len(focus_point) == 4:
             try:
-                from PIL import Image
-                img = Image.open(page_image)
-                img_w, img_h = img.size
-                
-                ymin, xmin, ymax, xmax = focus_point
-                y_min = int(ymin * img_h / 1000)
-                x_min = int(xmin * img_w / 1000)
-                y_max = int(ymax * img_h / 1000)
-                x_max = int(xmax * img_w / 1000)
-                
-                # Apply 15% margin padding
-                box_w = x_max - x_min
-                box_h = y_max - y_min
-                pad_w = int(box_w * 0.15)
-                pad_h = int(box_h * 0.15)
-                
-                x_min = max(0, x_min - pad_w)
-                y_min = max(0, y_min - pad_h)
-                x_max = min(img_w, x_max + pad_w)
-                y_max = min(img_h, y_max + pad_h)
-                
-                # Adjust coordinates to match target aspect ratio (w/h)
-                box_w = x_max - x_min
-                box_h = y_max - y_min
-                if box_w > 0 and box_h > 0:
-                    target_aspect = w / h
-                    box_aspect = box_w / box_h
-                    if box_aspect > target_aspect:
-                        # Expand height
-                        new_h = int(box_w / target_aspect)
-                        center_y = (y_min + y_max) // 2
-                        y_min = max(0, center_y - new_h // 2)
-                        y_max = min(img_h, y_min + new_h)
-                        if y_max - y_min < new_h:
-                            y_min = max(0, y_max - new_h)
-                    else:
-                        # Expand width
-                        new_w = int(box_h * target_aspect)
-                        center_x = (x_min + x_max) // 2
-                        x_min = max(0, center_x - new_w // 2)
-                        x_max = min(img_w, x_min + new_w)
-                        if x_max - x_min < new_w:
-                            x_min = max(0, x_max - new_w)
-                    
-                    cropped_img = img.crop((x_min, y_min, x_max, y_max))
-                    temp_crop_path = os.path.join(video_dir, f"crop_{idx:04d}.jpg")
-                    cropped_img.save(temp_crop_path, "JPEG", quality=95)
-                    page_image = temp_crop_path
+                page_image = _crop_to_focus(
+                    page_image, focus_point, box_aspect,
+                    os.path.join(video_dir, f"crop_{idx:04d}.jpg"),
+                )
             except Exception as e:
                 print(f"[video] Failed to crop page to focus point: {e}", file=sys.stderr)
-
-        seg_path = os.path.join(video_dir, f"seg_{idx:04d}.mp4")
+        else:
+            focus_point = None
 
         # For beats, play just this panel's slice of the page audio; for pages,
         # use the whole file.
@@ -353,115 +695,101 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             continue
         duration = round(duration, 3)
 
-        caption_seg = {
+        try:
+            images = _prepare_clip_images(page_image, idx, w, h, fill, video_dir)
+        except Exception as e:
+            print(f"[video] Skipping unreadable image for page {page_num}: {e}", file=sys.stderr)
+            continue
+
+        motion = "still"
+        if effect != "none":
+            motion = pick_motion(images["aspect"], images["box_aspect"], turn, prev_motion)
+            turn += 1
+            prev_motion = motion
+
+        clips.append({
+            "idx": idx, "page": page_num, "images": images, "motion": motion,
+            "source": source_image, "focus": focus_point,
+            "audio_path": audio_path, "offset": audio_offset,
+            "start": timeline, "duration": duration,
+        })
+        caption_segments.append({
             "text": seg.get("text", ""),
             "start_ms": int(round(timeline * 1000)),
             "end_ms": int(round((timeline + duration) * 1000)),
             "audio_path": audio_path,
             "audio_offset_ms": int(round(audio_offset * 1000)),
-        }
+        })
+        timeline += duration
+        boundaries.append(timeline)
 
-        # Skip if already rendered
-        if os.path.exists(seg_path) and os.path.getsize(seg_path) > 100:
-            segment_paths.append(seg_path)
-            caption_segments.append(caption_seg)
-            timeline += duration
-            boundaries.append(timeline)
-            continue
-
-        # Build video filter for this segment
-        vf_parts = [
-            # Fit to the target resolution, preserving aspect ratio
-            fit_filter(w, h, fill),
-            "setsar=1",
-        ]
-
-        if effect != "none":
-            # Cycle through ZOOMPAN_PRESETS based on segment index
-            preset_idx = idx % len(ZOOMPAN_PRESETS)
-            preset_str = ZOOMPAN_PRESETS[preset_idx]
-            frames = max(1, int(duration * 30))
-            zoompan_expr = f"{preset_str}:d={frames}:s={w}x{h}:fps=30"
-            vf_parts = [
-                fit_filter(int(w * 1.2), int(h * 1.2), fill),
-                zoompan_expr
-            ]
-
-        if transition == "fade":
-            # Add fade in/out
-            frames = int(duration * 30)
-            fade_frames = min(int(trans_dur * 30), frames // 4)
-            vf_parts.append(f"fade=in:0:{fade_frames}")
-            vf_parts.append(f"fade=out:{max(0, frames - fade_frames)}:{fade_frames}")
-
-        vf = ",".join(vf_parts)
-
-        # When rendering a beat, seek into the page audio so this clip carries
-        # only the panel's slice (-ss before -i seeks the audio input).
-        audio_in = ["-i", audio_path]
-        if audio_offset > 0.001:
-            audio_in = ["-ss", f"{audio_offset:.3f}", "-i", audio_path]
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-hide_banner", "-loglevel", "error",
-            "-loop", "1", "-i", page_image,
-            *audio_in,
-            "-vf", vf,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-af", "aresample=async=1:first_pts=0",
-            "-r", "30",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-t", f"{duration:.3f}",
-            seg_path,
-        ]
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if result.returncode != 0:
-                print(f"[video] FFmpeg error for page {page_num}: {result.stderr[:300]}", file=sys.stderr)
-                continue
-            segment_paths.append(seg_path)
-            caption_segments.append(caption_seg)
-            timeline += duration
-            boundaries.append(timeline)
-        except subprocess.TimeoutExpired:
-            print(f"[video] Timeout rendering page {page_num}", file=sys.stderr)
-            continue
-
-    if not segment_paths:
+    if not clips:
         raise RuntimeError("No video segments were generated")
 
-    # ── Step 2: Concatenate all segments ──
-    if progress_cb:
-        progress_cb("video", total + 1, total * 3)
+    chunks = plan_chunks(len(clips), CHUNK_CLIPS)
+    report = _Progress(progress_cb, len(chunks) > 1)
+    report("prepare", 1.0)
 
-    concat_list = os.path.join(video_dir, "concat.txt")
-    with open(concat_list, 'w') as f:
-        for sp in segment_paths:
-            f.write(f"file '{sp}'\n")
+    # ── Step 2: Render each clip's video (with a tail that the next crossfade eats) ──
+    durations = [c["duration"] for c in clips]
+    starts, trans = plan_transitions(durations, [c["page"] for c in clips], trans_kind, trans_dur)
+    frame_counts = [clip_frames(starts, trans, k, durations[-1]) for k in range(len(clips))]
+    all_frames = max(1, sum(frame_counts))
+    rendered = 0
+    clip_paths = []
+    for k, c in enumerate(clips):
+        frames = frame_counts[k]
+        key = clip_key(c["source"], c["focus"], c["motion"], frames, w, h, fill)
+        path = os.path.join(video_dir, f"clip_{c['idx']:04d}_{key}.mp4")
+        # Reuse a clip an interrupted run already rendered.
+        if not (os.path.exists(path) and os.path.getsize(path) > 100):
+            try:
+                _render_clip(c, frames, w, h, path)
+            except Exception as e:
+                print(f"[video] {e} (page {c['page']}); retrying as a still", file=sys.stderr)
+                c["motion"] = "still"
+                _render_clip(c, frames, w, h, path)
+        clip_paths.append(path)
+        rendered += frames
+        report("clips", rendered / all_frames)
 
-    concat_video = os.path.join(video_dir, "concat.mp4")
+    # Narration, sample-accurate against the same timeline.
+    narration = os.path.join(video_dir, "narration.wav")
+    _build_narration(clips, video_dir, narration)
 
-    _simple_concat(concat_list, concat_video)
+    # ── Step 3: Crossfade runs of clips into chunks (long chapters only) ──
+    if len(chunks) == 1:
+        video_inputs = clip_paths
+        video_starts, video_trans = starts, trans
+    else:
+        video_inputs, video_starts, video_trans = [], [], []
+        for ci, (a, b) in enumerate(chunks):
+            names = [os.path.basename(p) for p in clip_paths[a:b]]
+            ckey = clip_key("", None, [names, trans[a + 1:b]], 0, w, h, fill)
+            chunk_path = os.path.join(video_dir, f"chunk_{ci:03d}_{ckey}.mp4")
+            span = (starts[b] if b < len(starts) else timeline) - starts[a]
+            if not (os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 100):
+                _render_chunk(
+                    clip_paths[a:b], starts[a:b], [None] + trans[a + 1:b], chunk_path, span,
+                    lambda f, ci=ci: report("chunks", (ci + f) / len(chunks)),
+                )
+            video_inputs.append(chunk_path)
+            video_starts.append(starts[a])
+            video_trans.append(trans[a])
+            report("chunks", (ci + 1) / len(chunks))
 
-    if not os.path.exists(concat_video):
-        raise RuntimeError("Failed to concatenate video segments")
-
-    # ── Step 3: Burn captions + mix background music + move to final location ──
-    if progress_cb:
-        progress_cb("video", total * 3, total * 3)
-
+    # ── Step 4: Burn captions + mix narration and music + move to final location ──
     bg_music = config.get("bg_music")
     bg_music_volume = float(config.get("bg_music_volume") or 0.15)
     narration_volume = float(config.get("narration_volume") or 1.0)
     bg_music_loop = bool(config.get("bg_music_loop", True))
+    try:
+        music_volume = max(0.0, float(config.get("music_volume", 1.0)))
+    except (TypeError, ValueError):
+        music_volume = 1.0
     # MangaVox's own score (mv-score): already timed to the narration, ducked and limited.
     score = config.get("score")
-    
+
     ass_path = None
     try:
         import captions
@@ -471,32 +799,28 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     except Exception as e:
         print(f"[video] Failed to generate styled captions: {e}", file=sys.stderr)
 
+    video = {"inputs": video_inputs, "starts": video_starts, "trans": video_trans}
+    on_final = lambda f: report("finalize", f)
     success = _finalize_video_with_audio_mix_and_captions(
-        concat_video,
-        final_video,
-        ass_path,
-        bg_music,
-        narration_volume,
-        bg_music_volume,
-        bg_music_loop,
-        w,
-        h,
-        score=score,
+        video, narration, final_video, ass_path, bg_music,
+        narration_volume, bg_music_volume, bg_music_loop, w, h, timeline,
+        score=score, music_volume=music_volume, on_fraction=on_final,
     )
+    if not success:
+        print("[video] Finalization failed, retrying without captions and music", file=sys.stderr)
+        success = _finalize_video_with_audio_mix_and_captions(
+            video, narration, final_video, None, None,
+            narration_volume, 0.0, False, w, h, timeline,
+            score=None, music_volume=0.0, on_fraction=on_final,
+        )
+    if not success:
+        raise RuntimeError("Failed to finalize the video")
 
-    if success:
-        try:
-            os.unlink(concat_video)
-        except OSError:
-            pass
-    else:
-        print("[video] Complex finalization failed, falling back to simple video copy", file=sys.stderr)
-        try:
-            if os.path.exists(final_video):
-                os.unlink(final_video)
-            shutil.move(concat_video, final_video)
-        except Exception as e:
-            print(f"[video] Fallback failed: {e}", file=sys.stderr)
+    try:
+        with open(timeline_file, "w", encoding="utf-8") as f:
+            json.dump({"duration": round(timeline, 3), "boundaries": [round(b, 3) for b in boundaries[:-1]]}, f)
+    except OSError as e:
+        print(f"[video] Could not save the timeline: {e}", file=sys.stderr)
 
     # Clean up temp segment files
     try:
@@ -512,186 +836,137 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         # Reels from an earlier upright render no longer match this video.
         shutil.rmtree(reels_dir, ignore_errors=True)
 
+    report("finalize", 1.0)
     return final_video
 
 
+def _audio_mix_graph(first, has_music, narration_vol, music_vol, solo=False):
+    """Narration (input `first`) plus optional music (input `first + 1`) mixed at unity into
+    [mix]; the music is ducked under the narration by a gentle sidechain compressor. With
+    `solo` (and music) the narration alone is also left in [solo]."""
+    fmt = f"aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo"
+    nar = f"[{first}:a]{fmt},volume={narration_vol}"
+    if not has_music:
+        return f"{nar}[mix]"
+    if solo:
+        split = f"{nar},asplit=3[nar][key][solo];"
+    else:
+        split = f"{nar},asplit=2[nar][key];"
+    return (
+        split +
+        f"[{first + 1}:a]{fmt},volume={music_vol}[mus];"
+        "[mus][key]sidechaincompress=threshold=0.03:ratio=4:attack=20:release=400[duck];"
+        "[nar][duck]amix=inputs=2:duration=first:normalize=0[mix]"
+    )
+
+
+def _measure_loudness(audio_inputs, mix_graph):
+    """Integrated loudness (LUFS) of the mix, from a fast audio-only EBU R128 analysis pass."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats", *audio_inputs,
+        "-filter_complex", f"{mix_graph};[mix]ebur128=framelog=quiet[out]",
+        "-map", "[out]", "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        found = re.findall(r"^\s*I:\s*(-?[\d.]+|-inf)\s*LUFS", result.stderr or "", re.M)
+        if result.returncode != 0 or not found:
+            return None
+        value = float(found[-1])
+        # Below ~-70 LUFS is effectively silence: no meaningful gain to derive.
+        return value if math.isfinite(value) and value > -70 else None
+    except Exception as e:
+        print(f"[video] Loudness measurement failed: {e}", file=sys.stderr)
+        return None
+
+
 def _finalize_video_with_audio_mix_and_captions(
-    input_video, output_video, ass_path, bg_music,
-    narration_vol, bg_vol, bg_loop, w, h, score=None
+    video, narration, output_video, ass_path, bg_music,
+    narration_vol, bg_vol, bg_loop, w, h, total, score=None, music_volume=1.0, on_fraction=None,
 ):
     """
-    Adjusts narration volume, mixes background music, loops it, and burns subtitles
-    in a single FFmpeg command.
+    Joins the clip/chunk videos with their crossfades, burns subtitles, and mixes the
+    narration with the score (or looped background music) in a single FFmpeg command.
+    With music, a second "Narration only" audio track is written too.
+
+    Loudness is two-pass and linear: the mix is measured first, then one fixed gain brings
+    it to LOUD_I and a limiter catches peaks, so music never swells in narration pauses.
     """
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-    
-    # Input 0: Concatenated video
-    cmd += ["-i", input_video]
-    
-    # Input 1: the chapter's own score, which replaces any looped background track,
-    # else background music (if present)
-    has_score = bool(score) and os.path.exists(score)
-    has_bg = bool(bg_music) and os.path.exists(bg_music) and not has_score
+    inputs = []
+    for p in video["inputs"]:
+        inputs += ["-i", p]
+    n_video = len(video["inputs"])
+
+    # The chapter's own score replaces any looped background track.
+    has_score = bool(score) and os.path.exists(score) and music_volume > 0
+    has_bg = bool(bg_music) and os.path.exists(bg_music) and not has_score and music_volume > 0 and bg_vol > 0
+    audio_inputs = ["-i", narration]
+    music_vol = 1.0
     if has_score:
-        cmd += ["-i", score]
-    if has_bg:
-        if bg_loop:
-            cmd += ["-stream_loop", "-1"]
-        cmd += ["-i", bg_music]
-        
-    filter_complex = []
-    
-    # 1. Audio processing
-    if has_score:
-        # Mix at unity (the score is mastered against this narration), bring the whole mix to
-        # streaming loudness and keep true peaks under -1.5 dBFS.
-        filter_complex.append(
-            f"[0:a]volume={narration_vol},aresample=48000,aformat=channel_layouts=stereo[a0];"
-            f"[1:a]aresample=48000,aformat=channel_layouts=stereo[a1];"
-            f"[a0][a1]amix=inputs=2:duration=first:normalize=0,"
-            f"loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,alimiter=limit=0.84:level=0[a]"
-        )
+        audio_inputs += ["-i", score]
+        music_vol = music_volume
     elif has_bg:
-        filter_complex.append(
-            f"[0:a]volume={narration_vol}[a0];"
-            f"[1:a]volume={bg_vol}[a1];"
-            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]"
-        )
-    else:
-        filter_complex.append(f"[0:a]volume={narration_vol}[a]")
-        
-    # 2. Subtitle processing
-    has_video_filter = False
-    if ass_path and os.path.exists(ass_path):
+        if bg_loop:
+            audio_inputs += ["-stream_loop", "-1"]
+        audio_inputs += ["-i", bg_music]
+        music_vol = bg_vol * music_volume
+
+    has_music = has_score or has_bg
+    if on_fraction:
+        on_fraction(0.0)
+    measured = _measure_loudness(audio_inputs, _audio_mix_graph(0, has_music, narration_vol, music_vol))
+    gain_db = 0.0 if measured is None else max(-20.0, min(20.0, LOUD_I - measured))
+    limit = round(10 ** (LOUD_TP / 20), 4)
+    if on_fraction:
+        on_fraction(0.05)
+
+    graph = []
+    # 1. Video: crossfade the parts, then captions
+    labels = []
+    for i in range(n_video):
+        graph.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[p{i}]")
+        labels.append(f"p{i}")
+    graph.append(xfade_chain(labels, video["starts"], video["trans"], "vx"))
+    has_subs = bool(ass_path) and os.path.exists(ass_path)
+    if has_subs:
         from caption_engine import subtitles_filter
-        filter_complex.append(f"[0:v]{subtitles_filter(ass_path)}[v]")
-        has_video_filter = True
-        
-    cmd += ["-filter_complex", ";".join(filter_complex)]
-    
-    if has_video_filter:
-        cmd += ["-map", "[v]"]
+        graph.append(f"[vx]{subtitles_filter(ass_path)},format=yuv420p[v]")
     else:
-        cmd += ["-map", "0:v"]
-        
-    cmd += ["-map", "[a]"]
-    
-    if has_video_filter:
-        cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
-    else:
-        cmd += ["-c:v", "copy"]
-        
-    cmd += [
-        "-c:a", "aac", "-b:a", "192k",
+        graph.append("[vx]format=yuv420p[v]")
+
+    # 2. Audio: mix, one measured gain, limiter (and the narration alone, when there is music)
+    graph.append(_audio_mix_graph(n_video, has_music, narration_vol, music_vol, solo=has_music))
+    graph.append(f"[mix]volume={gain_db:.2f}dB,alimiter=limit={limit}:level=0:latency=1,aresample={AUDIO_RATE}[a]")
+    maps = ["-map", "[v]", "-map", "[a]"]
+    # MP4 keeps a track's name as its handler name (players list tracks by it).
+    first = "Narration + music" if has_music else "Narration"
+    tracks = ["-metadata:s:a:0", f"title={first}", "-metadata:s:a:0", f"handler_name={first}", "-disposition:a:0", "default"]
+    if has_music:
+        graph.append(f"[solo]volume={gain_db:.2f}dB,alimiter=limit={limit}:level=0:latency=1,aresample={AUDIO_RATE}[a2]")
+        maps += ["-map", "[a2]"]
+        tracks += ["-metadata:s:a:1", "title=Narration only", "-metadata:s:a:1", "handler_name=Narration only", "-disposition:a:1", "0"]
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        *inputs, *audio_inputs,
+        "-filter_complex", ";".join(graph),
+        *maps,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE),
+        *tracks,
+        "-t", f"{total:.3f}",
         "-movflags", "+faststart",
-        output_video
+        output_video,
     ]
-    
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            print(f"[video] Finalization command failed: {result.stderr[:400]}", file=sys.stderr)
+        code, stderr = run_ffmpeg_progress(
+            cmd, total, (lambda f: on_fraction(0.05 + 0.95 * f)) if on_fraction else None,
+        )
+        if code != 0:
+            print(f"[video] Finalization command failed: {stderr[:400]}", file=sys.stderr)
             return False
         return os.path.exists(output_video) and os.path.getsize(output_video) > 1000
     except Exception as e:
         print(f"[video] Finalization command error: {e}", file=sys.stderr)
         return False
-
-
-def _simple_concat(concat_list, output):
-    """Concatenate videos with fresh timestamps to prevent accumulated drift."""
-    subprocess.run([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-fflags", "+genpts",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_list,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "192k",
-        "-af", "aresample=async=1:first_pts=0",
-        "-r", "30",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        output,
-    ], check=True, capture_output=True, timeout=900)
-
-
-def _crossfade_concat(segment_paths, output, trans_dur, w, h):
-    """Concatenate with crossfade transitions using xfade filter."""
-    if len(segment_paths) < 2:
-        _simple_concat_from_paths(segment_paths, output)
-        return
-
-    cmd = ["ffmpeg", "-y"]
-
-    # Add all inputs
-    for sp in segment_paths:
-        cmd += ["-i", sp]
-
-    # Build xfade filter chain
-    n = len(segment_paths)
-    filter_parts = []
-    durations = []
-
-    # Get durations of each segment
-    for sp in segment_paths:
-        try:
-            result = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", sp],
-                capture_output=True, text=True, timeout=30
-            )
-            durations.append(float(result.stdout.strip()))
-        except Exception:
-            durations.append(5.0)
-
-    # Build xfade chain
-    offset = durations[0] - trans_dur
-    if n == 2:
-        filter_parts.append(
-            f"[0:v][1:v]xfade=transition=fade:duration={trans_dur}:offset={max(0, offset)}[v]"
-        )
-        filter_parts.append(
-            f"[0:a][1:a]acrossfade=d={trans_dur}[a]"
-        )
-        cmd += ["-filter_complex", ";".join(filter_parts)]
-        cmd += ["-map", "[v]", "-map", "[a]"]
-    else:
-        # Chain xfades for multiple inputs
-        prev_v = "0:v"
-        prev_a = "0:a"
-
-        for i in range(1, n):
-            out_v = f"v{i}" if i < n - 1 else "v"
-            out_a = f"a{i}" if i < n - 1 else "a"
-            offset = max(0.1, sum(durations[:i]) - trans_dur * i)
-
-            filter_parts.append(
-                f"[{prev_v}][{i}:v]xfade=transition=fade:duration={trans_dur}:offset={offset}[{out_v}]"
-            )
-            filter_parts.append(
-                f"[{prev_a}][{i}:a]acrossfade=d={trans_dur}[{out_a}]"
-            )
-            prev_v = out_v
-            prev_a = out_a
-
-        cmd += ["-filter_complex", ";".join(filter_parts)]
-        cmd += ["-map", "[v]", "-map", "[a]"]
-
-    cmd += [
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-pix_fmt", "yuv420p",
-        output,
-    ]
-
-    subprocess.run(cmd, capture_output=True, timeout=1800)
-
-
-def _simple_concat_from_paths(paths, output):
-    """Concat from a list of paths."""
-    tmp = output + ".txt"
-    with open(tmp, 'w') as f:
-        for p in paths:
-            f.write(f"file '{p}'\n")
-    _simple_concat(tmp, output)
-    os.unlink(tmp)

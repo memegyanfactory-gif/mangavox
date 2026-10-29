@@ -176,14 +176,32 @@ impl StorageManager {
     fn cancel_pending(&mut self, cx: &mut Context<Self>) {
         let mut loc = Location::load();
         loc.reset.clear();
-        loc.pending_move = None;
+        let cancelled = loc.pending_move.take();
+        // A switch to another folder without moving is cancelled too.
+        if loc.root.as_ref().is_some_and(|r| *r != paths::root()) {
+            loc.root = (paths::root() != paths::default_root()).then(paths::root);
+        }
         match loc.save() {
             Ok(()) => {
                 self.pending = loc;
                 self.say("Queued changes cancelled", false, cx);
+                // The copy made for the move is not needed any more.
+                if let Some(m) = cancelled {
+                    cx.background_executor().spawn(async move { paths::discard_incomplete(&m.to) }).detach();
+                }
             }
             Err(e) => self.say(format!("{e:#}"), true, cx),
         }
+    }
+
+    /// Hides the result of the last move (shown once after the restart).
+    fn forget_move_result(&mut self, cx: &mut Context<Self>) {
+        let mut loc = Location::load();
+        loc.moved = None;
+        loc.move_error = None;
+        let _ = loc.save();
+        self.pending = loc;
+        cx.notify();
     }
 
     fn pick_folder(&mut self, cx: &mut Context<Self>) {
@@ -199,7 +217,7 @@ impl StorageManager {
     fn offer(&mut self, to: PathBuf, cx: &mut Context<Self>) {
         // Picking an empty folder means "put MangaVox's data in it"; a folder with other things
         // in it gets a MangaVox subfolder so the data stays tidy.
-        let to = if paths::has_data(&to) || std::fs::read_dir(&to).map(|mut r| r.next().is_none()).unwrap_or(true) { to } else { to.join("MangaVox") };
+        let to = if paths::has_data(&to) || paths::is_empty_dir(&to) || paths::is_unfinished_copy(&to) { to } else { to.join("MangaVox") };
         match paths::check_new_root(&to) {
             Ok(()) => {
                 let has_data = paths::has_data(&to);
@@ -229,20 +247,40 @@ impl StorageManager {
         cx.spawn(async move |this, cx| {
             let (d, t) = (done.clone(), total.clone());
             let dest = to.clone();
-            let work = mv_ui::bg::blocking(move || {
-                paths::precopy(&paths::root(), &dest, &|n, all| {
-                    d.store(n, Ordering::Relaxed);
-                    t.store(all, Ordering::Relaxed);
-                })
-                .and_then(|_| paths::choose_root(&dest, true))
+            let work = mv_ui::bg::blocking(move || -> Result<bool> {
+                let from = paths::root();
+                paths::check_new_root(&dest)?;
+                // On the same drive the move at restart is a rename: nothing to copy now.
+                let same_drive = paths::is_empty_dir(&dest) && paths::same_volume(&from, &dest);
+                if !same_drive {
+                    let need = paths::copy_size(&from).saturating_sub(paths::dir_size(&dest));
+                    if let Some(free) = crate::models::scan::free_space(&dest) {
+                        const MARGIN: u64 = 512 * 1024 * 1024;
+                        if need.saturating_add(MARGIN) > free {
+                            anyhow::bail!("Not enough space there: the data needs {} and that drive has {} free.", format_bytes(need), format_bytes(free));
+                        }
+                    }
+                    // Copy ahead only into a folder of our own: data being replaced stays as it
+                    // is until the restart, so cancelling leaves it untouched. Files in use now
+                    // are copied at the restart.
+                    if paths::is_empty_dir(&dest) || paths::is_unfinished_copy(&dest) {
+                        paths::precopy(&from, &dest, &|n, all| {
+                            d.store(n, Ordering::Relaxed);
+                            t.store(all, Ordering::Relaxed);
+                        })?;
+                    }
+                }
+                paths::choose_root(&dest, true)?;
+                Ok(same_drive)
             });
-            let r: Result<()> = work.await.and_then(|r| r);
+            let r: Result<bool> = work.await.and_then(|r| r);
             let _ = this.update(cx, |m, cx| {
                 m.moving = None;
                 m.pending = Location::load();
                 match r {
-                    Ok(()) => m.say(format!("Copied. Restart MangaVox to finish moving to {}.", to.display()), false, cx),
-                    Err(e) => m.say(format!("Could not copy the data: {e:#}"), true, cx),
+                    Ok(true) => m.say(format!("Ready. Restart MangaVox to move the data to {} (same drive, so it is quick).", to.display()), false, cx),
+                    Ok(false) => m.say(format!("Copied. Restart MangaVox to finish moving to {}.", to.display()), false, cx),
+                    Err(e) => m.say(format!("Could not move the data: {e:#}. MangaVox still uses {}.", paths::root().display()), true, cx),
                 }
             });
         })
@@ -429,19 +467,52 @@ impl StorageManager {
 
     fn render_data_folder(&self, cx: &mut Context<Self>) -> Div {
         let root = paths::root();
-        let custom = std::env::var_os("MANGAVOX_HOME").is_none() && root != paths::default_root();
+        let env_set = std::env::var_os("MANGAVOX_HOME").is_some_and(|p| !p.is_empty());
+        let custom = !env_set && root != paths::default_root();
+        let busy = matches!(self.moving, Some(Move::Copying { .. })) || self.pending.pending_move.is_some();
         let r2 = root.clone();
         let actions = div()
             .flex()
             .items_center()
             .gap(px(6.))
             .child(icon_button("data-open", ph::FOLDER_OPEN, "Show in Explorer").on_click(move |_, _, cx| Self::reveal(r2.clone(), cx)))
-            .when(custom, |d| {
+            .when(custom && !busy, |d| {
                 d.child(icon_button("data-default", ph::ARROW_COUNTER_CLOCKWISE, "Go back to the default folder").on_click(cx.listener(|m, _: &ClickEvent, _, cx| m.offer(paths::default_root(), cx))))
             })
-            .child(btn("data-change", "Move…", ButtonKind::Secondary).icon(ph::FOLDER_SIMPLE_PLUS).on_click(cx.listener(|m, _: &ClickEvent, _, cx| m.pick_folder(cx))));
+            .child(
+                btn("data-change", "Move…", ButtonKind::Secondary)
+                    .icon(ph::FOLDER_SIMPLE_PLUS)
+                    .when(env_set, |b| b.disabled("The MANGAVOX_HOME environment variable sets the data folder"))
+                    .when(!env_set && busy, |b| b.disabled("A move is already under way"))
+                    .on_click(cx.listener(|m, _: &ClickEvent, _, cx| m.pick_folder(cx))),
+            );
+        let hint = if env_set {
+            "Set by MANGAVOX_HOME"
+        } else if custom {
+            "A custom folder"
+        } else {
+            "The default folder"
+        };
         let mut c = setting_section("Data folder", Some("Library, downloads, Studio work, models, chats, settings and cache all live here. Pick another drive or folder to move it.".into()))
-            .child(path_row(glyphs::FOLDER, "Location", if custom { "A custom folder" } else { "The default folder" }, root.display().to_string(), actions));
+            .child(path_row(glyphs::FOLDER, "Location", hint, root.display().to_string(), actions));
+        let weak = cx.entity().downgrade();
+        if let Some(err) = self.pending.move_error.clone() {
+            let w = weak.clone();
+            c = c.child(div().my(px(8.)).child(inline_alert(AlertKind::Error, "The data folder was not moved", err).dismissible(move |_, _, cx| {
+                let _ = w.update(cx, |m, cx| m.forget_move_result(cx));
+            })));
+        } else if let Some(done) = self.pending.moved.clone() {
+            let w = weak.clone();
+            let body = match &self.pending.cleanup {
+                Some(old) => format!("{done}. The old folder {} is being removed.", old.display()),
+                None => format!("{done}."),
+            };
+            c = c.child(div().my(px(8.)).child(inline_alert(AlertKind::Success, "Data folder moved", body).dismissible(move |_, _, cx| {
+                let _ = w.update(cx, |m, cx| m.forget_move_result(cx));
+            })));
+        } else if let Some(old) = self.pending.cleanup.clone() {
+            c = c.child(div().my(px(8.)).child(inline_alert(AlertKind::Info, "Removing the old data folder", format!("{} is deleted in the background; files still in use go at the next start.", old.display()))));
+        }
         match &self.moving {
             Some(Move::Choose { to, has_data }) => {
                 let (a, b, c2) = (to.clone(), to.clone(), to.clone());
@@ -459,9 +530,9 @@ impl StorageManager {
                         .child(div().flex().items_center().gap(px(8.)).child(ph_icon(ph::FOLDER_OPEN, Weight::Fill, Tokens::accent(), icon_px::MD)).child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child("New data folder")))
                         .child(mv_ui::path_chip(to.display().to_string()))
                         .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(if *has_data {
-                            "That folder already has MangaVox data. Use it as it is, or replace it with what you have now."
+                            "That folder already has MangaVox data. Use it as it is (your current data stays where it is), or replace it with your current data: what is there now is deleted when MangaVox restarts."
                         } else {
-                            "Moving copies everything now, then MangaVox restarts and removes the old folder. Large libraries take a while."
+                            "Moving copies everything there now (on the same drive it is a quick rename at restart). When you restart, MangaVox finishes the copy, checks every file, updates saved paths, switches to the new folder and then deletes the old one. If anything fails it keeps using the old folder."
                         }))
                         .child(
                             div()
@@ -499,7 +570,7 @@ impl StorageManager {
                                 .gap(px(8.))
                                 .child(spinner("mv-copy-spin", Tokens::accent(), icon_px::SM))
                                 .child(div().flex_1().truncate().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("Copying to {}", to.display())))
-                                .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(format!("{} of {}", format_bytes(d), format_bytes(t)))),
+                                .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(if t == 0 { "Checking space…".to_string() } else { format!("{} of {}", format_bytes(d), format_bytes(t)) })),
                         )
                         .child(progress_bar("mv-copy-bar", frac, true)),
                 );

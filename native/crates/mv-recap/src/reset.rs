@@ -163,10 +163,10 @@ fn outputs(ch: &ChapterRef, step: Step) -> Vec<PathBuf> {
         // (sync_map.py) are timed to them.
         Step::Audio => vec![out.join("audio"), out.join("sync_map.json"), out.join("captions.srt")],
         // mv-score: chapter::score_json, score_wav, preview_wav.
-        Step::Music => vec![st.join("score.json"), out.join("score.wav"), out.join("score_preview.wav")],
+        Step::Music => vec![st.join("score.json"), out.join("score.wav"), out.join("score_preview.wav"), out.join("music_credits.txt")],
         // The pipeline's job files (`job.json`, mv-studio `JobPayload::write_job_file`) are
         // written by every audio job too, so they belong to no step: a chapter reset sweeps them.
-        Step::Video => vec![out.join("video_final.mp4"), out.join("reels"), out.join("video_parts"), out.join("captions.ass")],
+        Step::Video => vec![out.join("video_final.mp4"), out.join("video_timeline.json"), out.join("reels"), out.join("video_parts"), out.join("captions.ass")],
     }
 }
 

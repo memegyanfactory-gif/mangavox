@@ -1439,7 +1439,7 @@ pub(crate) fn progress_line(id: &str, p: f32, label: String) -> Div {
         .child(progress_bar(SharedString::from(format!("{id}-bar")), p, true))
 }
 
-fn play_video(title: &str, path: &Path, window: &mut Window, cx: &mut App) {
+pub(crate) fn play_video(title: &str, path: &Path, window: &mut Window, cx: &mut App) {
     let request = PlayRequest { title: title.to_string(), source: path.display().to_string(), file_idx: None, imdb_id: None, mal_id: None, season: None, episode: None };
     mv_ui::navigate(Route::Player { request }, window, cx);
 }
