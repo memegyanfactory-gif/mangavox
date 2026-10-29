@@ -9,11 +9,15 @@ set -u
 
 mode=${1:-staged}
 if [ "$mode" = range ]; then
-  files=$(git diff --name-only --diff-filter=ACMR "$2" "$3" --)
-  added() { git diff -U0 --diff-filter=ACMR "$2" "$3" -- "$1" | grep '^+' | grep -v '^+++'; }
+  from=${2:?range needs <from> <to>}
+  to=${3:?range needs <from> <to>}
+  files=$(git diff --name-only --diff-filter=ACMR "$from" "$to" --) || { echo "Personal data check could not read $from..$to" >&2; exit 1; }
+  added() { git diff -U0 --diff-filter=ACMR "$from" "$to" -- "$1" | grep '^+' | grep -v '^+++'; }
+  blob() { echo "$to:$1"; }
 else
-  files=$(git diff --cached --name-only --diff-filter=ACMR --)
+  files=$(git diff --cached --name-only --diff-filter=ACMR --) || { echo "Personal data check could not read the staged files" >&2; exit 1; }
   added() { git diff --cached -U0 --diff-filter=ACMR -- "$1" | grep '^+' | grep -v '^+++'; }
+  blob() { echo ":$1"; }
 fi
 
 bad=0
@@ -43,11 +47,7 @@ for f in $files; do
     *.jpg|*.jpeg|*.png|*.webp|*.gif|*.avif|*.bmp|*.tif|*.tiff)
       allowed "$f" || { say "$f (image: manga pages and panels stay on your PC)"; continue; } ;;
   esac
-  if [ "$mode" = range ]; then
-    size=$(git cat-file -s "$3:$f" 2>/dev/null || echo 0)
-  else
-    size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
-  fi
+  size=$(git cat-file -s "$(blob "$f")" 2>/dev/null || echo 0)
   if [ "$size" -gt 5000000 ]; then
     say "$f (over 5 MB)"; continue
   fi
