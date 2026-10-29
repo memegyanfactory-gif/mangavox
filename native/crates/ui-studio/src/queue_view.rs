@@ -37,6 +37,11 @@ impl StudioPage {
                 self.sync_pipeline(cx);
                 let format = self.prefs.format.clone();
                 let (n, w, already) = pipeline::enqueue(&items, until, force, &format, None, true);
+                for c in &items {
+                    if !self.fixing.contains(&c.id) {
+                        self.fixing.push(c.id.clone());
+                    }
+                }
                 let what = match items.as_slice() {
                     [one] => one.label(),
                     many => format!("{} chapters", many.len()),
@@ -49,6 +54,9 @@ impl StudioPage {
             Fix::Retry(id) => {
                 self.sync_pipeline(cx);
                 pipeline::resume(id);
+                if let Some(c) = self.queue.get(id).map(|it| it.chapter.id.clone()).filter(|c| !self.fixing.contains(c)) {
+                    self.fixing.push(c);
+                }
                 self.side_open = true;
                 self.side = Side::Activity;
             }
@@ -73,6 +81,9 @@ impl StudioPage {
                 pipeline::resume_all();
             }
         }
+        // Show the fix at once (tiles and issues read this copy of the queue; the poll would
+        // only catch up a moment later).
+        self.queue = pipeline::snapshot();
         cx.notify();
     }
 
@@ -106,6 +117,7 @@ impl StudioPage {
             setup,
             targets: &targets,
             step: editor.then(|| self.phase.step()),
+            fixing: &self.fixing,
         };
         let mut out = crate::issues::collect(&inputs);
         out.retain(|i| !self.dismissed.contains(&i.key));
@@ -341,6 +353,9 @@ impl StudioPage {
 
     /// One issue: the sentence, its fixes, and the raw error behind "Details".
     pub(crate) fn issue_card(&self, ix: usize, issue: &Issue, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(id) = issue.fixing {
+            return self.fixing_card(ix, issue, id, cx);
+        }
         let (color, soft, border, icon) = issue.kind.colors();
         let key = issue.key.clone();
         let nav = issue.chapter.clone().map(|c| (c, issue.step));
@@ -405,6 +420,34 @@ impl StudioPage {
             .into_any_element()
     }
 
+    /// An issue Generate is fixing now: the chapter, which step it is on, and its progress.
+    fn fixing_card(&self, ix: usize, issue: &Issue, id: u64, cx: &mut Context<Self>) -> AnyElement {
+        let item = self.queue.get(id);
+        let step = item.and_then(|it| it.current_step()).or(issue.step).unwrap_or(Step::Read);
+        let (p, line) = match item.map(|it| (it.state, self.item_progress(it))) {
+            Some((ItemState::Running, Some((p, line)))) => (p, format!("{} · {line}", step.label())),
+            Some((ItemState::Running, None)) => (0., format!("{} · starting", step.label())),
+            Some((ItemState::Paused, _)) => (0., "Paused · resume Generate to carry on".to_string()),
+            _ => (0., "Waiting in the queue".to_string()),
+        };
+        let nav = issue.chapter.clone();
+        div()
+            .id(("issue", ix))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(space::SM))
+            .rounded(px(radius::MD))
+            .bg(Tokens::accent_soft())
+            .border_1()
+            .border_color(Tokens::accent_border())
+            .when(nav.is_some(), |d| d.hover(|s| s.border_color(Tokens::accent())).pressable().tooltip(tip("Open this chapter")))
+            .when_some(nav, |d, c| d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(&c, Some(step), cx))))
+            .child(div().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(issue.title.clone()))
+            .child(crate::phases::progress_line(&format!("fixing-{ix}"), p, line))
+            .into_any_element()
+    }
+
     /// The Issues tab.
     pub(crate) fn issues_view(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let issues = self.issues.clone();
@@ -421,13 +464,18 @@ impl StudioPage {
                 if issues.is_empty() {
                     d.child(div().pt(px(space::XL)).child(empty_view(ph::CHECK_CIRCLE, "No issues", "When a step fails or a chapter is missing something, it shows up here with the fix.").compact()))
                 } else {
-                    let n = issues.len();
+                    let n = issues.iter().filter(|i| i.fixing.is_none()).count();
+                    let fixing = issues.len() - n;
                     d.child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(space::SM))
-                            .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(format!("{n} issue{}", plural(n))))
+                            .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(match (n, fixing) {
+                                (0, f) => format!("{f} being fixed"),
+                                (n, 0) => format!("{n} issue{}", plural(n)),
+                                (n, f) => format!("{n} issue{} · {f} being fixed", plural(n)),
+                            }))
                             .child(btn("issues-clear", "Dismiss all", ButtonKind::Ghost).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 for i in this.issues.clone() {
                                     this.dismissed.insert(i.key);

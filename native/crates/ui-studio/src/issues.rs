@@ -51,6 +51,9 @@ pub(crate) struct Issue {
     pub actions: Vec<IssueAction>,
     /// A failed Generate chapter (it can be dismissed from the queue).
     pub queue_item: Option<u64>,
+    /// Generate is working on this now (after "Fix it" or a retry): the queue item to follow.
+    /// The issue then shows as in progress instead of asking for a fix again.
+    pub fixing: Option<u64>,
 }
 
 /// A chapter as issues name it.
@@ -135,6 +138,9 @@ pub(crate) struct Inputs<'a> {
     /// Chapters the open step works on, and that step (prerequisite gaps).
     pub targets: &'a [String],
     pub step: Option<Step>,
+    /// Chapters the user pressed a fix for: while Generate works on them they show as being
+    /// fixed, even when the fixed issue itself is gone (a retried chapter is no longer failed).
+    pub fixing: &'a [String],
 }
 
 /// Every issue, worst first.
@@ -154,6 +160,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
                 detail: None,
                 actions: vec![act("Open Setup", Fix::OpenSetup)],
                 queue_item: None,
+                fixing: None,
             });
         }
         if !ffmpeg {
@@ -166,6 +173,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
                 detail: None,
                 actions: vec![act("Open Setup", Fix::OpenSetup)],
                 queue_item: None,
+                fixing: None,
             });
         }
         if let Some(v) = voice {
@@ -178,6 +186,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
                 detail: None,
                 actions: vec![act("Open Audio settings", Fix::AudioSettings)],
                 queue_item: None,
+                fixing: None,
             });
         }
     }
@@ -199,6 +208,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
             detail: (!raw.is_empty()).then_some(raw),
             actions,
             queue_item: Some(it.id),
+            fixing: None,
         });
         covered.push(&it.chapter.id);
     }
@@ -214,6 +224,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
                 detail: None,
                 actions: vec![act("Resume", Fix::ResumeQueue)],
                 queue_item: None,
+                fixing: None,
             });
         }
     }
@@ -245,6 +256,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
             detail: Some(raw.clone()),
             actions,
             queue_item: None,
+            fixing: None,
         });
         covered.push(&j.chapter_id);
     }
@@ -275,6 +287,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
                 detail: Some(raw.clone()),
                 actions,
                 queue_item: None,
+                fixing: None,
             });
         }
     }
@@ -310,6 +323,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
                 detail: None,
                 actions: vec![act(format!("{} for all {}", needs_label(missing), gaps.len()), Fix::Make { chapters: all.clone(), until: missing, force: None }), act(format!("Make {} for all", step.label().to_lowercase()), Fix::Make { chapters: all, until: step, force: None })],
                 queue_item: None,
+                fixing: None,
             });
         } else {
             for (c, missing, why) in gaps {
@@ -322,10 +336,73 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
                     detail: None,
                     actions: vec![act(needs_label(missing), Fix::Make { chapters: vec![c.clone()], until: missing, force: None }), act(format!("Open {}", missing.label()), Fix::Open { chapter: c.clone(), step: missing })],
                     queue_item: None,
+                    fixing: None,
                 });
             }
         }
     }
+    being_fixed(out, i.queue, i.fixing, &label)
+}
+
+/// Issues of chapters Generate is working on now turn into "being fixed" rows (one per
+/// chapter, after the real issues), following that chapter's queue item.
+fn being_fixed(issues: Vec<Issue>, queue: &Queue, fixed: &[String], label: &dyn Fn(&str) -> String) -> Vec<Issue> {
+    let active = |c: &str| queue.items.iter().find(|it| it.chapter.id == c && it.state.active()).map(|it| it.id);
+    let mut out = vec![];
+    let mut fixing = vec![];
+    let mut seen: Vec<String> = vec![];
+    for mut is in issues {
+        // The chapters this issue is about (a many-chapter gap names them in its fix).
+        let chapters: Vec<String> = match &is.chapter {
+            Some(c) => vec![c.clone()],
+            None => is.actions.iter().find_map(|a| match &a.fix {
+                Fix::Make { chapters, .. } => Some(chapters.clone()),
+                _ => None,
+            }).unwrap_or_default(),
+        };
+        let ids: Vec<u64> = chapters.iter().filter_map(|c| active(c)).collect();
+        if chapters.is_empty() || ids.len() < chapters.len() {
+            out.push(is);
+            continue;
+        }
+        let who = match chapters.as_slice() {
+            [one] => label(one),
+            many => format!("{} chapters", many.len()),
+        };
+        if seen.contains(&who) {
+            continue;
+        }
+        seen.push(who.clone());
+        is.key = format!("fixing-{}", chapters.join(","));
+        is.kind = AlertKind::Info;
+        is.title = format!("{who}: being fixed");
+        is.actions.clear();
+        is.detail = None;
+        is.queue_item = None;
+        is.fixing = Some(ids[0]);
+        fixing.push(is);
+    }
+    // Fixed chapters whose issue is gone while the fix runs.
+    for c in fixed {
+        let Some(it) = queue.items.iter().find(|it| it.chapter.id == *c && it.state.active()) else { continue };
+        let who = label(c);
+        if seen.contains(&who) {
+            continue;
+        }
+        seen.push(who.clone());
+        fixing.push(Issue {
+            key: format!("fixing-{c}"),
+            kind: AlertKind::Info,
+            chapter: Some(c.clone()),
+            step: Some(it.current_step().unwrap_or(it.until_step())),
+            title: format!("{who}: being fixed"),
+            detail: None,
+            actions: vec![],
+            queue_item: None,
+            fixing: Some(it.id),
+        });
+    }
+    out.extend(fixing);
     out
 }
 
@@ -390,7 +467,7 @@ mod tests {
         let statuses = HashMap::new();
         let names = names();
         let q = Queue::default();
-        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None });
+        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[] });
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "Chapter 4 video failed: it has no narration audio.");
         assert_eq!(issues[0].actions.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(), vec!["Generate audio", "Retry video", "Open Video"]);
@@ -398,11 +475,38 @@ mod tests {
     }
 
     #[test]
+    fn a_fix_in_progress_shows_as_being_fixed_not_as_an_issue() {
+        let jobs = vec![job(2, "c4", true, JobView::Failed("No audio files found".into()))];
+        let (statuses, names) = (HashMap::new(), names());
+        let mut q = Queue::default();
+        let ch = crate::pipeline::QChapter { id: "c4".into(), manga_id: "m".into(), manga_title: "M".into(), number: Some(4.0), title: None, pages_dir: "/p".into(), output_dir: "/o".into() };
+        q.add(ch, Step::Audio, None, "landscape", None);
+        let id = q.items[0].id;
+        // Fix it was pressed: the failure turns into a progress row (it used to just vanish).
+        let fixing = vec!["c4".to_string()];
+        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &fixing });
+        assert_eq!(issues.len(), 1);
+        assert_eq!((issues[0].title.as_str(), issues[0].fixing, issues[0].actions.len()), ("Chapter 4: being fixed", Some(id), 0));
+
+        // A missing step of a chapter Generate is making shows as being fixed too.
+        let mut statuses = HashMap::new();
+        statuses.insert("c4".to_string(), PhaseStatus { read_pages: 5, total_pages: 5, story: false, ..Default::default() });
+        let targets = vec!["c4".to_string()];
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Audio), fixing: &[] });
+        assert_eq!(issues.iter().map(|i| i.fixing).collect::<Vec<_>>(), vec![Some(id)]);
+
+        // Once it is done, nothing is left.
+        q.items[0].state = ItemState::Done;
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &fixing });
+        assert!(issues.is_empty());
+    }
+
+    #[test]
     fn a_later_success_clears_a_failure() {
         // Newest first: the render succeeded after it failed.
         let jobs = vec![job(3, "c4", true, JobView::Done), job(2, "c4", true, JobView::Failed("boom".into()))];
         let (statuses, names, q) = (HashMap::new(), names(), Queue::default());
-        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None });
+        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[] });
         assert!(issues.is_empty());
     }
 
@@ -413,11 +517,11 @@ mod tests {
         statuses.insert("c4".to_string(), PhaseStatus { read_pages: 5, total_pages: 5, story: false, ..Default::default() });
         let (names, q) = (names(), Queue::default());
         let targets = vec!["c3".to_string(), "c4".to_string()];
-        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Audio) });
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Audio), fixing: &[] });
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "Chapter 4 has no story yet, so it can't be narrated.");
         assert_eq!(issues[0].actions[0].label, "Write story");
-        let video = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Video) });
+        let video = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Video), fixing: &[] });
         assert_eq!(video.len(), 2);
         assert!(video.iter().all(|i| i.title.ends_with("has no narration audio.")));
     }
@@ -431,7 +535,7 @@ mod tests {
         q.items[0].current = Some(Step::Audio.index());
         q.items[0].error = Some("The narrator voice is not ready: Kokoro Heart".into());
         let (statuses, names) = (HashMap::new(), names());
-        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: Some((true, false, None)), targets: &[], step: None });
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: Some((true, false, None)), targets: &[], step: None, fixing: &[] });
         assert_eq!(issues[0].key, "setup-ffmpeg");
         assert_eq!(issues[1].title, "Chapter 3 audio failed: the narrator voice (Kokoro Heart) isn't downloaded or set up.");
         assert_eq!(issues[1].queue_item, Some(q.items[0].id));

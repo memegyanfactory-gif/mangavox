@@ -63,10 +63,44 @@ impl Answers {
     }
 }
 
+/// Steps Generate can make again on purpose ("Redo from"), as the menus name them. Every step
+/// after the one picked is made again too, since it is built from it.
+pub(crate) const REDO: [(Step, &str, Ph); 5] = [
+    (Step::Read, "Read the pages", glyphs::READ),
+    (Step::Story, "Write the story", glyphs::STORY),
+    (Step::Audio, "Narrate (audio)", ph::MICROPHONE_STAGE),
+    (Step::Music, "Music (new take)", glyphs::MUSIC),
+    (Step::Video, "Video", glyphs::VIDEO),
+];
+
+/// "Read, Story, Audio, Music and Video": what a redo from `from` makes again.
+pub(crate) fn redo_summary(from: Step) -> String {
+    let names: Vec<&str> = REDO.iter().filter(|(s, _, _)| s.index() >= from.index()).map(|(s, _, _)| s.label()).collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.to_string(),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod redo_tests {
+    use super::redo_summary;
+    use mv_recap::Step;
+
+    #[test]
+    fn a_redo_names_every_step_it_makes_again() {
+        assert_eq!(redo_summary(Step::Audio), "Audio, Music and Video");
+        assert_eq!(redo_summary(Step::Video), "Video");
+    }
+}
+
 /// The open Generate sheet.
 pub(crate) struct Sheet {
     pub chapters: Vec<ChapterItem>,
     pub answers: Answers,
+    /// Make this step and every later one again, even where done.
+    pub redo: Option<Step>,
     pub lang: &'static str,
     /// Every voice is listed (else the ready ones and the picked one).
     pub all_voices: bool,
@@ -79,7 +113,8 @@ const FORMATS: [(&str, &str, &str, Ph); 2] = [
 
 impl StudioPage {
     /// Opens the questions for `chapters` (the dashboard's Generate button).
-    pub(crate) fn open_generate(&mut self, chapters: Vec<ChapterItem>, cx: &mut Context<Self>) {
+    /// `redo`: make that step and the later ones again, even where they are done.
+    pub(crate) fn open_generate(&mut self, chapters: Vec<ChapterItem>, redo: Option<Step>, cx: &mut Context<Self>) {
         if chapters.is_empty() {
             toast::show(cx, Toast::info("Pick at least one chapter first"));
             return;
@@ -97,7 +132,7 @@ impl StudioPage {
         answers.subtitle_size = subs.size;
         answers.subtitle_style = Some(subs.style);
         let lang = crate::page::lang_of(&voice);
-        self.sheet = Some(Sheet { chapters, answers: Answers { voice: Some(voice), ..answers }, lang, all_voices: false });
+        self.sheet = Some(Sheet { chapters, answers: Answers { voice: Some(voice), ..answers }, redo, lang, all_voices: false });
         cx.notify();
     }
 
@@ -112,7 +147,9 @@ impl StudioPage {
             Prefs::update(|p| p.format = f);
         }
         self.gen_answers = Some(a.clone());
-        let (n, widened, already) = self.generate_chapters(&sheet.chapters, &a, true, cx);
+        let (n, widened, already) = self.generate_chapters(&sheet.chapters, &a, sheet.redo, true, cx);
+        // A redo is a one-off: the next Generate only fills gaps again.
+        self.dash_redo = None;
         let msg = match (n + widened, already) {
             (0, k) => format!("{k} chapter{} already in the queue", plural(k)),
             (m, 0) => format!("Generating {m} chapter{}", plural(m)),
@@ -126,7 +163,8 @@ impl StudioPage {
 
     /// Applies `a` (voice, music) to `chapters` and adds them to the queue. Returns the counts
     /// [`pipeline::enqueue`] reports.
-    pub(crate) fn generate_chapters(&mut self, chapters: &[ChapterItem], a: &Answers, start: bool, cx: &mut Context<Self>) -> (usize, usize, usize) {
+    /// `redo`: make that step and every later one again for all of them.
+    pub(crate) fn generate_chapters(&mut self, chapters: &[ChapterItem], a: &Answers, redo: Option<Step>, start: bool, cx: &mut Context<Self>) -> (usize, usize, usize) {
         let default = self.prefs.voice.clone().unwrap_or_default();
         // A made video whose subtitles or music change is made again (otherwise it is "done").
         let subs_before: Vec<crate::video::SubtitleSetting> = chapters.iter().map(crate::video::subtitle_setting_for).collect();
@@ -147,6 +185,9 @@ impl StudioPage {
         }
         apply_subtitles(chapters, a);
         self.sync_pipeline(cx);
+        if let Some(r) = redo {
+            return pipeline::enqueue(chapters, Step::Video, Some(r), &a.format, Some(a.captions), start);
+        }
         let (mut redo, mut rest) = (vec![], vec![]);
         for (i, c) in chapters.iter().enumerate() {
             let made = self.statuses.get(&c.id).is_some_and(|s| s.video.is_some());
@@ -280,6 +321,7 @@ impl StudioPage {
         let sheet = self.sheet.as_ref()?;
         let chapters = sheet.chapters.clone();
         let a = sheet.answers.clone();
+        let redo = sheet.redo;
         let lang = sheet.lang;
         let env = self.setup.read(cx).env.clone();
         let engines = env.as_ref().map(|e| e.engines.clone()).unwrap_or_default();
@@ -303,7 +345,9 @@ impl StudioPage {
                     let changed = pipeline::voice_changed(st.audio_files, pipeline::narrated_voice(&c.output_dir).as_deref(), &wanted);
                     let f = pipeline::Facts { narration_complete: st.audio_files > 0, voice_changed: changed, music_on: a.music, music_fresh: st.music, status: st };
                     // A new narrator re-makes the audio, and the music and video built on it.
-                    pipeline::plan(s, &f, &a.format, changed && s.index() > Step::Audio.index()).is_ok()
+                    // A redo makes its step and every later one again.
+                    let redone = redo.is_some_and(|r| s.index() >= r.index());
+                    pipeline::plan(s, &f, &a.format, redone || (changed && s.index() > Step::Audio.index())).is_ok()
                 })
                 .count()
         };
@@ -447,6 +491,23 @@ impl StudioPage {
                 }))
         }));
 
+        // Redo: make a step (and the ones after it) again, even where done.
+        let redo_items: Vec<(Option<Step>, &str)> = std::iter::once((None, "Nothing")).chain(REDO.iter().map(|(s, _, _)| (Some(*s), s.label()))).collect();
+        let redo_pick = redo_items.iter().position(|(s, _)| *s == redo).unwrap_or(0);
+        let redo_steps: Vec<Option<Step>> = redo_items.iter().map(|(s, _)| *s).collect();
+        let redo_seg = segmented("gen-redo", redo_items.iter().map(|(_, l)| (None, *l)), redo_pick).small().on_change(cx.listener(move |this, ix: &usize, _, cx| {
+            let r = redo_steps[*ix];
+            if let Some(s) = this.sheet.as_mut() {
+                s.redo = r;
+            }
+            this.dash_redo = r;
+            cx.notify();
+        }));
+        let redo_q = div().flex().flex_col().gap(px(space::SM)).child(div().flex().child(redo_seg)).child(muted(match redo {
+            None => "Only the steps a chapter is missing are made.".to_string(),
+            Some(r) => format!("{} are made again for every chapter, even where done.", redo_summary(r)),
+        }));
+
         // Q4: music.
         let music = div()
             .flex()
@@ -520,7 +581,10 @@ impl StudioPage {
                             .flex_1()
                             .min_w_0()
                             .gap(px(2.))
-                            .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(format!("Generate {n} chapter{}", plural(n))))
+                            .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(match redo {
+                                Some(r) => format!("Redo {n} chapter{} from {}", plural(n), r.label()),
+                                None => format!("Generate {n} chapter{}", plural(n)),
+                            }))
                             .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} · {numbers}", manga.join(", "))))
                             .child(div().pt(px(space::SM)).child(plan_row))
                             .child(muted(if skipped > 0 {
@@ -552,6 +616,7 @@ impl StudioPage {
                     .gap(px(space::LG))
                     .p(px(space::LG))
                     .child(question(ph::MICROPHONE_STAGE, "Narrator voice", "Who reads the recap. Press play to hear a voice first.", div().flex().flex_col().gap(px(space::SM)).child(div().flex().child(langs)).child(voice_rows).children(more_voices).into_any_element()))
+                    .child(question(ph::ARROWS_CLOCKWISE, "Make again", "Redo a step even where it is done; every step after it is made again too.", redo_q.into_any_element()))
                     .child(question(ph::FRAME_CORNERS, "Format", "Landscape makes one video; Reels makes upright parts for Shorts, Reels and TikTok.", formats.into_any_element()))
                     .child(self.subtitle_slot(a.captions, a.subtitle_style.as_deref(), cx))
                     .child(question(glyphs::MUSIC, "Music", "An original score that follows each scene.", music.into_any_element()))
@@ -606,7 +671,7 @@ impl StudioPage {
                         cx.notify();
                     })))
                     .child(
-                        btn("gen-go", format!("Generate {n} chapter{}", plural(n)), ButtonKind::Primary)
+                        btn("gen-go", if redo.is_some() { format!("Redo {n} chapter{}", plural(n)) } else { format!("Generate {n} chapter{}", plural(n)) }, ButtonKind::Primary)
                             .icon(ph::ROCKET_LAUNCH)
                             .when_some(blocker.as_ref().map(|b| b.0.clone()), |b, why| b.disabled(why))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_generate(cx))),
@@ -640,7 +705,7 @@ impl StudioPage {
         if self.queue.active() == 0 {
             return;
         }
-        let (n, w, _) = self.generate_chapters(std::slice::from_ref(chapter), &a, false, cx);
+        let (n, w, _) = self.generate_chapters(std::slice::from_ref(chapter), &a, None, false, cx);
         if n + w > 0 {
             toast::show(cx, Toast::info(format!("{} added to the queue", chapter.label())).icon(ph::QUEUE));
         }

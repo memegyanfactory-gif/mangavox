@@ -212,7 +212,8 @@ impl Queue {
                 it.until = until;
                 widened = true;
             }
-            if force.is_some() && it.force.is_none() && it.state != ItemState::Running {
+            // An earlier redo step covers a later one (it re-makes everything after it).
+            if force.is_some_and(|f| it.force.is_none_or(|g| f < g)) && it.state != ItemState::Running {
                 it.force = force;
                 widened = true;
             }
@@ -612,8 +613,14 @@ pub fn pause(id: u64) {
     }
 }
 
+/// Resumes or retries one chapter. Asked for by the user, so it runs now even when the whole
+/// queue was held.
 pub fn resume(id: u64) {
-    edit(|q| q.resume(id));
+    edit(|q| {
+        q.resume(id);
+        q.paused = false;
+        q.interrupted = false;
+    });
     ensure_runner();
 }
 
@@ -712,7 +719,7 @@ async fn run_item(id: u64) {
             continue;
         }
         edit(|q| q.set_step(id, step, StepState::Running));
-        let out = run_step(id, &item, step, &facts, dirty).await;
+        let out = run_step(id, &item, step, &facts, dirty, item.force == Some(step.index())).await;
         touch(|q| {
             if let Some(it) = q.get_mut(id) {
                 it.job = None;
@@ -760,14 +767,16 @@ pub const NO_STORY: &str = "There is no story to narrate yet";
 pub const NO_AUDIO: &str = "No audio files found: there is no narration to put in the video";
 pub const VOICE_NOT_READY: &str = "The narrator voice is not ready";
 
-async fn run_step(id: u64, item: &QueueItem, step: Step, facts: &Facts, dirty: bool) -> Outcome {
+/// `redo`: the user asked to make this step again (Redo from it), so it starts over instead of
+/// only filling gaps.
+async fn run_step(id: u64, item: &QueueItem, step: Step, facts: &Facts, dirty: bool, redo: bool) -> Outcome {
     let ch = item.chapter.chref();
     let ctx = ctx();
     let stop = move || !still_running(id);
     match step {
         Step::Read => {
             let Some((ctx, (model, label))) = ctx.and_then(|c| c.model.clone().map(|m| (c, m))) else { return Outcome::Failed(NO_MODEL.into()) };
-            run::read_one(ctx.reg, model, label, ch, stop).await.into()
+            run::read_one(ctx.reg, model, label, ch, redo, stop).await.into()
         }
         Step::Transcript => {
             let r = ch.clone();
@@ -796,14 +805,14 @@ async fn run_step(id: u64, item: &QueueItem, step: Step, facts: &Facts, dirty: b
                 return Outcome::Failed(format!("{VOICE_NOT_READY}: {name}"));
             }
             let c = ctx.expect("ctx");
-            // A story written in this run, or a new narrator, replaces every clip; otherwise only
-            // missing pages are voiced.
-            let req = request(&c, voice, &item.format, &["tts"], dirty || facts.voice_changed);
+            // A story written in this run, a new narrator or a redo replaces every clip; otherwise
+            // only missing pages are voiced.
+            let req = request(&c, voice, &item.format, &["tts"], dirty || redo || facts.voice_changed);
             job_step(id, item, &env, req, None, stop).await
         }
         Step::Music => {
             let reg_model = ctx.as_ref().map(|c| (c.reg.clone(), c.model.clone().map(|m| m.0)));
-            music_step(ch, reg_model).await
+            music_step(ch, reg_model, redo).await
         }
         Step::Video => {
             let Some(env) = ctx.as_ref().and_then(|c| c.env.clone()) else { return Outcome::Failed(NO_SETUP.into()) };
@@ -873,8 +882,13 @@ async fn job_step(id: u64, item: &QueueItem, env: &Env, req: NarrationRequest, e
 }
 
 /// Composes the chapter's score (AI spotting first when it is on and there is no cue sheet).
-async fn music_step(ch: ChapterRef, reg_model: Option<(Arc<Registry>, Option<ModelChoice>)>) -> Outcome {
+/// `new_take`: a redo picks different music (the next take) instead of rebuilding the same score.
+async fn music_step(ch: ChapterRef, reg_model: Option<(Arc<Registry>, Option<ModelChoice>)>, new_take: bool) -> Outcome {
     let mut settings = mv_score::load_settings(&ch);
+    if new_take {
+        settings.take = settings.take.wrapping_add(1);
+        let _ = mv_score::save_settings(&ch, &settings);
+    }
     if settings.use_ai && settings.directions.is_empty() {
         if let Some((reg, Some(model))) = reg_model {
             // A failed spotting falls back to the rules, like the Music step.
@@ -914,6 +928,17 @@ mod tests {
         assert_eq!(q.items.len(), 1);
         assert_eq!(q.items[0].force, Some(Step::Video.index()));
         assert_eq!(q.items[0].format, "reels");
+    }
+
+    #[test]
+    fn an_earlier_redo_replaces_a_later_one_on_a_waiting_chapter() {
+        let mut q = Queue::default();
+        q.add(ch("a"), Step::Video, Some(Step::Video), "landscape", None);
+        assert_eq!(q.add(ch("a"), Step::Video, Some(Step::Audio), "landscape", None), Added::Widened);
+        assert_eq!(q.items[0].force, Some(Step::Audio.index()));
+        // A later redo is already covered (Audio re-makes Music and Video).
+        assert_eq!(q.add(ch("a"), Step::Video, Some(Step::Music), "landscape", None), Added::Already);
+        assert_eq!(q.items[0].force, Some(Step::Audio.index()));
     }
 
     #[test]

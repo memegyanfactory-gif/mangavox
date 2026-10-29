@@ -301,6 +301,10 @@ pub struct StudioPage {
     pub(crate) dash_pick: BTreeSet<String>,
     pub(crate) dash_anchor: Option<String>,
     pub(crate) dash_filter: crate::dashboard::Filter,
+    /// The pick bar's "Redo from" step: Generate makes it and every later step again.
+    pub(crate) dash_redo: Option<Step>,
+    /// Chapters a "Fix it" is working on: shown as being fixed until Generate finishes them.
+    pub(crate) fixing: Vec<String>,
     pub(crate) dash_scroll: ScrollHandle,
     /// The open Generate questions.
     pub(crate) sheet: Option<crate::generate::Sheet>,
@@ -424,6 +428,8 @@ impl StudioPage {
             dash_pick: BTreeSet::new(),
             dash_anchor: None,
             dash_filter: Default::default(),
+            dash_redo: None,
+            fixing: vec![],
             dash_scroll: ScrollHandle::new(),
             sheet: None,
             gen_answers: None,
@@ -1492,7 +1498,8 @@ impl StudioPage {
                 .child(div().flex_none().child("Studio"))
                 .when_some(title, |d, t| d.child(icon_ph(ph::CARET_RIGHT, Tokens::text_3(), icon_px::XS)).child(div().min_w_0().truncate().text_color(Tokens::text_1()).font_weight(FontWeight::MEDIUM).child(t)))
         };
-        let issues = self.issues.len();
+        // Issues being fixed are progress, not problems.
+        let issues = self.issues.iter().filter(|i| i.fixing.is_none()).count();
         let worst = self.issues.iter().any(|i| i.kind == AlertKind::Error);
         let narrow = self.vw < NARROW;
         div()
@@ -1675,7 +1682,7 @@ impl StudioPage {
             .child(div().id("batch-count").flex().flex_1().min_w_0().items_center().gap(px(4.)).font_weight(FontWeight::MEDIUM).text_color(Tokens::accent()).tooltip(tip(format!("{n} chapter{} ticked", plural(n)))).child(icon_ph(ph::LIST_CHECKS, Tokens::accent(), icon_px::SM)).child(div().truncate().child(format!("{n}"))))
             .child(icon_button("batch-generate", ph::ROCKET_LAUNCH, format!("Generate {what}: every step, in order")).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 let targets = this.targets();
-                this.open_generate(targets, cx);
+                this.open_generate(targets, None, cx);
             })))
             .child(
                 icon_button("batch-read", glyphs::READ, format!("Read {what}"))
@@ -1878,6 +1885,8 @@ impl Render for StudioPage {
         let editor = self.view == View::Editor;
         let show_lib = editor && self.lib_open && !(self.vw < NARROW && self.side_open);
         self.center_w = self.vw - 12. - if show_lib { LIBRARY_W + 6. } else { 0. } - if self.side_open { SIDE_W + 6. } else { 0. };
+        let queue = &self.queue;
+        self.fixing.retain(|c| queue.items.iter().any(|it| it.chapter.id == *c && it.state.active()));
         self.issues = self.collect_issues(cx);
         let center = if editor { self.center(window, cx) } else { self.dashboard(cx) };
         let side = self.side_open.then(|| self.side_panel(window, cx));
