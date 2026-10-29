@@ -536,6 +536,21 @@ pub fn set_context(ctx: Ctx) {
     *CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
 }
 
+/// The runner was handed a context (the Studio page was opened, or [`context_from_app`] ran).
+pub fn has_context() -> bool {
+    CTX.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// The context the Studio page hands over (see `StudioPage::sync_pipeline`), built without the
+/// page for callers that queue work before Studio was opened (the phone companion): the
+/// Assistant's registry and model, `env` (the last setup check) and the saved Studio prefs.
+pub fn context_from_app(env: Option<Env>, cx: &mut gpui_kit::App) -> Ctx {
+    let (provider, model) = ui_assistant::assistant_model(cx);
+    let model = serde_json::from_value::<mv_ai::AiProviderId>(serde_json::Value::String(provider)).ok().map(|provider| (ModelChoice { provider, model }, ui_assistant::model_label(cx)));
+    let prefs = mv_recap::Prefs::load();
+    Ctx { reg: ui_assistant::registry(cx), model, env, speed: prefs.speed, resolution: prefs.resolution, styles: prefs.styles }
+}
+
 fn ctx() -> Option<Ctx> {
     CTX.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }

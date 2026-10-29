@@ -1,0 +1,14 @@
+{
+  "name": "MangaVox",
+  "short_name": "MangaVox",
+  "description": "Read, listen and control MangaVox on your PC from your phone.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "icons": [
+    { "src": "/icon.png", "sizes": "192x192", "type": "image/png", "purpose": "any" }
+  ]
+}

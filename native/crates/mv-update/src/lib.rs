@@ -365,6 +365,17 @@ pub fn uninstall() -> Result<()> {
     let mut cmd = Command::new("reg");
     cmd.args(["delete", &format!(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{PRODUCT}"), "/f"]);
     let _ = cmd.output();
+    // The Phone access firewall rule (ui-phone::firewall::RULE_NAME) can only go with admin
+    // rights; Settings → Apps runs this per-user uninstall without them, so this best-effort,
+    // prompt-free try usually leaves it (it then points at a deleted exe and allows nothing).
+    let mut cmd = Command::new("netsh");
+    cmd.args(["advfirewall", "firewall", "delete", "rule", "name=MangaVox phone access"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd.output();
     if let Some(dir) = install_dir() {
         let pid = std::process::id();
         let script = std::env::temp_dir().join("mangavox-uninstall.cmd");

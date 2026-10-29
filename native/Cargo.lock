@@ -4094,6 +4094,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-range-header"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5401,6 +5407,7 @@ dependencies = [
  "ui-assistant",
  "ui-manga",
  "ui-media",
+ "ui-phone",
  "ui-player",
  "ui-settings",
  "ui-studio",
@@ -7269,6 +7276,12 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quanta"
@@ -9637,6 +9650,11 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "http-range-header",
+ "httpdate",
+ "mime",
+ "mime_guess",
+ "percent-encoding",
  "pin-project-lite",
  "tokio",
  "tokio-util",
@@ -9814,7 +9832,42 @@ dependencies = [
  "mv-ui",
  "rusqlite",
  "serde",
+ "serde_json",
  "ui-player",
+]
+
+[[package]]
+name = "ui-phone"
+version = "8.0.5004"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "futures",
+ "gpui-kit",
+ "image",
+ "mime_guess",
+ "mv-core",
+ "mv-media",
+ "mv-recap",
+ "mv-studio",
+ "mv-ui",
+ "qrcode",
+ "rand 0.8.8",
+ "raw-window-handle",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "ui-manga",
+ "ui-media",
+ "ui-studio",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -229,6 +229,7 @@ impl Shell {
             .or_else(|| ui_assistant::open(route, window, cx))
             .or_else(|| ui_settings::open(route, window, cx))
             .or_else(|| ui_studio::open(route, window, cx))
+            .or_else(|| ui_phone::open(route, window, cx))
             .or_else(|| ui_welcome::open(route, window, cx))
             .unwrap_or_else(|| {
                 let title = route_title(route).into();
@@ -258,7 +259,7 @@ impl Shell {
             if let Some(s) = SECTIONS.into_iter().find(|s| nav_label(*s, &route).is_some()) {
                 // Studio and Settings belong to no section, so Back from the destination still
                 // leads to them ("Open Library" in Studio, then Back).
-                let carry = matches!(self.route, Route::Studio | Route::Settings { .. }).then(|| self.current_entry()).filter(|e| e.view.is_some());
+                let carry = matches!(self.route, Route::Studio | Route::Mobile | Route::Settings { .. }).then(|| self.current_entry()).filter(|e| e.view.is_some());
                 self.set_section(s, window, cx);
                 if self.already_there(&route) {
                     // The section opened on the destination itself (its home, or the page it was
@@ -338,6 +339,12 @@ impl Shell {
     }
 
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The page undoes its own last step first (closes its dialog, leaves a genre or a
+        // "See all" grid), so Back returns to exactly where the user was.
+        if mv_ui::local_back(self.page.entity_id(), window, cx) {
+            cx.notify();
+            return;
+        }
         let target = match self.history.pop() {
             Some(e) => e,
             // Nothing to go back to (e.g. right after a section switch): land on the section home.
@@ -473,7 +480,7 @@ impl Shell {
         let mut history = std::mem::take(&mut self.history);
         let mut forward = std::mem::take(&mut self.forward);
         let parked = loop {
-            if !matches!(route, Route::Player { .. } | Route::Settings { .. } | Route::Studio) {
+            if !matches!(route, Route::Player { .. } | Route::Settings { .. } | Route::Studio | Route::Mobile) {
                 break true;
             }
             forward.clear();
@@ -522,7 +529,7 @@ impl Shell {
     /// <https://www.nngroup.com/articles/navigation-you-are-here/>).
     fn nav_owner(&self) -> Option<Route> {
         let dest = nav_for(self.section);
-        let is_dest = |r: &Route| *r == Route::Studio || dest.iter().any(|e| &e.route == r);
+        let is_dest = |r: &Route| matches!(r, Route::Studio | Route::Mobile) || dest.iter().any(|e| &e.route == r);
         if is_dest(&self.route) {
             return Some(self.route.clone());
         }
@@ -565,6 +572,7 @@ impl Shell {
                 None => vec![here("Settings")],
             },
             Route::Studio => vec![here("Studio")],
+            Route::Mobile => vec![here("Mobile")],
             Route::Reader { manga_id, chapter_id } => vec![
                 section_crumb,
                 link(self.manga_names.get(manga_id).cloned().unwrap_or_else(|| "Manga".into()), CrumbTo::Manga(manga_id.clone())).loading(self.looking_up.contains(manga_id)),
@@ -1161,6 +1169,9 @@ impl Shell {
         let settings = nav_item("nav-settings", glyphs::SETTINGS, "Settings", matches!(self.route, Route::Settings { .. }), rail)
             .kbd(Shortcut::Settings.keys())
             .on_click(cx.listener(|this, _, w, cx| this.go(Route::Settings { tab: None }, w, cx)));
+        // In every section: the phone companion is app-wide, like Settings.
+        let mobile = nav_item("nav-mobile", ph::DEVICE_MOBILE, "Mobile", owner.as_ref() == Some(&Route::Mobile), rail)
+            .on_click(cx.listener(|this, _, w, cx| this.go(Route::Mobile, w, cx)));
 
         // Distinct ids: the rail and the floating copy can be on screen together.
         div()
@@ -1207,7 +1218,7 @@ impl Shell {
                     .px(px(2.))
                     .when(rail, |d| d.items_center())
                     .children(updates::footer(rail, cx))
-                    .child(div().w_full().pt(px(8.)).border_t_1().border_color(Tokens::border()).flex().when(rail, |d| d.justify_center()).child(settings)),
+                    .child(div().w_full().pt(px(8.)).border_t_1().border_color(Tokens::border()).flex().flex_col().gap(px(2.)).when(rail, |d| d.items_center()).child(mobile).child(settings)),
             )
     }
 
@@ -1383,6 +1394,7 @@ fn route_title(route: &Route) -> &'static str {
         Route::MovieDetail { .. } => "Movie",
         Route::Player { .. } => "Player",
         Route::Studio => "Studio",
+        Route::Mobile => "Mobile",
         Route::Settings { .. } => "Settings",
         Route::Welcome => "Welcome",
         _ => "MangaVox",
@@ -1527,5 +1539,6 @@ mod tests {
             }
         }
         assert_eq!(route_title(&Route::Studio), "Studio");
+        assert_eq!(route_title(&Route::Mobile), "Mobile");
     }
 }

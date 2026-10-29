@@ -125,6 +125,8 @@ fn main() {
             |window, cx| cx.new(|cx| shell::Shell::new(window, cx)),
         )
         .expect("open window");
+        // Phone companion: the UI bridge for its server, and the server when Phone access is on.
+        ui_phone::start(main.0, cx);
         #[cfg(windows)]
         tray::install(main.0, cx);
     });

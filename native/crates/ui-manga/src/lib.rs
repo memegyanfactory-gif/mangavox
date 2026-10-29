@@ -13,7 +13,7 @@ mod downloads_page;
 mod history;
 mod library;
 pub mod logic;
-mod ops;
+pub mod ops;
 mod reader;
 mod sources;
 pub mod store;

@@ -467,6 +467,7 @@ pub enum Hover {
     /// Click plays: a filled play disc appears.
     Play,
     /// Click opens the detail page: just the outline.
+    #[allow(dead_code)]
     Open,
 }
 

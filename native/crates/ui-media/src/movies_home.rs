@@ -1,5 +1,9 @@
-//! Movies home, Netflix-style: rotating billboard, continue watching, Top 10 rows,
-//! trending / acclaimed / genre rows, "See all" grids and search. Data comes from Cinemeta.
+//! Movies home, Netflix-style (see `nfx`): an inset rotating billboard, Continue Watching, Top 10
+//! rows, trending / acclaimed / genre rows of logo boxart with hover cards, "Explore All" grids
+//! and search. Data comes from Cinemeta.
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -8,15 +12,23 @@ use mv_core::repo::watchlist;
 use mv_media::cinemeta::{CinemetaCatalog, CinemetaClient};
 use mv_media::types::AnimeSearchResult;
 use mv_ui::motion::reduced;
-use mv_ui::theme::{icon as isz, ramp};
-use mv_ui::{btn, chip, disclosure, empty_view, error_view, glyphs, icon, inline_alert, muted, navigate, ph, size, AlertKind, ButtonKind, RampExt, Route, Tokens};
+use mv_ui::theme::{icon as isz, radius, ramp};
+use mv_ui::toast::{self, Toast};
+use mv_ui::{btn, disclosure, empty_view, error_view, glyphs, icon, inline_alert, muted, navigate, ph, AlertKind, ButtonKind, Interactive, RampExt, Route, Tokens};
 
-use crate::common::{self, db, fetch, fetch_cached, fraction, mark_watching, media_id, route_for_media, Load, DAY, SEARCH_DEBOUNCE};
-use crate::look::{self, Hover, OnClick, RowOffsets, EDGE};
+use crate::common::{self, announce_list_toggle, db, fetch, fetch_cached, fraction, mark_watching, media_id, media_title, route_for_media, set_watchlist, Load, DAY, SEARCH_DEBOUNCE};
+use crate::detail_modal::detail_modal;
+use crate::look::{self, OnClick, RowOffsets};
+use crate::movie_detail::MovieDetail;
+use crate::nfx::{self, CardKey, EDGE};
 use crate::streams::{self, PlayBase, StreamState};
 
 /// Genre rows shown on the home page, in order.
 const ROW_GENRES: &[&str] = &["Action", "Comedy", "Sci-Fi", "Thriller", "Animation", "Horror", "Romance", "Documentary"];
+
+/// A Top 10 item (numeral + poster, see `look::top10_card`) is this many times its height wide
+/// at 1.037; this height makes it exactly one boxart wide, so the row pages evenly.
+const TOP10_H: f32 = 0.96;
 
 /// Cinemeta pages hold 100 titles.
 const CINEMETA_PAGE: usize = 100;
@@ -80,6 +92,18 @@ pub fn series_point(imdb: &str, episode: Option<i64>) -> Option<(u32, u32)> {
     (ep >= last).then_some((s, ep))
 }
 
+/// The rows of a home tab ("home" | "movies" | "series") for the phone companion:
+/// (id, title, top 10?, movie?, catalog, genre), same order as this page.
+#[allow(clippy::type_complexity)]
+pub(crate) fn home_rows(tab: &str) -> Vec<(&'static str, String, bool, bool, CinemetaCatalog, Option<&'static str>)> {
+    let tab = match tab {
+        "movies" => Tab::Movies,
+        "series" => Tab::Series,
+        _ => Tab::Home,
+    };
+    MoviesHome::plan(tab).into_iter().map(|(id, title, look, movie, cat, genre)| (id, title, look == Look::Top10, movie, cat, genre)).collect()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Home,
@@ -91,7 +115,6 @@ enum Tab {
 enum Look {
     Landscape,
     Top10,
-    Poster,
 }
 
 struct Row {
@@ -115,8 +138,79 @@ struct Expanded {
     error: Option<String>,
 }
 
+/// Where the user was on this page: Back returns there, and the tab and genre open again at
+/// the next launch.
+#[derive(Clone)]
+struct Place {
+    tab: Tab,
+    genre: Option<&'static str>,
+    scroll: Point<Pixels>,
+    offsets: RowOffsets,
+}
+
+/// The Genres menu, as (Cinemeta genre, title on Movies, title on Series), in Netflix's order.
+const GENRES: &[(&str, &str, &str)] = &[
+    ("Action", "Action", "Action"),
+    ("Adventure", "Adventure", "Adventure"),
+    ("Animation", "Animation", "Animation"),
+    ("Comedy", "Comedies", "Comedies"),
+    ("Crime", "Crime", "Crime"),
+    ("Documentary", "Documentaries", "Docuseries"),
+    ("Drama", "Dramas", "Dramas"),
+    ("Family", "Family", "Kids & Family"),
+    ("Fantasy", "Fantasy", "Fantasy"),
+    ("History", "History", "History"),
+    ("Horror", "Horror", "Horror"),
+    ("Mystery", "Mysteries", "Mysteries"),
+    ("Romance", "Romance", "Romance"),
+    ("Sci-Fi", "Sci-Fi", "Sci-Fi"),
+    ("Sport", "Sports", "Sports"),
+    ("Thriller", "Thrillers", "Thrillers"),
+    ("Biography", "Biographical", "Biographical"),
+    ("War", "War", "War"),
+    ("Western", "Westerns", "Westerns"),
+    ("Reality-TV", "", "Reality TV"),
+];
+
+/// The menu's genres for a tab (Reality TV is a Series genre only).
+fn genres_for(movie: bool) -> impl Iterator<Item = (&'static str, &'static str)> {
+    GENRES.iter().map(move |(g, m, s)| (*g, if movie { *m } else { *s })).filter(|(_, label)| !label.is_empty())
+}
+
+fn genre_label(genre: &str, movie: bool) -> &'static str {
+    genres_for(movie).find(|(g, _)| *g == genre).map(|(_, l)| l).unwrap_or("")
+}
+
+/// The tab and genre last open, from config.json (`movies_place`).
+fn saved_place() -> (Tab, Option<&'static str>) {
+    let v = mv_core::config::Config::open_default().get("movies_place").unwrap_or_default();
+    let tab = match v.get("tab").and_then(|t| t.as_str()) {
+        Some("movies") => Tab::Movies,
+        Some("series") => Tab::Series,
+        _ => Tab::Home,
+    };
+    let genre = v.get("genre").and_then(|g| g.as_str()).and_then(|g| GENRES.iter().find(|(id, _, _)| *id == g).map(|(id, _, _)| *id));
+    (tab, if tab == Tab::Home { None } else { genre })
+}
+
+fn save_place(tab: Tab, genre: Option<&'static str>) {
+    let tab = match tab {
+        Tab::Home => "home",
+        Tab::Movies => "movies",
+        Tab::Series => "series",
+    };
+    let _ = mv_core::config::Config::open_default().set("movies_place", serde_json::json!({ "tab": tab, "genre": genre }));
+}
+
 pub struct MoviesHome {
     tab: Tab,
+    /// The genre picked from the Genres menu (Movies and Series tabs).
+    genre: Option<&'static str>,
+    genre_menu: bool,
+    /// Tabs and genres visited before, for Back.
+    places: Vec<Place>,
+    /// Scroll position and row pages to put back once the rows of a place Back returned to are in.
+    pending_scroll: Option<(Point<Pixels>, RowOffsets)>,
     rows: Vec<Row>,
     cont: Vec<PlaybackState>,
     my_list: Vec<AnimeSearchResult>,
@@ -126,6 +220,15 @@ pub struct MoviesHome {
     hero_bounds: look::BoundsSlot,
     hero_paused: bool,
     offsets: RowOffsets,
+    /// Where each row slid from and when, so the slide animates (settled after `nfx::SLIDE`).
+    slides: HashMap<&'static str, (usize, Instant)>,
+    /// Card bounds and the open hover card.
+    hov: nfx::Hovering,
+    /// My List is being saved from a hover card.
+    saving_list: bool,
+    /// The "More Info" modal over the page, and the focus it takes so Escape reaches it.
+    detail: Option<Entity<MovieDetail>>,
+    detail_focus: FocusHandle,
     search: Entity<InputState>,
     search_gen: u64,
     results: Option<(String, Load<Vec<AnimeSearchResult>>)>,
@@ -170,8 +273,16 @@ impl MoviesHome {
             InputEvent::Change => this.debounce_search(cx),
             _ => {}
         });
+        let (tab, genre) = saved_place();
+        let weak = cx.weak_entity();
+        let me = cx.entity_id();
+        mv_ui::set_local_back(cx, me, move |w, cx| weak.update(cx, |v, cx| v.local_back(w, cx)).unwrap_or(false));
         let mut s = Self {
-            tab: Tab::Home,
+            tab,
+            genre,
+            genre_menu: false,
+            places: vec![],
+            pending_scroll: None,
             rows: vec![],
             cont: vec![],
             my_list: vec![],
@@ -180,6 +291,11 @@ impl MoviesHome {
             hero_bounds: Default::default(),
             hero_paused: false,
             offsets: Default::default(),
+            slides: Default::default(),
+            hov: Default::default(),
+            saving_list: false,
+            detail: None,
+            detail_focus: cx.focus_handle(),
             search,
             search_gen: 0,
             results: None,
@@ -252,6 +368,19 @@ impl MoviesHome {
         );
     }
 
+    /// A genre page: its Top 10, its popular titles and its best rated (Cinemeta's genre filter).
+    #[allow(clippy::type_complexity)]
+    fn plan_for(tab: Tab, genre: Option<&'static str>) -> Vec<(&'static str, String, Look, bool, CinemetaCatalog, Option<&'static str>)> {
+        let Some(g) = genre.filter(|_| tab != Tab::Home) else { return Self::plan(tab) };
+        let movie = tab == Tab::Movies;
+        let label = genre_label(g, movie);
+        vec![
+            ("genre-top10", format!("Top 10 {label} Today"), Look::Top10, movie, CinemetaCatalog::Top, Some(g)),
+            ("genre-popular", format!("Popular {label}"), Look::Landscape, movie, CinemetaCatalog::Top, Some(g)),
+            ("genre-acclaimed", format!("Critically Acclaimed {label}"), Look::Landscape, movie, CinemetaCatalog::ImdbRating, Some(g)),
+        ]
+    }
+
     #[allow(clippy::type_complexity)]
     fn plan(tab: Tab) -> Vec<(&'static str, String, Look, bool, CinemetaCatalog, Option<&'static str>)> {
         // (id, title, look, movie?, catalog, genre)
@@ -264,11 +393,11 @@ impl MoviesHome {
         }
         if tab != Tab::Series {
             v.push(("trending", "Trending Now".to_string(), Look::Landscape, true, CinemetaCatalog::Popular, None));
-            v.push(("acclaimed", "Critically Acclaimed Movies".to_string(), Look::Poster, true, CinemetaCatalog::ImdbRating, None));
+            v.push(("acclaimed", "Critically Acclaimed Movies".to_string(), Look::Landscape, true, CinemetaCatalog::ImdbRating, None));
         }
         if tab != Tab::Movies {
             v.push(("binge", "Binge-worthy Series".to_string(), Look::Landscape, false, CinemetaCatalog::Popular, None));
-            v.push(("acclaimed-tv", "Critically Acclaimed TV".to_string(), Look::Poster, false, CinemetaCatalog::ImdbRating, None));
+            v.push(("acclaimed-tv", "Critically Acclaimed TV".to_string(), Look::Landscape, false, CinemetaCatalog::ImdbRating, None));
         }
         let ids: [&'static str; 8] = ["g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7"];
         for (i, g) in ROW_GENRES.iter().enumerate() {
@@ -296,7 +425,7 @@ impl MoviesHome {
         self.hero = 0;
         self.hero_prev = None;
         self.offsets.clear();
-        self.rows = Self::plan(self.tab)
+        self.rows = Self::plan_for(self.tab, self.genre)
             .into_iter()
             .map(|(id, title, look, movie, cat, genre)| {
                 let load = fetch_cached(cx, catalog_key(movie, cat, genre), DAY, catalog(movie, cat, genre, 1), move |v: &mut Self, l| {
@@ -313,7 +442,7 @@ impl MoviesHome {
     }
 
     fn step(&mut self, window: &Window) -> bool {
-        if look::pointer_over(&self.hero_bounds, window) || self.hero_paused || reduced() || !matches!(self.streams, StreamState::Idle) || self.results.is_some() || self.expanded.is_some() {
+        if look::pointer_over(&self.hero_bounds, window) || self.hero_paused || reduced() || !matches!(self.streams, StreamState::Idle) || self.results.is_some() || self.expanded.is_some() || self.detail.is_some() {
             return false;
         }
         self.go_hero(self.hero + 1);
@@ -395,6 +524,59 @@ impl MoviesHome {
         self.search.update(cx, |s, cx| s.set_value("", window, cx));
         self.restore_home();
         cx.notify();
+    }
+
+    /// Opens a tab (and genre) and remembers where the user was, for Back and the next launch.
+    fn go_to(&mut self, tab: Tab, genre: Option<&'static str>, window: &mut Window, cx: &mut Context<Self>) {
+        self.genre_menu = false;
+        if self.results.is_none() && self.expanded.is_none() {
+            let here = Place { tab: self.tab, genre: self.genre, scroll: self.scroll.offset(), offsets: self.offsets.clone() };
+            self.places.push(here);
+            if self.places.len() > 30 {
+                self.places.remove(0);
+            }
+        }
+        self.tab = tab;
+        self.genre = genre;
+        self.results = None;
+        self.expanded = None;
+        self.home_offset = None;
+        self.pending_scroll = None;
+        // Leaving search for a tab clears the query too (the field kept showing a search whose
+        // results were gone), and the new tab starts at its top.
+        self.search_gen += 1;
+        self.search.update(cx, |s, cx| s.set_value("", window, cx));
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        save_place(tab, genre);
+        self.load(cx);
+    }
+
+    /// Back on this page: undoes the last step here (menu, More Info, sources, a grid or search,
+    /// then the tab / genre visited before, at its scroll position). False when there is none,
+    /// and the shell leaves the page.
+    fn local_back(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.genre_menu {
+            self.genre_menu = false;
+        } else if self.detail.is_some() {
+            self.close_detail(cx);
+        } else if !matches!(self.streams, StreamState::Idle) {
+            close_streams(self, window, cx);
+        } else if self.results.is_some() || self.expanded.is_some() {
+            self.back_home(window, cx);
+        } else if let Some(p) = self.places.pop() {
+            self.tab = p.tab;
+            self.genre = p.genre;
+            save_place(p.tab, p.genre);
+            self.load(cx);
+            // Rows load from the cache within a frame or two; the old scroll position is put
+            // back once they are in, or it would be clamped to an empty page.
+            self.pending_scroll = Some((p.scroll, p.offsets));
+        } else {
+            return false;
+        }
+        self.hov.close();
+        cx.notify();
+        true
     }
 
     /// Billboard picks: the first top row's titles that have artwork and a synopsis.
@@ -479,26 +661,32 @@ impl MoviesHome {
         });
     }
 
-    fn hero(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Netflix's billboard keeps one shape at every width (about 0.46 of its width tall).
+    fn hero_height(width: f32) -> f32 {
+        ((width - EDGE * 2.) * 0.46).clamp(340., 880.)
+    }
+
+    fn hero(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let items = self.featured();
-        let height = 540.;
+        let height = Self::hero_height(width);
+        let copy_w = (width - EDGE * 2.) * 0.42;
         if items.is_empty() {
-            return look::billboard("movies-hero", height, None, None).child(look::hero_copy(110.).child(look::hero_skeleton())).into_any_element();
+            return nfx::billboard("movies-hero", height, None, None).child(nfx::hero_copy(copy_w).child(look::hero_skeleton())).into_any_element();
         }
         let n = items.len();
         let current = self.hero % n;
         let r = items[current].clone();
         let under = self.hero_prev.map(|p| p % n).filter(|p| *p != current).and_then(|p| background_of(&items[p]));
         let movie = kind_of(&r) == "movie";
-        let genres = r.genres.clone().unwrap_or_default().into_iter().take(3).collect::<Vec<_>>().join(" · ");
-        let meta = look::meta_line(
-            look::score(r.score, isz::MD, Some("IMDb")),
-            vec![r.year.map(|y| y.to_string()).unwrap_or_default(), if movie { "Movie".into() } else { "Series".into() }, genres],
-        );
+        // "Film • Comedy • 2017", as Netflix's billboard line.
+        let mut parts = vec![if movie { "Film".to_string() } else { "Series".to_string() }];
+        parts.extend(r.genres.clone().unwrap_or_default().into_iter().take(2));
+        parts.extend(r.year.map(|y| y.to_string()));
+        let meta = nfx::dot_line(parts, 16.).children(look::score(r.score, isz::SM, None));
         // "Resume" only when Play really resumes: a series needs its season (see `play`), or it
         // starts at S1 E1 and the label would be wrong.
         let resume = self.resume_of(&r).is_some_and(|h| movie || r.imdb_id.as_deref().and_then(|id| series_point(id, h.episode_number)).is_some());
-        let (play_r, route) = (r.clone(), Route::MovieDetail { imdb_id: r.imdb_id.clone().unwrap_or_default(), kind: kind_of(&r).into(), title: r.title.clone() });
+        let (play_r, info_r) = (r.clone(), r.clone());
         let paused = self.hero_paused;
         let pause = (!reduced()).then(|| {
             look::glass_button("hero-pause", if paused { ph::PLAY } else { ph::PAUSE }, if paused { "Play slideshow" } else { "Pause slideshow" }, 28.).on_click(cx.listener(|this, _, _, cx| {
@@ -506,42 +694,328 @@ impl MoviesHome {
                 cx.notify();
             }))
         });
-        look::billboard(("movies-hero", current), height, background_of(&r), under)
+        nfx::billboard(("movies-hero", current), height, background_of(&r), under)
             .child(look::bounds_probe(&self.hero_bounds))
             .child(
-                look::hero_copy(96.)
-                    .child(look::hero_title(&r.title, logo_of(&r)))
+                nfx::hero_copy(copy_w)
+                    .child(nfx::hero_logo(&r.title, logo_of(&r), (height * 0.26).clamp(80., 200.)))
                     .child(meta)
-                    .child(div().text_size(px(size::LG)).line_height(px(22.)).text_color(Tokens::text_1()).line_clamp(3).child(SharedString::from(r.description.as_deref().map(look::blurb).unwrap_or_default())))
+                    .child(div().text_size(px(18.)).line_height(px(26.)).text_color(Tokens::text_1()).line_clamp(3).child(SharedString::from(r.description.as_deref().map(look::blurb).unwrap_or_default())))
                     .child(
                         div()
                             .flex()
                             .gap(px(10.))
-                            .mt(px(4.))
-                            .child(look::hero_play("hero-play", if resume { "Resume" } else { "Play" }).on_click(cx.listener(move |this, _, w, cx| this.play(&play_r, w, cx))))
-                            .child(look::hero_more("hero-info").on_click(move |_, w, cx| navigate(route.clone(), w, cx))),
+                            .mt(px(2.))
+                            .child(nfx::play_pill("hero-play", if resume { "Resume" } else { "Play" }).on_click(cx.listener(move |this, _, w, cx| this.play(&play_r, w, cx))))
+                            .child(nfx::info_pill("hero-info", "More Info").on_click(cx.listener(move |this, _, w, cx| this.open_detail(&info_r, w, cx)))),
                     ),
             )
-            .child(div().absolute().right(px(EDGE - 5.)).bottom(px(104.)).flex().items_center().gap(px(6.)).children(pause).child(look::dots(cx, n, current, |v: &mut Self, i| v.go_hero(i))))
+            .child(div().absolute().right(px(28.)).bottom(px(30.)).flex().items_center().gap(px(6.)).children(pause).child(look::dots(cx, n, current, |v: &mut Self, i| v.go_hero(i))))
             .into_any_element()
     }
 
-    /// Tabs + search, floating over the top of the billboard.
+    /// The title's detail ("More Info").
+    fn open_detail(&mut self, r: &AnimeSearchResult, window: &mut Window, cx: &mut Context<Self>) {
+        let route = Route::MovieDetail { imdb_id: r.imdb_id.clone().unwrap_or_else(|| r.id.clone()), kind: kind_of(r).into(), title: r.title.clone() };
+        self.open_route(&route, window, cx);
+    }
+
+    /// A title's detail opens in the modal over the page (a "More Like This" card in it replaces
+    /// it); any other route is navigated to.
+    fn open_route(&mut self, route: &Route, window: &mut Window, cx: &mut Context<Self>) {
+        self.hov.close();
+        let Route::MovieDetail { imdb_id, kind, title } = route else {
+            navigate(route.clone(), window, cx);
+            return;
+        };
+        let weak = cx.weak_entity();
+        let (id, kind, title) = (imdb_id.clone(), kind.clone(), title.clone());
+        self.detail = Some(cx.new(|cx| {
+            MovieDetail::new_modal(id, kind, title, cx).on_open(move |route, w, cx| {
+                let _ = weak.update(cx, |v, cx| v.open_route(route, w, cx));
+            })
+        }));
+        window.focus(&self.detail_focus, cx);
+        cx.notify();
+    }
+
+    fn close_detail(&mut self, cx: &mut Context<Self>) {
+        // Dropping the view cancels its source lookup.
+        self.detail = None;
+        cx.notify();
+    }
+
+    fn in_my_list(&self, r: &AnimeSearchResult) -> bool {
+        let id = r.imdb_id.as_deref().unwrap_or(&r.id);
+        self.my_list.iter().any(|m| m.imdb_id.as_deref().unwrap_or(&m.id) == id)
+    }
+
+    /// My List from a hover card's + / check disc, with the Undo toast of the detail page.
+    fn toggle_list(&mut self, r: &AnimeSearchResult, cx: &mut Context<Self>) {
+        if self.saving_list {
+            return;
+        }
+        let Some(imdb) = r.imdb_id.clone() else { return };
+        let add = !self.in_my_list(r);
+        let t = media_title(kind_of(r), &imdb, r, &r.title);
+        self.saving_list = true;
+        let undo_title = t.clone();
+        cx.spawn(async move |this, cx| {
+            let res = set_watchlist(t, add).await;
+            let _ = this.update(cx, |v, cx| {
+                v.saving_list = false;
+                match res {
+                    // The list row reloads itself: `set_watchlist` moved the list epoch.
+                    Ok(before) => announce_list_toggle(cx, add, before, undo_title, |_: &mut Self, _| {}),
+                    Err(e) => toast::show(cx, Toast::error(format!("My List could not be updated: {e}"))),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Pointer moved over the page: open the hover card of the card it rests on (after
+    /// `POP_DELAY`), keep it while the pointer is on it, close it once the pointer leaves.
+    fn track_hover(&mut self, pos: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hov.shown.is_some() && look::pointer_over(&self.hov.popup, window) {
+            return;
+        }
+        let at = self.hov.card_at(pos, self.scroll.bounds());
+        if at.is_some() && at == self.hov.shown {
+            return;
+        }
+        if self.hov.shown.is_some() {
+            self.hov.shown = None;
+            self.hov.popup.set(None);
+            cx.notify();
+        }
+        if at == self.hov.pending {
+            return;
+        }
+        self.hov.pending = at;
+        self.hov.generation += 1;
+        let Some(key) = at else { return };
+        if !matches!(self.streams, StreamState::Idle) {
+            return;
+        }
+        let generation = self.hov.generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(nfx::POP_DELAY).await;
+            let _ = this.update(cx, |v, cx| {
+                if v.hov.generation == generation && v.hov.pending == Some(key) {
+                    v.hov.shown = Some(key);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The title behind a card key, for the hover card.
+    fn item_of(&self, key: CardKey) -> Option<AnimeSearchResult> {
+        match key.0 {
+            "mylist" => self.my_list.get(key.1).cloned(),
+            "res" => self.results.as_ref().and_then(|(_, l)| l.ready()).and_then(|v| v.get(key.1)).cloned(),
+            "all" => self.expanded.as_ref().and_then(|e| e.items.get(key.1)).cloned(),
+            id => self.rows.iter().find(|r| r.id == id).and_then(|r| r.load.ready()).and_then(|v| v.get(key.1)).cloned(),
+        }
+    }
+
+    /// The open hover card, if any, positioned over its card.
+    fn hover_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let key = self.hov.shown?;
+        let anchor = self.hov.bounds_of(key)?;
+        let page = self.scroll.bounds();
+        let generation = self.hov.generation;
+        if key.0 == "cont" {
+            let h = self.cont.get(key.1)?.clone();
+            let imdb = h.media_id.rsplit(':').next().filter(|id| id.starts_with("tt")).map(str::to_string);
+            let image = imdb.as_ref().map(|id| format!("https://images.metahub.space/background/medium/{id}/img")).or_else(|| h.cover_url.clone());
+            let logo = imdb.as_ref().map(|id| format!("https://images.metahub.space/logo/medium/{id}/img"));
+            let resume = Self::resume_point(&h);
+            let route = route_for_media(&h.media_id, &h.title);
+            let episode = resume.as_ref().and_then(|(b, _, _)| b.season.zip(b.episode)).map(|(s, e)| format!("S{s}:E{e}")).or_else(|| h.episode_number.map(|e| format!("Episode {e}")));
+            let total = (h.duration_secs / 60.).round() as u64;
+            let watched = (h.position_secs / 60.).round() as u64;
+            let actions = div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .when_some(resume, |d, (base, label, movie)| d.child(nfx::disc("pop-play", ph::PLAY, "Resume", true).on_click(cx.listener(move |this, _, w, cx| {
+                    this.hov.close();
+                    this.start(label.clone(), base.clone(), movie, w, cx);
+                }))))
+                .child(div().flex_1())
+                .when_some(route, |d, route| d.child(nfx::disc("pop-info", ph::CARET_DOWN, "More Info", false).on_click(cx.listener(move |this, _, w, cx| this.open_route(&route, w, cx)))));
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(actions)
+                .when_some(episode, |d, e| d.child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(SharedString::from(e))))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(div().flex_1().h(px(3.)).bg(Tokens::track()).child(div().h_full().w(relative(fraction(&h).clamp(0.02, 1.))).bg(Tokens::accent())))
+                        .child(div().text_size(px(13.)).text_color(Tokens::text_2()).child(SharedString::from(format!("{watched} of {total}m")))),
+                );
+            return Some(nfx::hover_card(&self.hov.popup, generation, anchor, page, image, logo, &h.title, body));
+        }
+        let r = self.item_of(key)?;
+        let movie = kind_of(&r) == "movie";
+        let saved = self.in_my_list(&r);
+        let (play_r, list_r, info_r) = (r.clone(), r.clone(), r.clone());
+        let actions = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(nfx::disc("pop-play", ph::PLAY, if self.resume_of(&r).is_some() { "Resume" } else { "Play" }, true).on_click(cx.listener(move |this, _, w, cx| {
+                this.hov.close();
+                this.play(&play_r, w, cx);
+            })))
+            .when(r.imdb_id.is_some(), |d| {
+                d.child(nfx::disc("pop-list", if saved { ph::CHECK } else { ph::PLUS }, if saved { "Remove from My List" } else { "Add to My List" }, false).on_click(cx.listener(move |this, _, _, cx| this.toggle_list(&list_r, cx))))
+            })
+            .child(div().flex_1())
+            .child(nfx::disc("pop-info", ph::CARET_DOWN, "More Info", false).on_click(cx.listener(move |this, _, w, cx| this.open_detail(&info_r, w, cx))));
+        let meta = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(14.))
+            .text_color(Tokens::text_2())
+            .child(div().child(if movie { "Film" } else { "Series" }))
+            .when_some(r.year, |d, y| d.child(nfx::box_tag(y.to_string())))
+            .children(look::score(r.score, isz::XS, None))
+            .child(nfx::box_tag("HD"));
+        let genres = r.genres.clone().unwrap_or_default().into_iter().take(3).collect::<Vec<_>>();
+        let body = div().flex().flex_col().gap(px(10.)).child(actions).child(meta).when(!genres.is_empty(), |d| d.child(nfx::dot_line(genres, 13.)));
+        Some(nfx::hover_card(&self.hov.popup, generation, anchor, page, background_of(&r), logo_of(&r), &r.title, body))
+    }
+
+    /// "Movies › Comedies  [Genres ▾]" over the billboard of the Movies and Series tabs, as on
+    /// Netflix; the menu lists Cinemeta's genres.
+    fn genre_header(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.tab == Tab::Home {
+            return None;
+        }
+        let movie = self.tab == Tab::Movies;
+        let (tab, open, current) = (self.tab, self.genre_menu, self.genre);
+        let noun = if movie { "Movies" } else { "Series" };
+        let pill = div()
+            .id("genre-pill")
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(36.))
+            .pl(px(16.))
+            .pr(px(12.))
+            .rounded_full()
+            .border_1()
+            .border_color(Tokens::text_1().alpha(if open { 0.8 } else { 0.4 }))
+            .bg(Tokens::base().alpha(0.5))
+            .text_size(px(15.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(Tokens::text_1())
+            .cursor_pointer()
+            .role(Role::Button)
+            .aria_label("Genres")
+            .aria_expanded(open)
+            .pressable()
+            .hover(|s| s.border_color(Tokens::text_1().alpha(0.8)))
+            .focus_ring()
+            .child("Genres")
+            .child(icon(if open { ph::CARET_UP.fill() } else { ph::CARET_DOWN.fill() }, Tokens::text_1(), isz::SM))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.genre_menu = !this.genre_menu;
+                this.hov.close();
+                cx.notify();
+            }));
+        let item = |ix: usize, label: String, genre: Option<&'static str>, cx: &mut Context<Self>| {
+            let on = genre == current;
+            div()
+                .id(("genre-item", ix))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .h(px(42.))
+                .px(px(18.))
+                .text_size(px(15.))
+                .font_weight(if on { FontWeight::BOLD } else { FontWeight::SEMIBOLD })
+                .text_color(if on { Tokens::text_1() } else { Tokens::text_2() })
+                .cursor_pointer()
+                .role(Role::MenuItemRadio)
+                .aria_selected(on)
+                .hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1()))
+                .focus_ring()
+                .child(SharedString::from(label))
+                .when(on, |d| d.child(div().flex_1()).child(icon(ph::CHECK.bold(), Tokens::accent(), isz::SM)))
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    if this.genre == genre {
+                        this.genre_menu = false;
+                        cx.notify();
+                    } else {
+                        this.go_to(tab, genre, w, cx);
+                    }
+                }))
+        };
+        let menu = open.then(|| {
+            let mut list = div()
+                .id("genre-menu")
+                .w(px(300.))
+                .max_h(px(460.))
+                .overflow_y_scroll()
+                .py(px(8.))
+                .rounded(px(radius::SM))
+                .bg(Tokens::popover())
+                .border_1()
+                .border_color(Tokens::border())
+                .shadow_lg()
+                .occlude()
+                .role(Role::Menu)
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.genre_menu = false;
+                    cx.notify();
+                }))
+                .child(item(0, format!("All {noun}"), None, cx));
+            for (i, (g, label)) in genres_for(movie).enumerate() {
+                list = list.child(item(i + 1, label.to_string(), Some(g), cx));
+            }
+            deferred(anchored().anchor(Anchor::TopLeft).offset(point(px(0.), px(6.))).snap_to_window_with_margin(px(8.)).child(list)).with_priority(2)
+        });
+        let title = div()
+            .id("genre-title")
+            .text_size(px(34.))
+            .line_height(px(40.))
+            .font_weight(FontWeight::BOLD)
+            .text_color(if current.is_some() { Tokens::text_2() } else { Tokens::text_1() })
+            .when(current.is_some(), |d| d.cursor_pointer().hover(|s| s.text_color(Tokens::text_1())).on_click(cx.listener(move |this, _, w, cx| this.go_to(tab, None, w, cx))))
+            .child(noun);
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .px(px(EDGE))
+                .mb(px(16.))
+                .child(title)
+                .when_some(current, |d, g| {
+                    d.child(icon(ph::CARET_RIGHT.bold(), Tokens::text_3(), isz::LG)).child(div().text_size(px(34.)).line_height(px(40.)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(genre_label(g, movie)))
+                })
+                .child(div().relative().ml(px(10.)).child(pill).children(menu)),
+        )
+    }
+
+    /// Brand, tabs and search over the top of the billboard; solid once the page scrolled.
     fn top_bar(&self, cx: &mut Context<Self>) -> Div {
-        let scrolled = self.results.is_some() || self.expanded.is_some() || f32::from(self.scroll.offset().y) < -40.0;
+        let scrolled = self.results.is_some() || self.expanded.is_some() || f32::from(self.scroll.offset().y) < -8.0;
         let tab = |id: &'static str, label: &'static str, t: Tab, cur: Tab, cx: &mut Context<Self>| {
-            chip(id, label, t == cur).on_click(cx.listener(move |this, _, w, cx| {
-                if this.tab != t || this.results.is_some() || this.expanded.is_some() {
-                    this.tab = t;
-                    this.results = None;
-                    this.expanded = None;
-                    this.home_offset = None;
-                    // Leaving search for a tab clears the query too (the field kept showing a
-                    // search whose results were gone), and the new tab starts at its top.
-                    this.search_gen += 1;
-                    this.search.update(cx, |s, cx| s.set_value("", w, cx));
-                    this.scroll.set_offset(point(px(0.), px(0.)));
-                    this.load(cx);
+            nfx::nav_tab(id, label, t == cur && self.results.is_none() && self.expanded.is_none()).on_click(cx.listener(move |this, _, w, cx| {
+                if this.tab != t || this.genre.is_some() || this.results.is_some() || this.expanded.is_some() {
+                    this.go_to(t, None, w, cx);
                 }
             }))
         };
@@ -554,17 +1028,18 @@ impl MoviesHome {
             .px(px(EDGE))
             .flex()
             .items_center()
-            .gap(px(10.))
-            .map(|d| if scrolled { d.bg(Tokens::base()).border_b_1().border_color(Tokens::border()) } else { d })
+            .gap(px(4.))
+            .child(nfx::bar_backdrop(scrolled))
             // Cards scrolled under the bar must not take its hovers and clicks; the wheel still scrolls.
             .block_mouse_except_scroll()
             .child(
                 div()
+                    .relative()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .mr(px(12.))
-                    .child(icon(glyphs::MOVIES.fill(), Tokens::accent(), isz::XL))
+                    .gap(px(6.))
+                    .mr(px(18.))
+                    .child(icon(glyphs::MOVIES.fill(), Tokens::accent(), isz::LG))
                     .child(div().ramp(ramp::TITLE_3).font_weight(FontWeight::BLACK).text_color(Tokens::accent()).child("MOVIES")),
             )
             .child(tab("tab-home", "Home", Tab::Home, self.tab, cx))
@@ -576,65 +1051,52 @@ impl MoviesHome {
 
     fn rows(&self, width: f32, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = vec![];
-        let card = 300.;
+        let (per, card) = nfx::card_fit(width);
+        let card_h = card * 9. / 16.;
+        // Titles in a Top 10 list wear the "TOP 10" mark in every other row too.
+        let top: HashSet<String> = self.rows.iter().filter(|r| r.look == Look::Top10).filter_map(|r| r.load.ready()).flat_map(|v| v.iter().take(10).map(|r| r.id.clone())).collect();
         if !self.cont.is_empty() {
-            let items = self
-                .cont
-                .iter()
-                .enumerate()
-                .filter_map(|(i, h)| {
-                    let route = route_for_media(&h.media_id, &h.title)?;
-                    let left = look::time_left(h.position_secs, h.duration_secs);
-                    let resume = Self::resume_point(h);
-                    // "S2 E5 · 12m left" when the season is known, as Netflix's resume line.
-                    let episode = match resume.as_ref().and_then(|(b, _, _)| b.season.zip(b.episode)) {
-                        Some((s, e)) => Some(format!("S{s} E{e}")),
-                        None => h.episode_number.map(|e| format!("E{e}")),
-                    };
-                    let sub = [episode, left].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-                    let imdb = h.media_id.rsplit(':').next().filter(|id| id.starts_with("tt"));
-                    let image = imdb.map(|id| format!("https://images.metahub.space/background/medium/{id}/img")).or_else(|| h.cover_url.clone());
-                    let hover = if resume.is_some() { Hover::Play } else { Hover::Open };
-                    let card_el = look::landscape_card(("cont", i), card, image, &h.title, Some(sub).filter(|s| !s.is_empty()), Some(fraction(h)), hover);
-                    let info_route = route.clone();
-                    let card_el = match resume {
-                        Some((base, label, movie)) => card_el
-                            .on_click(cx.listener(move |this, _, w, cx| this.start(label.clone(), base.clone(), movie, w, cx)))
-                            .child(div().absolute().top(px(8.)).right(px(8.)).child(look::glass_button(("cont-info", i), ph::INFO, "Details", 28.).on_click(move |_, w, cx| {
-                                // The card under the button would resume playback.
-                                cx.stop_propagation();
-                                navigate(info_route.clone(), w, cx);
-                            }))),
-                        None => card_el.on_click(move |_, w, cx| navigate(route.clone(), w, cx)),
-                    };
-                    Some(card_el.into_any_element())
-                })
-                .collect();
+            let cont = &self.cont;
+            let hov = &self.hov;
+            let make = |i: usize, cx: &mut Context<Self>| -> AnyElement {
+                let h = &cont[i];
+                let imdb = h.media_id.rsplit(':').next().filter(|id| id.starts_with("tt"));
+                let image = imdb.map(|id| format!("https://images.metahub.space/background/medium/{id}/img")).or_else(|| h.cover_url.clone());
+                let logo = imdb.map(|id| format!("https://images.metahub.space/logo/medium/{id}/img"));
+                let el = nfx::card(hov, ("cont", i), card, image, logo, &h.title, false, None, Some(fraction(h)));
+                match (Self::resume_point(h), route_for_media(&h.media_id, &h.title)) {
+                    (Some((base, label, movie)), _) => el.on_click(cx.listener(move |this, _, w, cx| {
+                        this.hov.close();
+                        this.start(label.clone(), base.clone(), movie, w, cx);
+                    })),
+                    (None, Some(route)) => el.on_click(move |_, w, cx| navigate(route.clone(), w, cx)),
+                    (None, None) => el,
+                }
+                .into_any_element()
+            };
             let history: OnClick = std::rc::Rc::new(|_, w, cx| navigate(Route::MediaHistory, w, cx));
-            out.push(look::row(cx, "cont", "Continue Watching", self.offset("cont"), look::per_row(width, card, 8.), 8., items, set_offset, Some(history)).into_any_element());
+            out.push(nfx::row(cx, "cont", "Continue Watching", cont.len(), card, per, self.slide("cont"), make, set_offset, Some(history)).into_any_element());
         }
         if !self.my_list.is_empty() {
-            let items = self.my_list.iter().enumerate().map(|(i, r)| self.card(Look::Landscape, ("mylist", i), i, r)).collect();
             let list: OnClick = std::rc::Rc::new(|_, w, cx| navigate(Route::Favorites, w, cx));
-            out.push(look::row(cx, "mylist", "My List", self.offset("mylist"), look::per_row(width, card, 8.), 8., items, set_offset, Some(list)).into_any_element());
+            let make = |i: usize, cx: &mut Context<Self>| self.card(Look::Landscape, ("mylist", i), i, card, &self.my_list[i], top.contains(&self.my_list[i].id), cx);
+            out.push(nfx::row(cx, "mylist", "My List", self.my_list.len(), card, per, self.slide("mylist"), make, set_offset, Some(list)).into_any_element());
         }
         for row in &self.rows {
-            let (w, h) = match row.look {
-                Look::Landscape => (card, card * 9. / 16.),
-                Look::Top10 => (217., 210.),
-                Look::Poster => (180., 270.),
-            };
+            let top10 = row.look == Look::Top10;
+            // Top 10: the numeral and a poster in about a boxart's width.
+            let (w, h) = if top10 { (card, card * TOP10_H) } else { (card, card_h) };
             match &row.load {
-                Load::Loading => out.push(look::skeleton_row(&row.title, w, h, 8).into_any_element()),
+                Load::Loading => out.push(nfx::skeleton_row(&row.title, w, h, per + 1).into_any_element()),
                 // A row that fails or comes back empty is simply left out.
                 Load::Failed(_) => {}
                 Load::Ready(v) if v.is_empty() => {}
                 Load::Ready(v) => {
-                    let top10 = row.look == Look::Top10;
-                    let items = v.iter().take(if top10 { 10 } else { 40 }).enumerate().map(|(i, r)| self.card(row.look, (row.id, i), i, r)).collect();
+                    let n = v.len().min(if top10 { 10 } else { 40 });
                     let id = row.id;
-                    let see_all: Option<OnClick> = (!top10).then(|| std::rc::Rc::new(cx.listener(move |this, _, _, cx| this.expand(id, cx))) as OnClick);
-                    out.push(look::row(cx, row.id, row.title.clone(), self.offset(row.id), look::per_row(width, w, 8.), 8., items, set_offset, see_all).into_any_element());
+                    let make = |i: usize, cx: &mut Context<Self>| self.card(row.look, (id, i), i, card, &v[i], !top10 && top.contains(&v[i].id), cx);
+                    let explore: Option<OnClick> = (!top10).then(|| std::rc::Rc::new(cx.listener(move |this, _, _, cx| this.expand(id, cx))) as OnClick);
+                    out.push(nfx::row(cx, row.id, row.title.clone(), n, w, per, self.slide(row.id), make, set_offset, explore).into_any_element());
                 }
             }
         }
@@ -661,27 +1123,30 @@ impl MoviesHome {
         self.offsets.get(id).copied().unwrap_or(0)
     }
 
-    fn card(&self, look_: Look, key: (&'static str, usize), rank: usize, r: &AnimeSearchResult) -> AnyElement {
-        let route = Route::MovieDetail { imdb_id: r.imdb_id.clone().unwrap_or_else(|| r.id.clone()), kind: kind_of(r).into(), title: r.title.clone() };
-        let card = match look_ {
-            Look::Top10 => look::top10_card(key, rank + 1, r.cover_url.as_deref().map(look::hi_res), 210., &r.title),
-            Look::Poster => look::poster_card(key, 180., r.cover_url.as_deref().map(look::hi_res), &r.title, r.year.map(|y| y.to_string()).unwrap_or_default(), r.score, r.description.as_deref().map(look::blurb), None),
-            Look::Landscape => {
-                let sub = r.genres.clone().unwrap_or_default().into_iter().take(2).collect::<Vec<_>>().join(" · ");
-                look::landscape_card(key, 300., background_of(r), &r.title, Some(sub).filter(|s| !s.is_empty()), None, Hover::Open)
-            }
-        };
-        card.on_click(move |_, w, cx| navigate(route.clone(), w, cx)).into_any_element()
+    /// (from, to) of a row's slide; `from == to` once the slide has had its time.
+    fn slide(&self, id: &'static str) -> (usize, usize) {
+        let to = self.offset(id);
+        match self.slides.get(id) {
+            Some((from, at)) if at.elapsed() < nfx::SLIDE => (*from, to),
+            _ => (to, to),
+        }
     }
 
-    fn grid(width: f32, items: &[AnimeSearchResult], prefix: &'static str) -> Div {
-        let per = look::per_row(width, 300., 8.);
-        let w = ((width - EDGE * 2.0 - 8.0 * (per as f32 - 1.0)) / per as f32).max(200.);
-        div().flex().flex_wrap().gap_x(px(8.)).gap_y(px(24.)).children(items.iter().enumerate().map(|(i, r)| {
-            let route = Route::MovieDetail { imdb_id: r.imdb_id.clone().unwrap_or_else(|| r.id.clone()), kind: kind_of(r).into(), title: r.title.clone() };
-            let sub = [r.year.map(|y| y.to_string()), Some(if kind_of(r) == "movie" { "Movie".to_string() } else { "Series".to_string() })].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-            look::landscape_card((prefix, i), w, background_of(r), &r.title, Some(sub), None, Hover::Open).on_click(move |_, w, cx| navigate(route.clone(), w, cx))
-        }))
+    fn card(&self, look_: Look, key: CardKey, rank: usize, w: f32, r: &AnimeSearchResult, top10: bool, cx: &mut Context<Self>) -> AnyElement {
+        let item = r.clone();
+        let card = match look_ {
+            Look::Top10 => {
+                let h = w * TOP10_H;
+                look::top10_card(key, rank + 1, r.cover_url.as_deref().map(look::hi_res), h, &r.title).relative().child(self.hov.probe(key))
+            }
+            Look::Landscape => nfx::card(&self.hov, key, w, background_of(r), logo_of(r), &r.title, top10, None, None),
+        };
+        card.on_click(cx.listener(move |this, _, w, cx| this.open_detail(&item, w, cx))).into_any_element()
+    }
+
+    fn grid(&self, width: f32, items: &[AnimeSearchResult], prefix: &'static str, cx: &mut Context<Self>) -> Div {
+        let (_, w) = nfx::card_fit(width);
+        div().flex().flex_wrap().gap_x(px(nfx::GAP)).gap_y(px(28.)).children(items.iter().enumerate().map(|(i, r)| self.card(Look::Landscape, (prefix, i), i, w, r, false, cx)))
     }
 
     fn grid_header(&self, title: String, count: Option<usize>, cx: &mut Context<Self>) -> Div {
@@ -712,7 +1177,7 @@ impl MoviesHome {
                 }))
                 .into_any_element(),
             Load::Ready(v) if v.is_empty() => empty_view(ph::MAGNIFYING_GLASS_MINUS, format!("No matches for \"{q}\""), "Check the spelling, or search for the original title.").into_any_element(),
-            Load::Ready(v) => Self::grid(width, v, "res").into_any_element(),
+            Load::Ready(v) => self.grid(width, v, "res", cx).into_any_element(),
         };
         div().pt(px(84.)).px(px(EDGE)).child(self.grid_header(format!("Results for \"{q}\""), load.ready().map(Vec::len), cx)).child(body)
     }
@@ -722,7 +1187,7 @@ impl MoviesHome {
             .pt(px(84.))
             .px(px(EDGE))
             .child(self.grid_header(e.title.clone(), Some(e.items.len()), cx))
-            .child(Self::grid(width, &e.items, "all"))
+            .child(self.grid(width, &e.items, "all", cx))
             .when_some(e.error.clone(), |d, err| {
                 d.child(div().mt(px(20.)).child(inline_alert(AlertKind::Error, "More titles could not be loaded", err).action("Try again", cx.listener(|this, _, _, cx| this.load_more(cx)))))
             })
@@ -735,20 +1200,34 @@ impl MoviesHome {
 }
 
 fn set_offset(v: &mut MoviesHome, id: &'static str, n: usize) {
+    let from = v.offset(id);
+    v.slides.insert(id, (from, Instant::now()));
     v.offsets.insert(id, n);
+    v.hov.close();
 }
 
 impl Render for MoviesHome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_personal(cx);
         let width = look::page_width(&self.scroll, window);
+        // The hover card is placed from last frame's card bounds; this frame's probes refill them.
+        let hover = if matches!(self.streams, StreamState::Idle) && self.detail.is_none() { self.hover_card(cx) } else { None };
+        self.hov.begin_frame();
+        // Back returned to a tab or genre: its scroll position and row pages come back once its
+        // rows are in.
+        if self.pending_scroll.is_some() && !self.rows.iter().any(|r| matches!(r.load, Load::Loading)) {
+            if let Some((at, offsets)) = self.pending_scroll.take() {
+                self.offsets = offsets;
+                self.scroll.set_offset(at);
+            }
+        }
         let content = if let Some(e) = &self.expanded {
             div().pb(px(40.)).child(self.expanded_view(e, width, cx))
         } else if let Some((q, load)) = &self.results {
             div().pb(px(40.)).child(self.search_results(q, load, width, cx))
         } else {
             let rows = self.rows(width, cx);
-            div().pb(px(40.)).child(self.hero(cx)).child(div().mt(px(-70.)).relative().children(rows))
+            div().pt(px(72.)).pb(px(40.)).children(self.genre_header(cx)).child(self.hero(width, cx)).child(div().mt(px(36.)).relative().children(rows))
         };
         let panel = streams::panel(&self.streams, cx, close_streams, retry_lookup);
         let weak = cx.weak_entity();
@@ -756,8 +1235,21 @@ impl Render for MoviesHome {
             .relative()
             .size_full()
             .bg(Tokens::base())
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, w, cx| this.track_hover(ev.position, w, cx)))
+            // Netflix closes a hover card on scroll; the bar also turns solid as the page moves.
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.hov.close();
+                cx.notify();
+            }))
             .child(mv_ui::scroll_page("movies-home", &self.scroll).child(content))
             .child(self.top_bar(cx))
+            .children(hover)
+            .children(self.detail.clone().map(|e| {
+                let weak = cx.weak_entity();
+                detail_modal(&self.detail_focus, e, width, move |_, cx| {
+                    let _ = weak.update(cx, |v, cx| v.close_detail(cx));
+                })
+            }))
             .children(panel.map(|p| {
                 look::overlay(&self.focus, p, move |w, cx| {
                     let _ = weak.update(cx, |v, cx| {

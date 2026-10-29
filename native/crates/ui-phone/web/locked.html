@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="theme-color" content="#0b0d10">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex">
+<title>Connect to MangaVox</title>
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
+<style>
+:root{--bg:#0b0d10;--s1:#14171c;--s2:#1b1f26;--line:#262b34;--t1:#f2f4f7;--t2:#c3c9d1;--t3:#8b93a1;--ac:#2bd49a}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--t1);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-text-size-adjust:100%}
+body{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:calc(24px + env(safe-area-inset-top)) calc(20px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));background:radial-gradient(120% 70% at 50% 0%,rgba(43,212,154,.13),transparent 60%),var(--bg)}
+main{width:100%;max-width:420px;text-align:center}
+.logo{display:inline-flex;align-items:center;gap:10px;font-weight:800;letter-spacing:.2px;font-size:18px;color:var(--t1);margin-bottom:22px}
+.logo img{width:36px;height:36px;border-radius:9px}
+svg{width:min(260px,72vw);height:auto;display:block;margin:0 auto 18px}
+h1{font-size:24px;line-height:1.25;margin:0 0 10px;font-weight:750}
+p{margin:0 0 18px;color:var(--t2)}
+ol{list-style:none;padding:0;margin:0 0 22px;text-align:left;background:var(--s1);border:1px solid var(--line);border-radius:16px}
+li{display:flex;gap:12px;align-items:flex-start;padding:14px 16px;color:var(--t2)}
+li+li{border-top:1px solid var(--line)}
+li b{flex:none;width:26px;height:26px;border-radius:50%;background:rgba(43,212,154,.15);color:var(--ac);display:grid;place-items:center;font-size:13px}
+li strong{color:var(--t1);font-weight:650}
+a.btn{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 26px;border-radius:999px;background:var(--ac);color:#04140d;font-weight:700;text-decoration:none}
+a.btn:focus-visible{outline:3px solid var(--t1);outline-offset:3px}
+.note{font-size:13px;color:var(--t3);margin-top:18px}
+@media (prefers-reduced-motion:no-preference){.pulse{animation:p 2.4s ease-in-out infinite;transform-origin:center}@keyframes p{0%,100%{opacity:.35}50%{opacity:1}}}
+</style>
+</head>
+<body>
+<main>
+  <div class="logo"><img src="/icon.png" alt="">MangaVox</div>
+  <svg viewBox="0 0 260 170" role="img" aria-label="A phone scanning a QR code shown on a computer screen">
+    <rect x="18" y="14" width="170" height="112" rx="10" fill="#14171c" stroke="#262b34" stroke-width="2"/>
+    <rect x="28" y="24" width="150" height="90" rx="5" fill="#0b0d10"/>
+    <rect x="80" y="126" width="46" height="12" fill="#1b1f26"/>
+    <rect x="62" y="138" width="82" height="7" rx="3.5" fill="#1b1f26"/>
+    <g fill="#c3c9d1">
+      <rect x="78" y="36" width="50" height="50" rx="4" fill="#f2f4f7"/>
+      <g fill="#0b0d10">
+        <rect x="82" y="40" width="14" height="14"/><rect x="110" y="40" width="14" height="14"/><rect x="82" y="68" width="14" height="14"/>
+        <rect x="85" y="43" width="8" height="8" fill="#f2f4f7"/><rect x="113" y="43" width="8" height="8" fill="#f2f4f7"/><rect x="85" y="71" width="8" height="8" fill="#f2f4f7"/>
+        <rect x="100" y="42" width="5" height="5"/><rect x="100" y="52" width="5" height="5"/><rect x="104" y="60" width="5" height="5"/>
+        <rect x="112" y="60" width="5" height="5"/><rect x="118" y="66" width="6" height="6"/><rect x="104" y="72" width="5" height="10"/>
+        <rect x="112" y="76" width="12" height="6"/><rect x="82" y="58" width="6" height="5"/><rect x="92" y="60" width="5" height="5"/>
+      </g>
+    </g>
+    <rect x="40" y="94" width="40" height="5" rx="2.5" fill="#262b34"/><rect x="126" y="94" width="40" height="5" rx="2.5" fill="#2bd49a" opacity=".7"/>
+    <path class="pulse" d="M150 72 L196 86" stroke="#2bd49a" stroke-width="2" stroke-dasharray="4 4" fill="none"/>
+    <g transform="rotate(-10 222 100)">
+      <rect x="196" y="58" width="52" height="96" rx="10" fill="#1b1f26" stroke="#2bd49a" stroke-width="2.5"/>
+      <rect x="202" y="68" width="40" height="72" rx="4" fill="#0b0d10"/>
+      <path d="M208 80v-6h6M236 80v-6h-6M208 128v6h6M236 128v6h-6" stroke="#2bd49a" stroke-width="2" fill="none" stroke-linecap="round"/>
+      <rect class="pulse" x="208" y="102" width="28" height="2" fill="#2bd49a"/>
+      <rect x="214" y="61" width="16" height="3" rx="1.5" fill="#262b34"/>
+    </g>
+  </svg>
+  <h1>Connect this phone</h1>
+  <p>Scan the QR code shown in <strong>MangaVox → Mobile</strong> on your PC to connect this phone.</p>
+  <ol>
+    <li><b>1</b><span>Open <strong>MangaVox</strong> on your PC.</span></li>
+    <li><b>2</b><span>Go to the <strong>Mobile</strong> page in the sidebar.</span></li>
+    <li><b>3</b><span>Point your phone’s camera at the QR code and open the link.</span></li>
+  </ol>
+  <a class="btn" href="/">I’ve scanned it</a>
+  <p class="note">Your phone and PC need to be on the same Wi‑Fi network. Each QR code works once and expires after a few minutes.</p>
+</main>
+</body>
+</html>

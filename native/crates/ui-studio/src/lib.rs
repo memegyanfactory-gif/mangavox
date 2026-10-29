@@ -6,13 +6,14 @@ use gpui_kit::*;
 use mv_ui::Route;
 
 pub mod audio;
+pub use export::join_full_recap;
 pub mod data;
 mod dashboard;
 mod export;
 mod generate;
 mod issues;
 mod music;
-mod pipeline;
+pub mod pipeline;
 mod queue_view;
 mod restyle;
 mod page;

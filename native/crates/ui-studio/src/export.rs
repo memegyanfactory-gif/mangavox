@@ -340,6 +340,13 @@ pub(crate) fn joined_path(manga_id: &str) -> PathBuf {
     mv_core::paths::studio_projects().join(mv_core::paths::safe_name(manga_id)).join("full_recap.mp4")
 }
 
+/// Joins a manga's chapter videos (`files`, in order) into its `full_recap.mp4`, as Play full /
+/// Export do, for callers outside the page (the phone companion). Blocking; `progress` gets
+/// (0..1, label) and setting `cancel` stops it.
+pub fn join_full_recap(manga_id: &str, files: &[PathBuf], progress: Arc<Mutex<(f32, String)>>, cancel: Arc<AtomicBool>) -> Result<PathBuf> {
+    join(files, &joined_path(manga_id), &Reporter { state: progress, cancel }).map(|j| j.path)
+}
+
 /// What the joined video was made from (path, size, modified) - a match means it is current.
 fn sources_key(files: &[PathBuf]) -> Value {
     json!(files

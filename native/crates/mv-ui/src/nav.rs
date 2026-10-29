@@ -2,7 +2,7 @@
 //! installs the handler at startup with `set_navigator`.
 use std::rc::Rc;
 
-use gpui_kit::{App, Global, Window};
+use gpui_kit::{App, EntityId, Global, Window};
 
 /// Every screen in the app. Params are plain data so routes can be stored in history.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +26,8 @@ pub enum Route {
     Player { request: PlayRequest },
     // Studio
     Studio,
+    // Phone companion (QR pairing, see ui-phone)
+    Mobile,
     // App
     Settings { tab: Option<String> },
     /// First-run setup (full window; also "Run welcome setup again" in Settings › About).
@@ -73,4 +75,24 @@ pub fn set_back_target(cx: &mut App, route: Option<Route>) {
 
 pub fn back_target(cx: &App) -> Option<Route> {
     cx.try_global::<BackTarget>().and_then(|b| b.0.clone())
+}
+
+/// A page's own Back step (close its dialog, leave a sub-view), asked before the shell leaves
+/// the page. Returns true when it handled Back. Keyed by the page's view, so a kept-alive page
+/// that is not showing never takes Back.
+type LocalBack = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
+
+#[derive(Default)]
+struct LocalBacks(std::collections::HashMap<EntityId, LocalBack>);
+impl Global for LocalBacks {}
+
+/// Registers `f` as `view`'s own Back step (replaces an earlier one).
+pub fn set_local_back(cx: &mut App, view: EntityId, f: impl Fn(&mut Window, &mut App) -> bool + 'static) {
+    cx.default_global::<LocalBacks>().0.insert(view, Rc::new(f));
+}
+
+/// Runs `view`'s own Back step; false when it has none or nothing to undo.
+pub fn local_back(view: EntityId, window: &mut Window, cx: &mut App) -> bool {
+    let f = cx.try_global::<LocalBacks>().and_then(|b| b.0.get(&view).cloned());
+    f.is_some_and(|f| f(window, cx))
 }

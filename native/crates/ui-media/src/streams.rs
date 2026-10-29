@@ -16,7 +16,7 @@ use crate::common::{jikan, registry, STREAMS_TTL};
 use crate::look;
 
 pub const NO_ADDONS: &str = "No stream addons are installed. Add one in Settings, Addons.";
-const NOT_FOUND: &str = "No playable sources were found for this title.";
+pub(crate) const NOT_FOUND: &str = "No playable sources were found for this title.";
 const NO_MAPPING: &str = "This title has no IMDb or Kitsu mapping, so sources cannot be looked up.";
 
 /// What is being played; becomes the `PlayRequest` once a source is chosen.
@@ -84,7 +84,7 @@ pub fn play_now(req: PlayRequest, window: &mut Window, cx: &mut App) {
     navigate(Route::Player { request: req }, window, cx);
 }
 
-async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) -> Result<(PlayBase, Vec<AnimeTorrentStream>), String> {
+pub(crate) async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) -> Result<(PlayBase, Vec<AnimeTorrentStream>), String> {
     let reg = registry();
     if reg.stream_addons(kind).is_empty() {
         return Err(NO_ADDONS.into());
@@ -119,7 +119,7 @@ async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) -> Result<(
 }
 
 /// Cache key for a title's links; includes the enabled addons so installing one refetches.
-fn stream_key(base: &PlayBase, kind: &str) -> String {
+pub(crate) fn stream_key(base: &PlayBase, kind: &str) -> String {
     let addons: Vec<String> = registry().stream_addons(kind).into_iter().map(|m| format!("{}@{}", m.id, m.version)).collect();
     let id = base.imdb_id.clone().or_else(|| base.mal_id.as_ref().map(|m| format!("mal{m}"))).unwrap_or_default();
     format!("streams2:{kind}:{id}:{}:{}:{}", base.season.unwrap_or(0), base.episode.unwrap_or(0), addons.join(","))

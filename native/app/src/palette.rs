@@ -137,6 +137,11 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
         });
     }
 
+    out.push(Group {
+        heading: "Mobile".into(),
+        rows: vec![row("Mobile", ph::DEVICE_MOBILE, Cmd::Go(Route::Mobile)).keys(["connect phone", "phone", "pair", "qr code", "remote", "wifi", "companion"]).current(*c.route == Route::Mobile)],
+    });
+
     let mut settings = vec![row("Settings", glyphs::SETTINGS, Cmd::Go(Route::Settings { tab: None })).keys(["preferences", "options"]).shortcut(Shortcut::Settings)];
     // Icons, names and search words come from ui-settings, so a row looks like its rail entry.
     settings.extend(SETTINGS_TABS.iter().filter(|id| c.studio || **id != "studio").filter_map(|id| {
@@ -301,6 +306,14 @@ mod tests {
         let studio = Route::Studio;
         let in_studio = cmds(&groups(&Ctx { studio: true, can_dock: false, ..ctx(&studio) }, "", &[]));
         assert!(!in_studio.contains(&Cmd::Run(Shortcut::Assistant)));
+    }
+
+    #[test]
+    fn mobile_is_always_offered() {
+        let route = Route::Mobile;
+        let gs = groups(&ctx(&route), "", &[]);
+        let mobile = gs.iter().find(|g| g.heading.as_ref() == "Mobile").expect("mobile group");
+        assert!(mobile.rows.iter().any(|r| r.current && r.cmd == Cmd::Go(Route::Mobile)));
     }
 
     #[test]

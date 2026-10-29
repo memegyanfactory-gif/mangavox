@@ -14,3 +14,4 @@ rusqlite = { workspace = true }
 futures = "0.3"
 chrono = "0.4"
 serde = { workspace = true }
+serde_json = { workspace = true }

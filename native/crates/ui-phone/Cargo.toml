@@ -1,0 +1,39 @@
+[package]
+name = "ui-phone"
+edition.workspace = true
+version.workspace = true
+description = "Phone companion: a LAN web app (paired by QR code) to read, listen, generate and remote-control MangaVox"
+
+[dependencies]
+gpui-kit = { workspace = true }
+mv-ui = { path = "../mv-ui" }
+mv-core = { path = "../mv-core" }
+mv-media = { path = "../mv-media" }
+ui-manga = { path = "../ui-manga" }
+ui-media = { path = "../ui-media" }
+ui-studio = { path = "../ui-studio" }
+mv-recap = { path = "../mv-recap" }
+mv-studio = { path = "../mv-studio" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+subtle = "2"
+qrcode = { version = "0.14", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+mime_guess = "2"
+raw-window-handle = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_UI_Shell", "Win32_System_Registry"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

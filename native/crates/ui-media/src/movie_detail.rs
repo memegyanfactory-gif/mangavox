@@ -1,17 +1,21 @@
-//! Movie / series detail, Netflix-style: billboard with logo and actions, synopsis with cast,
-//! season picker + episode list with thumbnails, and "More like this". The hero resumes where
-//! you left off; an episode row plays on click and can open its sources right under it.
+//! Movie / series detail in the shape of Netflix's "More Info" modal: art with the logo, a light
+//! Play button and the My List disc; a two-column body (meta and synopsis | cast, genres,
+//! director); numbered episode rows with thumbnails; and a "More Like This" card grid. It runs as
+//! a page (`Route::MovieDetail`) or inside [`crate::detail_modal::detail_modal`] over Movies home
+//! ([`MovieDetail::new_modal`]). The hero resumes where you left off; an episode row plays on
+//! click and can open its sources right under it.
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::media::PlaybackState;
 use mv_media::types::{AnimeEpisode, AnimeSearchResult};
-use mv_ui::theme::{icon as isz, radius, ramp};
+use mv_ui::theme::{icon as isz, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    empty_view, error_view, icon, icon_button, icon_tag, menu_button, muted, navigate, ph, segmented, size, skeleton, skeleton_line, Interactive, MenuItem, Ph, RampExt, Route,
-    Tokens, Tone,
+    empty_view, error_view, icon, icon_button, icon_tag, menu_button, navigate, ph, segmented, size, skeleton, skeleton_line, spinner, tip, Interactive, MenuItem, Ph,
+    Route, Tokens, Tone,
 };
 
 use crate::common::{
@@ -58,7 +62,16 @@ pub struct MovieDetail {
     progress_epoch: Option<(u64, u64)>,
     checked_epoch: Option<(u64, u64)>,
     scroll: ScrollHandle,
+    /// Shown inside [`crate::detail_modal::detail_modal`]: a shorter hero, and the sources panel
+    /// sits under the body instead of beside the hero copy (the modal is too narrow for both).
+    modal: bool,
+    /// Opens a "More Like This" title. Unset, the title opens as a page (`navigate`); the modal's
+    /// host sets it to swap the modal's title instead.
+    on_open: Option<OpenTitle>,
 }
+
+/// Handler for a "More Like This" click, given the title's `Route::MovieDetail`.
+pub type OpenTitle = Rc<dyn Fn(&Route, &mut Window, &mut App)>;
 
 /// Season number from a Stremio video id (`tt123:2:5`).
 fn season_of(ep: &AnimeEpisode) -> u32 {
@@ -117,6 +130,92 @@ fn close_inline(v: &mut MovieDetail) {
     v.lookup = None;
 }
 
+/// Netflix's main action: a light button with dark text and the filled play glyph, the inverse of
+/// the page so it reads over any art.
+fn play_button(id: impl Into<ElementId>, label: String) -> Stateful<Div> {
+    let label = SharedString::from(label);
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(10.))
+        .h(px(44.))
+        .pl(px(20.))
+        .pr(px(26.))
+        .rounded(px(radius::XS))
+        .bg(Tokens::text_1())
+        .text_size(px(size::LG))
+        .font_weight(FontWeight::BOLD)
+        .text_color(Tokens::base())
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .cursor_pointer()
+        .focus_ring()
+        .hover(|s| s.bg(Tokens::text_1().alpha(0.8)))
+        .active(|s| s.bg(Tokens::text_1().alpha(0.7)))
+        .child(icon(ph::PLAY.fill(), Tokens::base(), isz::LG))
+        .child(label)
+}
+
+/// My List as Netflix's round outlined disc: a plus to add, a check once listed, a spinner while
+/// saving. The tooltip names what a click will do.
+fn list_disc(id: impl Into<ElementId>, saved: bool, saving: bool) -> Stateful<Div> {
+    let label = if saved { "Remove from My List" } else { "Add to My List" };
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(42.))
+        .rounded_full()
+        .bg(Tokens::glass())
+        .border_2()
+        .border_color(Tokens::text_1().alpha(0.5))
+        .role(Role::Button)
+        .aria_label(label)
+        .aria_toggled(if saved { Toggled::True } else { Toggled::False })
+        .tooltip(tip(label))
+        .cursor_pointer()
+        .focus_ring()
+        .hover(|s| s.bg(Tokens::text_1().alpha(0.1)).border_color(Tokens::text_1()))
+        .map(|d| if saving { d.child(spinner("list-saving", Tokens::text_1(), isz::MD)) } else { d.child(icon(if saved { ph::CHECK.bold() } else { ph::PLUS.bold() }, Tokens::text_1(), isz::MD)) })
+}
+
+/// Small outlined box in a meta line ("HD", "4K", "Series"), as Netflix marks quality.
+fn box_tag(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(20.))
+        .px(px(6.))
+        .rounded(px(3.))
+        .border_1()
+        .border_color(Tokens::text_3())
+        .text_size(px(size::XS))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(Tokens::text_2())
+        .child(text.into())
+}
+
+/// "Cast: a, b, c" in the body's right column: the label muted, the names wrapping beside it.
+fn info_line(label: &'static str, value: String) -> Div {
+    div()
+        .flex()
+        .gap(px(4.))
+        .text_size(px(14.))
+        .line_height(px(20.))
+        .child(div().flex_none().text_color(Tokens::text_3()).child(label))
+        .child(div().flex_1().min_w_0().text_color(Tokens::text_1()).child(SharedString::from(value)))
+}
+
+/// Section heading in the modal's 24px bold.
+fn section_title(text: &'static str) -> Div {
+    div().text_size(px(24.)).line_height(px(32.)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(text)
+}
+
 impl MovieDetail {
     pub fn new(imdb_id: String, kind: String, title: String, cx: &mut Context<Self>) -> Self {
         let series = kind == "series";
@@ -157,7 +256,21 @@ impl MovieDetail {
             progress_epoch: None,
             checked_epoch: None,
             scroll: ScrollHandle::new(),
+            modal: false,
+            on_open: None,
         }
+    }
+
+    /// [`Self::new`] for showing inside [`crate::detail_modal::detail_modal`] (the wrapper draws
+    /// the scrim and the close button).
+    pub fn new_modal(imdb_id: String, kind: String, title: String, cx: &mut Context<Self>) -> Self {
+        Self { modal: true, ..Self::new(imdb_id, kind, title, cx) }
+    }
+
+    /// What a "More Like This" click does instead of opening the title as a page.
+    pub fn on_open(mut self, f: impl Fn(&Route, &mut Window, &mut App) + 'static) -> Self {
+        self.on_open = Some(Rc::new(f));
+        self
     }
 
     fn fetch_details(imdb_id: &str, kind: &str, title: &str, cx: &mut Context<Self>) -> (Load<AnimeSearchResult>, Vec<AnimeSearchResult>) {
@@ -430,34 +543,19 @@ impl MovieDetail {
         streams::sources_panel(&self.streams, heading, self.addon_filter.as_deref(), cx, |v: &mut Self, f| v.addon_filter = f, close, retry_sources)
     }
 
+    /// Art with the logo and the actions bottom-left. As a page, the sources panel docks on the
+    /// right of the art; in the modal it sits under the body ([`Self::sources_below`]).
     fn hero(&self, width: f32, cx: &mut Context<Self>) -> Stateful<Div> {
-        let series = self.series();
-        let height = 560.;
+        let height = if self.modal { 480. } else { 560. };
         let fallback = AnimeSearchResult { title: self.title.clone(), imdb_id: Some(self.imdb_id.clone()), ..Default::default() };
         let d = self.details.ready().unwrap_or(&fallback);
-        let seasons = self.episodes.ready().map(|v| seasons_of(v).into_iter().filter(|s| *s > 0).count());
         let next = self.next();
-        let mut copy = look::hero_copy(70.).when(!self.inline && !matches!(self.streams, StreamState::Idle), |d| d.max_w(look::beside_panel(width))).child(look::hero_title(&d.title, logo_of(d)));
-        match &self.details {
-            Load::Loading => copy = copy.child(skeleton(px(280.), px(18.), radius::SM)),
-            Load::Failed(e) => {
-                copy = copy.child(error_view(e.clone()).title("This title could not be loaded").compact().retry(cx.listener(|this, _, _, cx| this.reload_details(cx))).items_start());
-            }
-            Load::Ready(_) => {
-                let meta = look::meta_line(
-                    look::score(d.score, isz::MD, Some("IMDb")),
-                    vec![
-                        d.year.map(|y| y.to_string()).unwrap_or_default(),
-                        if series { seasons.filter(|n| *n > 0).map(|n| if n == 1 { "1 Season".to_string() } else { format!("{n} Seasons") }).unwrap_or_default() } else { d.duration_minutes.map(runtime).unwrap_or_default() },
-                    ],
-                )
-                // Quality comes from the links that were found, never assumed.
-                .children(streams::quality_tags(&self.streams).into_iter().map(look::quality_tag))
-                .child(look::meta_tag(if series { "Series" } else { "Movie" }));
-                copy = copy.child(meta);
-            }
+        let docked = !self.modal && !self.inline;
+        let panel = if docked { self.panel(cx) } else { None };
+        let mut copy = look::hero_copy(if self.modal { 36. } else { 56. }).when(panel.is_some(), |d| d.max_w(look::beside_panel(width))).child(look::hero_title(&d.title, logo_of(d)));
+        if let Load::Failed(e) = &self.details {
+            copy = copy.child(error_view(e.clone()).title("This title could not be loaded").compact().retry(cx.listener(|this, _, _, cx| this.reload_details(cx))).items_start());
         }
-        let panel = if self.inline { None } else { self.panel(cx) };
         let (ps, pe) = (next.season, next.episode);
         look::billboard("movie-hero", height, background_of(d), None).children(panel.map(|p| div().absolute().right(px(EDGE)).top(px(24.)).bottom(px(24.)).w(px(look::SIDE_PANEL)).child(p))).child(
             copy.child(
@@ -469,91 +567,127 @@ impl MovieDetail {
                     .child(
                         div()
                             .flex()
+                            .items_center()
                             .gap(px(10.))
-                            .child(look::hero_play("play-main", next.label.clone()).on_click(cx.listener(move |this, _, w, cx| this.play_at(ps, pe, false, w, cx))))
-                            .child(look::list_button("toggle-list", self.in_list == Some(true), self.saving).on_click(cx.listener(|this, _, _, cx| this.toggle_list(cx)))),
+                            .child(play_button("play-main", next.label.clone()).on_click(cx.listener(move |this, _, w, cx| this.play_at(ps, pe, false, w, cx))))
+                            .child(list_disc("toggle-list", self.in_list == Some(true), self.saving).on_click(cx.listener(|this, _, _, cx| this.toggle_list(cx)))),
                     )
                     .when_some(next.progress, |c, (p, left)| c.child(look::resume_note("resume-bar", p, left))),
             ),
         )
     }
 
+    /// Two columns under the art: the meta line ("2022  4 Seasons  [HD]") and the synopsis on
+    /// the left, cast, genres and director on the right.
     fn about(&self) -> Option<Div> {
-        let d = self.details.ready()?;
-        let line = |glyph: Ph, label: &'static str, v: String| {
-            div()
-                .flex()
-                .items_start()
-                .gap(px(8.))
-                .text_size(px(size::SM))
-                .line_height(px(20.))
-                .child(div().pt(px(3.)).child(icon(glyph.bold(), Tokens::text_3(), isz::SM)))
-                .child(div().flex().flex_wrap().gap(px(4.)).child(div().text_color(Tokens::text_3()).child(label)).child(div().text_color(Tokens::text_1()).child(SharedString::from(v))))
+        let body = div().flex().items_start().gap(px(32.)).px(px(EDGE)).pt(px(8.)).mb(px(36.));
+        let d = match &self.details {
+            Load::Loading => {
+                return Some(body.child(div().flex_1().flex().flex_col().gap(px(12.)).child(skeleton(px(220.), px(20.), radius::XS)).child(skeleton_line(relative(0.9))).child(skeleton_line(relative(0.7)))));
+            }
+            Load::Failed(_) => return None,
+            Load::Ready(d) => d,
         };
+        let series = self.series();
+        let seasons = self.episodes.ready().map(|v| seasons_of(v).into_iter().filter(|s| *s > 0).count());
+        let meta = look::meta_line(
+            look::score(d.score, isz::MD, Some("IMDb")),
+            vec![
+                d.year.map(|y| y.to_string()).unwrap_or_default(),
+                if series { seasons.filter(|n| *n > 0).map(|n| if n == 1 { "1 Season".to_string() } else { format!("{n} Seasons") }).unwrap_or_default() } else { d.duration_minutes.map(runtime).unwrap_or_default() },
+            ],
+        )
+        .text_size(px(size::LG))
+        // Quality comes from the links that were found, never assumed.
+        .children(streams::quality_tags(&self.streams).into_iter().map(box_tag))
+        .child(box_tag(if series { "Series" } else { "Movie" }));
         let join = |v: &Option<Vec<String>>| v.clone().unwrap_or_default().into_iter().take(5).collect::<Vec<_>>().join(", ");
+        let (cast, genres, directors) = (join(&d.cast), join(&d.genres), join(&d.directors));
         Some(
-            div()
-                .flex()
-                .gap(px(40.))
-                .px(px(EDGE))
-                .mb(px(36.))
-                .child(div().flex_1().min_w_0().text_size(px(size::LG)).line_height(px(24.)).text_color(Tokens::text_1()).child(SharedString::from(d.description.clone().unwrap_or_else(|| "No overview available.".into()))))
-                .child(
-                    div()
-                        .w(px(320.))
-                        .flex_none()
-                        .flex()
-                        .flex_col()
-                        .gap(px(10.))
-                        .when(!join(&d.cast).is_empty(), |x| x.child(line(ph::USERS, "Cast:", join(&d.cast))))
-                        .when(!join(&d.genres).is_empty(), |x| x.child(line(ph::TAG, "Genres:", join(&d.genres))))
-                        .when(!join(&d.directors).is_empty(), |x| x.child(line(ph::FILM_SLATE, "Director:", join(&d.directors)))),
-                ),
+            body.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .child(meta)
+                    .child(div().text_size(px(16.)).line_height(px(24.)).text_color(Tokens::text_1()).child(SharedString::from(d.description.clone().unwrap_or_else(|| "No overview available.".into())))),
+            )
+            .child(
+                div()
+                    .w(relative(0.35))
+                    .max_w(px(420.))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .when(!cast.is_empty(), |x| x.child(info_line("Cast:", cast)))
+                    .when(!genres.is_empty(), |x| x.child(info_line("Genres:", genres)))
+                    .when(!directors.is_empty(), |x| x.child(info_line("Director:", directors))),
+            ),
         )
     }
 
-    /// One episode row. Click plays it (the hover shows a play glyph); the list button opens its
-    /// sources right under the row. The selected row keeps an accent bar so it never looks like
-    /// a hover (Material 3 states).
-    fn episode_row(&self, ep: &AnimeEpisode, thumb: Option<String>, single_season: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// The modal's sources panel, full width under the body: beside the hero copy it would cover
+    /// it at the modal's width. Rows that opened their sources inline keep them under the row.
+    fn sources_below(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.modal || self.inline {
+            return None;
+        }
+        self.panel(cx).map(|p| div().px(px(EDGE)).mb(px(36.)).h(px(440.)).child(p))
+    }
+
+    /// One Netflix episode row: number, 16:9 thumbnail, title with the air date on the right and
+    /// the watch state under it. Click plays it (the hover shows a play glyph); the list button
+    /// opens its sources right under the row. The episode the hero continues with sits on
+    /// `surface_2` (Netflix's current row); a row whose sources are open also keeps an accent bar,
+    /// so it never looks like a hover (Material 3 states).
+    fn episode_row(&self, ep: &AnimeEpisode, thumb: Option<String>, single_season: bool, current: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let (n, s) = (ep.number, season_of(ep));
         let group: SharedString = format!("mep-{}-{s}-{n}", self.imdb_id).into();
         let selected = self.inline && self.sel == Some((s, n));
+        let lit = selected || current;
         // History has no season: the marks belong to the one regular season, never to Specials.
         let watched = single_season && s > 0 && self.watched.contains(&n);
-        let progress = self.resume.as_ref().filter(|h| in_progress(h) && self.resume_at(h) == Some((s, n))).map(fraction);
+        let resume = self.resume.as_ref().filter(|h| in_progress(h) && self.resume_at(h) == Some((s, n)));
+        let progress = resume.map(fraction);
+        let left = resume.and_then(|h| look::time_left(h.position_secs, h.duration_secs));
         let title = ep.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| format!("Episode {n}"));
+        let aired = ep.air_date.as_deref().map(|d| d.chars().take(10).collect::<String>()).filter(|d| !d.is_empty());
         div()
             .id(("ep", (s * 10000 + n) as usize))
             .group(group.clone())
             .relative()
             .flex()
             .items_center()
-            .gap(px(20.))
+            .gap(px(16.))
             .px(px(16.))
-            .py(px(14.))
-            .rounded(px(radius::MD))
+            .py(px(16.))
+            .rounded(px(radius::XS))
+            .border_b_1()
+            .border_color(Tokens::border())
             .role(Role::Button)
             .aria_label(SharedString::from(format!("Play episode {n}: {title}")))
-            .map(|d| if selected { d.bg(Tokens::active()) } else { d })
+            .when(lit, |d| d.bg(Tokens::surface_2()))
             .pressable()
-            .hover(move |x| x.bg(if selected { Tokens::active_hover() } else { Tokens::hover() }))
-            .when(selected, |d| d.child(div().absolute().left_0().top(px(14.)).bottom(px(14.)).w(px(3.)).rounded_full().bg(Tokens::accent())))
-            .child(div().w(px(32.)).flex_none().ramp(ramp::TITLE_3).text_color(if selected { Tokens::text_1() } else { Tokens::text_3() }).child(SharedString::from(n.to_string())))
+            .hover(move |x| x.bg(if lit { Tokens::surface_3() } else { Tokens::hover() }))
+            .when(selected, |d| d.child(div().absolute().left_0().top(px(16.)).bottom(px(16.)).w(px(3.)).rounded_full().bg(Tokens::accent())))
+            .child(div().w(px(36.)).flex_none().flex().justify_center().text_size(px(24.)).line_height(px(32.)).text_color(Tokens::text_2()).child(SharedString::from(n.to_string())))
             .child(
                 div()
                     .relative()
                     .flex_none()
-                    .w(px(160.))
-                    .h(px(90.))
-                    .rounded(px(radius::SM))
+                    .w(px(130.))
+                    .h(px(73.))
+                    .rounded(px(radius::XS))
                     .overflow_hidden()
-                    .bg(Tokens::surface_2())
+                    .bg(Tokens::surface_3())
                     .when_some(thumb, |d, u| d.child(look::pic(u)))
                     .when(watched, |d| d.child(div().absolute().inset_0().bg(Tokens::scrim())))
                     .child(
                         div().absolute().inset_0().flex().items_center().justify_center().opacity(0.).group_hover(group.clone(), |s| s.opacity(1.)).child(
-                            div().size(px(36.)).rounded_full().bg(Tokens::glass()).border_1().border_color(Tokens::text_1()).flex().items_center().justify_center().child(icon(ph::PLAY.fill(), Tokens::text_1(), isz::MD)),
+                            div().size(px(32.)).rounded_full().bg(Tokens::glass()).border_1().border_color(Tokens::text_1()).flex().items_center().justify_center().child(icon(ph::PLAY.fill(), Tokens::text_1(), isz::SM)),
                         ),
                     )
                     .when(watched, |d| d.child(div().absolute().left_0().bottom_0().w_full().h(px(3.)).bg(Tokens::accent())))
@@ -565,16 +699,28 @@ impl MovieDetail {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
-                    .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(if watched { Tokens::text_3() } else { Tokens::text_1() }).truncate().child(SharedString::from(title)))
+                    .gap(px(6.))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.))
-                            .child(muted(ep.air_date.as_deref().map(|d| d.chars().take(10).collect::<String>()).unwrap_or_default()))
-                            .when(watched, |d| d.child(icon_tag(ph::CHECK, "Watched", Tone::Neutral))),
-                    ),
+                            .gap(px(12.))
+                            .child(div().flex_1().min_w_0().text_size(px(16.)).font_weight(FontWeight::BOLD).text_color(if watched { Tokens::text_3() } else { Tokens::text_1() }).truncate().child(SharedString::from(title)))
+                            .when_some(aired, |d, a| d.child(div().flex_none().text_size(px(14.)).text_color(Tokens::text_2()).child(SharedString::from(a)))),
+                    )
+                    .when(watched || left.is_some(), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .text_size(px(14.))
+                                .line_height(px(20.))
+                                .text_color(Tokens::text_2())
+                                .when(watched, |d| d.child(icon_tag(ph::CHECK, "Watched", Tone::Neutral)))
+                                .when_some(left, |d, l| d.child(SharedString::from(l))),
+                        )
+                    }),
             )
             .child(icon_button(("ep-sources", (s * 10000 + n) as usize), ph::LIST, if selected { "Hide sources" } else { "Choose source" }).selected(selected).on_click(cx.listener(move |this, _, w, cx| {
                 // The row under the button would start playback.
@@ -594,8 +740,18 @@ impl MovieDetail {
         let mut picker: Option<AnyElement> = None;
         let mut count: Option<String> = None;
         let body = match &self.episodes {
-            Load::Loading => div().flex().flex_col().gap(px(8.)).children((0..5).map(|_| {
-                div().flex().items_center().gap(px(20.)).px(px(16.)).py(px(14.)).child(skeleton(px(32.), px(24.), radius::XS)).child(skeleton(px(160.), px(90.), radius::SM)).child(div().flex_1().flex().flex_col().gap(px(8.)).child(skeleton_line(relative(0.5))).child(skeleton_line(relative(0.2))))
+            Load::Loading => div().flex().flex_col().children((0..5).map(|_| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .px(px(16.))
+                    .py(px(16.))
+                    .border_b_1()
+                    .border_color(Tokens::border())
+                    .child(skeleton(px(28.), px(24.), radius::XS))
+                    .child(skeleton(px(130.), px(73.), radius::XS))
+                    .child(div().flex_1().flex().flex_col().gap(px(8.)).child(skeleton_line(relative(0.5))).child(skeleton_line(relative(0.2))))
             })),
             Load::Failed(e) => div().child(error_view(e.clone()).title("Episodes could not be loaded").compact().retry(cx.listener(|this, _, _, cx| {
                 this.episodes = Load::Loading;
@@ -646,13 +802,17 @@ impl MovieDetail {
                     }
                 };
                 let in_season: Vec<&AnimeEpisode> = v.iter().filter(|e| season_of(e) == current).collect();
-                count = Some(in_season.len().to_string());
+                count = Some(match in_season.len() {
+                    1 => "1 episode".to_string(),
+                    n => format!("{n} episodes"),
+                });
                 let fallback_img = self.details.ready().and_then(background_of);
                 let single = seasons.iter().filter(|s| **s > 0).count() <= 1;
+                let next = self.next();
                 let mut list = div().flex().flex_col();
                 for ep in in_season {
                     let (s, n) = (season_of(ep), ep.number);
-                    list = list.child(self.episode_row(ep, ep.thumbnail.clone().or_else(|| fallback_img.clone()), single, cx));
+                    list = list.child(self.episode_row(ep, ep.thumbnail.clone().or_else(|| fallback_img.clone()), single, (next.season, next.episode) == (s, n), cx));
                     if self.inline && self.sel == Some((s, n)) {
                         if let Some(p) = self.panel(cx) {
                             list = list.child(div().w_full().h(px(440.)).my(px(8.)).child(p));
@@ -665,26 +825,86 @@ impl MovieDetail {
         div()
             .px(px(EDGE))
             .mb(px(40.))
-            .child(div().flex().items_center().gap(px(16.)).mb(px(14.)).child(look::media_section("Episodes", ph::PLAYLIST, count)).child(div().flex_1()).children(picker))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .mb(px(16.))
+                    .child(section_title("Episodes"))
+                    .when_some(count, |d, c| d.child(div().text_size(px(size::MD)).text_color(Tokens::text_3()).child(SharedString::from(c))))
+                    .child(div().flex_1())
+                    .children(picker),
+            )
             .child(body)
     }
 
+    /// "More Like This" as Netflix's card grid: three per row in the modal (more on a wide page),
+    /// landscape art over a `surface_2` card with the meta and a three-line synopsis.
     fn more_like_this(&self, width: f32) -> Option<Div> {
         if self.similar.is_empty() {
             return None;
         }
-        let per = look::per_row(width, 170., 10.);
-        let w = ((width - EDGE * 2.0 - 10.0 * (per as f32 - 1.0)) / per as f32).clamp(140., 220.);
+        let gap = 16.;
+        let cols = if self.modal { 3 } else { look::per_row(width, 260., gap).max(3) };
+        let w = ((width - EDGE * 2.0 - gap * (cols as f32 - 1.0)) / cols as f32).max(160.);
+        let on_open = self.on_open.clone();
         Some(
-            div()
-                .px(px(EDGE))
-                .mb(px(40.))
-                .child(div().mb(px(14.)).child(look::media_section("More Like This", ph::CARDS, None)))
-                .child(div().flex().flex_wrap().gap_x(px(10.)).gap_y(px(20.)).children(self.similar.iter().enumerate().map(|(i, r)| {
-                    let route = Route::MovieDetail { imdb_id: r.imdb_id.clone().unwrap_or_else(|| r.id.clone()), kind: kind_of(r).into(), title: r.title.clone() };
-                    look::poster_card(("similar", i), w, r.cover_url.as_deref().map(look::hi_res), &r.title, r.year.map(|y| y.to_string()).unwrap_or_default(), r.score, r.description.as_deref().map(look::blurb), None)
-                        .on_click(move |_, w, cx| navigate(route.clone(), w, cx))
-                }))),
+            div().px(px(EDGE)).mb(px(40.)).child(section_title("More Like This").mb(px(16.))).child(div().flex().flex_wrap().gap(px(gap)).children(self.similar.iter().enumerate().map(|(i, r)| {
+                let route = Route::MovieDetail { imdb_id: r.imdb_id.clone().unwrap_or_else(|| r.id.clone()), kind: kind_of(r).into(), title: r.title.clone() };
+                let on_open = on_open.clone();
+                let title = SharedString::from(r.title.clone());
+                let art = background_of(r).or_else(|| r.cover_url.as_deref().map(look::hi_res));
+                let blurb = r.description.as_deref().map(look::blurb).filter(|b| !b.is_empty());
+                let group = look::group_of("mlt", ("similar", i));
+                div()
+                    .id(("similar", i))
+                    .group(group.clone())
+                    .flex_none()
+                    .w(px(w))
+                    .flex()
+                    .flex_col()
+                    .rounded(px(radius::XS))
+                    .overflow_hidden()
+                    .bg(Tokens::surface_2())
+                    .role(Role::Link)
+                    .aria_label(title.clone())
+                    .cursor_pointer()
+                    .focus_ring()
+                    .hover(|s| s.bg(Tokens::surface_3()))
+                    .child(
+                        div().relative().w_full().h(px(w * 9. / 16.)).bg(Tokens::surface_3()).when_some(art, |d, u| d.child(look::pic(u))).child(
+                            div().absolute().inset_0().flex().items_center().justify_center().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
+                                div().size(px(40.)).rounded_full().bg(Tokens::glass()).border_1().border_color(Tokens::text_1()).flex().items_center().justify_center().child(icon(ph::INFO.bold(), Tokens::text_1(), isz::MD)),
+                            ),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .p(px(14.))
+                            .child(div().text_size(px(size::LG)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).truncate().child(title))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .text_size(px(14.))
+                                    .text_color(Tokens::text_2())
+                                    .children(look::score(r.score, isz::SM, None))
+                                    .when_some(r.year, |d, y| d.child(SharedString::from(y.to_string())))
+                                    .child(box_tag(if kind_of(r) == "series" { "Series" } else { "Movie" })),
+                            )
+                            .when_some(blurb, |d, b| d.child(div().text_size(px(14.)).line_height(px(20.)).text_color(Tokens::text_2()).line_clamp(3).child(SharedString::from(b)))),
+                    )
+                    .on_click(move |_, w, cx| match &on_open {
+                        Some(f) => f(&route, w, cx),
+                        None => navigate(route.clone(), w, cx),
+                    })
+            }))),
         )
     }
 }
@@ -720,11 +940,14 @@ impl Render for MovieDetail {
             }
         }
 
-        div()
-            .relative()
-            .size_full()
-            .bg(Tokens::base())
-            .child(mv_ui::scroll_page("movie-detail", &self.scroll).child(self.hero(width, cx)).children(self.about()).when(series, |d| d.child(self.episodes(cx))).children(self.more_like_this(width)))
+        div().relative().size_full().bg(Tokens::base()).child(
+            mv_ui::scroll_page("movie-detail", &self.scroll)
+                .child(self.hero(width, cx))
+                .children(self.about())
+                .children(self.sources_below(cx))
+                .when(series, |d| d.child(self.episodes(cx)))
+                .children(self.more_like_this(width)),
+        )
     }
 }
 

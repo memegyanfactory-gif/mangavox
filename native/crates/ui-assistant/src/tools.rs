@@ -59,6 +59,7 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::AnimeDetail { .. } => "anime-detail",
         Route::MoviesHome => "movies",
         Route::MovieDetail { .. } => "movie-detail",
+        Route::Mobile => "mobile",
         Route::Discover => "discover",
         Route::MediaHistory => "media-history",
         Route::Favorites => "favorites",
@@ -80,7 +81,7 @@ pub fn section_name(route: &Route) -> &'static str {
 
 // ── Tool table ───────────────────────────────────────────────────────────────────
 
-pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "settings"];
+pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "mobile", "settings"];
 pub const SETTINGS_TABS: &[&str] = &["providers", "models", "profile", "playback", "sources", "extensions", "addons", "streaming", "storage", "themes", "mode", "about"];
 
 fn obj(properties: Value, required: &[&str]) -> Value {
@@ -187,6 +188,7 @@ pub fn page_title(id: &str) -> String {
         "favorites" => "Favorites",
         "media-history" => "Watch history",
         "studio" => "Studio",
+        "mobile" => "Mobile",
         "settings" => "Settings",
         "" => "the page",
         other => return capitalize(other),
@@ -293,6 +295,7 @@ pub fn route_for_page(page: &str) -> Option<Route> {
         "favorites" => Route::Favorites,
         "media-history" => Route::MediaHistory,
         "studio" => Route::Studio,
+        "mobile" => Route::Mobile,
         "settings" => Route::Settings { tab: None },
         _ => return None,
     })

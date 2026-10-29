@@ -7,11 +7,14 @@ mod addons_panel;
 mod anime_detail;
 mod anime_home;
 mod common;
+mod detail_modal;
 mod discover;
 mod history;
 mod look;
 mod movie_detail;
 mod movies_home;
+mod nfx;
+pub mod remote;
 mod streams;
 
 pub use mv_media::addons::AddonRegistry;

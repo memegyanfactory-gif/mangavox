@@ -201,7 +201,7 @@ phosphor! {
     TAG = "tag", TAG_SIMPLE = "tag-simple", TRAFFIC_CONE = "traffic-cone", BINOCULARS = "binoculars",
     FEATHER = "feather", SHARE_NETWORK = "share-network", CHAT_CIRCLE = "chat-circle",
     CHAT_CIRCLE_DOTS = "chat-circle-dots", CHATS_CIRCLE = "chats-circle", CHAT_TEARDROP = "chat-teardrop",
-    SCAN = "scan", GIT_BRANCH = "git-branch",
+    SCAN = "scan", GIT_BRANCH = "git-branch", QR_CODE = "qr-code",
 
     // vendor-phosphor:end
 }
