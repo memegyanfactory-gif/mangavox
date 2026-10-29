@@ -21,7 +21,7 @@ use mv_ui::{appear, btn, empty_view, glyphs, icon_button, icon_ph, kbd, nav_item
 use crate::keys::{self, Shortcut};
 use crate::palette::{self, Cmd, Palette, Title};
 use crate::prefs::{self, ShellPrefs, DOCK_MAX, DOCK_MIN};
-use crate::routes::{is_detail, is_focus, keep_alive, nav_for, nav_label, Section, SECTIONS};
+use crate::routes::{is_detail, is_focus, is_workspace, keep_alive, nav_for, nav_label, Section, SECTIONS};
 use crate::updates;
 
 /// Fluent NavigationView: the expanded pane needs 1008px; below it the sidebar is a rail.
@@ -230,6 +230,7 @@ impl Shell {
             .or_else(|| ui_settings::open(route, window, cx))
             .or_else(|| ui_studio::open(route, window, cx))
             .or_else(|| ui_phone::open(route, window, cx))
+            .or_else(|| ui_youtube::open(route, window, cx))
             .or_else(|| ui_welcome::open(route, window, cx))
             .unwrap_or_else(|| {
                 let title = route_title(route).into();
@@ -259,7 +260,7 @@ impl Shell {
             if let Some(s) = SECTIONS.into_iter().find(|s| nav_label(*s, &route).is_some()) {
                 // Studio and Settings belong to no section, so Back from the destination still
                 // leads to them ("Open Library" in Studio, then Back).
-                let carry = matches!(self.route, Route::Studio | Route::Mobile | Route::Settings { .. }).then(|| self.current_entry()).filter(|e| e.view.is_some());
+                let carry = (is_workspace(&self.route) || matches!(self.route, Route::Mobile | Route::Settings { .. })).then(|| self.current_entry()).filter(|e| e.view.is_some());
                 self.set_section(s, window, cx);
                 if self.already_there(&route) {
                     // The section opened on the destination itself (its home, or the page it was
@@ -448,7 +449,7 @@ impl Shell {
     /// the wide Studio page the 60px rail, restoring the user's own sidebar state afterwards.
     fn sync_back(&mut self, cx: &mut App) {
         set_back_target(cx, self.back_route());
-        if self.route == Route::Studio {
+        if is_workspace(&self.route) {
             if self.saved_collapsed.is_none() {
                 self.saved_collapsed = Some(self.collapsed);
                 self.collapsed = true;
@@ -480,7 +481,7 @@ impl Shell {
         let mut history = std::mem::take(&mut self.history);
         let mut forward = std::mem::take(&mut self.forward);
         let parked = loop {
-            if !matches!(route, Route::Player { .. } | Route::Settings { .. } | Route::Studio | Route::Mobile) {
+            if !matches!(route, Route::Player { .. } | Route::Settings { .. } | Route::Mobile) && !is_workspace(&route) {
                 break true;
             }
             forward.clear();
@@ -529,7 +530,7 @@ impl Shell {
     /// <https://www.nngroup.com/articles/navigation-you-are-here/>).
     fn nav_owner(&self) -> Option<Route> {
         let dest = nav_for(self.section);
-        let is_dest = |r: &Route| matches!(r, Route::Studio | Route::Mobile) || dest.iter().any(|e| &e.route == r);
+        let is_dest = |r: &Route| is_workspace(r) || matches!(r, Route::Mobile) || dest.iter().any(|e| &e.route == r);
         if is_dest(&self.route) {
             return Some(self.route.clone());
         }
@@ -573,6 +574,7 @@ impl Shell {
             },
             Route::Studio => vec![here("Studio")],
             Route::Mobile => vec![here("Mobile")],
+            Route::YouTube => vec![here("YouTube")],
             Route::Reader { manga_id, chapter_id } => vec![
                 section_crumb,
                 link(self.manga_names.get(manga_id).cloned().unwrap_or_else(|| "Manga".into()), CrumbTo::Manga(manga_id.clone())).loading(self.looking_up.contains(manga_id)),
@@ -584,6 +586,7 @@ impl Shell {
                     let owner = self.nav_owner().filter(|o| o != r);
                     let mut v = match &owner {
                         Some(Route::Studio) => vec![link("Studio".into(), CrumbTo::Up(Route::Studio))],
+                        Some(Route::YouTube) => vec![link("YouTube".into(), CrumbTo::Up(Route::YouTube))],
                         Some(o) => vec![section_crumb, link(nav_label(sec, o).unwrap_or("Back").into(), CrumbTo::Up(o.clone()))],
                         None => vec![section_crumb],
                     };
@@ -680,11 +683,11 @@ impl Shell {
     fn mode_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !mv_ui::mode::studio_enabled(cx) {
             self.dock_open = false;
-            if self.route == Route::Studio {
+            if is_workspace(&self.route) {
                 let home = self.section.home();
                 self.go(home, window, cx);
             }
-            let not_studio = |e: &Entry| e.route != Route::Studio;
+            let not_studio = |e: &Entry| !is_workspace(&e.route);
             self.history.retain(not_studio);
             self.forward.retain(not_studio);
             for p in self.parked.values_mut() {
@@ -717,7 +720,7 @@ impl Shell {
     }
 
     fn dock_allowed(&self, cx: &App) -> bool {
-        mv_ui::mode::studio_enabled(cx) && !is_focus(&self.route) && self.route != Route::Studio
+        mv_ui::mode::studio_enabled(cx) && !is_focus(&self.route) && !is_workspace(&self.route)
     }
 
     fn toggle_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1015,7 +1018,7 @@ impl Shell {
             icon_button("assistant", glyphs::ASSISTANT, if self.dock_open { "Close assistant" } else { "Open assistant" })
                 .selected(self.dock_open && allowed)
                 .kbd(Shortcut::Assistant.keys())
-                .when(!allowed, |b| b.disabled("Studio has its own assistant panel"))
+                .when(!allowed, |b| b.disabled("This page has its own assistant panel"))
                 .occlude()
                 .on_click(cx.listener(|this, _, w, cx| this.toggle_dock(w, cx)))
         });
@@ -1158,12 +1161,14 @@ impl Shell {
 
         let studio = mv_ui::mode::studio_enabled(cx).then(|| {
             let active = owner.as_ref() == Some(&Route::Studio);
+            let yt_active = owner.as_ref() == Some(&Route::YouTube);
             div()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
                 .map(|d| if rail { d.pt(px(10.)).border_t_1().border_color(Tokens::border()) } else { d.child(section_label("Studio").px(px(10.))) })
                 .child(nav_item("nav-studio", glyphs::STUDIO, "Studio", active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Studio, w, cx))))
+                .child(nav_item("nav-youtube", glyphs::YOUTUBE, "YouTube", yt_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::YouTube, w, cx))))
         });
 
         let settings = nav_item("nav-settings", glyphs::SETTINGS, "Settings", matches!(self.route, Route::Settings { .. }), rail)
@@ -1395,6 +1400,7 @@ fn route_title(route: &Route) -> &'static str {
         Route::Player { .. } => "Player",
         Route::Studio => "Studio",
         Route::Mobile => "Mobile",
+        Route::YouTube => "YouTube",
         Route::Settings { .. } => "Settings",
         Route::Welcome => "Welcome",
         _ => "MangaVox",
@@ -1540,5 +1546,6 @@ mod tests {
         }
         assert_eq!(route_title(&Route::Studio), "Studio");
         assert_eq!(route_title(&Route::Mobile), "Mobile");
+        assert_eq!(route_title(&Route::YouTube), "YouTube");
     }
 }

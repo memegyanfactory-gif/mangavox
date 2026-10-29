@@ -5412,6 +5412,7 @@ dependencies = [
  "ui-settings",
  "ui-studio",
  "ui-welcome",
+ "ui-youtube",
  "windows-sys 0.60.2",
  "winresource",
 ]
@@ -5860,6 +5861,25 @@ dependencies = [
  "tao",
  "tokio",
  "wry",
+]
+
+[[package]]
+name = "mv-youtube"
+version = "8.0.5004"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "mv-ai",
+ "mv-core",
+ "rand 0.8.8",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -9790,6 +9810,7 @@ dependencies = [
  "mv-core",
  "mv-media",
  "mv-ui",
+ "mv-youtube",
  "serde",
  "serde_json",
  "sysinfo",
@@ -9947,6 +9968,24 @@ dependencies = [
  "sysinfo",
  "ui-manga",
  "ui-media",
+]
+
+[[package]]
+name = "ui-youtube"
+version = "8.0.5004"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "gpui-kit",
+ "mv-ai",
+ "mv-core",
+ "mv-recap",
+ "mv-ui",
+ "mv-youtube",
+ "serde_json",
+ "ui-assistant",
+ "ui-studio",
 ]
 
 [[package]]

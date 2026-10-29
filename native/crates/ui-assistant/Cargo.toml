@@ -9,6 +9,7 @@ mv-ui = { path = "../mv-ui" }
 mv-ai = { path = "../mv-ai" }
 mv-core = { path = "../mv-core" }
 mv-media = { path = "../mv-media" }
+mv-youtube = { path = "../mv-youtube" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -133,7 +133,10 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
     if c.studio {
         out.push(Group {
             heading: "Studio".into(),
-            rows: vec![row("Studio", glyphs::STUDIO, Cmd::Go(Route::Studio)).keys(["recap", "video", "narrate", "project"]).current(*c.route == Route::Studio)],
+            rows: vec![
+                row("Studio", glyphs::STUDIO, Cmd::Go(Route::Studio)).keys(["recap", "video", "narrate", "project"]).current(*c.route == Route::Studio),
+                row("YouTube", glyphs::YOUTUBE, Cmd::Go(Route::YouTube)).keys(["upload", "schedule", "channel", "analytics", "seo"]).current(*c.route == Route::YouTube),
+            ],
         });
     }
 

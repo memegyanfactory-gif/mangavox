@@ -113,6 +113,10 @@ fn main() {
             ui_media::warm_up();
         }
         ui_settings::start_cli_update_checks(cx);
+        // Channel refresh and the smart-upload dip automation, when YouTube is connected.
+        if mv_ui::mode::studio_enabled(cx) {
+            ui_youtube::start(cx);
+        }
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         let main = gpui_kit::open_window(
             WindowOptions {

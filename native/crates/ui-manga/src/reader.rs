@@ -4,7 +4,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::DropdownMenu as _;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::chapter::{self, Chapter};
@@ -15,11 +17,13 @@ use mv_ui::{
     RampExt, Route, Tokens, Tone, Weight,
 };
 
+use mv_ui::Interactive as _;
+
 use crate::backend;
 use crate::downloads::{downloads, ChapterDl, Downloads, Job};
 use crate::logic::{self, Fit, ReaderMode};
 use crate::store;
-use crate::ui::{fill_menu, icon_trigger, Entry, Load};
+use crate::ui::{fill_menu, icon_trigger, menu_trigger, Entry, Load};
 
 const MAX_INFLIGHT: usize = 3;
 const STRIP_WIDTH: f32 = 860.0;
@@ -33,6 +37,10 @@ const EDGE_BOTTOM: f32 = 140.0;
 /// Paged-mode zoom range and button step.
 const MAX_ZOOM: f32 = 4.0;
 const ZOOM_STEP: f32 = 1.25;
+/// Auto-scroll frame time (about 60 fps, smooth enough for a slow strip scroll).
+const AUTO_FRAME: Duration = Duration::from_millis(16);
+/// Auto-scroll waits this long at the end of a strip or a tall page before moving on.
+const AUTO_END_HOLD: f32 = 1.5;
 
 #[derive(Clone)]
 enum PageState {
@@ -149,6 +157,9 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("end", "Last page"),
     ("n", "Next chapter"),
     ("p", "Previous chapter"),
+    ("a", "Start or stop auto-scroll"),
+    ("[", "Auto-scroll slower"),
+    ("]", "Auto-scroll faster"),
     ("m", "Change reading mode"),
     ("f", "Change page fit"),
     ("=", "Zoom in (or Ctrl + mouse wheel, or double-click the middle)"),
@@ -200,6 +211,15 @@ pub struct ReaderPage {
     queue: Entity<Downloads>,
     /// The open chapter was queued or downloading at the last queue change.
     dl_pending: bool,
+    /// Auto-scroll is on: the strip (or a tall page) scrolls by itself and pages turn on a timer.
+    auto: bool,
+    /// Seconds per screen (long strip, tall pages) or per page (paged modes).
+    auto_secs: f32,
+    auto_task: Option<Task<()>>,
+    /// Paged: time on the current page; strip: time held at the end of the chapter.
+    auto_elapsed: f32,
+    /// The custom timer field, while it is open.
+    auto_custom: Option<(Entity<InputState>, Subscription)>,
     _watch: Subscription,
 }
 
@@ -247,6 +267,11 @@ impl ReaderPage {
             focus_inside: false,
             queue,
             dl_pending: false,
+            auto: false,
+            auto_secs: backend::config_str("readerAutoScrollSecs").and_then(|s| logic::parse_auto_secs(&s)).unwrap_or(logic::AUTO_DEFAULT),
+            auto_task: None,
+            auto_elapsed: 0.,
+            auto_custom: None,
             _watch: watch,
         };
         p.open_chapter(chapter_id, false, cx);
@@ -563,6 +588,219 @@ impl ReaderPage {
         self.set_zoom(if z < 1.05 { 1. } else { z }, anchor, cx);
     }
 
+    // ------------------------------------------------------------ auto-scroll
+
+    fn toggle_auto(&mut self, cx: &mut Context<Self>) {
+        if self.auto {
+            self.stop_auto(None, cx);
+        } else {
+            self.start_auto(cx);
+        }
+    }
+
+    fn start_auto(&mut self, cx: &mut Context<Self>) {
+        if self.auto {
+            return;
+        }
+        self.auto = true;
+        self.auto_elapsed = 0.;
+        // Reading starts: the bars get out of the way.
+        self.hide_overlay(cx);
+        self.auto_task = Some(cx.spawn(async move |this, cx| {
+            let mut last = Instant::now();
+            loop {
+                cx.background_executor().timer(AUTO_FRAME).await;
+                let now = Instant::now();
+                // A stalled frame (window dragged, PC busy) must not jump a whole screen.
+                let dt = now.duration_since(last).as_secs_f32().min(0.1);
+                last = now;
+                if this.update(cx, |t, cx| t.auto_tick(dt, cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn stop_auto(&mut self, reason: Option<&str>, cx: &mut Context<Self>) {
+        self.auto = false;
+        self.auto_task = None;
+        self.auto_elapsed = 0.;
+        if let Some(r) = reason {
+            mv_ui::toast::show(cx, mv_ui::toast::Toast::info(r.to_string()).icon(ph::PAUSE_CIRCLE));
+        }
+        cx.notify();
+    }
+
+    fn set_auto_secs(&mut self, secs: f32, cx: &mut Context<Self>) {
+        self.auto_secs = logic::clamp_auto_secs(secs);
+        self.auto_elapsed = self.auto_elapsed.min(self.auto_secs);
+        backend::set_config_str("readerAutoScrollSecs", &self.auto_secs.to_string());
+        cx.notify();
+    }
+
+    /// Opens the field for a timer of your own (seconds, or minutes:seconds).
+    fn open_custom_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.auto_secs.to_string();
+        let input = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("Seconds, e.g. 6 or 1:30");
+            s.set_value(current, window, cx);
+            s
+        });
+        let sub = cx.subscribe_in(&input, window, |this: &mut Self, _, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                this.apply_custom_timer(window, cx);
+            }
+        });
+        window.focus(&input.focus_handle(cx), cx);
+        self.auto_custom = Some((input, sub));
+        self.show_overlay(cx);
+        cx.notify();
+    }
+
+    fn close_custom_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.auto_custom = None;
+        self.refocus(window, cx);
+        cx.notify();
+    }
+
+    fn apply_custom_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((input, _)) = &self.auto_custom else { return };
+        let text = input.read(cx).value().to_string();
+        match logic::parse_auto_secs(&text) {
+            Some(s) => {
+                self.close_custom_timer(window, cx);
+                self.set_auto_secs(s, cx);
+                self.start_auto(cx);
+            }
+            None => mv_ui::toast::show(cx, mv_ui::toast::Toast::warning("Type a time in seconds, like 6, 7.5 or 1:30")),
+        }
+    }
+
+    /// Something else has the reader's attention: the timer waits.
+    fn auto_paused(&self) -> bool {
+        self.dragging || self.menu_open || self.show_keys || self.auto_custom.is_some() || self.pan.is_some() || !matches!(self.pages, Load::Ready(_)) || (!self.strip() && self.zoom > 1.)
+    }
+
+    /// One auto-scroll frame. Long strip: one screen per `auto_secs`, then on to the next
+    /// chapter. Paged: a page taller than the window scrolls the same way first; a page that fits
+    /// turns after `auto_secs`.
+    fn auto_tick(&mut self, dt: f32, cx: &mut Context<Self>) {
+        if self.auto_paused() {
+            return;
+        }
+        let strip = self.strip();
+        let handle = if strip { self.strip_scroll.clone() } else { self.page_scroll.clone() };
+        let h = f32::from(handle.bounds().size.height);
+        let max = f32::from(handle.max_offset().y);
+        let y = -f32::from(handle.offset().y);
+        let scrolls = (strip || self.transition.is_none()) && max > 1. && h > 0.;
+        if scrolls && y < max - 0.5 {
+            let o = handle.offset();
+            let ny = (y + logic::auto_step(h, self.auto_secs, dt)).min(max);
+            handle.set_offset(point(o.x, px(-ny)));
+            if strip {
+                self.sync_strip_page(cx);
+            }
+            cx.notify();
+            return;
+        }
+        // At the end of the strip or the page: wait, then move on.
+        self.auto_elapsed += dt;
+        let wait = if scrolls { AUTO_END_HOLD.min(self.auto_secs) } else if strip { AUTO_END_HOLD } else { self.auto_secs };
+        if self.auto_elapsed < wait {
+            if !strip {
+                // the countdown line under the page
+                cx.notify();
+            }
+            return;
+        }
+        self.auto_elapsed = 0.;
+        if strip || self.transition == Some(1) {
+            if !self.step_chapter(1, cx) {
+                self.stop_auto(Some("Auto-scroll stopped: this is the last chapter"), cx);
+            }
+            return;
+        }
+        self.next(cx);
+    }
+
+    fn auto_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.auto;
+        let secs = self.auto_secs;
+        let unit = if self.strip() { "per screen" } else { "per page" };
+        let toggle = icon_button("auto-scroll", if on { ph::PAUSE } else { ph::PLAY }, if on { "Stop auto-scroll" } else { "Auto-scroll" }).small().selected(on).kbd("a").on_click(cx.listener(|this, _, w, cx| {
+            this.refocus(w, cx);
+            this.toggle_auto(cx);
+        }));
+        let weak = cx.entity().downgrade();
+        let mut entries: Vec<Entry> = vec![Entry::Heading(format!("Auto-scroll timer · {unit}").into())];
+        for (name, p) in ["Fast", "Quick", "Normal", "Relaxed", "Slow"].into_iter().zip(logic::AUTO_PRESETS) {
+            let w = weak.clone();
+            entries.push(
+                Entry::new(name, move |window, cx| {
+                    let _ = w.update(cx, |t, cx| {
+                        t.set_auto_secs(p, cx);
+                        t.refocus(window, cx);
+                        t.start_auto(cx);
+                    });
+                })
+                .hint(logic::fmt_auto_secs(p))
+                .checked((secs - p).abs() < 0.01),
+            );
+        }
+        let custom = !logic::AUTO_PRESETS.iter().any(|p| (secs - p).abs() < 0.01);
+        let w = weak.clone();
+        entries.push(Entry::Separator);
+        let custom_entry = Entry::new("Custom timer…", move |window, cx| {
+            let _ = w.update(cx, |t, cx| t.open_custom_timer(window, cx));
+        })
+        .checked(custom);
+        entries.push(if custom { custom_entry.hint(logic::fmt_auto_secs(secs)) } else { custom_entry });
+        let w = cx.entity().downgrade();
+        let accent = if on { Tokens::accent() } else { Tokens::text_2() };
+        let menu = menu_trigger(
+            div()
+                .id("auto-speed")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(4.))
+                .h(px(28.))
+                .px(px(8.))
+                .rounded(px(radius::MD))
+                .text_size(px(size::SM))
+                .text_color(accent)
+                .hover(|s| s.bg(Tokens::hover()))
+                .pressable()
+                .child(icon_ph(ph::TIMER, accent, icon_px::SM))
+                .child(logic::fmt_auto_secs(secs))
+                .child(icon_ph(ph::CARET_UP, Tokens::text_3(), icon_px::XS)),
+            format!("Auto-scroll timer: {} {unit}", logic::fmt_auto_secs(secs)),
+        )
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| fill_menu(menu.min_w(px(240.)), &entries))
+        .on_open_change(move |open, window, cx| {
+            let _ = w.update(cx, |t, cx| {
+                t.menu_open = *open;
+                if *open {
+                    t.show_overlay(cx);
+                } else if t.auto_custom.is_none() {
+                    t.refocus(window, cx);
+                }
+            });
+        });
+        let field = self.auto_custom.as_ref().map(|(input, _)| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(div().w(px(150.)).child(Input::new(input).small()))
+                .child(btn("auto-custom-ok", "Set", ButtonKind::Primary).small().on_click(cx.listener(|this, _, w, cx| this.apply_custom_timer(w, cx))))
+                .child(icon_button("auto-custom-x", ph::X, "Cancel").small().on_click(cx.listener(|this, _, w, cx| this.close_custom_timer(w, cx))))
+        });
+        div().flex().items_center().gap(px(2.)).child(toggle).child(menu).children(field)
+    }
+
     // ------------------------------------------------------------ overlay
 
     fn show_overlay(&mut self, cx: &mut Context<Self>) {
@@ -576,7 +814,7 @@ impl ReaderPage {
                 cx.background_executor().timer(Duration::from_millis(400)).await;
                 let done = this
                     .update(cx, |t, cx| {
-                        let keep = t.over_bars || t.dragging || t.show_keys || t.menu_open || t.focus_inside || !matches!(t.pages, Load::Ready(_)) || t.transition.is_some();
+                        let keep = t.over_bars || t.dragging || t.show_keys || t.menu_open || t.focus_inside || t.auto_custom.is_some() || !matches!(t.pages, Load::Ready(_)) || t.transition.is_some();
                         if keep {
                             t.last_activity = Instant::now();
                         }
@@ -708,6 +946,9 @@ impl ReaderPage {
             "left" | "pageup" | "up" => self.prev(cx),
             "home" => self.jump(0, cx),
             "end" => self.jump(self.total().saturating_sub(1), cx),
+            "a" => self.toggle_auto(cx),
+            "[" => self.set_auto_secs(logic::auto_nudge(self.auto_secs, -1), cx),
+            "]" => self.set_auto_secs(logic::auto_nudge(self.auto_secs, 1), cx),
             "m" => {
                 let i = ReaderMode::ALL.iter().position(|m| *m == self.mode).unwrap_or(0);
                 self.set_mode(ReaderMode::ALL[(i + 1) % ReaderMode::ALL.len()], cx);
@@ -1204,6 +1445,7 @@ impl ReaderPage {
                                     })),
                                 )
                             })
+                            .child(self.auto_control(cx))
                             .child(div().flex_1())
                             .children(zoom_group),
                     ),
@@ -1454,6 +1696,11 @@ impl Render for ReaderPage {
             .when(overlay, |d| d.child(self.top_bar(window, cx)).child(self.bottom_bar(cx)))
             // With the overlay hidden a small back button stays in the corner for mouse users.
             .when(!overlay, |d| d.child(div().absolute().top(px(10.)).left(px(10.)).opacity(0.55).hover(|s| s.opacity(1.)).rounded(px(radius::MD)).bg(Tokens::glass()).child(back_button("reader-back-mini", false))))
+            // Paged auto-scroll: a thin line along the bottom fills up until the page turns.
+            .when(self.auto && !strip && matches!(self.pages, Load::Ready(_)), |d| {
+                let f = (self.auto_elapsed / self.auto_secs.max(0.1)).clamp(0., 1.);
+                d.child(div().absolute().bottom_0().left_0().right_0().h(px(3.)).bg(Tokens::track()).child(div().h_full().w(relative(f)).bg(Tokens::accent())))
+            })
             .when(self.show_keys, |d| d.child(self.keys_panel(cx)))
     }
 }

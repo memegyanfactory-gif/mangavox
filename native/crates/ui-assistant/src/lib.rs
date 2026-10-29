@@ -14,6 +14,7 @@ pub mod store;
 pub mod tools;
 mod ui;
 mod usage_meter;
+mod youtube;
 
 pub use agent::set_studio_context;
 pub use picker::ModelPicker;

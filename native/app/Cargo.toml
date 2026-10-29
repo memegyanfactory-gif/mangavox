@@ -16,6 +16,7 @@ ui-assistant = { path = "../crates/ui-assistant" }
 ui-settings = { path = "../crates/ui-settings" }
 ui-studio = { path = "../crates/ui-studio" }
 ui-phone = { path = "../crates/ui-phone" }
+ui-youtube = { path = "../crates/ui-youtube" }
 ui-welcome = { path = "../crates/ui-welcome" }
 mv-net = { path = "../crates/mv-net" }
 mv-update = { path = "../crates/mv-update" }

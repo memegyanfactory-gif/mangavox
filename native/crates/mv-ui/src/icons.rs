@@ -202,6 +202,7 @@ phosphor! {
     FEATHER = "feather", SHARE_NETWORK = "share-network", CHAT_CIRCLE = "chat-circle",
     CHAT_CIRCLE_DOTS = "chat-circle-dots", CHATS_CIRCLE = "chats-circle", CHAT_TEARDROP = "chat-teardrop",
     SCAN = "scan", GIT_BRANCH = "git-branch", QR_CODE = "qr-code",
+    YOUTUBE_LOGO = "youtube-logo", TREND_UP = "trend-up", TREND_DOWN = "trend-down", HASH = "hash",
 
     // vendor-phosphor:end
 }
@@ -228,6 +229,7 @@ pub mod glyphs {
     pub const ANIME: Ph = ph::TELEVISION_SIMPLE;
     pub const MOVIES: Ph = ph::FILM_SLATE;
     pub const STUDIO: Ph = ph::MAGIC_WAND;
+    pub const YOUTUBE: Ph = ph::YOUTUBE_LOGO;
     pub const ASSISTANT: Ph = ph::SPARKLE;
     pub const SOURCES: Ph = ph::PUZZLE_PIECE;
     pub const SETTINGS: Ph = ph::GEAR_SIX;

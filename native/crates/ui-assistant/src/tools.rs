@@ -65,6 +65,7 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::Favorites => "favorites",
         Route::Player { .. } => "player",
         Route::Studio => "studio",
+        Route::YouTube => "youtube",
         Route::Settings { .. } => "settings",
         Route::Welcome => "welcome",
         Route::Back => "back",
@@ -81,7 +82,7 @@ pub fn section_name(route: &Route) -> &'static str {
 
 // ── Tool table ───────────────────────────────────────────────────────────────────
 
-pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "mobile", "settings"];
+pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "youtube", "mobile", "settings"];
 pub const SETTINGS_TABS: &[&str] = &["providers", "models", "profile", "playback", "sources", "extensions", "addons", "streaming", "storage", "themes", "mode", "about"];
 
 fn obj(properties: Value, required: &[&str]) -> Value {
@@ -146,6 +147,30 @@ pub fn app_tools() -> Vec<AppTool> {
             obj(json!({ "title": s("Title to play"), "category": s_enum("Kind", &["anime", "movie", "series"]) }), &["title"]),
             Risk::Act,
         ),
+        t(
+            "youtube_channel",
+            "The connected YouTube channel: subscribers, views in the last 28 days, the newest videos with views and trend (rising/steady/dipping), the upload queue with release times, and growth suggestions.".into(),
+            obj(json!({}), &[]),
+            Risk::Read,
+        ),
+        t(
+            "youtube_video",
+            "One YouTube video's title, description, tags, numbers, views per day since release and its SEO checklist. Pass the id from youtube_channel.".into(),
+            obj(json!({ "id": s("Video id") }), &["id"]),
+            Risk::Read,
+        ),
+        t(
+            "youtube_update_video",
+            "Change a live YouTube video's title, description and/or tags (only the fields given). Use to apply better SEO the user agreed to.".into(),
+            obj(json!({ "id": s("Video id"), "title": s("New title (max 100 chars)"), "description": s("New description"), "tags": s("Comma-separated tags") }), &["id"]),
+            Risk::Act,
+        ),
+        t(
+            "youtube_schedule",
+            "Set when a video goes public: a queued upload (queue item id) or a private video on YouTube (video id). `at` is local time \"YYYY-MM-DD HH:MM\". Keep each series in chapter order.".into(),
+            obj(json!({ "id": s("Queue item id or video id"), "at": s("Local time YYYY-MM-DD HH:MM") }), &["id", "at"]),
+            Risk::Act,
+        ),
     ]
 }
 
@@ -189,6 +214,7 @@ pub fn page_title(id: &str) -> String {
         "media-history" => "Watch history",
         "studio" => "Studio",
         "mobile" => "Mobile",
+        "youtube" => "YouTube",
         "settings" => "Settings",
         "" => "the page",
         other => return capitalize(other),
@@ -236,6 +262,10 @@ pub fn phrases(name: &str, args: &Map<String, Value>) -> Phrases {
         "open_movie" => p("Open", "Opening", "Opened", &titled("title", "the movie")),
         "open_manga" => p("Open", "Opening", "Opened", &titled("title", "the manga")),
         "play_title" => p("Open", "Opening", "Opened", &titled("title", "the title")),
+        "youtube_channel" => p("Read", "Reading", "Read", "your YouTube channel"),
+        "youtube_video" => p("Read", "Reading", "Read", "the video's details"),
+        "youtube_update_video" => p("Update", "Updating", "Updated", &titled("title", "the video on YouTube")),
+        "youtube_schedule" => p("Schedule the video for", "Scheduling the video for", "Scheduled the video for", a("at")),
         other => p("Run", "Running", "Ran", other),
     }
 }
@@ -296,6 +326,7 @@ pub fn route_for_page(page: &str) -> Option<Route> {
         "media-history" => Route::MediaHistory,
         "studio" => Route::Studio,
         "mobile" => Route::Mobile,
+        "youtube" => Route::YouTube,
         "settings" => Route::Settings { tab: None },
         _ => return None,
     })
@@ -457,6 +488,7 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
                 json!({ "ok": true, "opened": hit.title, "note": "Opened the title page; the user presses play there." }),
             )
         }
+        name if name.starts_with("youtube_") => crate::youtube::execute(name, args).await.map(ToolOutput::Value),
         other => Err(format!("Unknown tool {other}")),
     }
 }

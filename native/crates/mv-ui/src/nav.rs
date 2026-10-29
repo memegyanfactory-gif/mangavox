@@ -28,6 +28,8 @@ pub enum Route {
     Studio,
     // Phone companion (QR pairing, see ui-phone)
     Mobile,
+    /// Channel dashboard, uploads, scheduler and insights for the connected YouTube channel.
+    YouTube,
     // App
     Settings { tab: Option<String> },
     /// First-run setup (full window; also "Run welcome setup again" in Settings › About).

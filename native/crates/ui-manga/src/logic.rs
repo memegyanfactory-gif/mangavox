@@ -491,9 +491,85 @@ pub fn tap_zone(x: f32, width: f32, mode: ReaderMode) -> i32 {
     }
 }
 
+/// Auto-scroll timer presets: seconds per screen (long strip) or per page (paged modes).
+pub const AUTO_PRESETS: [f32; 5] = [3., 5., 8., 12., 20.];
+/// The default auto-scroll timer.
+pub const AUTO_DEFAULT: f32 = 8.;
+
+/// A custom timer kept to 1 second .. 5 minutes.
+pub fn clamp_auto_secs(s: f32) -> f32 {
+    if s.is_finite() {
+        s.clamp(1., 300.)
+    } else {
+        AUTO_DEFAULT
+    }
+}
+
+/// A typed timer: "7", "7s", "7.5 sec", "1:30" (minutes:seconds). None when it is not a time.
+pub fn parse_auto_secs(text: &str) -> Option<f32> {
+    let t = text.trim().to_lowercase();
+    let t = t.trim_end_matches("seconds").trim_end_matches("second").trim_end_matches("secs").trim_end_matches("sec").trim_end_matches('s').trim();
+    let secs = match t.split_once(':') {
+        Some((m, s)) => m.trim().parse::<f32>().ok()? * 60. + s.trim().parse::<f32>().ok()?,
+        None => t.parse::<f32>().ok()?,
+    };
+    (secs > 0. && secs.is_finite()).then(|| clamp_auto_secs(secs))
+}
+
+/// "8 s", "1.5 s", "1:30" for the timer button and menu.
+pub fn fmt_auto_secs(s: f32) -> String {
+    if s >= 60. {
+        format!("{}:{:02}", (s / 60.) as u32, (s % 60.).round() as u32)
+    } else if s.fract() == 0. {
+        format!("{} s", s as u32)
+    } else {
+        format!("{s:.1} s")
+    }
+}
+
+/// How far a long strip moves in `dt` seconds so one screen (`viewport` px) takes `secs`.
+pub fn auto_step(viewport: f32, secs: f32, dt: f32) -> f32 {
+    if secs <= 0. {
+        return 0.;
+    }
+    viewport * dt / secs
+}
+
+/// One step slower (`dir` < 0, a longer timer) or faster through the presets; a custom timer
+/// moves to the nearest preset in that direction.
+pub fn auto_nudge(secs: f32, dir: i32) -> f32 {
+    if dir < 0 {
+        AUTO_PRESETS.iter().copied().find(|p| *p > secs + 0.01).unwrap_or(AUTO_PRESETS[AUTO_PRESETS.len() - 1].max(secs))
+    } else {
+        AUTO_PRESETS.iter().rev().copied().find(|p| *p < secs - 0.01).unwrap_or(AUTO_PRESETS[0].min(secs))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_scroll_timer() {
+        assert_eq!(parse_auto_secs("7"), Some(7.));
+        assert_eq!(parse_auto_secs(" 7.5 s"), Some(7.5));
+        assert_eq!(parse_auto_secs("10 sec"), Some(10.));
+        assert_eq!(parse_auto_secs("1:30"), Some(90.));
+        assert_eq!(parse_auto_secs("0"), None);
+        assert_eq!(parse_auto_secs("fast"), None);
+        assert_eq!(parse_auto_secs("0.2"), Some(1.));
+        assert_eq!(parse_auto_secs("900"), Some(300.));
+        assert_eq!(fmt_auto_secs(8.), "8 s");
+        assert_eq!(fmt_auto_secs(2.5), "2.5 s");
+        assert_eq!(fmt_auto_secs(90.), "1:30");
+        assert_eq!(auto_step(800., 8., 0.5), 50.);
+        assert_eq!(auto_nudge(8., 1), 5.);
+        assert_eq!(auto_nudge(8., -1), 12.);
+        assert_eq!(auto_nudge(3., 1), 3.);
+        assert_eq!(auto_nudge(20., -1), 20.);
+        assert_eq!(auto_nudge(6.5, 1), 5.);
+        assert_eq!(auto_nudge(45., -1), 45.);
+    }
 
     fn manga(title: &str, status: Option<&str>, fav: bool, added: &str, read: Option<&str>) -> Manga {
         Manga {

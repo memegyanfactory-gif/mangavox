@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["app", "crates/mv-core", "crates/mv-net", "crates/mv-sources", "crates/mv-plugins", "crates/mv-media", "crates/mv-ai", "crates/mv-torrent", "crates/mv-ui", "crates/mv-webwall", "crates/mv-studio", "crates/ui-manga", "crates/ui-media", "crates/ui-player", "crates/ui-assistant", "crates/ui-settings", "crates/ui-studio", "crates/ui-phone", "crates/ui-welcome", "crates/mv-recap", "crates/mv-score", "crates/mv-update", "setup"]
+members = ["app", "crates/mv-core", "crates/mv-net", "crates/mv-sources", "crates/mv-plugins", "crates/mv-media", "crates/mv-ai", "crates/mv-torrent", "crates/mv-ui", "crates/mv-webwall", "crates/mv-studio", "crates/ui-manga", "crates/ui-media", "crates/ui-player", "crates/ui-assistant", "crates/ui-settings", "crates/ui-studio", "crates/ui-phone", "crates/ui-welcome", "crates/mv-recap", "crates/mv-score", "crates/mv-update", "crates/mv-youtube", "crates/ui-youtube", "setup"]
 
 [workspace.package]
 edition = "2021"

@@ -93,6 +93,12 @@ pub fn nav_label(section: Section, route: &Route) -> Option<&'static str> {
     nav_for(section).into_iter().find(|e| &e.route == route).map(|e| e.label)
 }
 
+/// Studio and YouTube: wide pages of their own (no section, the 60px rail, their own assistant
+/// panel), shown only in Studio mode.
+pub fn is_workspace(route: &Route) -> bool {
+    matches!(route, Route::Studio | Route::YouTube)
+}
+
 /// Full-screen routes hide the sidebar and dock (the welcome setup fills the window too).
 pub fn is_focus(route: &Route) -> bool {
     matches!(route, Route::Reader { .. } | Route::Player { .. } | Route::Welcome)
@@ -131,6 +137,16 @@ mod tests {
         for s in SECTIONS {
             for e in nav_for(s) {
                 assert!(!is_detail(&e.route) && !is_focus(&e.route), "{}", e.label);
+            }
+        }
+    }
+
+    #[test]
+    fn studio_and_youtube_are_workspaces() {
+        assert!(is_workspace(&Route::Studio) && is_workspace(&Route::YouTube));
+        for s in SECTIONS {
+            for e in nav_for(s) {
+                assert!(!is_workspace(&e.route), "{}", e.label);
             }
         }
     }
