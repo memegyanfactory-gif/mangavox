@@ -294,9 +294,10 @@ fn outcome(res: &anyhow::Result<()>, cancel: &CancellationToken) -> Outcome {
     }
 }
 
-/// Generate's Read step: reads one chapter (continuing where an earlier read stopped) and saves
-/// its transcript, shown in Activity like any read. Returns when it ended.
-pub async fn read_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch: ChapterRef, stop: impl Fn() -> bool) -> Outcome {
+/// Generate's Read step: reads one chapter (continuing where an earlier read stopped, or every
+/// page again with `force`, a Redo) and saves its transcript, shown in Activity like any read.
+/// Returns when it ended.
+pub async fn read_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch: ChapterRef, force: bool, stop: impl Fn() -> bool) -> Outcome {
     let Some(cancel) = claim(RunKind::Read, &label, &stop).await else { return Outcome::Cancelled };
     update(|r| {
         r.chapter = Some(ch.label.clone());
@@ -305,7 +306,7 @@ pub async fn read_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch:
         r.log(format!("Generate · {} · {} with {label}", ch.manga_title, ch.label));
     });
     let brain = brain(&ch.manga_id, &ch.manga_title);
-    let res = match mv_recap::read_chapter(reg, model, ch.clone(), brain, ReadOptions { force: false, pages: None }, progress_fn(), cancel.clone()).await {
+    let res = match mv_recap::read_chapter(reg, model, ch.clone(), brain, ReadOptions { force, pages: None }, progress_fn(), cancel.clone()).await {
         Ok(read) => mv_recap::update_transcript(&ch, &read).map(|_| ()),
         Err(e) => Err(e),
     };

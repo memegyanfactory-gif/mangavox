@@ -18,3 +18,42 @@ resources/models/
 .playwright-mcp/
 native/target/
 target/
+
+# Personal data never goes in git (scripts/check-private.sh enforces it on commit and push):
+# downloaded manga, Studio work, app data, media, databases, local settings and keys.
+.mangavox/
+library/manga/
+studio/projects/
+downloads/
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+*.avif
+!native/crates/mv-ui/assets/**
+!logo manga vox.png
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.srt
+*.ass
+*.cbz
+*.cbr
+*.epub
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.env
+.env.*
+*.pem
+*.key
+.claude/settings.local.json

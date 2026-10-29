@@ -1,0 +1,14 @@
+#!/bin/sh
+# Blocks a push that would upload personal data (manga, Studio media, app data, keys): every
+# commit not yet on the remote is checked, so nothing slips through in history either.
+root=$(git rev-parse --show-toplevel)
+empty=$(git hash-object -t tree /dev/null)
+zero=0000000000000000000000000000000000000000
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  for c in $(git rev-list --reverse "$local_sha" --not --remotes); do
+    parent=$(git rev-parse -q --verify "$c^" 2>/dev/null || echo "$empty")
+    sh "$root/scripts/check-private.sh" range "$parent" "$c" || { echo "(in commit $(git log -1 --format='%h %s' "$c"))" >&2; exit 1; }
+  done
+done
+exit 0

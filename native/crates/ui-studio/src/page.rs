@@ -301,6 +301,8 @@ pub struct StudioPage {
     pub(crate) dash_pick: BTreeSet<String>,
     pub(crate) dash_anchor: Option<String>,
     pub(crate) dash_filter: crate::dashboard::Filter,
+    /// The pick bar's "Redo from" step: Generate makes it and every later step again.
+    pub(crate) dash_redo: Option<Step>,
     pub(crate) dash_scroll: ScrollHandle,
     /// The open Generate questions.
     pub(crate) sheet: Option<crate::generate::Sheet>,
@@ -424,6 +426,7 @@ impl StudioPage {
             dash_pick: BTreeSet::new(),
             dash_anchor: None,
             dash_filter: Default::default(),
+            dash_redo: None,
             dash_scroll: ScrollHandle::new(),
             sheet: None,
             gen_answers: None,
@@ -1675,7 +1678,7 @@ impl StudioPage {
             .child(div().id("batch-count").flex().flex_1().min_w_0().items_center().gap(px(4.)).font_weight(FontWeight::MEDIUM).text_color(Tokens::accent()).tooltip(tip(format!("{n} chapter{} ticked", plural(n)))).child(icon_ph(ph::LIST_CHECKS, Tokens::accent(), icon_px::SM)).child(div().truncate().child(format!("{n}"))))
             .child(icon_button("batch-generate", ph::ROCKET_LAUNCH, format!("Generate {what}: every step, in order")).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 let targets = this.targets();
-                this.open_generate(targets, cx);
+                this.open_generate(targets, None, cx);
             })))
             .child(
                 icon_button("batch-read", glyphs::READ, format!("Read {what}"))

@@ -9,8 +9,8 @@ use mv_recap::{PhaseStatus, Step};
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::Interactive as _;
 use mv_ui::{
-    btn, cover_tile, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, ph, ph_icon, progress_bar, progress_ring_sized, selected_badge, size, skeleton, skeleton_line, spinner, status_tag,
-    tip, ButtonKind, CoverSource, Ph, Route, StatusKind, Tokens, Weight,
+    btn, cover_tile, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, ph, ph_icon, progress_bar, progress_ring_sized, selected_badge, size, skeleton, skeleton_line, spinner, status_tag,
+    tip, ButtonKind, CoverSource, MenuItem, Ph, Route, StatusKind, Tokens, Weight,
 };
 
 use crate::data::{ChapterItem, MangaGroup};
@@ -613,6 +613,41 @@ impl StudioPage {
             .into_any_element()
     }
 
+    /// The pick bar's "Redo" dropdown: tick a step to make it again, even where done. Every step
+    /// after it is ticked too ("follows"), since it is built from it.
+    fn redo_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let redo = self.dash_redo;
+        let weak = cx.entity().downgrade();
+        let set = move |r: Option<Step>| {
+            let weak = weak.clone();
+            move |_: &mut Window, cx: &mut App| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.dash_redo = r;
+                    cx.notify();
+                });
+            }
+        };
+        let mut items = vec![MenuItem::heading("Make again"), MenuItem::new("Nothing · only missing steps", set(None)).icon(ph::CHECKS).checked(redo.is_none()), MenuItem::separator()];
+        for (s, label, icon) in crate::generate::REDO {
+            let on = redo.is_some_and(|r| s.index() >= r.index());
+            let text = if on && redo != Some(s) { format!("{label} · follows") } else { label.to_string() };
+            // Ticking the first ticked step again clears the redo.
+            let next = if redo == Some(s) { None } else { Some(s) };
+            items.push(MenuItem::new(text, set(next)).icon(icon).checked(on));
+        }
+        let label = match redo {
+            Some(r) => format!("Redo: {}", r.label()),
+            None => "Redo".to_string(),
+        };
+        menu_button("dash-redo", ph::ARROWS_CLOCKWISE, "Make steps again, even where they are done", items)
+            .label(label)
+            .small()
+            .min_width(240.)
+            .border_1()
+            .border_color(if redo.is_some() { Tokens::accent() } else { Tokens::border() })
+            .into_any_element()
+    }
+
     /// The bar under the tiles: what is picked and the Generate button.
     fn pick_bar(&self, picked: &[ChapterItem], cx: &mut Context<Self>) -> AnyElement {
         let n = picked.len();
@@ -641,9 +676,10 @@ impl StudioPage {
         let names = picked.iter().map(|c| pipeline::short_label(c.number, c.title.as_deref())).collect::<Vec<_>>();
         let names = if names.len() > 8 { format!("{} and {} more", names[..8].join(", "), names.len() - 8) } else { names.join(", ") };
         let note = match (queued, made) {
+            _ if self.dash_redo.is_some() => format!("{} made again, even where done", crate::generate::redo_summary(self.dash_redo.unwrap_or(Step::Video))),
             (q, _) if q > 0 && generating => format!("{q} already in the queue; new picks join it"),
             (q, _) if q > 0 => format!("{q} already in the queue"),
-            (_, m) if m > 0 => format!("{m} already ha{} a video; only missing steps run", if m == 1 { "s" } else { "ve" }),
+            (_, m) if m > 0 => format!("{m} already ha{} a video; only missing steps run (use Redo to make steps again)", if m == 1 { "s" } else { "ve" }),
             _ => "Read → Transcript → Story → Audio → Music → Video, skipping steps already made".to_string(),
         };
         let single = (n == 1).then(|| picked[0].id.clone());
@@ -673,15 +709,23 @@ impl StudioPage {
                 this.dash_anchor = None;
                 cx.notify();
             })))
-            .child(
-                btn("dash-generate", if fresh.is_empty() { "Already queued".to_string() } else { format!("Generate {}", if fresh.len() == 1 { "1 chapter".to_string() } else { format!("{} chapters", fresh.len()) }) }, ButtonKind::Primary)
+            .child(self.redo_menu(cx))
+            .child(match self.dash_redo {
+                // A redo takes every pick, queued or not (a waiting chapter gets the redo added).
+                Some(r) => btn("dash-generate", format!("Redo {} from {}", if n == 1 { "1 chapter".to_string() } else { format!("{n} chapters") }, r.label()), ButtonKind::Primary)
+                    .icon(ph::ARROWS_CLOCKWISE)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let redo = this.dash_redo;
+                        this.open_generate(to_open.clone(), redo, cx);
+                    })),
+                None => btn("dash-generate", if fresh.is_empty() { "Already queued".to_string() } else { format!("Generate {}", if fresh.len() == 1 { "1 chapter".to_string() } else { format!("{} chapters", fresh.len()) }) }, ButtonKind::Primary)
                     .icon(ph::ROCKET_LAUNCH)
                     .when(fresh.is_empty(), |b| b.disabled("Every picked chapter is already in the queue"))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let fresh: Vec<ChapterItem> = to_open.iter().filter(|c| !this.queue.for_chapter(&c.id).is_some_and(|i| i.state.active())).cloned().collect();
-                        this.open_generate(fresh, cx);
+                        this.open_generate(fresh, None, cx);
                     })),
-            )
+            })
             .into_any_element()
     }
 }

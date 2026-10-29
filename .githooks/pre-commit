@@ -1,0 +1,3 @@
+#!/bin/sh
+# Blocks personal data (manga, Studio media, app data, keys) from being committed.
+exec sh "$(git rev-parse --show-toplevel)/scripts/check-private.sh" staged

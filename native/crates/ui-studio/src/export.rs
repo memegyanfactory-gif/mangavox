@@ -333,6 +333,8 @@ pub(crate) struct Joined {
     pub boundaries: Vec<f64>,
     /// A second, music-free audio track exists.
     pub solo: bool,
+    /// Chapters whose music is still on that track (their narration could not be rebuilt).
+    pub music_kept: usize,
 }
 
 /// Where a manga's joined video is kept.
@@ -352,10 +354,77 @@ fn sources_key(files: &[PathBuf]) -> Value {
         .collect::<Vec<_>>())
 }
 
+/// Bumped when the joined video's makeup changes, so an older one is made again.
+const JOIN_VERSION: u64 = 2;
+
+/// The narration of a chapter video made before videos carried a "Narration only" track,
+/// rebuilt from the chapter's audio clips: each beat's slice of its clip (as the sync map
+/// gives it) laid end to end, spread evenly over the video's `secs` (old renders drift a
+/// fraction of a second over a chapter). Written as a WAV at the clips' own rate to `out`.
+pub(crate) fn rebuild_narration(video: &Path, secs: f64, out: &Path) -> Result<()> {
+    let dir = video.parent().ok_or_else(|| anyhow!("no chapter folder"))?;
+    let sm: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sync_map.json")).context("read the sync map")?)?;
+    let beats = sm["beat_segments"].as_array().filter(|a| !a.is_empty()).or_else(|| sm["segments"].as_array()).cloned().unwrap_or_default();
+    // (clip, offset s, length s) per beat the video showed, like the generator picks them.
+    let mut plan = vec![];
+    for b in &beats {
+        let Some(file) = b["audio_file"].as_str().map(str::to_string).or_else(|| b["page"].as_u64().map(|p| format!("page_{p:04}.wav"))) else { continue };
+        let path = dir.join("audio").join(&file);
+        let len = b["duration_ms"].as_f64().unwrap_or(0.) / 1000.;
+        if !path.is_file() || len < 0.1 {
+            continue;
+        }
+        plan.push((path, b["audio_offset_ms"].as_f64().unwrap_or(0.) / 1000., len));
+    }
+    let total: f64 = plan.iter().map(|p| p.2).sum();
+    if plan.is_empty() || total <= 0. {
+        bail!("no narration clips");
+    }
+    let mut clips: std::collections::HashMap<PathBuf, Vec<i16>> = Default::default();
+    let mut spec: Option<hound::WavSpec> = None;
+    for (p, _, _) in &plan {
+        if clips.contains_key(p) {
+            continue;
+        }
+        let mut rd = hound::WavReader::open(p).with_context(|| format!("read {}", p.display()))?;
+        let s = rd.spec();
+        if s.sample_format != hound::SampleFormat::Int || s.bits_per_sample != 16 {
+            bail!("{} is not 16-bit audio", p.display());
+        }
+        match spec {
+            Some(old) if (old.sample_rate, old.channels) != (s.sample_rate, s.channels) => bail!("the narration clips differ in format"),
+            _ => spec = Some(s),
+        }
+        clips.insert(p.clone(), rd.samples::<i16>().collect::<std::result::Result<_, _>>()?);
+    }
+    let spec = spec.ok_or_else(|| anyhow!("no narration clips"))?;
+    let (rate, ch) = (spec.sample_rate as f64, spec.channels as usize);
+    let scale = if secs > 0. { secs / total } else { 1. };
+    let frames = |t: f64| (t * rate).round() as usize;
+    let mut buf = vec![0i16; frames(total * scale) * ch];
+    let mut at = 0.;
+    for (p, offset, len) in &plan {
+        let src = &clips[p];
+        let from = frames(*offset) * ch;
+        let n = (frames(*len) * ch).min(src.len().saturating_sub(from));
+        let to = frames(at * scale) * ch;
+        let n = n.min(buf.len().saturating_sub(to));
+        buf[to..to + n].copy_from_slice(&src[from..from + n]);
+        at += len;
+    }
+    let mut w = hound::WavWriter::create(out, spec)?;
+    for s in buf {
+        w.write_sample(s)?;
+    }
+    w.finalize()?;
+    Ok(())
+}
+
 /// Joins `files` (in order) into `out`, reusing it when it was made from the same files.
 /// Losslessly when every video matches, else re-encoded to the first one's frame. The joined
-/// video keeps a "Narration only" track when any chapter has one (chapters made without it
-/// play their only track there).
+/// video has a second "Narration only" track: each chapter's own, or for chapters made before
+/// videos carried one, its narration rebuilt from the chapter's audio clips (a chapter where
+/// that fails keeps its only track there).
 pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined> {
     if files.is_empty() {
         bail!("No chapter has a video yet");
@@ -363,12 +432,13 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
     let meta = out.with_extension("json");
     let key = sources_key(files);
     if let Some(m) = std::fs::read_to_string(&meta).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
-        if m["sources"] == key && out.is_file() {
+        if m["sources"] == key && m["v"].as_u64() == Some(JOIN_VERSION) && out.is_file() {
             return Ok(Joined {
                 path: out.to_path_buf(),
                 total: m["total"].as_f64().unwrap_or(0.),
                 boundaries: m["boundaries"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default(),
                 solo: m["solo"].as_bool().unwrap_or(false),
+                music_kept: m["music_kept"].as_u64().unwrap_or(0) as usize,
             });
         }
     }
@@ -386,27 +456,75 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
         boundaries.push(at);
     }
     boundaries.pop();
-    let solo = probes.iter().any(|p| p.solo().is_some());
-    let second = |p: &Probe| p.solo().unwrap_or(0);
-    let same = probes.iter().all(|p| p.video == probes[0].video && p.audio[0].0 == probes[0].audio[0].0 && (!solo || p.audio[second(p)].0 == probes[0].audio[0].0));
+    let work = out.with_extension("parts");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)?;
+    let res = join_into(files, &probes, total, &work, out, r);
+    let _ = std::fs::remove_dir_all(&work);
+    let (solo, music_kept) = res?;
+    let _ = std::fs::write(&meta, serde_json::to_string(&json!({"v": JOIN_VERSION, "sources": key, "total": total, "boundaries": boundaries, "solo": solo, "music_kept": music_kept}))?);
+    Ok(Joined { path: out.to_path_buf(), total, boundaries, solo, music_kept })
+}
+
+/// [`join`]'s work in `work`. Returns whether the second, music-free track was made, and how
+/// many chapters still have their music on it (no narration could be rebuilt for them).
+fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: &Path, r: &Reporter) -> Result<(bool, usize)> {
+    // The music-free track of each chapter: (extra input file, if rebuilt; its audio stream).
+    let mut solos: Vec<(Option<PathBuf>, usize)> = vec![];
+    for (i, (f, p)) in files.iter().zip(probes).enumerate() {
+        r.set(0.15 * i as f32 / files.len() as f32, "Preparing the music-free sound");
+        if r.cancelled() {
+            bail!(CANCELLED);
+        }
+        if let Some(k) = p.solo() {
+            solos.push((None, k));
+            continue;
+        }
+        let wav = work.join(format!("{i:04}_narration.wav"));
+        let m4a = work.join(format!("{i:04}_narration.m4a"));
+        let made = rebuild_narration(f, p.duration, &wav).and_then(|_| {
+            let args: Vec<String> = vec![
+                "-i".into(), wav.to_string_lossy().into(),
+                "-af".into(), "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000".into(),
+                "-ac".into(), "2".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(),
+                m4a.to_string_lossy().into(),
+            ];
+            ffmpeg(&args, 0., r, &mut |_| {})
+        });
+        let _ = std::fs::remove_file(&wav);
+        match made {
+            Ok(()) => solos.push((Some(m4a), 0)),
+            Err(e) if e.to_string() == CANCELLED => return Err(e),
+            // That chapter keeps its music on the music-free track (the export says so).
+            Err(_) => solos.push((None, usize::MAX)),
+        }
+    }
+    let kept = solos.iter().filter(|s| s.1 == usize::MAX).count();
+    for s in solos.iter_mut().filter(|s| s.1 == usize::MAX) {
+        s.1 = 0;
+    }
+    let solo = kept < files.len();
+    let solo_params = |i: usize| if solos[i].0.is_some() { "aac/48000/2".to_string() } else { probes[i].audio[solos[i].1].0.clone() };
+    let same = (0..files.len()).all(|i| probes[i].video == probes[0].video && probes[i].audio[0].0 == probes[0].audio[0].0 && (!solo || solo_params(i) == probes[0].audio[0].0));
     let tmp = out.with_extension("part.mp4");
     let _ = std::fs::remove_file(&tmp);
 
     if same {
         // Lossless: pick the tracks of each file, then concatenate the copies.
-        let work = out.with_extension("parts");
-        let _ = std::fs::remove_dir_all(&work);
-        std::fs::create_dir_all(&work)?;
         let mut parts = vec![];
-        for (i, (f, p)) in files.iter().zip(&probes).enumerate() {
+        for (i, f) in files.iter().enumerate() {
             let part = work.join(format!("{i:04}.mp4"));
-            let mut args: Vec<String> = vec!["-i".into(), f.to_string_lossy().into(), "-map".into(), "0:v:0".into(), "-map".into(), "0:a:0".into()];
+            let mut args: Vec<String> = vec!["-i".into(), f.to_string_lossy().into()];
+            if let (true, Some(extra)) = (solo, &solos[i].0) {
+                args.extend(["-i".into(), extra.to_string_lossy().into()]);
+            }
+            args.extend(["-map".into(), "0:v:0".into(), "-map".into(), "0:a:0".into()]);
             if solo {
-                args.extend(["-map".into(), format!("0:a:{}", second(p))]);
+                args.extend(["-map".into(), if solos[i].0.is_some() { "1:a:0".into() } else { format!("0:a:{}", solos[i].1) }]);
             }
             args.extend(["-c".into(), "copy".into(), part.to_string_lossy().into()]);
             ffmpeg(&args, 0., r, &mut |_| {})?;
-            r.set(0.5 * (i + 1) as f32 / files.len() as f32, "Joining the chapters");
+            r.set(0.15 + 0.35 * (i + 1) as f32 / files.len() as f32, "Joining the chapters");
             parts.push(part);
         }
         let list = work.join("list.txt");
@@ -414,9 +532,7 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
         let mut args: Vec<String> = vec!["-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), list.to_string_lossy().into(), "-map".into(), "0".into(), "-c".into(), "copy".into()];
         args.extend(track_tags(solo));
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
-        let res = ffmpeg(&args, total, r, &mut |f| r.set(0.5 + 0.5 * f, "Joining the chapters"));
-        let _ = std::fs::remove_dir_all(&work);
-        res?;
+        ffmpeg(&args, total, r, &mut |f| r.set(0.5 + 0.5 * f, "Joining the chapters"))?;
     } else {
         // Different sizes or sound: re-encode everything to the first video's frame.
         let (w, h) = probes[0].size;
@@ -424,13 +540,26 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
         for f in files {
             args.extend(["-i".into(), f.to_string_lossy().into()]);
         }
+        // Rebuilt narrations are extra inputs after the videos.
+        let mut solo_src: Vec<String> = vec![];
+        let mut next = files.len();
+        for (i, (extra, k)) in solos.iter().enumerate() {
+            match extra {
+                Some(p) => {
+                    args.extend(["-i".into(), p.to_string_lossy().into()]);
+                    solo_src.push(format!("{next}:a:0"));
+                    next += 1;
+                }
+                None => solo_src.push(format!("{i}:a:{k}")),
+            }
+        }
         let mut graph = String::new();
         let aformat = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
-        for (i, p) in probes.iter().enumerate() {
+        for i in 0..files.len() {
             graph.push_str(&fit_blur(&format!("{i}:v:0"), &format!("v{i}"), w, h));
             graph.push_str(&format!(";[{i}:a:0]{aformat}[a{i}];"));
             if solo {
-                graph.push_str(&format!("[{i}:a:{}]{aformat}[b{i}];", second(p)));
+                graph.push_str(&format!("[{}]{aformat},apad,atrim=0:{:.3}[b{i}];", solo_src[i], probes[i].duration));
             }
         }
         for i in 0..files.len() {
@@ -448,12 +577,11 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
         args.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "192k"].map(String::from));
         args.extend(track_tags(solo));
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
-        ffmpeg(&args, total, r, &mut |f| r.set(f, "Joining the chapters (re-encoding: they differ in size or sound)"))?;
+        ffmpeg(&args, total, r, &mut |f| r.set(0.15 + 0.85 * f, "Joining the chapters (re-encoding: they differ in size or sound)"))?;
     }
     let _ = std::fs::remove_file(out);
     std::fs::rename(&tmp, out).with_context(|| format!("save {}", out.display()))?;
-    let _ = std::fs::write(&meta, serde_json::to_string(&json!({"sources": key, "total": total, "boundaries": boundaries, "solo": solo}))?);
-    Ok(Joined { path: out.to_path_buf(), total, boundaries, solo })
+    Ok((solo, kept))
 }
 
 /// Writes the export of `j` into `out_dir`: one file, or (for parts and reels) a folder of them.
@@ -609,6 +737,8 @@ impl StudioPage {
                     "Joining the chapters",
                     move |_, j, r, window, cx| {
                         let r = r.clone();
+                        // Chapters whose music could not be taken out (said in the result).
+                        let kept = if prefs.music { 0 } else { j.music_kept };
                         cx.spawn_in(window, async move |this, cx| {
                             let res = mv_ui::bg::blocking(move || export(&j, prefs.mode(), prefs.music, &dir, &name, &r)).await.and_then(|r| r);
                             let _ = this.update(cx, |this, cx| {
@@ -622,7 +752,8 @@ impl StudioPage {
                                             Mode::Parts(_) => format!("{n} part{}", plural(n)),
                                             Mode::Reels => format!("{n} reel{}", plural(n)),
                                         };
-                                        toast::show(cx, Toast::success(format!("Exported {what}")).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
+                                        let note = if kept > 0 { format!(" · {kept} chapter{} still ha{} music: re-make {} with Redo → Video", plural(kept), if kept == 1 { "s" } else { "ve" }, if kept == 1 { "it" } else { "them" }) } else { String::new() };
+                                        toast::show(cx, Toast::success(format!("Exported {what}{note}")).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
                                     }
                                     Err(e) if e.to_string() == CANCELLED => toast::show(cx, Toast::info("Export cancelled")),
                                     Err(e) => toast::show(cx, Toast::error(format!("Could not export: {e:#}"))),
@@ -715,7 +846,7 @@ impl StudioPage {
                         this.export_prefs.music = *on;
                         cx.notify();
                     })))
-                    .child(muted(if prefs.music { "Background music on" } else { "Music off · narration only (chapters made before this option keep theirs)" }))
+                    .child(muted(if prefs.music { "Background music on" } else { "Music off · narration only" }))
                     .child(div().flex_1())
                     .child(
                         btn("vid-export", "Export…", ButtonKind::Secondary)
@@ -790,6 +921,30 @@ mod tests {
     }
 
     #[test]
+    fn narration_is_rebuilt_from_the_beats_and_spread_over_the_video() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("audio")).unwrap();
+        let spec = hound::WavSpec { channels: 1, sample_rate: 1000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        // One page clip: 1 s of 1s then 1 s of 2s; two beats slice it.
+        let mut w = hound::WavWriter::create(d.path().join("audio/page_0000.wav"), spec).unwrap();
+        for i in 0..2000 {
+            w.write_sample(if i < 1000 { 1i16 } else { 2 }).unwrap();
+        }
+        w.finalize().unwrap();
+        std::fs::write(
+            d.path().join("sync_map.json"),
+            r#"{"beat_segments":[{"audio_file":"page_0000.wav","audio_offset_ms":0,"duration_ms":1000},{"audio_file":"missing.wav","duration_ms":500},{"audio_file":"page_0000.wav","audio_offset_ms":1000,"duration_ms":1000}]}"#,
+        )
+        .unwrap();
+        let out = d.path().join("n.wav");
+        // The video ran 10% long: beats are spread to match.
+        super::rebuild_narration(&d.path().join("video_final.mp4"), 2.2, &out).unwrap();
+        let s: Vec<i16> = hound::WavReader::open(&out).unwrap().samples::<i16>().map(|x| x.unwrap()).collect();
+        assert_eq!(s.len(), 2200);
+        assert_eq!((s[0], s[999], s[1050], s[1100], s[2099], s[2150]), (1, 1, 0, 2, 2, 0));
+    }
+
+    #[test]
     fn names_and_durations() {
         assert_eq!(part_name("Solo", Mode::Parts(6), 2, 6), "Solo - Part 2 of 6.mp4");
         assert_eq!(part_name("Solo", Mode::Reels, 3, 9), "Solo - Reel 03.mp4");
@@ -824,7 +979,9 @@ mod tests {
         let r = job.reporter();
         let j = join(&parts, &out.join("joined.mp4"), &r).unwrap();
         println!("joined {:.1}s solo={} boundaries={}", j.total, j.solo, j.boundaries.len());
-        for mode in [Mode::Whole, Mode::Parts(3), Mode::Reels] {
+        // MV_EXPORT_WHOLE=1: only the whole video (quick).
+        let modes = if std::env::var("MV_EXPORT_WHOLE").is_ok() { vec![Mode::Whole] } else { vec![Mode::Whole, Mode::Parts(3), Mode::Reels] };
+        for mode in modes {
             let files = export(&j, mode, false, &out, "Test", &r).unwrap();
             println!("{mode:?}: {} file(s)", files.len());
         }
