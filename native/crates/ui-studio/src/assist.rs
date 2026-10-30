@@ -695,7 +695,7 @@ pub(crate) fn apply_look(look: &mut Look, a: &Map<String, Value>) -> Result<(), 
         }
     }
     if let Some(c) = Some(str_arg(a, "color")).filter(|c| !c.is_empty()) {
-        look.set_color(ColorPreset::parse(c).ok_or_else(|| format!("Unknown colour "{c}""))?);
+        look.set_color(ColorPreset::parse(c).ok_or_else(|| format!("Unknown colour \"{c}\""))?);
     }
     if let Some(on) = bool_arg(a, "watermark") {
         look.text.on = on;

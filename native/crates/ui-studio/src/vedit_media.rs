@@ -292,6 +292,8 @@ pub fn paint_waveform(bounds: Bounds<Pixels>, slice: &[(f32, f32)], window: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The glob above brings GPUI's own `test` attribute in: the standard one wins explicitly.
+    use ::core::prelude::v1::test;
 
     #[test]
     fn bucketer_peak_and_rms() {
