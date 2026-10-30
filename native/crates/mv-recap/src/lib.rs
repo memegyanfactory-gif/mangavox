@@ -7,6 +7,7 @@
 
 mod brain;
 mod export;
+pub mod hook;
 mod json;
 mod llm;
 mod read;

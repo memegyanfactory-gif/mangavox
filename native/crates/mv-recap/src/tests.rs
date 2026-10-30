@@ -321,3 +321,21 @@ async fn story_chunks_and_saves() {
     assert!(user.contains("Kaito"));
     assert_eq!(load_story(&ch).unwrap().title, "Duel");
 }
+
+#[tokio::test]
+async fn hook_is_written_from_candidates_with_a_json_retry() {
+    use crate::hook::*;
+    let chapters = vec![
+        ("Chapter 1".to_string(), vec!["Ruko meets a stranger.".to_string(), "The stranger draws a blade!".to_string()]),
+        ("Chapter 2".to_string(), vec!["Kaito betrays the guild.".to_string()]),
+    ];
+    let cands = pick_candidates(&chapters, MAX_CANDIDATES);
+    let fake = Fake::new(&["not json", r#"{"lines":[{"id":1,"text":"A blade is drawn."},{"id":2,"text":"A friend turns traitor."}],"outro":"Let's see how it begins."}"#]);
+    let h = crate::hook::write_hook_with(&fake, &model(), "Test Manga", &cands, 20, &CancellationToken::new()).await.unwrap();
+    assert_eq!(h.lines, vec![(1, "A blade is drawn.".to_string()), (2, "A friend turns traitor.".to_string())]);
+    let seen = fake.seen.lock().unwrap();
+    let user = &seen[0].messages[1].content;
+    assert!(user.contains("[2] (Chapter 2) Kaito betrays the guild."), "{user}");
+    assert!(user.contains("about 52 words"));
+    assert_eq!(seen.len(), 2, "one retry after the non-JSON answer");
+}
