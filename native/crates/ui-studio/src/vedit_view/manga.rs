@@ -17,7 +17,7 @@ use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{btn, icon_button, icon_ph, muted, ph, size, tip, ButtonKind, Tokens};
 
-use super::{lane_h, made, soft, Drag, Sel, Seq, HEAD_W, LEFT_W, RIGHT_W, RULER_H, TICK};
+use super::{clip_box, clip_tiles, lane_h, made, soft, track_color, Drag, Sel, Seq, BOTTOM_H, HEAD_W, LEFT_W, RIGHT_W, RULER_H, TICK};
 use crate::data::{ChapterItem, MangaGroup};
 use crate::look::{Look, Preset};
 use crate::page::{plural, StudioPage, View};
@@ -28,7 +28,7 @@ use crate::vedit_play;
 use crate::video::{self, SubtitleSetting};
 
 /// The chapter track's height.
-const CH_H: f32 = 36.;
+const CH_H: f32 = 30.;
 
 /// One chapter on the manga timeline.
 pub(crate) struct MChapter {
@@ -148,6 +148,9 @@ impl StudioPage {
         self.vedit.whole.looks.borrow_mut().clear();
         self.vedit.sel = None;
         self.vedit.fit_pending = true;
+        self.vedit.mark_in = None;
+        self.vedit.mark_out = None;
+        self.vedit.markers.clear();
         cx.notify();
     }
 
@@ -188,12 +191,12 @@ impl StudioPage {
         crate::vedit_tools::set_current(&c.item.manga_id, &c.item.id);
         self.vedit.seq = Some(Self::seq_of(c));
         self.vedit.sel = None;
-        self.vedit.undo.clear();
-        self.vedit.redo.clear();
+        self.vedit.hist = crate::vedit_history::History::new(self.vedit.seq.as_ref().map(|s| s.edit.clone()).unwrap_or_default());
+        self.vedit.ai = None;
     }
 
     /// Moves the manga playhead (and the open chapter with it).
-    fn manga_set_playhead(&mut self, t: u64) {
+    pub(super) fn manga_set_playhead(&mut self, t: u64) {
         let Some(m) = self.vedit.whole.all.as_mut() else { return };
         let t = t.min(m.total());
         m.playhead = t;
@@ -239,36 +242,30 @@ impl StudioPage {
         cx.notify();
     }
 
-    /// Snaps manga time to the chapter starts and the playhead.
+    /// Snaps manga time to the chapter starts, the playhead, in / out and the markers.
     pub(super) fn manga_snap(&mut self, t: i64) -> i64 {
         let Some(m) = self.vedit.whole.all.as_ref() else { return t };
         let mut pts = vm::edges(&m.spans);
         pts.push(m.playhead);
-        let reach = (vedit::SNAP_PX / self.vedit.pps * 1000.) as u64;
-        let (s, hit) = vedit::snap(t, &pts, reach);
-        if hit {
-            self.vedit.snapped = Some(s.max(0) as u64);
+        pts.extend(self.vedit.mark_in);
+        pts.extend(self.vedit.mark_out);
+        pts.extend(self.vedit.markers.iter().copied());
+        match crate::vedit_tl::snap_point(t, &pts, crate::vedit_tl::snap_reach(self.vedit.pps)) {
+            Some(p) => {
+                self.vedit.snapped = Some(p);
+                p as i64
+            }
+            None => t,
         }
-        s
     }
 
     pub(super) fn manga_fit(&mut self) {
         let total = self.timeline_ms();
         let w = f32::from(self.vedit.lanes.get().size.width).max(400.);
         if total > 0 {
-            self.vedit.pps = (w / (total as f32 / 1000.)).clamp(0.02, 400.);
+            self.vedit.pps = (w / (total as f32 / 1000.)).clamp(crate::vedit_tl::MIN_PPS, crate::vedit_tl::MAX_PPS);
             self.vedit.scroll_x = 0.;
         }
-    }
-
-    fn manga_zoom(&mut self, k: f32, anchor_x: Option<f32>) {
-        let now = self.manga_now();
-        let e = &mut self.vedit;
-        let old = e.pps;
-        e.pps = (e.pps * k).clamp(0.02, 400.);
-        let ax = anchor_x.unwrap_or(now as f32 / 1000. * old - e.scroll_x);
-        let t = (e.scroll_x + ax) / old;
-        e.scroll_x = (t * e.pps - ax).max(0.);
     }
 
     fn manga_follow(&mut self) {
@@ -326,7 +323,7 @@ impl StudioPage {
     }
 
     /// Previous / next edit on the manga timeline (clip edges and chapter starts).
-    fn manga_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+    pub(super) fn manga_step(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(m) = self.vedit.whole.all.as_ref() else { return };
         let now = self.manga_now();
         let mut edges: Vec<u64> = vm::edges(&m.spans);
@@ -341,35 +338,12 @@ impl StudioPage {
         }
     }
 
-    fn manga_chapter_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+    pub(super) fn manga_chapter_step(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(m) = self.vedit.whole.all.as_ref() else { return };
         let now = self.manga_now();
         let starts: Vec<u64> = m.spans.iter().filter(|s| s.dur_ms > 0).map(|s| s.start_ms).collect();
         let to = if forward { starts.iter().copied().find(|s| *s > now + 5) } else { starts.iter().rev().copied().find(|s| *s + 1500 < now) };
         self.manga_seek(to.unwrap_or(if forward { u64::MAX } else { 0 }), cx);
-    }
-
-    /// The keys that move around the manga timeline; the rest act on the open chapter.
-    pub(super) fn manga_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let k = &ev.keystroke;
-        let cmd = k.modifiers.control || k.modifiers.platform;
-        match k.key.as_str() {
-            "escape" if self.vedit.whole.confirm => self.vedit.whole.confirm = false,
-            "space" if !cmd => self.manga_toggle_play(cx),
-            "home" => self.manga_seek(0, cx),
-            "end" => self.manga_seek(u64::MAX, cx),
-            "up" => self.manga_step(false, cx),
-            "down" => self.manga_step(true, cx),
-            "pageup" => self.manga_chapter_step(false, cx),
-            "pagedown" => self.manga_chapter_step(true, cx),
-            "left" => self.manga_seek(self.manga_now().saturating_sub(1000 / vedit::FPS), cx),
-            "right" => self.manga_seek(self.manga_now() + 1000 / vedit::FPS, cx),
-            "=" | "+" => self.manga_zoom(1.5, None),
-            "-" => self.manga_zoom(1. / 1.5, None),
-            "\\" => self.manga_fit(),
-            _ => return false,
-        }
-        true
     }
 
     // ------------------------------------------------------------------------------ sync
@@ -799,7 +773,7 @@ impl StudioPage {
         let viewport = window.viewport_size();
         let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
         let room_w = (vw - LEFT_W - RIGHT_W - 60.).max(240.);
-        let room_h = (vh - 52. - 38. - 330. - 30. - 96. - 40.).max(140.);
+        let room_h = (vh - 52. - 38. - BOTTOM_H - 30. - 96. - 40.).max(140.);
         let aspect = if seq.reels { 9. / 16. } else { 16. / 9. };
         let (fw, fh) = if room_w / room_h > aspect { (room_h * aspect, room_h) } else { (room_w, room_w / aspect) };
         let frame = self.frame(seq, &placed, local, fw, fh, window, cx);
@@ -889,69 +863,18 @@ impl StudioPage {
             .border_b_1()
             .border_color(Tokens::border())
             .child(div().text_size(px(size::LG)).font_family(crate::page::MONO).text_color(Tokens::accent()).child(vedit::timecode(now)))
-            .child(div().w(px(space::MD)))
-            .child(icon_button("vedit-m-zoom-out", ph::MAGNIFYING_GLASS_MINUS, "Zoom out (-)").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.manga_zoom(1. / 1.5, None);
-                cx.notify();
-            })))
-            .child(icon_button("vedit-m-zoom-in", ph::MAGNIFYING_GLASS, "Zoom in (=)").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.manga_zoom(1.5, None);
-                cx.notify();
-            })))
-            .child(icon_button("vedit-m-zoom-fit", ph::ARROWS_IN_SIMPLE, "Zoom to the whole manga (\\)").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.manga_fit();
-                cx.notify();
-            })))
+            .child(div().w(px(space::SM)))
+            .child(self.timeline_buttons(cx))
             .child(div().flex_1())
             .when(remaking > 0, |d| d.child(div().text_size(px(size::SM)).text_color(Tokens::accent()).child(format!("Re-making {remaking}"))))
             .when(old > 0, |d| d.child(div().text_size(px(size::SM)).text_color(Tokens::warning()).child(format!("{old} on an old look"))))
             .child(muted(format!("{} chapters · {}", m.chapters.len(), vedit::timecode(total))));
-
-        // Ruler.
-        let (major, minor) = vedit::ruler_step(pps);
-        let mut ruler = div()
-            .id("vedit-m-ruler")
-            .relative()
-            .h(px(RULER_H))
-            .overflow_hidden()
-            .border_b_1()
-            .border_color(Tokens::border())
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                this.vedit.drag = Some(Drag::Playhead);
-                this.drag_move(ev.position, cx);
-            }));
-        let step_ms = ((major * 1000.) as u64).max(1);
-        let mut t = t0 / step_ms * step_ms;
-        while t <= t1.min(total + step_ms) {
-            let x = xof(t);
-            ruler = ruler.child(div().absolute().left(px(x)).bottom_0().w(px(1.)).h(px(10.)).bg(Tokens::text_3())).child(div().absolute().left(px(x + 3.)).top(px(2.)).text_size(px(size::XS)).font_family(crate::page::MONO).text_color(Tokens::text_3()).child(vedit::timecode(t)));
-            for k in 1..minor {
-                let mx = xof(t + step_ms * k as u64 / minor as u64);
-                ruler = ruler.child(div().absolute().left(px(mx)).bottom_0().w(px(1.)).h(px(4.)).bg(Tokens::border_strong()));
-            }
-            t += step_ms;
-        }
-        ruler = ruler.child(div().absolute().left(px(xof(now) - 5.)).top(px(RULER_H - 12.)).w(px(11.)).h(px(12.)).rounded(px(2.)).bg(Tokens::accent()));
+        let ruler = self.ruler("vedit-m-ruler", total, now, cx);
 
         let sel = self.vedit.sel;
         let focus = m.focus;
         let visible: Vec<(usize, &MChapter, Span)> = m.chapters.iter().zip(&m.spans).enumerate().filter(|(_, (_, s))| s.dur_ms > 0 && s.end_ms() >= t0 && s.start_ms <= t1).map(|(k, (c, s))| (k, c, *s)).collect();
-        let block = |id: SharedString, x: f32, w: f32, h: f32, fill: Rgba, edge: Rgba, selected: bool| {
-            div()
-                .id(id)
-                .absolute()
-                .left(px(x))
-                .top(px(2.))
-                .w(px(w.max(2.)))
-                .h(px(h - 4.))
-                .rounded(px(3.))
-                .overflow_hidden()
-                .bg(fill)
-                .border_1()
-                .border_color(if selected { Tokens::text_1() } else { edge })
-                .when(selected, |d| d.border_2())
-        };
+        let (ai_clips, ai_layers) = self.flashed();
 
         // The chapter track.
         let mut ch_lane = div().id("vedit-m-lane-ch").relative().h(px(CH_H)).overflow_hidden().border_b_1().border_color(Tokens::border());
@@ -960,29 +883,16 @@ impl StudioPage {
             let (x, w) = (xof(s.start_ms), s.dur_ms as f32 / 1000. * pps);
             let remake = self.remake_of(&c.item.id);
             let state = looks.get(&c.item.id).copied();
-            let (fill, edge, note) = match (&remake, state) {
-                (Some(r), _) if r.failed => (soft(Tokens::danger(), 0.25), Tokens::danger(), r.label.clone()),
-                (Some(r), _) => (soft(Tokens::accent(), 0.30), Tokens::accent(), r.label.clone()),
-                (None, Some(LookState::Current)) => (soft(Tokens::info(), 0.22), Tokens::info(), "current look".to_string()),
-                (None, _) => (soft(Tokens::warning(), 0.22), Tokens::warning(), "old look — re-edit to update".to_string()),
+            let (color, note) = match (&remake, state) {
+                (Some(r), _) if r.failed => (Tokens::danger(), r.label.clone()),
+                (Some(r), _) => (Tokens::accent(), r.label.clone()),
+                (None, Some(LookState::Current)) => (Tokens::info(), "current look".to_string()),
+                (None, _) => (Tokens::warning(), "old look — re-edit to update".to_string()),
             };
-            let mut el = block(SharedString::from(format!("vedit-m-ch-{k}")), x, w, CH_H, fill, edge, k == focus)
+            let label = format!("{} · {note}", short_label(c.item.number, c.item.title.as_deref()));
+            let mut el = clip_box(SharedString::from(format!("vedit-m-ch-{k}")), x, w, CH_H, color, k == focus, false, None, label)
                 .cursor_pointer()
                 .tooltip(tip(format!("{} · {}: {note}. Double-click to open its own timeline.", c.item.label(), vedit::timecode(s.dur_ms))));
-            if w > 30. {
-                el = el.child(
-                    div()
-                        .absolute()
-                        .left(px(4.).max(px(-x + 4.)))
-                        .top(px(2.))
-                        .right(px(4.))
-                        .flex()
-                        .items_center()
-                        .gap(px(4.))
-                        .child(div().flex_none().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(short_label(c.item.number, c.item.title.as_deref())))
-                        .when(w > 110., |d| d.child(div().min_w_0().truncate().text_size(px(size::XS)).text_color(edge).child(note))),
-                );
-            }
             if let Some(p) = remake.as_ref().and_then(|r| r.progress) {
                 el = el.child(div().absolute().left_0().right_0().bottom_0().h(px(4.)).bg(Tokens::track())).child(div().absolute().left_0().bottom_0().h(px(4.)).w(relative(p.clamp(0.02, 1.))).bg(Tokens::accent()));
             }
@@ -1000,23 +910,18 @@ impl StudioPage {
         for t in Track::ALL {
             let h = lane_h(t);
             let mut lane = div().id(SharedString::from(format!("vedit-m-lane-{}", t.code()))).relative().h(px(h)).overflow_hidden().border_b_1().border_color(Tokens::border());
-            let (fill, edge) = match t {
-                Track::Clips => (soft(Tokens::info(), 0.32), Tokens::info()),
-                Track::Narration | Track::Music => (soft(Tokens::success(), 0.26), Tokens::success()),
-                Track::Layers => (soft(Tokens::accent_2(), 0.35), Tokens::accent_2()),
-                Track::Captions => (soft(Tokens::accent(), 0.28), Tokens::accent()),
-            };
+            let color = track_color(t);
             for (k, c, s) in &visible {
                 let (k, s) = (*k, *s);
                 let off = c.edit.flags(t).off;
-                let fill = if off { soft(fill, 0.08) } else { fill };
+                let color = if off { soft(color, 0.3) } else { color };
+                let lit = |i: usize| k == focus && ai_clips.contains(&i);
                 match t {
                     Track::Clips | Track::Narration | Track::Captions => {
                         // Zoomed far out: one block for the chapter instead of every clip.
                         let thin = c.placed.is_empty() || (s.dur_ms as f32 / 1000. * pps) / (c.placed.len() as f32) < 4.;
                         if thin {
-                            let x = xof(s.start_ms);
-                            lane = lane.child(block(SharedString::from(format!("vedit-m-{}-{k}", t.code())), x, s.dur_ms as f32 / 1000. * pps, h, fill, edge, false));
+                            lane = lane.child(clip_box(SharedString::from(format!("vedit-m-{}-{k}", t.code())), xof(s.start_ms), s.dur_ms as f32 / 1000. * pps, h, color, false, false, None, short_label(c.item.number, c.item.title.as_deref())));
                             continue;
                         }
                         for p in c.placed.iter().filter(|p| s.start_ms + p.end_ms() >= t0 && s.start_ms + p.start_ms <= t1) {
@@ -1030,15 +935,19 @@ impl StudioPage {
                                 Track::Narration => beat.and_then(|b| b.audio.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                                 _ => p.clip.text.clone().or_else(|| beat.map(|b| b.text.clone())).unwrap_or_default(),
                             };
-                            let mut el = block(SharedString::from(format!("vedit-m-{}-{k}-{index}", t.code())), x, w, h, fill, edge, selected);
-                            if t == Track::Clips && w > 44. {
-                                if let Some(img_p) = beat.and_then(|b| b.image.clone()) {
-                                    el = el.child(img(img_p).absolute().left_0().top_0().h_full().w(px((h - 4.) * 0.75)).object_fit(ObjectFit::Cover));
+                            let mut el = clip_box(SharedString::from(format!("vedit-m-{}-{k}-{index}", t.code())), x, w, h, color, selected, lit(index), None, label);
+                            match (t, beat) {
+                                (Track::Clips, Some(b)) if w > 12. => {
+                                    if let Some(image) = &b.image {
+                                        el = el.children(clip_tiles(image, x, w, h, view_w));
+                                    }
                                 }
-                            }
-                            if w > 26. {
-                                let pad = if t == Track::Clips && w > 44. { (h - 4.) * 0.75 + 4. } else { 4. };
-                                el = el.child(div().absolute().left(px(pad)).top(px(2.)).right(px(2.)).truncate().text_size(px(size::XS)).text_color(Tokens::text_1()).child(label));
+                                (Track::Narration, Some(b)) if w > 6. => {
+                                    if let Some(pk) = crate::vedit_media::peaks_ready(&b.audio) {
+                                        el = el.children(super::clip_wave(&pk, (b.offset_ms + p.clip.trim_in_ms) as f64 / 1000., x, w, h, pps, view_w));
+                                    }
+                                }
+                                _ => {}
                             }
                             lane = lane.child(el.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
@@ -1054,8 +963,7 @@ impl StudioPage {
                             let (x, w) = (xof(start), (l.end_ms - l.start_ms) as f32 / 1000. * pps);
                             let id = l.id;
                             let icon = if matches!(l.kind, LayerKind::Text { .. }) { ph::TEXT_T } else { ph::IMAGE };
-                            let el = block(SharedString::from(format!("vedit-m-layer-{k}-{id}")), x, w, h, fill, edge, k == focus && sel == Some(Sel::Layer(id)))
-                                .when(w > 26., |d| d.child(div().absolute().left(px(4.)).top(px(2.)).right(px(4.)).flex().items_center().gap(px(4.)).child(icon_ph(icon, Tokens::text_1(), icon_px::XS)).child(div().truncate().text_size(px(size::XS)).text_color(Tokens::text_1()).child(l.name()))));
+                            let el = clip_box(SharedString::from(format!("vedit-m-layer-{k}-{id}")), x, w, h, color, k == focus && sel == Some(Sel::Layer(id)), k == focus && ai_layers.contains(&id), Some(icon), l.name());
                             lane = lane.child(el.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
                                 this.manga_seek(start, cx);
@@ -1065,18 +973,18 @@ impl StudioPage {
                         }
                     }
                     Track::Music => {
-                        let name = match &c.edit.music.source {
-                            vedit::MusicSource::Score => c.score.as_ref().map(|_| "score".to_string()),
-                            vedit::MusicSource::File { path } => path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                        let src = match &c.edit.music.source {
+                            vedit::MusicSource::Score => c.score.clone().map(|p| (p, "score".to_string())),
+                            vedit::MusicSource::File { path } => Some((path.clone(), path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
                             vedit::MusicSource::None => None,
                         };
-                        if let Some(name) = name {
-                            let x = xof(s.start_ms);
-                            let w = s.dur_ms as f32 / 1000. * pps;
-                            lane = lane.child(
-                                block(SharedString::from(format!("vedit-m-music-{k}")), x, w, h, soft(fill, 0.8), edge, false)
-                                    .when(w > 40., |d| d.child(div().absolute().left(px(4.).max(px(-x + 4.))).top(px(2.)).flex().items_center().gap(px(4.)).child(icon_ph(ph::MUSIC_NOTES, Tokens::text_1(), icon_px::XS)).child(div().text_size(px(size::XS)).text_color(Tokens::text_1()).child(format!("{name} · {:.0}%", c.edit.music.volume * 100.))))),
-                            );
+                        if let Some((path, name)) = src {
+                            let (x, w) = (xof(s.start_ms), s.dur_ms as f32 / 1000. * pps);
+                            let mut el = clip_box(SharedString::from(format!("vedit-m-music-{k}")), x, w, h, color, false, false, Some(ph::MUSIC_NOTES), format!("{name} · {:.0}%", c.edit.music.volume * 100.));
+                            if let Some(pk) = crate::vedit_media::peaks_ready(&path) {
+                                el = el.children(super::clip_wave(&pk, 0., x, w, h, pps, view_w));
+                            }
+                            lane = lane.child(el);
                         }
                     }
                 }
@@ -1084,21 +992,17 @@ impl StudioPage {
             lanes.push(lane.into_any_element());
         }
 
-        // Chapter boundaries, the snap line and the playhead, over every lane.
+        // Chapter boundaries, in / out, markers, the snap line and the playhead, over every lane.
         let lanes_h: f32 = CH_H + Track::ALL.iter().map(|t| lane_h(*t)).sum::<f32>();
-        let mut over = div().absolute().top_0().left_0().right_0().h(px(lanes_h));
-        for (_, _, s) in visible.iter().skip_while(|(k, _, _)| *k == 0) {
-            over = over.child(div().absolute().left(px(xof(s.start_ms))).top_0().bottom_0().w(px(1.)).bg(Tokens::border_strong()));
-        }
-        if let Some(s) = self.vedit.snapped {
-            over = over.child(div().absolute().left(px(xof(s))).top_0().bottom_0().w(px(1.)).bg(Tokens::warning()));
-        }
-        over = over.child(div().absolute().left(px(xof(now))).top_0().bottom_0().w(px(1.)).bg(Tokens::accent()));
+        let edges: Vec<u64> = visible.iter().filter(|(k, _, _)| *k > 0).map(|(_, _, s)| s.start_ms).collect();
+        let over = div().absolute().top_0().left_0().right_0().h(px(lanes_h)).children(self.lane_overlays(total, now, Some(&edges)));
 
         let lanes_box = self.vedit.lanes.clone();
         let content = div()
             .id("vedit-m-lanes")
             .relative()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_w_0()
             .overflow_hidden()
@@ -1108,41 +1012,35 @@ impl StudioPage {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                 this.vedit.sel = None;
                 this.vedit.drag = Some(Drag::Playhead);
+                this.vedit.shift = ev.modifiers.shift;
                 this.drag_move(ev.position, cx);
             }))
-            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
-                let d = ev.delta.pixel_delta(px(20.));
-                let (dx, dy) = (f32::from(d.x), f32::from(d.y));
-                if ev.modifiers.control || ev.modifiers.alt {
-                    let ax = f32::from(ev.position.x) - f32::from(this.vedit.lanes.get().origin.x);
-                    this.manga_zoom(if dy > 0. { 1.2 } else { 1. / 1.2 }, Some(ax));
-                } else {
-                    let total = this.timeline_ms() as f32 / 1000. * this.vedit.pps;
-                    let w = f32::from(this.vedit.lanes.get().size.width);
-                    this.vedit.scroll_x = (this.vedit.scroll_x - if dx.abs() > dy.abs() { dx } else { dy }).clamp(0., (total - w + 40.).max(0.));
-                }
-                cx.notify();
-            }));
+            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| this.timeline_wheel(ev, cx)));
 
-        // Track headers (the switches act on the open chapter and, being global, on every chapter).
-        let head = |id: SharedString, code: &'static str, label: &'static str, h: f32, audio: bool| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .h(px(h))
-                .px(px(4.))
-                .border_b_1()
-                .border_color(Tokens::border())
-                .child(div().flex_none().w(px(26.)).h(px(20.)).rounded(px(3.)).flex().items_center().justify_center().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).bg(if audio { soft(Tokens::success(), 0.5) } else { soft(Tokens::info(), 0.5) }).text_color(Tokens::text_1()).child(code))
-                .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).text_color(Tokens::text_2()).child(label))
-        };
-        let mut heads = div().flex().flex_col().flex_none().w(px(HEAD_W)).border_r_1().border_color(Tokens::border()).child(div().h(px(RULER_H)).border_b_1().border_color(Tokens::border()));
-        heads = heads.child(head("vedit-m-head-ch".into(), "CH", "Chapters", CH_H, false));
+        // Track heads (the switches act on the open chapter and, being global, on every chapter).
+        let mut heads = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(HEAD_W))
+            .border_r_1()
+            .border_color(Tokens::border())
+            .child(div().h(px(RULER_H)).bg(Tokens::surface_2()).border_b_1().border_color(Tokens::border()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .h(px(CH_H))
+                    .pl(px(6.))
+                    .border_b_1()
+                    .border_color(Tokens::border())
+                    .child(div().flex_none().w(px(24.)).h(px(18.)).rounded(px(3.)).flex().items_center().justify_center().text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).bg(soft(Tokens::info(), 0.55)).text_color(Tokens::text_1()).child("CH"))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(size::XS)).text_color(Tokens::text_2()).child("Chapters")),
+            );
         for t in Track::ALL {
             let selected = sel == Some(Sel::Track(t));
-            heads = heads.child(head(SharedString::from(format!("vedit-m-head-{}", t.code())), t.code(), t.label(), lane_h(t), t.audio()).cursor_pointer().when(selected, |d| d.bg(Tokens::active())).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            heads = heads.child(self.track_head(SharedString::from(format!("vedit-m-head-{}", t.code())), t, lane_h(t), selected).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.vedit.sel = Some(Sel::Track(t));
                 if t == Track::Captions {
                     this.vedit.side_tab = 0;
@@ -1153,22 +1051,8 @@ impl StudioPage {
             })));
         }
 
-        let total_px = (total as f32 / 1000. * pps).max(1.);
-        let (bar_l, bar_w) = ((sx / total_px).clamp(0., 1.), (view_w / total_px).clamp(0.02, 1.));
-        let scroll = div()
-            .id("vedit-m-hscroll")
-            .relative()
-            .flex_none()
-            .h(px(12.))
-            .ml(px(HEAD_W))
-            .cursor_pointer()
-            .child(div().absolute().top(px(3.)).h(px(6.)).left(relative(bar_l)).w(relative(bar_w)).rounded_full().bg(Tokens::border_strong()))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                this.vedit.drag = Some(Drag::Scroll);
-                this.drag_move(ev.position, cx);
-            }));
-
-        let body = div().flex().flex_col().flex_1().min_h_0().child(toolbar).child(div().flex().flex_1().min_h_0().child(heads).child(content)).child(scroll);
+        let nav = self.navigator("vedit-m-nav", total, cx);
+        let body = div().flex().flex_col().flex_1().min_h_0().child(toolbar).child(div().flex().flex_1().min_h_0().child(heads).child(content)).child(nav);
         self.panel(&format!("{} · All chapters", g.title), Some(self.chapter_switcher(cx)), body).flex_1()
     }
 

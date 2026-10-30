@@ -86,11 +86,26 @@ pub fn parse_encoders(listing: &str) -> Vec<Encoder> {
     found
 }
 
+static DETECTED: OnceLock<Encoders> = OnceLock::new();
+
+/// The detected encoders, if [`detect_encoders`] has run (never blocks; for the UI).
+pub fn known_encoders() -> Option<&'static Encoders> {
+    DETECTED.get()
+}
+
+/// Detects the encoders in the background (the export dialog shows them when it opens).
+pub fn warm() {
+    if DETECTED.get().is_none() {
+        std::thread::spawn(|| {
+            detect_encoders();
+        });
+    }
+}
+
 /// Which encoders ffmpeg lists and, for the GPU ones, can actually open a device (a listed NVENC
 /// still fails on a machine without an NVIDIA GPU). Runs ffmpeg once; cached for the session.
 pub fn detect_encoders() -> &'static Encoders {
-    static E: OnceLock<Encoders> = OnceLock::new();
-    E.get_or_init(|| {
+    DETECTED.get_or_init(|| {
         let Ok(out) = quiet_command("ffmpeg").args(["-hide_banner", "-encoders"]).stderr(Stdio::null()).output() else { return Encoders::software() };
         let listed = parse_encoders(&String::from_utf8_lossy(&out.stdout));
         Encoders { available: listed.into_iter().filter(|e| !e.is_gpu() || probe(*e)).collect() }
