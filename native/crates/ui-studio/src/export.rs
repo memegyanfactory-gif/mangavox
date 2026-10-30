@@ -42,6 +42,11 @@ pub(crate) enum Mode {
     Reels,
 }
 
+/// Hook lengths offered, in seconds.
+pub(crate) const HOOK_SECONDS: [u32; 3] = [15, 20, 30];
+/// The font a text watermark is drawn in (from the scripts' `fonts/`).
+const MARK_FONT: &str = "Inter-ExtraBold.ttf";
+
 /// The section's choices.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExportPrefs {
@@ -49,11 +54,14 @@ pub(crate) struct ExportPrefs {
     pub kind: usize,
     pub parts: usize,
     pub music: bool,
+    /// A teaser before chapter 1 (one video only).
+    pub hook: bool,
+    pub hook_secs: u32,
 }
 
 impl Default for ExportPrefs {
     fn default() -> Self {
-        ExportPrefs { kind: 0, parts: 6, music: true }
+        ExportPrefs { kind: 0, parts: 6, music: true, hook: false, hook_secs: 20 }
     }
 }
 
@@ -264,16 +272,15 @@ fn probe(p: &Path) -> Result<Probe> {
     })
 }
 
-/// Runs ffmpeg with `args`, reporting 0..1 through `seconds` of output. Cancelling kills it.
-fn ffmpeg(args: &[String], seconds: f64, r: &Reporter, on: &mut dyn FnMut(f32)) -> Result<()> {
-    let mut child = mv_studio::python::quiet_command("ffmpeg")
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats"])
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("run ffmpeg (is it installed?)")?;
+/// Runs ffmpeg with `args` (in `cwd` when given), reporting 0..1 through `seconds` of output.
+/// Cancelling kills it.
+fn ffmpeg(args: &[String], seconds: f64, r: &Reporter, cwd: Option<&Path>, on: &mut dyn FnMut(f32)) -> Result<()> {
+    let mut cmd = mv_studio::python::quiet_command("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats"]).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd.spawn().context("run ffmpeg (is it installed?)")?;
     let mut stderr = child.stderr.take().ok_or_else(|| anyhow!("no ffmpeg output"))?;
     let errors = std::thread::spawn(move || {
         let mut s = String::new();
@@ -496,7 +503,7 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
                 "-ac".into(), "2".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(),
                 m4a.to_string_lossy().into(),
             ];
-            ffmpeg(&args, 0., r, &mut |_| {})
+            ffmpeg(&args, 0., r, None, &mut |_| {})
         });
         let _ = std::fs::remove_file(&wav);
         match made {
@@ -530,7 +537,7 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
                 args.extend(["-map".into(), if solos[i].0.is_some() { "1:a:0".into() } else { format!("0:a:{}", solos[i].1) }]);
             }
             args.extend(["-c".into(), "copy".into(), part.to_string_lossy().into()]);
-            ffmpeg(&args, 0., r, &mut |_| {})?;
+            ffmpeg(&args, 0., r, None, &mut |_| {})?;
             r.set(0.15 + 0.35 * (i + 1) as f32 / files.len() as f32, "Joining the chapters");
             parts.push(part);
         }
@@ -539,7 +546,7 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
         let mut args: Vec<String> = vec!["-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), list.to_string_lossy().into(), "-map".into(), "0".into(), "-c".into(), "copy".into()];
         args.extend(track_tags(solo));
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
-        ffmpeg(&args, total, r, &mut |f| r.set(0.5 + 0.5 * f, "Joining the chapters"))?;
+        ffmpeg(&args, total, r, None, &mut |f| r.set(0.5 + 0.5 * f, "Joining the chapters"))?;
     } else {
         // Different sizes or sound: re-encode everything to the first video's frame.
         let (w, h) = probes[0].size;
@@ -584,23 +591,214 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
         args.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "192k"].map(String::from));
         args.extend(track_tags(solo));
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
-        ffmpeg(&args, total, r, &mut |f| r.set(0.15 + 0.85 * f, "Joining the chapters (re-encoding: they differ in size or sound)"))?;
+        ffmpeg(&args, total, r, None, &mut |f| r.set(0.15 + 0.85 * f, "Joining the chapters (re-encoding: they differ in size or sound)"))?;
     }
     let _ = std::fs::remove_file(out);
     std::fs::rename(&tmp, out).with_context(|| format!("save {}", out.display()))?;
     Ok((solo, kept))
 }
 
-/// Writes the export of `j` into `out_dir`: one file, or (for parts and reels) a folder of them.
-pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: &str, r: &Reporter) -> Result<Vec<PathBuf>> {
+// ------------------------------------------------------------------ watermark
+
+/// One corner, edge middle or centre of the frame: (column, row), each 0..3.
+fn anchor(pos: &str) -> (usize, usize) {
+    let mut c = pos.chars();
+    let row = match c.next() {
+        Some('t') => 0,
+        Some('m') => 1,
+        _ => 2,
+    };
+    let col = match c.next() {
+        Some('l') => 0,
+        Some('c') => 1,
+        _ => 2,
+    };
+    (col, row)
+}
+
+/// ffmpeg position expressions for an item `iw`x`ih` at `pos` in a frame `fw`x`fh`, `margin` px in.
+fn place(pos: &str, (fw, fh): (&str, &str), (iw, ih): (&str, &str), margin: u32) -> (String, String) {
+    let (col, row) = anchor(pos);
+    let axis = |k: usize, f: &str, i: &str| match k {
+        0 => margin.to_string(),
+        1 => format!("({f}-{i})/2"),
+        _ => format!("{f}-{i}-{margin}"),
+    };
+    (axis(col, fw, iw), axis(row, fh, ih))
+}
+
+/// A logo or a line of text drawn over every export (Studio-wide `video_look.json`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Watermark {
+    /// (image, position code, width as a fraction of the frame's, opacity)
+    pub logo: Option<(PathBuf, String, f64, f64)>,
+    /// (text, position code, font size as a fraction of the frame's height, opacity)
+    pub text: Option<(String, String, f64, f64)>,
+}
+
+/// Where the Studio's video look (watermark included) is kept.
+fn video_look_path() -> PathBuf {
+    mv_core::paths::studio().join("video_look.json")
+}
+
+/// The watermark in the video look at `file`: `None` when it is missing, unreadable, or has
+/// neither a logo (whose image exists) nor text switched on.
+pub(crate) fn load_watermark(file: &Path) -> Option<Watermark> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+    let num = |x: &Value, k: &str, lo: f64, hi: f64, def: f64| x[k].as_f64().filter(|n| n.is_finite()).unwrap_or(def).clamp(lo, hi);
+    let pos = |x: &Value| x["pos"].as_str().filter(|p| p.len() == 2).unwrap_or("br").to_string();
+    let l = &v["logo"];
+    let logo = (l["on"].as_bool() == Some(true))
+        .then(|| l["path"].as_str().map(PathBuf::from))
+        .flatten()
+        .filter(|p| p.is_file())
+        .map(|p| (p, pos(l), num(l, "size", 0.04, 0.4, 0.12), num(l, "opacity", 0., 1., 1.)));
+    let t = &v["text"];
+    let text = (t["on"].as_bool() == Some(true))
+        .then(|| t["text"].as_str().map(|s| s.trim().to_string()))
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(|s| (s, pos(t), num(t, "size", 0.02, 0.12, 0.04), num(t, "opacity", 0., 1., 1.)));
+    (logo.is_some() || text.is_some()).then_some(Watermark { logo, text })
+}
+
+/// Filter drawing `wm` over `[input]` (a `w`x`h` frame) into `[out]`. The logo is ffmpeg input
+/// `logo_input`; text is drawn from `text.txt` in [`MARK_FONT`], both in ffmpeg's working folder.
+pub(crate) fn watermark_graph(wm: &Watermark, input: &str, out: &str, w: u32, h: u32, logo_input: usize) -> String {
+    let margin = (w.min(h) as f64 * 0.03).round() as u32;
+    let mut graph = String::new();
+    let mut at = input.to_string();
+    if let Some((_, pos, size, opacity)) = &wm.logo {
+        let lw = (((w as f64 * size) / 2.).round() as u32 * 2).max(2);
+        let (x, y) = place(pos, ("W", "H"), ("w", "h"), margin);
+        let next = if wm.text.is_some() { format!("{out}_l") } else { out.to_string() };
+        graph.push_str(&format!("[{logo_input}:v]scale={lw}:-1,format=rgba,colorchannelmixer=aa={opacity:.2}[{out}_logo];[{at}][{out}_logo]overlay=x={x}:y={y}[{next}]"));
+        at = next;
+    }
+    if let Some((_, pos, size, opacity)) = &wm.text {
+        // Sized on the shorter side, so upright reels keep the text inside the frame.
+        let fs = ((w.min(h) as f64 * size).round() as u32).max(8);
+        let (x, y) = place(pos, ("w", "h"), ("text_w", "text_h"), margin);
+        if !graph.is_empty() {
+            graph.push(';');
+        }
+        graph.push_str(&format!(
+            "[{at}]drawtext=fontfile={MARK_FONT}:textfile=text.txt:expansion=none:fontsize={fs}:fontcolor=white:alpha={opacity:.2}:shadowcolor=black@0.6:shadowx=2:shadowy=2:x={x}:y={y}[{out}]"
+        ));
+    }
+    graph
+}
+
+/// A watermark ready to draw: text needs the font and its text in a folder ffmpeg runs in
+/// (so no path needs escaping inside the filter). The folder goes when this is dropped.
+struct Mark {
+    wm: Watermark,
+    dir: Option<PathBuf>,
+}
+
+impl Mark {
+    /// `wm` with its text prepared (or dropped when `font` is missing); `None` when nothing is left.
+    fn prepare(wm: Option<Watermark>, font: Option<&Path>) -> Result<Option<Mark>> {
+        let Some(mut wm) = wm else { return Ok(None) };
+        let font = font.filter(|f| f.is_file());
+        if font.is_none() {
+            wm.text = None;
+        }
+        if wm.logo.is_none() && wm.text.is_none() {
+            return Ok(None);
+        }
+        let mut mark = Mark { wm, dir: None };
+        if let (Some((text, ..)), Some(font)) = (&mark.wm.text, font) {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("mangavox-mark-{}-{stamp}", std::process::id()));
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            mark.dir = Some(dir.clone());
+            std::fs::copy(font, dir.join(MARK_FONT)).context("copy the watermark font")?;
+            std::fs::write(dir.join("text.txt"), text)?;
+        }
+        Ok(Some(mark))
+    }
+
+    /// The `-i` arguments of the logo (none without one).
+    fn inputs(&self) -> Vec<String> {
+        self.wm.logo.as_ref().map(|(p, ..)| vec!["-i".to_string(), p.to_string_lossy().into()]).unwrap_or_default()
+    }
+}
+
+impl Drop for Mark {
+    fn drop(&mut self) {
+        if let Some(d) = &self.dir {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+/// What an export adds to the joined video.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Extras {
+    /// A hook video played before chapter 1 (one video only).
+    pub hook: Option<PathBuf>,
+    pub watermark: Option<Watermark>,
+    /// The watermark text's font file.
+    pub font: Option<PathBuf>,
+}
+
+/// Filter joining the hook (input 0, its audio track `hook_track`) and the joined video (input
+/// 1, track `track`) into a `w`x`h` `[video]` and `[a]`.
+pub(crate) fn hook_concat_graph(hook_track: usize, track: usize, w: u32, h: u32, video: &str) -> String {
+    let af = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+    format!(
+        "[0:v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[hv];\
+         [0:a:{hook_track}]{af}[ha];\
+         [1:v:0]scale={w}:{h},setsar=1,fps=30,format=yuv420p[jv];\
+         [1:a:{track}]{af}[ja];\
+         [hv][ha][jv][ja]concat=n=2:v=1:a=1[{video}][a]"
+    )
+}
+
+const H264: [&str; 10] = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac"];
+
+/// Writes the export of `j` into `out_dir`: one file, or (for parts and reels) a folder of them,
+/// with the hook before it (one video) and the watermark over it as `extras` say.
+pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: &str, extras: &Extras, r: &Reporter) -> Result<Vec<PathBuf>> {
     let track = if !music && j.solo { 1 } else { 0 };
     let src = j.path.to_string_lossy().to_string();
+    let mark = Mark::prepare(extras.watermark.clone(), extras.font.as_deref())?;
+    let cwd = mark.as_ref().and_then(|m| m.dir.clone());
+    let hook = if mode == Mode::Whole { extras.hook.as_ref().filter(|h| h.is_file()) } else { None };
+    let size = if mark.is_some() || hook.is_some() { probe(&j.path)?.size } else { (0, 0) };
     if mode == Mode::Whole {
         let out = out_dir.join(part_name(name, mode, 1, 1));
         let tmp = out.with_extension("part.mp4");
-        let mut args: Vec<String> = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}"), "-c", "copy"].map(String::from).to_vec();
+        let (w, h) = size;
+        let mut total = j.total;
+        let mut args: Vec<String>;
+        if let Some(hook) = hook {
+            let hp = probe(hook)?;
+            let hook_track = if music { 0 } else { hp.solo().unwrap_or(0) };
+            total += hp.duration;
+            args = vec!["-i".into(), hook.to_string_lossy().into(), "-i".into(), src.clone()];
+            let mut graph = hook_concat_graph(hook_track, track, w, h, if mark.is_some() { "cv" } else { "v" });
+            if let Some(m) = &mark {
+                args.extend(m.inputs());
+                graph.push(';');
+                graph.push_str(&watermark_graph(&m.wm, "cv", "v", w, h, 2));
+            }
+            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), "[a]".into()]);
+            args.extend(H264.map(String::from));
+            args.extend(["-b:a".into(), "192k".into()]);
+        } else if let Some(m) = &mark {
+            args = vec!["-i".into(), src.clone()];
+            args.extend(m.inputs());
+            args.extend(["-filter_complex".into(), watermark_graph(&m.wm, "0:v:0", "v", w, h, 1), "-map".into(), "[v]".into(), "-map".into(), format!("0:a:{track}")]);
+            args.extend(H264[..8].iter().map(|s| s.to_string()));
+            args.extend(["-c:a".into(), "copy".into()]);
+        } else {
+            args = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}"), "-c", "copy"].map(String::from).to_vec();
+        }
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
-        ffmpeg(&args, j.total, r, &mut |f| r.set(f, "Saving the video"))?;
+        let (from, label) = if hook.is_some() { (0.4, "Saving the video with its hook") } else { (0., "Saving the video") };
+        ffmpeg(&args, total, r, cwd.as_deref(), &mut |f| r.set(from + (1. - from) * f, label))?;
         let _ = std::fs::remove_file(&out);
         std::fs::rename(&tmp, &out)?;
         return Ok(vec![out]);
@@ -621,27 +819,229 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         let d = b - a;
         let file = dir.join(part_name(name, mode, k + 1, n));
         let tmp = file.with_extension("part.mp4");
-        let mut args: Vec<String> = vec!["-ss".into(), format!("{a:.3}"), "-i".into(), src.clone(), "-t".into(), format!("{d:.3}")];
-        if mode == Mode::Reels {
-            let (w, h) = REEL_SIZE;
+        let mut args: Vec<String> = vec!["-ss".into(), format!("{a:.3}"), "-i".into(), src.clone()];
+        // The logo is input 1; `-t` follows every input so it limits the output.
+        if let Some(m) = &mark {
+            args.extend(m.inputs());
+        }
+        args.extend(["-t".into(), format!("{d:.3}")]);
+        // The picture before the watermark, and its frame.
+        let (mut graph, base, (w, h)) = if mode == Mode::Reels {
             // A landscape recap keeps the page in the middle: crop to it (a little wider than
             // square, so captions survive) so the page fills the upright frame.
-            let graph = format!("[0:v:0]crop=w='min(iw\\,ih*9/10)':h=ih[src];{}", fit_blur("src", "v", w, h));
-            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into()]);
+            let (w, h) = REEL_SIZE;
+            (format!("[0:v:0]crop=w='min(iw\\,ih*9/10)':h=ih[src];{}", fit_blur("src", "fit", w, h)), "fit", (w, h))
         } else {
-            args.extend(["-map".into(), "0:v:0".into()]);
+            (String::new(), "0:v:0", size)
+        };
+        match &mark {
+            Some(m) => {
+                if !graph.is_empty() {
+                    graph.push(';');
+                }
+                graph.push_str(&watermark_graph(&m.wm, base, "v", w, h, 1));
+                args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into()]);
+            }
+            None if !graph.is_empty() => args.extend(["-filter_complex".into(), graph, "-map".into(), format!("[{base}]")]),
+            None => args.extend(["-map".into(), "0:v:0".into()]),
         }
         args.extend(["-map".into(), format!("0:a:{track}")]);
-        args.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"].map(String::from));
+        args.extend(H264.map(String::from));
+        args.extend(["-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"].map(String::from));
         args.push(tmp.to_string_lossy().into());
         let label = format!("{} {} of {n}", if mode == Mode::Reels { "Reel" } else { "Part" }, k + 1);
-        ffmpeg(&args, d, r, &mut |f| r.set(((done + f as f64 * d) / j.total) as f32, &label))?;
+        ffmpeg(&args, d, r, cwd.as_deref(), &mut |f| r.set(((done + f as f64 * d) / j.total) as f32, &label))?;
         let _ = std::fs::remove_file(&file);
         std::fs::rename(&tmp, &file)?;
         done += d;
         out.push(file);
     }
     Ok(out)
+}
+
+// ------------------------------------------------------------------ hook
+
+/// One narration beat of a made chapter, as its sync map has it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Beat {
+    pub text: String,
+    pub image: Option<String>,
+    pub focus: Value,
+    /// Seconds into the chapter video.
+    pub start: f64,
+}
+
+/// The beats of the chapter whose output folder is `dir` (`sync_map.json`'s `beat_segments`).
+pub(crate) fn chapter_beats(dir: &Path) -> Vec<Beat> {
+    let Some(sm) = std::fs::read_to_string(dir.join("sync_map.json")).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) else { return vec![] };
+    let mut at = 0.;
+    let mut out = vec![];
+    for b in sm["beat_segments"].as_array().into_iter().flatten() {
+        let start = b["start_ms"].as_f64().map(|ms| ms / 1000.).unwrap_or(at);
+        at = start + b["duration_ms"].as_f64().unwrap_or(0.) / 1000.;
+        out.push(Beat {
+            text: b["text"].as_str().unwrap_or("").trim().to_string(),
+            image: b["panel_image"].as_str().map(str::to_string),
+            focus: b.get("focus_point").cloned().unwrap_or(Value::Null),
+            start,
+        });
+    }
+    out
+}
+
+/// `generate_video`'s resolution preset for a frame `h` pixels high.
+pub(crate) fn resolution_for(h: u32) -> &'static str {
+    match h {
+        0..=800 => "720p",
+        801..=1200 => "1080p",
+        1201..=1700 => "1440p",
+        _ => "4k",
+    }
+}
+
+/// What making a hook needs, gathered on the UI thread.
+pub(crate) struct HookJob {
+    pub manga_id: String,
+    pub manga_title: String,
+    /// The manga's cover: the picture under the hook's closing line.
+    pub cover: Option<PathBuf>,
+    /// The made chapters, in order.
+    pub chapters: Vec<crate::data::ChapterItem>,
+    pub seconds: u32,
+    pub model: Option<mv_recap::ModelChoice>,
+    pub reg: Arc<mv_ai::Registry>,
+    pub python: mv_studio::PythonInterpreter,
+    pub layout: mv_studio::PythonLayout,
+}
+
+impl HookJob {
+    /// Where the hook is made (removed after the export).
+    pub fn work_dir(&self) -> PathBuf {
+        joined_path(&self.manga_id).with_extension("hook")
+    }
+}
+
+/// Awaits `task` (on the background runtime), checking for a cancel every 300 ms (which aborts
+/// it: a script it runs is killed) and calling `tick` meanwhile.
+async fn wait_for<T: Send + 'static>(task: tokio::task::JoinHandle<T>, r: &Reporter, ex: &BackgroundExecutor, mut tick: impl FnMut()) -> Result<T> {
+    loop {
+        if task.is_finished() {
+            return task.await.map_err(|e| anyhow!("{e}"));
+        }
+        if r.cancelled() {
+            task.abort();
+            bail!(CANCELLED);
+        }
+        tick();
+        ex.timer(Duration::from_millis(300)).await;
+    }
+}
+
+/// The `hook_maker.py` arguments for `script` over `chapters` (each with its beats). `None` when
+/// no line has a picture.
+pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Vec<Beat>)], script: &mv_recap::hook::HookScript, resolution: &str, work: &Path) -> Option<Value> {
+    let flat: Vec<(usize, &Beat)> = chapters.iter().enumerate().flat_map(|(c, (_, beats))| beats.iter().map(move |b| (c, b))).collect();
+    let lines: Vec<(usize, &Beat, &String)> = script.lines.iter().filter_map(|(id, text)| flat.get(*id).filter(|(_, b)| b.image.is_some()).map(|(c, b)| (*c, *b, text))).collect();
+    let (first_chapter, first_beat, _) = lines.first()?;
+    let (last, _) = chapters.last()?;
+    // The manga's cover, else its first page or panel.
+    let opening = job.cover.as_ref().map(|p| p.to_string_lossy().into_owned()).or_else(|| chapters.iter().find_map(|(_, beats)| beats.iter().find_map(|b| b.image.clone())).or_else(|| {
+        let first = &chapters.first()?.0;
+        let mut pages: Vec<PathBuf> = std::fs::read_dir(&first.pages_dir).ok()?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["jpg", "jpeg", "png", "webp"].contains(&x.to_ascii_lowercase().as_str()))).collect();
+        pages.sort();
+        pages.first().map(|p| p.to_string_lossy().into_owned())
+    }))?;
+    let voice = mv_studio::voices::voice_for_chapter(&last.id);
+    let engine = mv_studio::tts::engine_hint(&voice);
+    let score = mv_score::score_wav(&crate::page::chref(&chapters[*first_chapter].0));
+    let score = score.is_file().then(|| json!({"wav": score.to_string_lossy(), "start": first_beat.start, "seconds": job.seconds}));
+    Some(json!({
+        "lines": lines.iter().map(|(_, b, text)| json!({"text": text, "image": b.image, "focus": b.focus})).collect::<Vec<_>>(),
+        "outro": {"text": script.outro, "image": opening},
+        "voice": voice,
+        "engine": engine,
+        "speed": mv_recap::Prefs::load().speed,
+        "resolution": resolution,
+        "subtitles": crate::video::subtitle_config_for(last),
+        "score": score,
+        "out": work.join("hook.mp4").to_string_lossy(),
+        "work_dir": work.join("render").to_string_lossy(),
+    }))
+}
+
+/// Writes, voices and renders the hook of `job` for the joined video `j`. Returns the hook video,
+/// and why the model's script was not used when it failed (the narration's own lines were).
+pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &BackgroundExecutor) -> Result<(PathBuf, Option<String>)> {
+    use mv_recap::hook::{fallback_hook, pick_candidates, write_hook, MAX_CANDIDATES};
+    r.set(0.01, "Writing the hook");
+    let work = job.work_dir();
+    let (chapters, height) = {
+        let (items, work, joined) = (job.chapters.clone(), work.clone(), j.path.clone());
+        mv_ui::bg::blocking(move || -> Result<_> {
+            let _ = std::fs::remove_dir_all(&work);
+            std::fs::create_dir_all(&work).with_context(|| format!("create {}", work.display()))?;
+            let chapters: Vec<_> = items.into_iter().map(|c| {
+                let beats = chapter_beats(&c.output_dir);
+                (c, beats)
+            }).collect();
+            Ok((chapters, probe(&joined)?.size.1))
+        })
+        .await??
+    };
+    let texts: Vec<(String, Vec<String>)> = chapters.iter().map(|(c, beats)| (c.label(), beats.iter().map(|b| if b.image.is_some() { b.text.clone() } else { String::new() }).collect())).collect();
+    let candidates = pick_candidates(&texts, MAX_CANDIDATES);
+    if candidates.len() < 2 {
+        bail!("the chapters have too little narration for a hook");
+    }
+    let mut note = None;
+    let script = match job.model.clone() {
+        Some(model) => {
+            let token = mv_ai::CancellationToken::new();
+            let (reg, title, cands, secs, t) = (job.reg.clone(), job.manga_title.clone(), candidates.clone(), job.seconds, token.clone());
+            let task = mv_ui::bg::runtime().spawn(async move { write_hook(reg, model, &title, &cands, secs, t).await });
+            let res = wait_for(task, r, ex, || {}).await;
+            if r.cancelled() {
+                token.cancel();
+                bail!(CANCELLED);
+            }
+            match res.and_then(|x| x) {
+                Ok(s) => s,
+                Err(e) => {
+                    note = Some(format!("{e:#}"));
+                    fallback_hook(&candidates, job.seconds)
+                }
+            }
+        }
+        None => fallback_hook(&candidates, job.seconds),
+    };
+    r.set(0.08, "Voicing the hook");
+    let spec = hook_spec(&job, &chapters, &script, resolution_for(height), &work).ok_or_else(|| anyhow!("the hook's lines have no pictures"))?;
+    let args_file = work.join("args.json");
+    std::fs::write(&args_file, serde_json::to_string(&spec)?)?;
+    let script_path = job.layout.script("hook_maker.py").map_err(|e| anyhow!("{e}"))?;
+    let (py, dir) = (job.python.clone(), job.layout.dir.clone());
+    let arg = args_file.to_string_lossy().into_owned();
+    let task = mv_ui::bg::runtime().spawn(async move { mv_studio::bridge::run_capture(&py, &script_path, &[arg], &dir).await });
+    // The script writes its sync map once every line is voiced: rendering starts then.
+    let voiced = work.join("render").join("sync_map.json");
+    let mut rendering = false;
+    let (code, stdout, stderr) = wait_for(task, r, ex, || {
+        if !rendering && voiced.is_file() {
+            rendering = true;
+            r.set(0.25, "Rendering the hook");
+        }
+    })
+    .await?
+    .map_err(|e| anyhow!("{e}"))?;
+    let last = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let v: Value = serde_json::from_str(last).unwrap_or(Value::Null);
+    if v["ok"].as_bool() == Some(true) {
+        let path = v["path"].as_str().map(PathBuf::from).filter(|p| p.is_file()).ok_or_else(|| anyhow!("the hook video is missing"))?;
+        r.set(0.4, "Rendering the hook");
+        return Ok((path, note));
+    }
+    let why = v["message"].as_str().map(str::to_string).or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()).map(str::to_string)).unwrap_or_else(|| format!("hook_maker exited {code:?}"));
+    bail!("{why}")
 }
 
 // ------------------------------------------------------------------ UI
@@ -734,6 +1134,28 @@ impl StudioPage {
         let name = if videos.len() == 1 { format!("{} - {a}", safe_file_name(&g.title)) } else { format!("{} - {a} to {b}", safe_file_name(&g.title)) };
         let prefs = self.export_prefs;
         let group = g.clone();
+        let env = self.setup.read(cx).env.clone();
+        let scripts = env.as_ref().and_then(|e| e.scripts.as_ref().ok()).map(|l| l.dir.clone());
+        let font = scripts.or_else(|| mv_studio::PythonLayout::resolve(None).ok().map(|l| l.dir)).map(|d| d.join("fonts").join(MARK_FONT));
+        let hook = if prefs.mode() == Mode::Whole && prefs.hook {
+            let Some((python, layout)) = env.and_then(|e| Some((e.python.ok()?, e.scripts.ok()?))) else {
+                toast::show(cx, Toast::error("The hook is voiced by Studio's Python, which is not set up yet. Finish Setup, or turn the hook off."));
+                return;
+            };
+            Some(HookJob {
+                manga_id: g.id.clone(),
+                manga_title: g.title.clone(),
+                cover: g.cover.clone().filter(|p| p.is_file()),
+                chapters: videos.iter().map(|(c, _)| c.clone()).collect(),
+                seconds: prefs.hook_secs,
+                model: self.model(cx).map(|m| m.0),
+                reg: ui_assistant::registry(cx),
+                python,
+                layout,
+            })
+        } else {
+            None
+        };
         let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Export here".into()) });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else { return };
@@ -746,8 +1168,49 @@ impl StudioPage {
                         let r = r.clone();
                         // Chapters whose music could not be taken out (said in the result).
                         let kept = if prefs.music { 0 } else { j.music_kept };
+                        let ex = cx.background_executor().clone();
                         cx.spawn_in(window, async move |this, cx| {
-                            let res = mv_ui::bg::blocking(move || export(&j, prefs.mode(), prefs.music, &dir, &name, &r)).await.and_then(|r| r);
+                            let hook_dir = hook.as_ref().map(HookJob::work_dir);
+                            // A hook that could not be made leaves the video without it (said in the result).
+                            let mut hook_note = String::new();
+                            let mut hook_path = None;
+                            let res = match hook {
+                                Some(job) => match make_hook(job, &j, &r, &ex).await {
+                                    Ok((path, why)) => {
+                                        if let Some(why) = why {
+                                            hook_note = format!(" · the AI hook script failed ({why}), so the hook uses the narration's own lines");
+                                        }
+                                        hook_path = Some(path);
+                                        Ok(())
+                                    }
+                                    Err(e) if e.to_string() == CANCELLED => Err(e),
+                                    Err(e) => {
+                                        hook_note = format!(" · without the hook ({e:#})");
+                                        Ok(())
+                                    }
+                                },
+                                None => Ok(()),
+                            };
+                            let res = match res {
+                                Ok(()) => {
+                                    mv_ui::bg::blocking(move || {
+                                        let extras = Extras { hook: hook_path, watermark: load_watermark(&video_look_path()), font };
+                                        let out = export(&j, prefs.mode(), prefs.music, &dir, &name, &extras, &r);
+                                        if let Some(d) = hook_dir {
+                                            let _ = std::fs::remove_dir_all(d);
+                                        }
+                                        out
+                                    })
+                                    .await
+                                    .and_then(|r| r)
+                                }
+                                Err(e) => {
+                                    if let Some(d) = hook_dir {
+                                        let _ = mv_ui::bg::blocking(move || std::fs::remove_dir_all(d)).await;
+                                    }
+                                    Err(e)
+                                }
+                            };
                             let _ = this.update(cx, |this, cx| {
                                 this.export_job = None;
                                 match res {
@@ -760,7 +1223,7 @@ impl StudioPage {
                                             Mode::Reels => format!("{n} reel{}", plural(n)),
                                         };
                                         let note = if kept > 0 { format!(" · {kept} chapter{} still ha{} music: re-make {} with Redo → Video", plural(kept), if kept == 1 { "s" } else { "ve" }, if kept == 1 { "it" } else { "them" }) } else { String::new() };
-                                        toast::show(cx, Toast::success(format!("Exported {what}{note}")).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
+                                        toast::show(cx, Toast::success(format!("Exported {what}{note}{hook_note}")).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
                                     }
                                     Err(e) if e.to_string() == CANCELLED => toast::show(cx, Toast::info("Export cancelled")),
                                     Err(e) => toast::show(cx, Toast::error(format!("Could not export: {e:#}"))),
@@ -836,6 +1299,30 @@ impl StudioPage {
                 if total > 0. { format!(" (about {})", (total / REEL_SECONDS).ceil() as usize) } else { String::new() }
             ),
         };
+        let hook_row = (mode == Mode::Whole).then(|| {
+            let secs_seg = segmented("vid-hook-secs", HOOK_SECONDS.iter().map(|s| (None, format!("{s}s"))), HOOK_SECONDS.iter().position(|s| *s == prefs.hook_secs).unwrap_or(1)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+                this.export_prefs.hook_secs = HOOK_SECONDS[*ix];
+                cx.notify();
+            }));
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::XS))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(space::SM))
+                        .child(switch("vid-hook", prefs.hook).on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.export_prefs.hook = *on;
+                            cx.notify();
+                        })))
+                        .child(muted("Hook intro"))
+                        .when(prefs.hook, |d| d.child(secs_seg)),
+                )
+                .child(muted("AI picks the most gripping moments, writes and voices a teaser, and puts it before chapter 1."))
+        });
         let group = g.clone();
         let options = div()
             .flex()
@@ -843,6 +1330,7 @@ impl StudioPage {
             .gap(px(space::SM))
             .child(div().flex().flex_wrap().items_center().gap(px(space::SM)).child(muted("Export as")).child(kind_seg).when(matches!(mode, Mode::Parts(_)), |d| d.child(muted("Parts")).child(parts_seg)))
             .child(muted(note))
+            .children(hook_row)
             .child(
                 div()
                     .flex()
@@ -896,7 +1384,11 @@ impl StudioPage {
 
 #[cfg(test)]
 mod tests {
-    use super::{chapter_boundaries, concat_list, export, fmt_duration, join, part_name, plan_parts, plan_reels, Job, Mode};
+    use super::{
+        chapter_beats, chapter_boundaries, concat_list, export, fmt_duration, hook_concat_graph, join, load_watermark, part_name, plan_parts, plan_reels, resolution_for, watermark_graph, Extras,
+        Job, Mode, Watermark,
+    };
+    use serde_json::json;
     use std::path::PathBuf;
 
     #[test]
@@ -975,6 +1467,99 @@ mod tests {
         assert_eq!(chapter_boundaries(&v), vec![2.1, 5.4]);
     }
 
+    fn logo_at(pos: &str) -> Watermark {
+        Watermark { logo: Some((PathBuf::from("logo.png"), pos.into(), 0.1, 0.8)), text: None }
+    }
+
+    fn text_at(pos: &str) -> Watermark {
+        Watermark { logo: None, text: Some(("My Channel".into(), pos.into(), 0.05, 0.5)) }
+    }
+
+    #[test]
+    fn logo_lands_on_its_anchor_with_a_margin_of_the_shorter_side() {
+        // 3% of 1080 is 32 px; the logo is a tenth of the width.
+        let g = watermark_graph(&logo_at("tl"), "0:v:0", "v", 1920, 1080, 1);
+        assert_eq!(g, "[1:v]scale=192:-1,format=rgba,colorchannelmixer=aa=0.80[v_logo];[0:v:0][v_logo]overlay=x=32:y=32[v]");
+        let pos = |p: &str| {
+            let g = watermark_graph(&logo_at(p), "in", "v", 1920, 1080, 2);
+            g[g.find("overlay=").unwrap()..].to_string()
+        };
+        assert_eq!(pos("tr"), "overlay=x=W-w-32:y=32[v]");
+        assert_eq!(pos("mc"), "overlay=x=(W-w)/2:y=(H-h)/2[v]");
+        assert_eq!(pos("bl"), "overlay=x=32:y=H-h-32[v]");
+        assert_eq!(pos("bc"), "overlay=x=(W-w)/2:y=H-h-32[v]");
+        assert_eq!(pos("ml"), "overlay=x=32:y=(H-h)/2[v]");
+        // Upright reels: the margin follows the shorter side (the width).
+        assert!(watermark_graph(&logo_at("br"), "fit", "v", 1080, 1920, 1).ends_with("overlay=x=W-w-32:y=H-h-32[v]"));
+        assert!(watermark_graph(&logo_at("br"), "fit", "v", 1080, 1920, 1).starts_with("[1:v]scale=108:-1"));
+    }
+
+    #[test]
+    fn text_is_drawn_from_the_working_folder_with_a_soft_shadow() {
+        let g = watermark_graph(&text_at("bc"), "0:v:0", "v", 1920, 1080, 1);
+        assert_eq!(
+            g,
+            "[0:v:0]drawtext=fontfile=Inter-ExtraBold.ttf:textfile=text.txt:expansion=none:fontsize=54:fontcolor=white:alpha=0.50:shadowcolor=black@0.6:shadowx=2:shadowy=2:x=(w-text_w)/2:y=h-text_h-32[v]"
+        );
+        assert!(watermark_graph(&text_at("tr"), "a", "v", 1280, 720, 1).ends_with("x=w-text_w-22:y=22[v]"));
+        // Logo and text: chained, the text over the logo.
+        let both = Watermark { text: text_at("tl").text, ..logo_at("br") };
+        let g = watermark_graph(&both, "cv", "v", 1920, 1080, 2);
+        assert!(g.contains("[2:v]scale=192:-1") && g.contains("overlay=x=W-w-32:y=H-h-32[v_l];[v_l]drawtext="), "{g}");
+        assert!(g.ends_with("x=32:y=32[v]"));
+    }
+
+    #[test]
+    fn watermark_settings_are_read_forgivingly() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("video_look.json");
+        // Missing or broken file: no watermark.
+        assert_eq!(load_watermark(&f), None);
+        std::fs::write(&f, "{not json").unwrap();
+        assert_eq!(load_watermark(&f), None);
+        // Both off, or a logo whose image is gone: none.
+        std::fs::write(&f, r#"{"logo":{"on":false,"path":"x.png"},"text":{"on":false,"text":"Hi"},"grade":"warm"}"#).unwrap();
+        assert_eq!(load_watermark(&f), None);
+        std::fs::write(&f, r#"{"logo":{"on":true,"path":"Z:/missing/logo.png"}}"#).unwrap();
+        assert_eq!(load_watermark(&f), None);
+        // A logo that exists, sizes clamped, a bad position falls back to bottom right.
+        let logo = d.path().join("logo.png");
+        std::fs::write(&logo, b"png").unwrap();
+        let spec = json!({"logo": {"on": true, "path": logo, "pos": "tl", "size": 0.9, "opacity": 2}, "text": {"on": true, "text": "  Chan  ", "pos": "zz", "size": 0.001}});
+        std::fs::write(&f, spec.to_string()).unwrap();
+        let wm = load_watermark(&f).unwrap();
+        assert_eq!(wm.logo, Some((logo, "tl".into(), 0.4, 1.)));
+        assert_eq!(wm.text, Some(("Chan".into(), "zz".into(), 0.02, 1.)));
+        assert!(watermark_graph(&Watermark { logo: None, ..wm }, "i", "v", 1920, 1080, 1).ends_with("x=w-text_w-32:y=h-text_h-32[v]"));
+    }
+
+    #[test]
+    fn hook_joins_before_the_video_on_its_frame_and_sound() {
+        let g = hook_concat_graph(1, 0, 1920, 1080, "v");
+        assert!(g.starts_with("[0:v:0]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:"));
+        assert!(g.contains("[0:a:1]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ha]"));
+        assert!(g.contains("[1:a:0]aresample=48000"));
+        assert!(g.ends_with("[hv][ha][jv][ja]concat=n=2:v=1:a=1[v][a]"));
+        assert_eq!((resolution_for(720), resolution_for(1080), resolution_for(1440), resolution_for(2160)), ("720p", "1080p", "1440p", "4k"));
+    }
+
+    #[test]
+    fn beats_come_from_the_sync_map() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(chapter_beats(d.path()).is_empty());
+        std::fs::write(
+            d.path().join("sync_map.json"),
+            r#"{"beat_segments":[{"page":0,"panel_image":"a.jpg","text":" Hi ","start_ms":0,"duration_ms":1500},{"page":1,"panel_image":"b.jpg","focus_point":[0,0,0.5,0.5],"text":"Go!","duration_ms":800}]}"#,
+        )
+        .unwrap();
+        let b = chapter_beats(d.path());
+        assert_eq!(b.len(), 2);
+        assert_eq!((b[0].text.as_str(), b[0].start, b[0].image.as_deref()), ("Hi", 0., Some("a.jpg")));
+        // No start: it follows the beat before.
+        assert_eq!(b[1].start, 1.5);
+        assert_eq!(b[1].focus, json!([0, 0, 0.5, 0.5]));
+    }
+
     /// `MV_EXPORT="a.mp4;b.mp4;outdir" cargo test -p ui-studio export_real -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -988,8 +1573,15 @@ mod tests {
         println!("joined {:.1}s solo={} boundaries={}", j.total, j.solo, j.boundaries.len());
         // MV_EXPORT_WHOLE=1: only the whole video (quick).
         let modes = if std::env::var("MV_EXPORT_WHOLE").is_ok() { vec![Mode::Whole] } else { vec![Mode::Whole, Mode::Parts(3), Mode::Reels] };
+        // MV_EXPORT_LOOK=<video_look.json>: with its watermark; MV_EXPORT_HOOK=<hook.mp4>: with that hook.
+        let extras = Extras {
+            hook: std::env::var("MV_EXPORT_HOOK").ok().map(PathBuf::from),
+            watermark: std::env::var("MV_EXPORT_LOOK").ok().and_then(|f| load_watermark(&PathBuf::from(f))),
+            font: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../python/fonts/Inter-ExtraBold.ttf")),
+        };
+        println!("watermark: {:?}", extras.watermark);
         for mode in modes {
-            let files = export(&j, mode, false, &out, "Test", &r).unwrap();
+            let files = export(&j, mode, false, &out, "Test", &extras, &r).unwrap();
             println!("{mode:?}: {} file(s)", files.len());
         }
     }
