@@ -26,6 +26,11 @@ pub mod service;
 pub mod setup;
 mod setup_view;
 mod side;
+mod tile_menu;
+pub mod vedit;
+mod vedit_play;
+mod vedit_tools;
+mod vedit_view;
 pub mod video;
 mod widgets;
 mod ytpack;
@@ -37,6 +42,8 @@ pub fn register_assistant_tools() {
 }
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
+    // The assistant's video_* tools work from any page.
+    vedit_tools::register();
     match route {
         Route::Studio => Some(cx.new(|cx| page::StudioPage::new(window, cx)).into()),
         _ => None,

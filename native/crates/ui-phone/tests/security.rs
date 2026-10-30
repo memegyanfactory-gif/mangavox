@@ -41,6 +41,8 @@ const API_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/chapter/c1"),
     ("GET", "/api/chapter/c1/page/0"),
     ("POST", "/api/chapter/c1/progress"),
+    ("GET", "/api/chapter/c1/recap"),
+    ("GET", "/api/chapter/c1/recap/audio/page_0000.wav"),
     ("GET", "/api/movies?tab=home"),
     ("GET", "/api/movies/search?q=x"),
     ("POST", "/api/movies/play"),
@@ -670,4 +672,164 @@ async fn unknown_watch_sessions_are_not_found() {
     for path in ["/api/anime/..%2Fx", "/api/anime/21a", "/api/anime/x/episodes"] {
         assert_eq!(get_with(path, &cookie).await.status(), StatusCode::BAD_REQUEST, "{path}");
     }
+}
+
+// ---------------------------------------------------------------- Studio recaps
+
+/// A manga with two downloaded chapters in the temp library; the first gets a Studio narration.
+/// Returns (manga id, chapter with recap, chapter without). `tag` keeps each test's rows apart.
+fn recap_fixture(tag: &str) -> (String, String, String) {
+    use mv_core::repo::{chapter, manga};
+    let root = root().clone();
+    let conn = mv_core::db::open_default().unwrap();
+    let m = manga::add(&conn, &manga::AddMangaInput { source_plugin: "local".into(), source_id: format!("recap-{tag}"), title: "Recap Test".into(), ..Default::default() }).unwrap();
+    let mut ids = vec![];
+    for (n, sid) in [(1.0, format!("{tag}-1")), (2.0, format!("{tag}-2"))] {
+        let c = chapter::add(&conn, &chapter::AddChapterInput { manga_id: m.id.clone(), source_plugin: "local".into(), source_id: sid.clone(), number: Some(n), ..Default::default() }).unwrap();
+        let pages = root.join("library").join(&sid);
+        // The reader lists a cover first, so Studio's page 0 (`0001.jpg`) is the reader's page 1.
+        for f in ["0000-cover.jpg", "0001.jpg", "0002.jpg"] {
+            put(&pages.join(f), "IMG");
+        }
+        chapter::update_download_status(&conn, &c.id, "complete", Some(&pages.display().to_string())).unwrap();
+        ids.push(c.id);
+    }
+    let dir = ui_manga::recap::chapter_dir(&m.id, &ids[0]);
+    put(
+        &dir.join("sync_map.json"),
+        r#"{"total_duration_ms": 2000,
+            "segments": [{"page": 0, "audio_file": "C:\\x\\audio\\page_0000.wav", "start_ms": 0, "end_ms": 1000},
+                         {"page": 1, "audio_file": "page_0001.wav", "start_ms": 1000, "end_ms": 2000}],
+            "beat_segments": [{"page": 0, "panel": null, "panel_image": "/lib/rc1/0001.jpg", "text": "First passage", "start_ms": 0, "end_ms": 1000},
+                              {"page": 1, "panel": null, "panel_image": "/lib/rc1/0002.jpg", "text": "Second passage", "start_ms": 1000, "end_ms": 2000}]}"#,
+    );
+    put(&dir.join("audio/page_0000.wav"), "RIFF-CLIP-0");
+    put(&dir.join("audio/page_0001.wav"), "RIFF-CLIP-1");
+    // In the folder but not part of the narration.
+    put(&dir.join("audio/extra.wav"), SECRET);
+    put(&dir.join("studio/notes.wav"), SECRET);
+    put(&root.join("studio/secret.wav"), SECRET);
+    (m.id, ids[0].clone(), ids[1].clone())
+}
+
+fn json_of(s: &str) -> serde_json::Value {
+    serde_json::from_str(s).unwrap_or_else(|e| panic!("{e}: {s}"))
+}
+
+#[tokio::test]
+async fn recap_routes_serve_only_the_chapters_narration() {
+    let _g = setup();
+    let cookie = pair().await;
+    let (mid, cid, other) = recap_fixture("aloud");
+
+    // The chapter list says which chapters have a recap.
+    let r = get_with(&format!("/api/manga/{mid}"), &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = json_of(&text(r).await);
+    let row = |id: &str| v["chapters"].as_array().unwrap().iter().find(|c| c["id"] == id).cloned().unwrap();
+    assert_eq!(row(&cid)["recap"], serde_json::json!({ "video": false, "aloud": true }));
+    assert_eq!(row(&other)["recap"], serde_json::Value::Null);
+
+    // The timeline, with pages in the reader's list and clip URLs on this server.
+    let r = get_with(&format!("/api/chapter/{cid}/recap"), &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = json_of(&text(r).await);
+    assert_eq!((v["video"].clone(), v["aloud"].clone(), v["total_ms"].clone()), (false.into(), true.into(), 2000.into()));
+    assert_eq!(v["beats"][0], serde_json::json!({ "page": 1, "start_ms": 0, "end_ms": 1000, "y0": 0.0, "y1": 1.0, "text": "First passage" }));
+    assert_eq!(v["beats"][1]["page"], 2);
+    let clips: Vec<String> = v["clips"].as_array().unwrap().iter().map(|c| c["url"].as_str().unwrap().to_string()).collect();
+    assert_eq!(clips, [format!("/api/chapter/{cid}/recap/audio/page_0000.wav"), format!("/api/chapter/{cid}/recap/audio/page_0001.wav")]);
+
+    // Clips stream with Range.
+    let r = get_with(&clips[1], &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(r.headers()[header::CONTENT_TYPE].to_str().unwrap().contains("wav"));
+    assert_eq!(text(r).await, "RIFF-CLIP-1");
+    let r = send(req("GET", &clips[0], PEER).header(header::COOKIE, &cookie).header(header::RANGE, "bytes=0-3").body(Body::empty()).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(text(r).await, "RIFF");
+
+    // Nothing else: other files, other folders, odd names.
+    for file in [
+        "extra.wav",
+        "notes.wav",
+        "secret.wav",
+        "..%2Fextra.wav",
+        "..%2F..%2Fsecret.wav",
+        "..%5C..%5Csecret.wav",
+        "%2e%2e%2fstudio%2fnotes.wav",
+        "sync_map.json",
+        "page_0000.WAV",
+        "page_0000.wav%00",
+        "page_0000.wav%3A%3A%24DATA",
+        ".wav",
+        "CON.wav",
+    ] {
+        let r = get_with(&format!("/api/chapter/{cid}/recap/audio/{file}"), &cookie).await;
+        let status = r.status();
+        let body = text(r).await;
+        assert!(status.is_client_error(), "{file}: {status}");
+        assert!(!body.contains(SECRET) && !body.contains("RIFF") && !body.contains(":\\"), "{file}: {body}");
+    }
+    for path in [format!("/api/chapter/{cid}/recap/audio/../../../secret.wav"), format!("/api/chapter/{cid}/recap/audio/x/page_0000.wav")] {
+        let r = get_with(&path, &cookie).await;
+        assert!(r.status().is_client_error(), "{path}");
+        assert!(!text(r).await.contains(SECRET));
+    }
+    // Another chapter's or an unknown chapter's recap: 404.
+    for path in [format!("/api/chapter/{other}/recap"), format!("/api/chapter/{other}/recap/audio/page_0000.wav"), "/api/chapter/nope/recap".into(), "/api/chapter/nope/recap/audio/page_0000.wav".into()] {
+        assert_eq!(get_with(&path, &cookie).await.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn recap_videos_stream_without_history() {
+    let _g = setup();
+    let cookie = pair().await;
+    let (_, cid, other) = recap_fixture("video");
+    // Before Studio made the video, and for bad or unknown chapters: refused.
+    for (body, status) in [
+        (format!(r#"{{"kind":"recap","chapter":"{cid}"}}"#), StatusCode::NOT_FOUND),
+        (format!(r#"{{"kind":"recap","chapter":"{other}"}}"#), StatusCode::NOT_FOUND),
+        (r#"{"kind":"recap","chapter":"nope"}"#.into(), StatusCode::NOT_FOUND),
+        (r#"{"kind":"recap"}"#.into(), StatusCode::BAD_REQUEST),
+        (r#"{"kind":"recap","chapter":"  "}"#.into(), StatusCode::BAD_REQUEST),
+    ] {
+        let r = send(post("/api/watch", PEER).header(header::COOKIE, &cookie).body(Body::from(body.clone())).unwrap()).await;
+        assert_eq!(r.status(), status, "{body}");
+    }
+
+    let manga_id = {
+        let conn = mv_core::db::open_default().unwrap();
+        mv_core::repo::chapter::get(&conn, &cid).unwrap().unwrap().manga_id
+    };
+    put(&ui_manga::recap::chapter_dir(&manga_id, &cid).join("video_final.mp4"), "MP4-RECAP-DATA");
+    let r = send(post("/api/watch", PEER).header(header::COOKIE, &cookie).body(Body::from(format!(r#"{{"kind":"recap","chapter":"{cid}","title":"Recap Test · Ch. 1"}}"#))).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let s = json_of(&text(r).await);
+    assert_eq!(s["mode"], "direct");
+    assert_eq!(s["title"], "Recap Test · Ch. 1");
+    assert_eq!((s["resume"].clone(), s["next"].clone(), s["subtitles"].clone()), (serde_json::Value::Null, serde_json::Value::Null, serde_json::json!([])));
+    let url = s["url"].as_str().unwrap().to_string();
+    let id = s["id"].as_str().unwrap().to_string();
+    assert!(!url.contains("video_final") && !url.contains(&cid), "{url}");
+
+    let r = get_with(&url, &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[header::CONTENT_TYPE], "video/mp4");
+    assert_eq!(text(r).await, "MP4-RECAP-DATA");
+    let r = send(req("GET", &url, PEER).header(header::COOKIE, &cookie).header(header::RANGE, "bytes=4-8").body(Body::empty()).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(text(r).await, "RECAP");
+
+    // Progress is accepted but is not watch history.
+    let r = send(post(&format!("/api/watch/{id}/progress"), PEER).header(header::COOKIE, &cookie).body(Body::from(r#"{"pos":30,"duration":60}"#)).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // Another phone cannot use the session; stopping ends it.
+    let stranger = pair_from("192.168.1.77:5000").await;
+    assert_eq!(get_with(&url, &stranger).await.status(), StatusCode::NOT_FOUND);
+    let r = send(post(&format!("/api/watch/{id}/stop"), PEER).header(header::COOKIE, &cookie).body(Body::from("{}")).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(get_with(&url, &cookie).await.status(), StatusCode::NOT_FOUND);
 }

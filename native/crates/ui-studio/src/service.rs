@@ -196,7 +196,12 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
     }
     // The chapter's caption style (its own, else the Studio default; see `video`).
     if req.video {
-        job.video_config["subtitles"] = crate::video::subtitle_config_for(ch);
+        let subs = crate::video::subtitle_setting_for(ch);
+        job.video_config["subtitles"] = subs.to_json();
+        // The chapter's Video editor edit (clips, layers, music, look), so any re-render keeps it.
+        if let (Some(serde_json::Value::Object(extra)), Some(cfg)) = (crate::vedit::extra_for(&ch.output_dir, &ch.id, &ch.pages_dir, &subs), job.video_config.as_object_mut()) {
+            cfg.extend(extra);
+        }
     }
     job.ocr_engine = env.ocr_engine.clone();
     if matches!(env.ocr, OcrProvider::Local | OcrProvider::Unavailable { .. }) {

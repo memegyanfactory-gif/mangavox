@@ -12,9 +12,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context as _, Result};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ui::theme::{icon as icon_px, radius, space};
+use mv_ui::theme::{radius, space};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, glyphs, icon_button, muted, ph, ph_icon, segmented, size, switch, ButtonKind, Tokens, Weight};
+use mv_ui::{btn, glyphs, icon_button, muted, ph, segmented, size, switch, ButtonKind, Tokens};
 use serde_json::{json, Value};
 
 use crate::data::MangaGroup;
@@ -1275,36 +1275,17 @@ impl StudioPage {
         let prefs = self.export_prefs;
         let mode = prefs.mode();
 
-        let head = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(space::MD))
-            .child(div().flex().flex_none().items_center().justify_center().size(px(40.)).rounded(px(radius::LG)).bg(Tokens::accent_soft()).child(ph_icon(ph::FILM_STRIP, Weight::Duotone, Tokens::accent(), icon_px::XL)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(200.))
-                    .gap(px(2.))
-                    .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Full recap video"))
-                    .child(muted(if n == 0 {
-                        "Every made chapter joins here, in order, as one video.".to_string()
-                    } else if total > 0. {
-                        format!("{n} chapter{} in order · {}", plural(n), fmt_duration(total))
-                    } else {
-                        format!("{n} chapter{} in order", plural(n))
-                    })),
-            )
-            .child({
-                let group = g.clone();
-                btn("vid-play", "Play", ButtonKind::Primary)
-                    .icon(ph::PLAY)
-                    .tooltip("Play every made chapter as one video")
-                    .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.play_full(&group, window, cx)))
-            });
+        // The section header above says the title, the chapter count and the length.
+        let play = {
+            let group = g.clone();
+            btn("vid-play", "Play", ButtonKind::Primary)
+                .small()
+                .icon(ph::PLAY)
+                .tooltip("Play every made chapter as one video")
+                .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.play_full(&group, window, cx)))
+        };
+        let small = |t: String| div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(t);
 
         let kinds = [(ph::FILM_STRIP, "One video"), (ph::SQUARES_FOUR, "Parts"), (ph::DEVICE_MOBILE, "Reels · 1 min")];
         let kind_seg = segmented("vid-kind", kinds.iter().map(|&(i, l)| (Some(i), l)), prefs.kind).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
@@ -1330,50 +1311,51 @@ impl StudioPage {
             }));
             div()
                 .flex()
-                .flex_col()
+                .items_center()
                 .gap(px(space::XS))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(space::SM))
-                        .child(switch("vid-hook", prefs.hook).on_click(cx.listener(|this, on: &bool, _, cx| {
-                            this.export_prefs.hook = *on;
-                            cx.notify();
-                        })))
-                        .child(muted("Hook intro"))
-                        .when(prefs.hook, |d| d.child(secs_seg)),
-                )
-                .child(muted("AI picks the most gripping moments, writes and voices a teaser, and puts it before chapter 1."))
+                .child(switch("vid-hook", prefs.hook).on_click(cx.listener(|this, on: &bool, _, cx| {
+                    this.export_prefs.hook = *on;
+                    cx.notify();
+                })))
+                .child(div().id("vid-hook-label").tooltip(mv_ui::tip("AI picks the most gripping moments, writes and voices a teaser, and puts it before chapter 1.")).child(muted("Hook")))
+                .when(prefs.hook, |d| d.child(secs_seg))
         });
         let group = g.clone();
         let options = div()
             .flex()
             .flex_col()
-            .gap(px(space::SM))
-            .child(div().flex().flex_wrap().items_center().gap(px(space::SM)).child(muted("Export as")).child(kind_seg).when(matches!(mode, Mode::Parts(_)), |d| d.child(muted("Parts")).child(parts_seg)))
-            .child(muted(note))
-            .children(hook_row)
+            .gap(px(space::XS))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap(px(space::SM))
-                    .child(switch("vid-music", prefs.music).on_click(cx.listener(|this, on: &bool, _, cx| {
-                        this.export_prefs.music = *on;
-                        cx.notify();
-                    })))
-                    .child(muted(if prefs.music { "Background music on" } else { "Music off · narration only" }))
+                    .child(kind_seg)
+                    .when(matches!(mode, Mode::Parts(_)), |d| d.child(parts_seg))
+                    .children(hook_row)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(space::XS))
+                            .child(switch("vid-music", prefs.music).on_click(cx.listener(|this, on: &bool, _, cx| {
+                                this.export_prefs.music = *on;
+                                cx.notify();
+                            })))
+                            .child(muted(if prefs.music { "Music" } else { "No music · narration only" })),
+                    )
                     .child(div().flex_1())
+                    .child(play)
                     .child(
                         btn("vid-export", "Export…", ButtonKind::Secondary)
+                            .small()
                             .icon(glyphs::DOWNLOADS)
                             .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_export(&group, window, cx))),
                     ),
-            );
+            )
+            .child(small(if n == 0 { "Every made chapter joins here, in order, as one video.".to_string() } else { note }));
 
         let progress = job.map(|(here, (p, label))| {
             div()
@@ -1392,14 +1374,13 @@ impl StudioPage {
         div()
             .flex()
             .flex_col()
-            .gap(px(space::MD))
-            .p(px(space::LG))
+            .gap(px(space::SM))
+            .px(px(space::MD))
+            .py(px(space::SM))
             .rounded(px(radius::LG))
             .border_1()
             .border_color(Tokens::border())
             .bg(Tokens::surface())
-            .child(head)
-            .child(div().h(px(1.)).bg(Tokens::border()))
             .child(options)
             .children(progress)
             .into_any_element()

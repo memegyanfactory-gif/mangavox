@@ -18,7 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{badge, btn, icon_button, muted, ph, ph_icon, size, Btn, ButtonKind, Ph, Tokens, Tone, Weight};
+use mv_ui::{badge, btn, icon_button, muted, ph, ph_icon, shimmer, size, tip, Btn, ButtonKind, Ph, Tokens, Tone, Weight};
 use serde::{Deserialize, Serialize};
 
 use self::logic::{short_count, Cast, Matcher, Prediction, Suggestion, Video};
@@ -85,6 +85,8 @@ pub(crate) struct YtPackage {
     saved: Saved,
     open: bool,
     show_all: bool,
+    /// Long texts currently shown in full.
+    expanded: std::collections::HashSet<&'static str>,
     researching: bool,
     suggesting: bool,
     error: Option<String>,
@@ -140,6 +142,7 @@ impl YtPackage {
             open: saved.researched_at > 0,
             saved,
             show_all: false,
+            expanded: Default::default(),
             researching: false,
             suggesting: false,
             error: None,
@@ -315,27 +318,43 @@ fn copy_btn(id: impl Into<ElementId>, what: &'static str, text: String) -> Btn {
     })
 }
 
+/// A small section heading: icon, title and a dim hint.
 fn section(icon: Ph, title: &str, sub: impl Into<SharedString>) -> Div {
     div()
         .flex()
         .items_center()
         .gap(px(space::SM))
-        .child(ph_icon(icon, Weight::Duotone, Tokens::accent(), icon_px::MD))
-        .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title.to_string()))
-        .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(sub.into()))
+        .child(ph_icon(icon, Weight::Duotone, Tokens::accent(), icon_px::SM))
+        .child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title.to_string()))
+        .child(div().flex_1().min_w_0().text_size(px(size::XS)).text_color(Tokens::text_3()).line_clamp(1).child(sub.into()))
 }
 
-fn text_box(text: String) -> Div {
+/// Label column plus value, the card's one grid shape.
+fn row(label: &'static str, value: impl IntoElement) -> Div {
     div()
-        .p(px(space::MD))
-        .rounded(px(radius::MD))
-        .bg(Tokens::surface_2())
-        .border_1()
-        .border_color(Tokens::border())
-        .text_size(px(size::SM))
-        .text_color(Tokens::text_2())
-        .whitespace_normal()
-        .child(text)
+        .flex()
+        .items_start()
+        .gap(px(space::MD))
+        .child(div().flex_none().w(px(84.)).pt(px(2.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(label))
+        .child(div().flex().flex_col().flex_1().min_w_0().gap(px(2.)).child(value))
+}
+
+/// Whether text is long enough to need the "Show more" toggle at this clamp.
+fn is_long(text: &str, lines: usize) -> bool {
+    text.chars().count() > 85 * lines || text.lines().count() > lines
+}
+
+/// A grey placeholder bar with the shared shimmer sweeping across it.
+fn skeleton(w: Option<f32>, h: f32) -> Div {
+    let d = div().relative().overflow_hidden().h(px(h)).rounded(px(radius::SM)).bg(Tokens::surface_2()).child(shimmer());
+    match w {
+        Some(w) => d.w(px(w)),
+        None => d.w_full(),
+    }
+}
+
+fn skeleton_rows(widths: &[Option<f32>], h: f32) -> Div {
+    div().flex().flex_col().gap(px(6.)).children(widths.iter().map(|w| skeleton(*w, h)))
 }
 
 fn match_tone(score: f32) -> Tone {
@@ -348,14 +367,17 @@ fn match_tone(score: f32) -> Tone {
     }
 }
 
-fn video_row(id: (&'static str, usize), v: &Video) -> Stateful<Div> {
+fn video_card(id: (&'static str, usize), v: &Video) -> Stateful<Div> {
     let url = v.url();
-    let covers = if v.score >= 0.3 && !v.covers.is_empty() { format!("{} · {:.0}%", v.covers, v.score * 100.) } else { format!("Unknown manga · {:.0}%", v.score * 100.) };
+    let pct = format!("{:.0}%", v.score * 100.);
+    let tag = if v.score >= 0.3 && !v.covers.is_empty() { format!("{pct} · {}", v.covers.chars().take(16).collect::<String>()) } else { format!("{pct} match") };
     div()
         .id(id)
         .flex()
-        .gap(px(space::MD))
-        .p(px(space::SM))
+        .flex_col()
+        .flex_none()
+        .w(px(160.))
+        .gap(px(4.))
         .rounded(px(radius::MD))
         .cursor_pointer()
         .hover(|s| s.bg(Tokens::hover()))
@@ -363,7 +385,6 @@ fn video_row(id: (&'static str, usize), v: &Video) -> Stateful<Div> {
         .child(
             div()
                 .relative()
-                .flex_none()
                 .w(px(160.))
                 .h(px(90.))
                 .rounded(px(radius::SM))
@@ -374,24 +395,9 @@ fn video_row(id: (&'static str, usize), v: &Video) -> Stateful<Div> {
                     d.child(div().absolute().right(px(4.)).bottom(px(4.)).px(px(4.)).rounded(px(3.)).bg(Tokens::scrim()).text_size(px(size::XS)).text_color(Tokens::text_1()).child(v.length.clone()))
                 }),
         )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap(px(4.))
-                .child(div().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).line_clamp(2).child(v.title.clone()))
-                .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!("{} · {} views · {}", v.channel, short_count(v.views), if v.published.is_empty() { "date unknown" } else { v.published.as_str() })))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(space::XS))
-                        .child(badge(format!("Covers: {covers}"), match_tone(v.score)))
-                        .when(v.reference, |d| d.child(badge("Reference channel", Tone::Accent))),
-                ),
-        )
+        .child(div().h(px(32.)).overflow_hidden().text_size(px(size::XS)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).line_clamp(2).child(v.title.clone()))
+        .child(div().text_size(px(10.)).text_color(Tokens::text_3()).line_clamp(1).child(format!("{} · {} views", v.channel, short_count(v.views))))
+        .child(div().flex().gap(px(space::XS)).child(badge(tag, match_tone(v.score))).when(v.reference, |d| d.child(badge("Ref", Tone::Accent))))
 }
 
 impl Render for YtPackage {
@@ -399,35 +405,27 @@ impl Render for YtPackage {
         let s = &self.saved;
         let comparable = s.comparable();
         let summary = if s.researched_at == 0 {
-            "Thumbnail prompt, the recaps already on YouTube, and a title that fits".to_string()
+            "Thumbnail prompt, recaps on YouTube, and a title that fits".to_string()
         } else {
-            format!("{} recap{} of this manga found · checked {}", comparable.len(), if comparable.len() == 1 { "" } else { "s" }, crate::widgets::ago(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.researched_at)))
+            format!("{} recap{} found · checked {}", comparable.len(), if comparable.len() == 1 { "" } else { "s" }, crate::widgets::ago(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.researched_at)))
         };
         let head = div()
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(space::MD))
-            .child(div().flex().flex_none().items_center().justify_center().size(px(40.)).rounded(px(radius::LG)).bg(Tokens::accent_soft()).child(ph_icon(ph::YOUTUBE_LOGO, Weight::Duotone, Tokens::accent(), icon_px::XL)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(200.))
-                    .gap(px(2.))
-                    .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("YouTube package"))
-                    .child(muted(summary)),
-            )
+            .gap(px(space::SM))
+            .child(div().flex_1().min_w(px(180.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(summary))
             .child(
                 btn("ytp-research", if s.researched_at == 0 { "Research YouTube" } else { "Research again" }, ButtonKind::Secondary)
+                    .small()
                     .icon(ph::MAGNIFYING_GLASS)
                     .loading(self.researching)
                     .tooltip(format!("Find recaps of this manga under all its titles, and compare with {REFERENCE}"))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.research(cx))),
             )
             .child(
-                btn("ytp-suggest", "Suggest with AI", ButtonKind::Primary)
+                btn("ytp-suggest", if self.suggesting { "Thinking…" } else { "Suggest with AI" }, ButtonKind::Primary)
+                    .small()
                     .icon(ph::MAGIC_WAND)
                     .loading(self.suggesting)
                     .tooltip("Title, description and thumbnail idea from the model picked at the top, based on what performs best")
@@ -440,66 +438,82 @@ impl Render for YtPackage {
                 })),
             );
 
-        let mut card = crate::widgets::card().child(head);
+        let mut card = crate::widgets::card().gap(px(space::SM)).child(head);
         if let Some(e) = &self.error {
-            card = card.child(div().text_size(px(size::SM)).text_color(Tokens::danger()).child(e.clone()));
+            card = card.child(div().text_size(px(size::XS)).text_color(Tokens::danger()).child(e.clone()));
         }
         if !self.open {
             return card;
         }
-        card.child(self.thumbnail_section(cx)).child(self.suggestion_section(&comparable)).child(self.competitor_section(&comparable, cx))
+        card.child(self.thumbnail_section(cx)).child(self.suggestion_section(&comparable, cx)).child(self.competitor_section(&comparable, cx))
     }
 }
 
 impl YtPackage {
-    fn thumbnail_section(&self, _cx: &mut Context<Self>) -> Div {
+    /// Text clamped to `lines` lines with a Show more / Show less toggle (only when it is long).
+    fn clamped(&self, key: &'static str, text: String, lines: usize, cx: &mut Context<Self>) -> Div {
+        let open = self.expanded.contains(key);
+        let long = is_long(&text, lines);
+        let body = div().text_size(px(size::XS)).text_color(Tokens::text_2()).whitespace_normal().when(!open, |d| d.line_clamp(lines)).child(text);
+        div().flex().flex_col().gap(px(2.)).child(body).when(long, |d| {
+            d.child(
+                div().flex().child(
+                    btn((SharedString::from(format!("ytp-more-{key}")), 0usize), if open { "Show less" } else { "Show more" }, ButtonKind::Ghost)
+                        .small()
+                        .icon(if open { ph::CARET_UP } else { ph::CARET_DOWN })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            if !this.expanded.remove(key) {
+                                this.expanded.insert(key);
+                            }
+                            cx.notify();
+                        })),
+                ),
+            )
+        })
+    }
+
+    /// A clamped value with its Copy button on the right.
+    fn copy_row(&self, label: &'static str, id: &'static str, what: &'static str, text: String, lines: usize, cx: &mut Context<Self>) -> Div {
+        row(label, div().flex().items_start().gap(px(space::SM)).child(div().flex_1().min_w_0().child(self.clamped(id, text.clone(), lines, cx))).child(div().flex_none().child(copy_btn(id, what, text))))
+    }
+
+    fn thumbnail_section(&self, cx: &mut Context<Self>) -> Div {
         let prompt = self.prompt();
         let faces: Vec<(String, PathBuf)> = self.cast.iter().filter_map(|(c, f)| f.clone().map(|f| (c.name.clone(), f))).collect();
-        let refs = div()
-            .flex()
-            .flex_col()
-            .gap(px(space::SM))
-            .w(px(260.))
-            .flex_none()
-            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("Reference images to attach, in this order"))
-            .child(if faces.is_empty() {
-                muted("No faces yet. Read a chapter so Studio learns the characters.").into_any_element()
-            } else {
-                div()
-                    .flex()
-                    .gap(px(space::SM))
-                    .children(faces.iter().enumerate().map(|(i, (name, path))| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(px(4.))
-                            .w(px(76.))
-                            .child(div().size(px(76.)).rounded(px(radius::MD)).overflow_hidden().border_1().border_color(Tokens::border()).child(img(path.clone()).size_full().object_fit(ObjectFit::Cover)))
-                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).line_clamp(1).child(format!("{}. {name}", i + 1)))
-                    }))
-                    .into_any_element()
-            })
-            .child({
-                let dir = self.faces_dir.clone();
-                btn("ytp-faces", "Open faces folder", ButtonKind::Ghost).small().icon(ph::FOLDER_OPEN).when(faces.is_empty(), |b| b.disabled("No faces yet")).on_click(move |_, _, cx| cx.reveal_path(&dir))
-            });
+        let dir = self.faces_dir.clone();
+        let avatars = if faces.is_empty() {
+            div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("No faces yet. Read a chapter so Studio learns the characters.").into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(space::SM))
+                .children(faces.iter().enumerate().map(|(i, (name, path))| {
+                    div()
+                        .id(("ytp-face", i))
+                        .size(px(48.))
+                        .flex_none()
+                        .rounded_full()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(Tokens::border())
+                        .tooltip(tip(format!("{}. {name}", i + 1)))
+                        .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
+                }))
+                .child(btn("ytp-faces", "Faces folder", ButtonKind::Ghost).small().icon(ph::FOLDER_OPEN).tooltip("Open the faces folder; attach these images in this order").on_click(move |_, _, cx| cx.reveal_path(&dir)))
+                .into_any_element()
+        };
         div()
             .flex()
             .flex_col()
             .gap(px(space::SM))
             .child(section(ph::IMAGE, "Thumbnail prompt", "for Midjourney, GPT image, Flux…"))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(space::LG))
-                    .child(div().flex().flex_col().flex_1().min_w(px(320.)).gap(px(space::XS)).child(text_box(prompt.clone())).child(div().flex().child(copy_btn("ytp-copy-prompt", "thumbnail prompt", prompt))))
-                    .child(refs),
-            )
+            .child(self.copy_row("Prompt", "ytp-prompt", "thumbnail prompt", prompt, 3, cx))
+            .child(row("Attach", avatars))
     }
 
-    fn suggestion_section(&self, comparable: &[Video]) -> Div {
+    fn suggestion_section(&self, comparable: &[Video], cx: &mut Context<Self>) -> Div {
         let s = &self.saved;
         let mut col = div().flex().flex_col().gap(px(space::SM)).child(section(ph::LIGHTBULB, "Suggestions", "from what performs best"));
         if let Some(p) = &s.prediction {
@@ -509,49 +523,32 @@ impl YtPackage {
                 _ => Tone::Warning,
             };
             let range = if p.high == 0 { "Not enough data".to_string() } else { format!("{} – {} views", short_count(p.low), short_count(p.high)) };
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(space::XS))
-                    .p(px(space::MD))
-                    .rounded(px(radius::MD))
-                    .bg(Tokens::surface_2())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(px(space::SM))
-                            .child(icon_ph_trend())
-                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("Expected views, first months"))
-                            .child(div().text_size(px(size::LG)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(range))
-                            .child(badge(format!("{} confidence", p.confidence), tone))
-                            .when(comparable.is_empty(), |d| d.child(badge("no direct comparison", Tone::Neutral))),
-                    )
-                    .children(p.reasoning.iter().map(|r| div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!("• {r}")))),
-            );
+            let head = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(space::SM))
+                .child(div().text_size(px(size::SM)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(range))
+                .child(badge(format!("{} confidence", p.confidence), tone))
+                .when(comparable.is_empty(), |d| d.child(badge("no direct comparison", Tone::Neutral)));
+            let why = p.reasoning.join(" · ");
+            col = col.child(row("Forecast", div().flex().flex_col().gap(px(2.)).child(head).when(!why.is_empty(), |d| d.child(self.clamped("ytp-why", why, 2, cx)))));
+        }
+        if self.suggesting {
+            return col
+                .child(row("Title", skeleton_rows(&[Some(300.), None, Some(220.)], 12.)))
+                .child(row("Description", skeleton_rows(&[None, None, Some(260.)], 10.)))
+                .child(row("Thumbnail", skeleton_rows(&[None, Some(200.)], 10.)));
         }
         match &s.suggestion {
             None => col.child(muted(if s.researched_at == 0 { "Research YouTube first for better suggestions, then press Suggest with AI." } else { "Press Suggest with AI for a title, description and thumbnail idea." })),
             Some(g) => {
-                let field = |id: &'static str, label: &'static str, value: String| {
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .child(div().flex().items_center().justify_between().child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{}{}", label[..1].to_uppercase(), &label[1..]))).child(copy_btn(id, label, value.clone())))
-                        .child(text_box(value))
-                };
-                col.child(field("ytp-copy-title", "title", g.title.clone()))
-                    .when(!g.alt_titles.is_empty(), |d| d.child(div().flex().flex_col().gap(px(2.)).children(g.alt_titles.iter().map(|t| div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!("or: {t}"))))))
-                    .child(field("ytp-copy-desc", "description", g.description.clone()))
-                    .child(field(
-                        "ytp-copy-concept",
-                        "thumbnail concept",
-                        if g.thumbnail_text.is_empty() { g.thumbnail_concept.clone() } else { format!("{}\n\nText on the thumbnail: \"{}\"", g.thumbnail_concept, g.thumbnail_text) },
-                    ))
-                    .when(!g.notes.is_empty(), |d| d.child(muted(g.notes.clone())))
+                let concept = if g.thumbnail_text.is_empty() { g.thumbnail_concept.clone() } else { format!("{}\n\nText on the thumbnail: \"{}\"", g.thumbnail_concept, g.thumbnail_text) };
+                col.child(self.copy_row("Title", "ytp-title", "title", g.title.clone(), 2, cx))
+                    .when(!g.alt_titles.is_empty(), |d| d.child(row("Alternatives", div().flex().flex_col().gap(px(2.)).children(g.alt_titles.iter().map(|t| div().text_size(px(size::XS)).text_color(Tokens::text_2()).line_clamp(1).child(t.clone()))))))
+                    .child(self.copy_row("Description", "ytp-desc", "description", g.description.clone(), 3, cx))
+                    .child(self.copy_row("Thumbnail", "ytp-concept", "thumbnail concept", concept, 3, cx))
+                    .when(!g.notes.is_empty(), |d| d.child(row("Notes", self.clamped("ytp-notes", g.notes.clone(), 2, cx))))
             }
         }
     }
@@ -566,8 +563,9 @@ impl YtPackage {
         let weaker: Vec<&Video> = s.videos.iter().filter(|v| !comparable.iter().any(|c| c.id == v.id)).collect();
         if comparable.is_empty() {
             col = col.child(muted("No recap of this manga was found on YouTube. Being first is an opening."));
+        } else {
+            col = col.child(div().flex().flex_wrap().gap(px(space::SM)).children(comparable.iter().take(12).enumerate().map(|(i, v)| video_card(("ytp-comp", i), v))));
         }
-        col = col.children(comparable.iter().take(12).enumerate().map(|(i, v)| video_row(("ytp-comp", i), v)));
         if !weaker.is_empty() {
             col = col.child(
                 div().flex().child(
@@ -581,7 +579,7 @@ impl YtPackage {
                 ),
             );
             if self.show_all {
-                col = col.children(weaker.iter().take(30).enumerate().map(|(i, v)| video_row(("ytp-other", i), v)));
+                col = col.child(div().flex().flex_wrap().gap(px(space::SM)).children(weaker.iter().take(30).enumerate().map(|(i, v)| video_card(("ytp-other", i), v))));
             }
         }
         if !s.reference_recent.is_empty() {
@@ -596,14 +594,10 @@ impl YtPackage {
                     &format!("Reference: {}", s.reference_name),
                     format!("{}{}median {} views over its last {} uploads", s.reference_subs, if s.reference_subs.is_empty() { "" } else { " · " }, short_count(median), views.len()),
                 ))
-                .children(top.iter().take(4).enumerate().map(|(i, v)| video_row(("ytp-ref", i), v)));
+                .child(div().flex().flex_wrap().gap(px(space::SM)).children(top.iter().take(4).enumerate().map(|(i, v)| video_card(("ytp-ref", i), v))));
         }
         col
     }
-}
-
-fn icon_ph_trend() -> Svg {
-    ph_icon(ph::TREND_UP, Weight::Bold, Tokens::accent(), icon_px::MD)
 }
 
 #[cfg(test)]

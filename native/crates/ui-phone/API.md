@@ -20,16 +20,18 @@ JSON bodies use `Content-Type: application/json`. Errors: HTTP 4xx/5xx with `{"e
   always sends it) and, when an `Origin` header is present, it must equal `http://<Host>`.
 - Revoking a device (desktop Mobile page) makes its cookie invalid immediately.
 - Request bodies are capped at 256 KiB (413). No CORS headers are ever sent.
-- The phone never names a URL or a file to stream: `/api/watch` takes title ids only, watch
+- The phone never names a URL or a file to stream: `/api/watch` takes title (or chapter) ids only, watch
   sessions are 24 random bytes (base64url), belong to the device that started them (anyone else
   gets 404) and end after 30 min without requests.
+- Recap narration clips are served only by plain `.wav` names the chapter's own narration lists,
+  resolved inside its Studio `audio` folder.
 - `/api/img` only fetches http(s) DNS names on the default port; IP literals, `localhost` and
   local-only names are refused (400), and every resolved address (also at connect time and after
   each of at most 3 redirects) must be public: no loopback, RFC 1918, link-local, CGNAT, ULA or
   v6 forms embedding a v4 address. Image types only (no SVG), 15 MB at most.
 - Tests: `tests/security.rs` (every route unpaired, peer / Host / CSRF / Origin checks, code reuse,
   expiry and rate limit, revocation, media path traversal incl. junctions, image proxy SSRF,
-  unknown watch sessions).
+  unknown watch sessions, recap clip names and recap video sessions).
 
 Known limits (design tradeoffs, not bugs):
 - Plain HTTP on the LAN: someone who can sniff the Wi-Fi (open network, or a WPA2-PSK network whose
@@ -58,12 +60,24 @@ Known limits (design tradeoffs, not bugs):
   (library order: last read first; skips browse-only ids like the desktop library page)
 - `GET /api/manga/<id>` -> `{ "id","title","author","description","genres":[..],"status","cover",
    "chapters": [{ "id","number","title","read": bool,"progress": 0..1,"pages","downloaded": bool,
-                  "audio": bool, "video": bool }] }`   (chapters in reading order)
+                  "audio": bool, "video": bool, "recap": { "video": bool, "aloud": bool } | null }] }`
+   (chapters in reading order; `recap` = what Studio left in the chapter's Studio folder (`ui_manga::recap`):
+   `video_final.mp4` -> watch it, a voiced `sync_map.json` -> read aloud; null when neither)
 - `GET /api/manga/<id>/cover` -> image bytes (cached cover file / downloaded)
 - `GET /api/chapter/<id>` -> `{ "id","manga_id","title","number","pages": <n>, "start": <page index to resume>,
    "prev": <chapter id|null>, "next": <chapter id|null> }`
 - `GET /api/chapter/<id>/page/<n>` -> image bytes (n is 0-based; downloaded file or fetched via the source and cached)
 - `POST /api/chapter/<id>/progress` body `{ "page": n, "total": t }` -> `{}`
+- `GET /api/chapter/<id>/recap` -> `{ "video": bool, "aloud": bool, "total_ms",
+   "beats": [{ "page", "start_ms", "end_ms", "y0", "y1", "text" }],
+   "clips": [{ "url": "/api/chapter/<id>/recap/audio/<file>", "start_ms", "end_ms" }] }` : the chapter's
+   Studio narration as one timeline. `page` is an index into the reader's page list (`/page/<n>`; Studio's
+   pages matched by file name), `y0..y1` the band of the page being read (0..1; the whole page when the
+   passage is about no one panel). A clip's first sample plays at `start_ms`; clips are back to back.
+   Empty `beats` / `clips` (and `aloud: false`) when there is only a video. 404 when Studio made nothing.
+- `GET /api/chapter/<id>/recap/audio/<file>` -> one narration clip (WAV), with HTTP Range. `<file>` must be a
+   plain `[A-Za-z0-9_.-]+.wav` name (else 400) that the chapter's narration lists, inside its `audio`
+   folder (else 404).
 - `POST /api/manga/<id>/refresh` -> same as `GET /api/manga/<id>` after refreshing chapters from the source
 
 ### Studio + Listen (api_studio.rs)
@@ -114,9 +128,14 @@ Known limits (design tradeoffs, not bugs):
    sources / no addons, 503 `"Install FFmpeg on your PC to watch this on your phone"`, 504 nothing
    started in time, 502 otherwise. Records a "play" event (Continue Watching on the PC).
    A device keeps at most 3 sessions; a 4th stops the oldest.
+- `POST /api/watch` body `{ "kind": "recap", "chapter": "<chapter id>", "title"? }` -> the same session shape
+   for that chapter's Studio recap video (`video_final.mp4` on the PC; `direct` unless ffprobe says it needs
+   converting), with `resume`, `next` null and no subtitles. Nothing is recorded: `progress` is accepted
+   and ignored. 400 no chapter id, 404 unknown chapter or no recap video.
 - `GET /api/watch/<id>/stream?start=<s>`:
    - `direct` (MP4 with 8-bit H.264 + AAC/MP3, or .webm with VP8/VP9/AV1 + Opus/Vorbis): the file as is,
-     HTTP Range forwarded (206, Content-Range, Content-Length, Accept-Ranges); `start` ignored.
+     HTTP Range forwarded (206, Content-Range, Content-Length, Accept-Ranges); `start` ignored. A recap is
+     served straight from its file, with Range.
    - `remux` (H.264 in another container or with other audio: video copied) / `transcode` (libx264
      veryfast CRF 23, at most 1280 wide): fragmented MP4 (H.264 + AAC stereo 160k) from ffmpeg starting
      at `start`, no Range or Content-Length. A newer stream request for the session, `stop`, or the

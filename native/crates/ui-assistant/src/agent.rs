@@ -88,6 +88,7 @@ pub fn system_prompt(tools_enabled: bool, page: Option<&str>, section: Option<&s
         lines.push("Studio work goes through the same queue as the Studio dashboard: list chapters with studio_library, then studio_generate for exactly those chapters (use redo_from only when the user wants a step made again). Check progress with studio_status.".into());
         lines.push("Deletes, overwrites and big downloads ask the user for confirmation in the chat; if they decline, do not retry.".into());
         lines.push("After acting, confirm briefly what happened. When there is an obvious next step, end with suggest_replies so the user can click it.".into());
+        lines.extend(crate::ext::prompt());
     } else {
         lines.push("In this mode you cannot control the app; answer conversationally and suggest where in the app to go when useful.".into());
     }

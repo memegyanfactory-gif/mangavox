@@ -290,6 +290,7 @@ impl StudioPage {
     pub(crate) fn generate_sheet(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let sheet = self.sheet.as_ref()?;
         let chapters = sheet.chapters.clone();
+        let sheet_chapters = chapters.clone();
         let a = sheet.answers.clone();
         let redo = sheet.redo;
         let lang = sheet.lang;
@@ -552,8 +553,8 @@ impl StudioPage {
                             .min_w_0()
                             .gap(px(2.))
                             .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(match redo {
-                                Some(r) => format!("Redo {n} chapter{} from {}", plural(n), r.label()),
-                                None => format!("Generate {n} chapter{}", plural(n)),
+                                Some(r) => format!("Redo {} from {}", crate::dashboard::chapters_phrase(&sheet_chapters), r.label()),
+                                None => format!("Generate {}", crate::dashboard::chapters_phrase(&sheet_chapters)),
                             }))
                             .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} · {numbers}", manga.join(", "))))
                             .child(div().pt(px(space::SM)).child(plan_row))
@@ -641,7 +642,7 @@ impl StudioPage {
                         cx.notify();
                     })))
                     .child(
-                        btn("gen-go", if redo.is_some() { format!("Redo {n} chapter{}", plural(n)) } else { format!("Generate {n} chapter{}", plural(n)) }, ButtonKind::Primary)
+                        btn("gen-go", if redo.is_some() { format!("Redo {}", crate::dashboard::chapters_phrase(&sheet_chapters)) } else { format!("Generate {}", crate::dashboard::chapters_phrase(&sheet_chapters)) }, ButtonKind::Primary)
                             .icon(ph::ROCKET_LAUNCH)
                             .when_some(blocker.as_ref().map(|b| b.0.clone()), |b, why| b.disabled(why))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_generate(cx))),
@@ -667,18 +668,6 @@ impl StudioPage {
                 .child(card)
                 .into_any_element(),
         )
-    }
-
-    /// Auto-append: a chapter picked while Generate is running joins the queue with the last answers.
-    pub(crate) fn append_if_generating(&mut self, chapter: &ChapterItem, cx: &mut Context<Self>) {
-        let Some(a) = self.gen_answers.clone() else { return };
-        if self.queue.active() == 0 {
-            return;
-        }
-        let (n, w, _) = self.generate_chapters(std::slice::from_ref(chapter), &a, None, false, cx);
-        if n + w > 0 {
-            toast::show(cx, Toast::info(format!("{} added to the queue", chapter.label())).icon(ph::QUEUE));
-        }
     }
 
     pub(crate) fn open_audio_settings(window: &mut Window, cx: &mut App) {

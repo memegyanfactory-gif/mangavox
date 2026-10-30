@@ -98,3 +98,16 @@ pub fn local_back(view: EntityId, window: &mut Window, cx: &mut App) -> bool {
     let f = cx.try_global::<LocalBacks>().and_then(|b| b.0.get(&view).cloned());
     f.is_some_and(|f| f(window, cx))
 }
+
+/// The page on screen; the shell keeps it up to date. Pages the shell keeps alive in history
+/// use it to tell when they are not the one showing (Read aloud pauses then).
+struct CurrentRoute(Option<Route>);
+impl Global for CurrentRoute {}
+
+pub fn set_current_route(cx: &mut App, route: Route) {
+    cx.set_global(CurrentRoute(Some(route)));
+}
+
+pub fn current_route(cx: &App) -> Option<Route> {
+    cx.try_global::<CurrentRoute>().and_then(|r| r.0.clone())
+}

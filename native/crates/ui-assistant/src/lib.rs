@@ -7,6 +7,7 @@ pub mod agent;
 mod bridge;
 pub mod chapters;
 mod dock;
+pub mod ext;
 mod fit;
 mod hub;
 mod picker;

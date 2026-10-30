@@ -215,6 +215,8 @@ pub struct AppTool {
 pub fn app_tools() -> Vec<AppTool> {
     let mut all = builtin_tools();
     all.extend(registered_all().into_iter().map(|d| AppTool { name: d.name, description: d.description, parameters: d.parameters, risk: d.risk }));
+    // Provider-style tools (Studio's Video editor, `ext`).
+    all.extend(crate::ext::tools());
     all
 }
 
@@ -410,7 +412,7 @@ pub fn phrases(name: &str, args: &Map<String, Value>) -> Phrases {
         "app_suggestions" => p("Check", "Checking", "Checked", "what to do next"),
         other => match registered(other).and_then(|d| d.phrases) {
             Some(f) => f(args),
-            None => p("Run", "Running", "Ran", &other.replace('_', " ")),
+            None => crate::ext::phrases(other, args).unwrap_or_else(|| p("Run", "Running", "Ran", &other.replace('_', " "))),
         },
     }
 }
@@ -650,7 +652,11 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
         }
         other => match registered(other) {
             Some(d) => (d.run)(args.clone()).await,
-            None => Err(format!("Unknown tool {other}")),
+            // Provider-style tools (Studio's Video editor registers through `ext`).
+            None => match crate::ext::run(other, args) {
+                Some(f) => f.await,
+                None => Err(format!("Unknown tool {other}")),
+            },
         },
     }
 }
