@@ -308,6 +308,8 @@ pub struct StudioPage {
     pub(crate) dash_filter: crate::dashboard::Filter,
     /// The pick bar's "Redo from" step: Generate makes it and every later step again.
     pub(crate) dash_redo: Option<Step>,
+    /// The dashboard sections folded away (kept in prefs).
+    pub(crate) dash_collapsed: HashSet<String>,
     /// Chapters a "Fix it" is working on: shown as being fixed until Generate finishes them.
     pub(crate) fixing: Vec<String>,
     pub(crate) dash_scroll: ScrollHandle,
@@ -388,6 +390,7 @@ impl StudioPage {
             library: Load::Loading,
             statuses: HashMap::new(),
             open_groups: prefs.open_groups.iter().cloned().collect(),
+            dash_collapsed: prefs.dash_collapsed.iter().cloned().collect(),
             selected: prefs.selected.iter().cloned().collect(),
             search,
             dash_search,

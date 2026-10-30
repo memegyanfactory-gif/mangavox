@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ui::theme::{icon as icon_px, radius, ramp, space};
+use mv_ui::theme::{duration, easing, icon as icon_px, radius, ramp, space};
 use mv_ui::{btn, glyphs, icon_ph, inline_alert, ph, ph_icon, pulse_dot, size, tip, AlertKind, ButtonKind, Hue, Interactive as _, Ph, RampExt as _, Tokens, Weight};
 
 use crate::page::Phase;
@@ -158,6 +158,44 @@ pub(crate) fn scene_tag(id: impl Into<ElementId>, s: &mv_recap::Scene) -> Statef
         .when(s.intensity > 0, |d| {
             d.child(div().flex().gap(px(1.)).children((0..5).map(|i| div().w(px(3.)).h(px(8.)).rounded(px(1.)).bg(if (i as u8) * 2 < s.intensity { color } else { Tokens::active() }))))
         })
+}
+
+// ---------------------------------------------------------------- foldable section
+
+/// Header row of a section that folds away: a caret that turns as it opens, the section's icon
+/// and title, and a one-line summary (so a folded section still says what it holds). The caller
+/// adds `on_click` and shows the body while `open`.
+/// NN/g accordions: <https://www.nngroup.com/articles/accordions-on-desktop/>
+pub(crate) fn fold_head(id: &'static str, icon: Ph, title: &'static str, summary: impl Into<SharedString>, open: bool) -> Stateful<Div> {
+    let (from, to) = if open { (0., 0.25) } else { (0.25, 0.) };
+    let caret = icon_ph(ph::CARET_RIGHT, Tokens::text_3(), icon_px::SM);
+    // Keyed by the state, so the turn plays once each time it flips.
+    let caret = if mv_ui::motion::reduced() {
+        caret.with_transformation(Transformation::rotate(percentage(to))).into_any_element()
+    } else {
+        caret
+            .with_animation(ElementId::NamedInteger(SharedString::from(format!("{id}-caret")), open as u64), Animation::new(duration::BASE).with_easing(easing::standard), move |s, t| {
+                s.with_transformation(Transformation::rotate(percentage(from + (to - from) * t)))
+            })
+            .into_any_element()
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(space::SM))
+        .h(px(30.))
+        .px(px(space::SM))
+        .rounded(px(radius::MD))
+        .role(Role::Button)
+        .aria_expanded(open)
+        .aria_label(SharedString::from(title))
+        .pressable()
+        .hover(|s| s.bg(Tokens::hover()))
+        .child(caret)
+        .child(icon_ph(icon, if open { Tokens::accent() } else { Tokens::text_2() }, icon_px::SM))
+        .child(div().flex_none().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title))
+        .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).text_color(Tokens::text_3()).child(summary.into()))
 }
 
 // ---------------------------------------------------------------- tab bar
