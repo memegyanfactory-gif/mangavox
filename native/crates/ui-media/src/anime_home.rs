@@ -18,7 +18,7 @@ use crate::streams::{self, PlayBase, StreamState};
 const JIKAN_PAGE: usize = 25;
 
 #[derive(Clone, Copy)]
-enum Feed {
+pub(crate) enum Feed {
     Airing,
     Season,
     Top(Option<&'static str>),
@@ -27,7 +27,7 @@ enum Feed {
 }
 
 impl Feed {
-    fn key(self) -> String {
+    pub(crate) fn key(self) -> String {
         match self {
             Feed::Airing => "jikan:airing:1".into(),
             Feed::Season => "jikan:season:1".into(),
@@ -37,7 +37,7 @@ impl Feed {
         }
     }
 
-    async fn load(self, page: u32) -> Result<Vec<AnimeSearchResult>, String> {
+    pub(crate) async fn load(self, page: u32) -> Result<Vec<AnimeSearchResult>, String> {
         let j = jikan()?;
         let r = match self {
             Feed::Airing => j.airing_anime(page).await,
@@ -67,7 +67,7 @@ pub async fn prefetch() {
 }
 
 /// (row id, title, feed) in display order. The first row also feeds the carousel.
-const ROWS: &[(&str, &str, Feed)] = &[
+pub(crate) const ROWS: &[(&str, &str, Feed)] = &[
     ("airing", "Top Airing", Feed::Airing),
     ("season", "Popular This Season", Feed::Season),
     ("top", "Top Rated of All Time", Feed::Top(None)),

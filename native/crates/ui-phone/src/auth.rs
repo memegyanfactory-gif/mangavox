@@ -57,7 +57,7 @@ struct Code {
 static CODE: Mutex<Option<Code>> = Mutex::new(None);
 static FAILS: Mutex<Option<HashMap<IpAddr, Vec<Instant>>>> = Mutex::new(None);
 
-fn random_b64(n: usize) -> String {
+pub(crate) fn random_b64(n: usize) -> String {
     let mut buf = vec![0u8; n];
     rand::rngs::OsRng.fill_bytes(&mut buf);
     URL_SAFE_NO_PAD.encode(buf)
@@ -365,7 +365,7 @@ pub fn device_name(ua: &str) -> String {
 
 /// Paths a phone may open without being paired.
 fn is_public(path: &str) -> bool {
-    matches!(path, "/pair" | "/locked" | "/favicon.ico" | "/manifest.webmanifest" | "/icon.png")
+    matches!(path, "/pair" | "/locked" | "/favicon.ico" | "/manifest.webmanifest" | "/icon.png" | "/icon-512.png" | "/logo.png")
 }
 
 fn json_err(status: StatusCode, msg: &str) -> Response {

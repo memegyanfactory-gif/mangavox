@@ -29,7 +29,8 @@ const APP_CSS: &str = include_str!("../web/app.css");
 const SECRET: &str = "TOP-SECRET-FILE-CONTENTS";
 
 /// Every route the routers register (method, example path), from auth.rs, api_manga.rs,
-/// api_media.rs, api_studio.rs and screen.rs, plus unknown ones the fallback answers.
+/// api_media.rs, api_anime.rs, api_watch.rs, api_img.rs, api_studio.rs and screen.rs, plus unknown
+/// ones the fallback answers.
 const API_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/me"),
     ("POST", "/api/logout"),
@@ -45,6 +46,18 @@ const API_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/movies/play"),
     ("GET", "/api/movies/tt0111161?kind=movie"),
     ("POST", "/api/pc/open"),
+    ("GET", "/api/anime?tab=home"),
+    ("GET", "/api/anime/search?q=x"),
+    ("POST", "/api/anime/play"),
+    ("GET", "/api/anime/21"),
+    ("GET", "/api/anime/21/episodes?page=2"),
+    ("POST", "/api/watch"),
+    ("GET", "/api/watch/abc/stream?start=10"),
+    ("GET", "/api/watch/abc/status"),
+    ("POST", "/api/watch/abc/progress"),
+    ("POST", "/api/watch/abc/stop"),
+    ("GET", "/api/watch/abc/sub/e0.vtt"),
+    ("GET", "/api/img?u=https%3A%2F%2Fimages.metahub.space%2Fposter%2Fsmall%2Ftt0111161%2Fimg&w=300"),
     ("GET", "/api/studio"),
     ("POST", "/api/studio/generate"),
     ("GET", "/api/studio/jobs"),
@@ -69,6 +82,9 @@ fn body_for(path: &str) -> &'static str {
     match path {
         "/api/chapter/c1/progress" => r#"{"page":0,"total":10}"#,
         "/api/movies/play" => r#"{"imdb":"tt0111161","kind":"movie","title":"x"}"#,
+        "/api/anime/play" => r#"{"mal":"21","title":"x","episode":1}"#,
+        "/api/watch" => r#"{"imdb":"tt0111161","kind":"movie","title":"x"}"#,
+        "/api/watch/abc/progress" => r#"{"pos":10,"duration":100}"#,
         "/api/pc/open" => r#"{"page":"settings"}"#,
         "/api/studio/generate" => r#"{"chapters":["c1"],"what":"audio"}"#,
         "/api/screen/input" => r#"{"t":"text","s":"rm -rf /"}"#,
@@ -200,7 +216,7 @@ async fn unpaired_devices_get_nothing_from_any_route() {
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
     // What stays public: the locked page, icon and manifest, none of which carry the code.
-    for path in ["/locked", "/icon.png", "/favicon.ico", "/manifest.webmanifest"] {
+    for path in ["/locked", "/icon.png", "/icon-512.png", "/logo.png", "/favicon.ico", "/manifest.webmanifest"] {
         let r = get(path, PEER).await;
         assert_eq!(r.status(), StatusCode::OK, "{path}");
         assert_no_cors(&r, path);
@@ -380,7 +396,7 @@ async fn revoked_devices_are_locked_out_at_once() {
 async fn state_changes_need_the_csrf_header_and_same_origin() {
     let _g = setup();
     let cookie = pair().await;
-    let paths = ["/api/logout", "/api/screen/input", "/api/pc/open", "/api/movies/play", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress"];
+    let paths = ["/api/logout", "/api/screen/input", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress"];
     for path in paths {
         let body = body_for(path);
         let base = || req("POST", path, PEER).header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json");
@@ -573,5 +589,85 @@ async fn errors_for_strangers_carry_no_details() {
         assert!(r.status().is_client_error());
         let body = text(r).await;
         assert!(body.len() < 120 && !body.contains('\\') && !body.contains("MangaVox"), "{body}");
+    }
+}
+
+// ---------------------------------------------------------------- image proxy and watch sessions
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+#[tokio::test]
+async fn image_proxy_never_reaches_the_lan() {
+    let _g = setup();
+    let cookie = pair().await;
+    for u in [
+        "http://127.0.0.1/a.png",
+        "http://127.0.0.1:8790/api/me",
+        "http://192.168.1.1/a.png",
+        "http://192.168.1.2:8790/api/library",
+        "http://10.0.0.1/a.png",
+        "http://172.16.0.1/a.png",
+        "http://[::1]/a.png",
+        "http://[::ffff:192.168.1.1]/a.png",
+        "http://[fe80::1]/a.png",
+        "http://[fd00::1]/a.png",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://2130706433/a.png",
+        "http://0x7f000001/a.png",
+        "http://localhost/a.png",
+        "http://localhost:8790/api/me",
+        "http://LocalHost./a.png",
+        "http://printer.local/a.png",
+        "http://router/a.png",
+        "file:///C:/Windows/win.ini",
+        "file://localhost/etc/passwd",
+        "ftp://example.com/a.png",
+        "gopher://example.com/",
+        "data:image/png;base64,iVBORw0KGgo=",
+        "https://example.com:8790/a.png",
+        "https://user:pw@example.com/a.png",
+        "not a url",
+        "",
+    ] {
+        let r = get_with(&format!("/api/img?u={}&w=300", enc(u)), &cookie).await;
+        let status = r.status();
+        let body = text(r).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{u}: {body}");
+        assert!(body.starts_with(r#"{"error""#), "{u}: {body}");
+    }
+    assert_eq!(get_with("/api/img", &cookie).await.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn unknown_watch_sessions_are_not_found() {
+    let _g = setup();
+    let cookie = pair().await;
+    for id in ["abc", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "..%2F..%2Fphone", "%00", "x'%20OR%20'1'='1"] {
+        for path in [format!("/api/watch/{id}/stream"), format!("/api/watch/{id}/stream?start=30"), format!("/api/watch/{id}/status"), format!("/api/watch/{id}/sub/e0.vtt"), format!("/api/watch/{id}/sub/x0.vtt")] {
+            let r = get_with(&path, &cookie).await;
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        for path in [format!("/api/watch/{id}/progress"), format!("/api/watch/{id}/stop")] {
+            let r = send(post(&path, PEER).header(header::COOKIE, &cookie).body(Body::from(r#"{"pos":1,"duration":10}"#)).unwrap()).await;
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+    // Ids that are not title ids are refused before any lookup (the phone never names a URL).
+    for body in [
+        r#"{"kind":"movie","imdb":"../x"}"#,
+        r#"{"kind":"movie","imdb":"http://evil.example/x.mp4"}"#,
+        r#"{"kind":"movie"}"#,
+        r#"{"kind":"anime","mal":"21/../1"}"#,
+        r#"{"kind":"anime"}"#,
+        r#"{"kind":"file","imdb":"tt0111161"}"#,
+        "not json",
+    ] {
+        let r = send(post("/api/watch", PEER).header(header::COOKIE, &cookie).body(Body::from(body)).unwrap()).await;
+        assert!(r.status().is_client_error(), "{body}: {}", r.status());
+    }
+    for path in ["/api/anime/..%2Fx", "/api/anime/21a", "/api/anime/x/episodes"] {
+        assert_eq!(get_with(path, &cookie).await.status(), StatusCode::BAD_REQUEST, "{path}");
     }
 }

@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::watch;
 
-use crate::{api_manga, api_media, api_studio, auth, screen, state};
+use crate::{api_anime, api_img, api_manga, api_media, api_studio, api_watch, auth, screen, state};
 
 /// Ports tried after the configured one when it is busy.
 const PORT_TRIES: u16 = 20;
@@ -68,6 +68,7 @@ pub fn stop() {
         });
         eprintln!("[phone] server stopped");
     }
+    api_watch::stop_all();
     state::set_status(state::Status::default());
 }
 
@@ -154,6 +155,8 @@ const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
 /// The home-screen icon lives with the app's other assets (images outside mv-ui/assets are
 /// kept out of the repository by the privacy guard).
 const ICON_PNG: &[u8] = include_bytes!("../../mv-ui/assets/phone/icon.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../../mv-ui/assets/phone/icon-512.png");
+const LOGO_PNG: &[u8] = include_bytes!("../../mv-ui/assets/phone/logo.png");
 
 fn asset(body: impl Into<axum::body::Body>, mime: &'static str, no_cache: bool) -> Response {
     let mut r = Response::new(body.into());
@@ -188,10 +191,15 @@ pub(crate) fn router() -> Router {
         .route("/app.css", get(|| async { asset(APP_CSS, "text/css; charset=utf-8", true) }))
         .route("/manifest.webmanifest", get(|| async { asset(MANIFEST, "application/manifest+json", true) }))
         .route("/icon.png", get(|| async { asset(ICON_PNG, "image/png", false) }))
+        .route("/icon-512.png", get(|| async { asset(ICON_512_PNG, "image/png", false) }))
+        .route("/logo.png", get(|| async { asset(LOGO_PNG, "image/png", false) }))
         .route("/favicon.ico", get(|| async { asset(ICON_PNG, "image/png", false) }))
         .merge(auth::routes())
         .merge(api_manga::routes())
         .merge(api_media::routes())
+        .merge(api_anime::routes())
+        .merge(api_watch::routes())
+        .merge(api_img::routes())
         .merge(api_studio::routes())
         .merge(screen::routes())
         .fallback(not_found)

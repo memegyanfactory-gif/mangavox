@@ -74,13 +74,18 @@ pub fn last_played(imdb: &str) -> Option<(u32, u32)> {
     DataCache::shared().get::<(u32, u32)>(&last_key(imdb)).map(|(v, _)| v)
 }
 
-/// Opens the player on `req`, remembering a series' season and episode first.
-pub fn play_now(req: PlayRequest, window: &mut Window, cx: &mut App) {
+/// Remembers a series' season and episode for [`last_played`] (in the background).
+pub(crate) fn remember(req: &PlayRequest) {
     if req.mal_id.is_none() {
         if let (Some(imdb), Some(s), Some(e)) = (req.imdb_id.clone(), req.season, req.episode) {
             bg::runtime().spawn_blocking(move || DataCache::shared().put(&last_key(&imdb), &(s, e)));
         }
     }
+}
+
+/// Opens the player on `req`, remembering a series' season and episode first.
+pub fn play_now(req: PlayRequest, window: &mut Window, cx: &mut App) {
+    remember(&req);
     navigate(Route::Player { request: req }, window, cx);
 }
 

@@ -50,8 +50,19 @@ async fn home(Query(q): Query<TabQuery>) -> Json<Value> {
     let rows = remote::home(&q.tab).await;
     // Billboard: the first Top 10 row's first title with artwork and a synopsis (like the desktop).
     let hero = rows.iter().find(|r| r.top10).and_then(|r| r.items.iter().find(|i| i.description.is_some() && i.imdb_id.is_some())).map(item);
+    // Rows that failed are left out; nothing at all means the PC could not reach the catalogs.
+    let error = rows.is_empty().then_some("Movies could not be loaded. Check the PC's internet connection.");
     let rows: Vec<Value> = rows.iter().map(|r| json!({ "id": r.id, "title": r.title, "top10": r.top10, "items": r.items.iter().map(item).collect::<Vec<_>>() })).collect();
-    Json(json!({ "hero": hero, "rows": rows }))
+    Json(json!({ "hero": hero, "rows": rows, "error": error }))
+}
+
+/// Source lookup errors in words for the phone (where to fix them on the PC).
+pub(crate) fn friendly(e: String) -> String {
+    if e == remote::NO_ADDONS {
+        "No streaming addons are installed. Add one in MangaVox on your PC: Settings → Addons.".into()
+    } else {
+        e
+    }
 }
 
 #[derive(Deserialize)]
@@ -140,7 +151,7 @@ async fn play(Json(b): Json<PlayBody>) -> ApiResult<Json<Value>> {
     let movie = b.kind != "series";
     let title = if b.title.trim().is_empty() { imdb.clone() } else { b.title.trim().to_string() };
     eprintln!("[phone] play on PC: {imdb} ({})", if movie { "movie" } else { "series" });
-    let req = remote::find_best(title, imdb, movie, b.season, b.episode).await.map_err(|e| ApiError(StatusCode::NOT_FOUND, e))?;
+    let req = remote::find_best(title, imdb, movie, b.season, b.episode).await.map_err(|e| ApiError(StatusCode::NOT_FOUND, friendly(e)))?;
     bridge::on_ui(move |w, cx| remote::play_now(req, w, cx)).await.map_err(ApiError::unavailable)?;
     Ok(Json(json!({})))
 }
@@ -152,6 +163,7 @@ struct OpenBody {
     imdb: Option<String>,
     kind: Option<String>,
     title: Option<String>,
+    mal: Option<String>,
 }
 
 fn route_for(b: OpenBody) -> Option<Route> {
@@ -168,7 +180,11 @@ fn route_for(b: OpenBody) -> Option<Route> {
             }
             None => Route::MoviesHome,
         },
-        "anime" => Route::AnimeHome,
+        "anime" => match some(b.mal) {
+            Some(mal_id) if crate::api_anime::mal_ok(&mal_id) => Route::AnimeDetail { mal_id, title: some(b.title).unwrap_or_default() },
+            Some(_) => return None,
+            None => Route::AnimeHome,
+        },
         "studio" => Route::Studio,
         "settings" => Route::Settings { tab: None },
         "mobile" => Route::Mobile,
@@ -187,7 +203,7 @@ mod tests {
     use super::*;
 
     fn body(page: &str) -> OpenBody {
-        OpenBody { page: page.into(), manga_id: None, imdb: None, kind: None, title: None }
+        OpenBody { page: page.into(), manga_id: None, imdb: None, kind: None, title: None, mal: None }
     }
 
     #[test]
@@ -199,6 +215,9 @@ mod tests {
             Some(Route::MovieDetail { imdb_id: "tt1".into(), kind: "series".into(), title: String::new() })
         );
         assert_eq!(route_for(body("settings")), Some(Route::Settings { tab: None }));
+        assert_eq!(route_for(body("anime")), Some(Route::AnimeHome));
+        assert_eq!(route_for(OpenBody { mal: Some("21".into()), ..body("anime") }), Some(Route::AnimeDetail { mal_id: "21".into(), title: String::new() }));
+        assert_eq!(route_for(OpenBody { mal: Some("../x".into()), ..body("anime") }), None);
         assert_eq!(route_for(body("nope")), None);
     }
 

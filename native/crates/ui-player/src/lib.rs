@@ -3,7 +3,7 @@
 use gpui_kit::*;
 use mv_ui::Route;
 
-mod backend;
+pub mod backend;
 pub mod logic;
 pub mod mpv;
 mod overlay;

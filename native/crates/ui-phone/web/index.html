@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob: http: https:; media-src 'self' blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
-<meta name="theme-color" content="#0b0d10">
+<meta name="theme-color" content="#09090f">
 <meta name="color-scheme" content="dark">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -12,31 +12,31 @@
 <meta name="apple-mobile-web-app-title" content="MangaVox">
 <title>MangaVox</title>
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" type="image/png" href="/icon.png">
-<link rel="apple-touch-icon" href="/icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon.png">
+<link rel="apple-touch-icon" sizes="192x192" href="/icon.png">
 <link rel="stylesheet" href="/app.css">
 <script type="module" src="/app.js"></script>
 </head>
 <body data-route="">
 <header class="appbar" id="appbar">
   <button class="icon-btn" id="back" type="button" aria-label="Back" hidden></button>
-  <div class="brand" id="brand" aria-hidden="true">MV</div>
+  <img class="brand" id="brand" src="/logo.png" alt="" width="32" height="32" decoding="async">
   <div class="ttl">
     <h1 id="title">MangaVox</h1>
     <div class="sub" id="sub"><span class="dot" id="dot"></span><span id="subtext">Connecting…</span></div>
   </div>
   <div class="actions" id="actions"></div>
-  <button class="icon-btn" id="settings" type="button" aria-label="Settings"></button>
 </header>
+<div class="ptr" id="ptr" aria-hidden="true"></div>
 <div class="offline" id="offline" role="status" hidden>You’re offline. Join the same Wi‑Fi as your PC.</div>
 <main id="view" tabindex="-1"></main>
 <div class="player" id="player" role="region" aria-label="Audio player" hidden></div>
 <nav class="tabbar" id="tabbar" aria-label="Sections">
   <a href="#/library" data-tab="library" data-ic="book"><span>Library</span></a>
-  <a href="#/studio" data-tab="studio" data-ic="sparkle"><span>Studio</span></a>
-  <a href="#/listen" data-tab="listen" data-ic="headphones"><span>Listen</span></a>
   <a href="#/movies" data-tab="movies" data-ic="film"><span>Movies</span></a>
-  <a href="#/remote" data-tab="remote" data-ic="remote"><span>Remote</span></a>
+  <a href="#/anime" data-tab="anime" data-ic="tv"><span>Anime</span></a>
+  <a href="#/studio" data-tab="studio" data-ic="sparkle"><span>Studio</span></a>
+  <a href="#/more" data-tab="more" data-ic="grid"><span>More</span></a>
 </nav>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <noscript><p class="pad">MangaVox needs JavaScript.</p></noscript>

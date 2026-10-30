@@ -13,15 +13,23 @@ JSON bodies use `Content-Type: application/json`. Errors: HTTP 4xx/5xx with `{"e
   On success: create a device (id = random 8 bytes hex, name from User-Agent, e.g. "iPhone · Safari"),
   a 32-byte random session secret; persist `sha256(secret)` in `<root>/phone/devices.json`;
   set cookie `mv_phone=<secret>; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`; 303 to `/`.
-- Every other route except `/locked`, `/favicon.ico`, `/manifest.webmanifest`, `/icon.png`
-  requires a valid `mv_phone` cookie. Without it: HTML routes return `/locked` (200, the locked page),
+- Every other route except `/locked`, `/favicon.ico`, `/manifest.webmanifest`, `/icon.png`,
+  `/icon-512.png`, `/logo.png` requires a valid `mv_phone` cookie. Without it: HTML routes return `/locked` (200, the locked page),
   `/api/*` returns 401 `{"error":"not paired"}`.
 - State-changing requests (POST/DELETE) must also carry header `X-MangaVox: 1` (CSRF; the web app
   always sends it) and, when an `Origin` header is present, it must equal `http://<Host>`.
 - Revoking a device (desktop Mobile page) makes its cookie invalid immediately.
 - Request bodies are capped at 256 KiB (413). No CORS headers are ever sent.
+- The phone never names a URL or a file to stream: `/api/watch` takes title ids only, watch
+  sessions are 24 random bytes (base64url), belong to the device that started them (anyone else
+  gets 404) and end after 30 min without requests.
+- `/api/img` only fetches http(s) DNS names on the default port; IP literals, `localhost` and
+  local-only names are refused (400), and every resolved address (also at connect time and after
+  each of at most 3 redirects) must be public: no loopback, RFC 1918, link-local, CGNAT, ULA or
+  v6 forms embedding a v4 address. Image types only (no SVG), 15 MB at most.
 - Tests: `tests/security.rs` (every route unpaired, peer / Host / CSRF / Origin checks, code reuse,
-  expiry and rate limit, revocation, media path traversal incl. junctions).
+  expiry and rate limit, revocation, media path traversal incl. junctions, image proxy SSRF,
+  unknown watch sessions).
 
 Known limits (design tradeoffs, not bugs):
 - Plain HTTP on the LAN: someone who can sniff the Wi-Fi (open network, or a WPA2-PSK network whose
@@ -36,7 +44,9 @@ Known limits (design tradeoffs, not bugs):
 
 ## Static (web/, embedded with include_str!/include_bytes!)
 - `GET /` -> `web/index.html` (paired) ; `GET /locked` -> `web/locked.html`
-- `GET /app.js`, `GET /app.css`, `GET /manifest.webmanifest`, `GET /icon.png`
+- `GET /app.js`, `GET /app.css`, `GET /manifest.webmanifest`
+- `GET /icon.png` (192 px), `GET /icon-512.png`, `GET /logo.png` (96 px, app bar): from
+  `mv-ui/assets/phone/`, public.
 
 ## API
 ### Session
@@ -70,15 +80,63 @@ Known limits (design tradeoffs, not bugs):
   `<opaque>` maps to a path under `<root>/studio/projects` only (never a raw path from the client).
 
 ### Movies (api_media.rs)
-- `GET /api/movies?tab=home|movies|series` -> `{ "hero": Item|null, "rows": [{ "id","title","top10": bool,"items": [Item] }] }`
+- `GET /api/movies?tab=home|movies|series` -> `{ "hero": Item|null, "rows": [{ "id","title","top10": bool,"items": [Item] }], "error": string|null }`
+  (rows that fail to load are left out, never a 5xx; `error` is set only when nothing loaded)
   `Item = { "id","imdb","kind": "movie"|"series","title","year","description","genres":[..],"score",
             "poster","background","logo" }`
 - `GET /api/movies/search?q=` -> `[Item]`
 - `GET /api/movies/<imdb>?kind=movie|series` -> `Item + { "cast":[..],"runtime","seasons": [{ "season", "episodes": [{ "episode","title","thumbnail","overview" }] }] }`
 - `POST /api/movies/play` body `{ "imdb","kind","title","season"?, "episode"? }` -> `{}` : finds sources and
-  starts playback ON THE PC (desktop player), like the desktop Play button.
+  starts playback ON THE PC (desktop player), like the desktop Play button. 404 `{"error"}` with a
+  readable reason (no addons installed -> where to add one on the PC, no sources found).
 - `POST /api/pc/open` body `{ "page": "library"|"movies"|"anime"|"studio"|"settings"|"mobile",
-   "manga_id"?, "imdb"?, "kind"? }` -> `{}` : navigates the desktop app.
+   "manga_id"?, "imdb"?, "kind"?, "title"?, "mal"? }` -> `{}` : navigates the desktop app
+   (`anime` + `mal` opens that anime's detail page).
+
+### Anime (api_anime.rs; the same Jikan caches as the desktop Anime pages)
+- `GET /api/anime?tab=home|airing|top|movies` -> `{ "hero": A|null, "rows": [{ "id","title","top10","items":[A] }], "error": string|null }`
+  `A = { "id": "<mal id>", "mal", "kind": "anime", "title","year","description","genres":[..],"score",
+         "poster","background","episodes": n|null, "format": "TV"|"Movie"|.., "status" }`
+- `GET /api/anime/search?q=` -> `[A]`
+- `GET /api/anime/<mal>` -> `A + { "episodes_list": [{ "episode","title","thumbnail"|null,"aired"|null,"filler": bool }], "next_page": n|null }`
+- `GET /api/anime/<mal>/episodes?page=n` -> `{ "episodes": [...], "next_page": n|null }` (100 per page)
+- `POST /api/anime/play` body `{ "mal","title","episode"? }` -> `{}` : plays on the PC (like /api/movies/play).
+
+### Watch on phone (api_watch.rs)
+- `POST /api/watch` body `{ "imdb"?: "tt..", "mal"?: "<mal id>", "kind": "movie"|"series"|"anime", "title",
+   "season"?, "episode"? }` -> finds sources like the desktop Play button (phone-friendly releases first:
+   no 4K / remux / HEVC when there is a choice), opens the best on the PC's torrent engine (or its Range
+   proxy for http links; NOT the desktop player), probes it with ffprobe, and answers
+   `{ "id", "title", "duration": s|null, "mode": "direct"|"remux"|"transcode", "url": "/api/watch/<id>/stream",
+      "resume": s|null, "subtitles": [{ "id","label","lang","url": "/api/watch/<id>/sub/<sid>.vtt" }],
+      "next": { "season","episode","title" }|null }`.
+   Up to 3 sources are tried within 90 s (torrents wait for metadata). Errors: 400 bad ids, 404 no
+   sources / no addons, 503 `"Install FFmpeg on your PC to watch this on your phone"`, 504 nothing
+   started in time, 502 otherwise. Records a "play" event (Continue Watching on the PC).
+   A device keeps at most 3 sessions; a 4th stops the oldest.
+- `GET /api/watch/<id>/stream?start=<s>`:
+   - `direct` (MP4 with 8-bit H.264 + AAC/MP3, or .webm with VP8/VP9/AV1 + Opus/Vorbis): the file as is,
+     HTTP Range forwarded (206, Content-Range, Content-Length, Accept-Ranges); `start` ignored.
+   - `remux` (H.264 in another container or with other audio: video copied) / `transcode` (libx264
+     veryfast CRF 23, at most 1280 wide): fragmented MP4 (H.264 + AAC stereo 160k) from ffmpeg starting
+     at `start`, no Range or Content-Length. A newer stream request for the session, `stop`, or the
+     phone disconnecting kills the previous ffmpeg.
+- `GET /api/watch/<id>/status` -> `{ "state": "ready"|"error", "peers": n|null, "down_bps": n|null,
+   "progress": 0..1|null, "error": string|null }` (torrent stats; nulls for http sources).
+- `POST /api/watch/<id>/progress` body `{ "pos": s, "duration": s }` -> `{}` (same history / resume as the
+   desktop player; past 90% counts as watched).
+- `POST /api/watch/<id>/stop` -> `{}` (kills ffmpeg, releases the torrent).
+- `GET /api/watch/<id>/sub/<sid>.vtt` -> `text/vtt`: `e<n>` embedded text tracks (SRT/ASS/mov_text/WebVTT,
+  extracted with ffmpeg; this reads the whole file, so on a torrent it can take minutes), `x<n>` online
+  subtitles from the desktop's OpenSubtitles lookup (movies / series, English first), SRT converted.
+  4 MB cap, cached per session.
+- Unknown or another device's session id: 404.
+
+### Images (api_img.rs)
+- `GET /api/img?u=<url-encoded http(s) image url>&w=<max width>` -> image bytes,
+  `Cache-Control: private, max-age=604800`. Fetched by the PC and cached in `<root>/cache/phone-img`
+  (sha256 of url + w); JPEG / PNG wider than `w` (64..1920) are scaled down. 400 for URLs that are not
+  allowed (see Security), 502 when the fetch fails or the answer is not an image.
 
 ### Remote screen (screen.rs)
 - `GET /api/screen/frame?w=<max width>&q=<jpeg quality 30..90>` -> `image/jpeg` of the main window's
