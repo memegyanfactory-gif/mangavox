@@ -54,7 +54,8 @@ def make_hook(args):
     shots = [{"text": (l.get("text") or "").strip(), "image": l.get("image"), "focus": l.get("focus")} for l in args.get("lines") or []]
     outro = args.get("outro") or {}
     if (outro.get("text") or "").strip():
-        shots.append({"text": outro["text"].strip(), "image": outro.get("image"), "focus": None})
+        # The closing line shows the cover whole, centred (never half of a side-by-side pair).
+        shots.append({"text": outro["text"].strip(), "image": outro.get("image"), "focus": None, "layout": "single"})
     shots = [s for s in shots if s["text"] and s["image"] and os.path.isfile(s["image"])]
     if not shots:
         raise RuntimeError("The hook has no lines with a picture")
@@ -83,6 +84,8 @@ def make_hook(args):
             "duration_ms": int(round(secs * 1000)),
             "start_ms": int(round(total * 1000)),
         }
+        if s.get("layout"):
+            beat["layout"] = s["layout"]
         if s["focus"] and len(s["focus"]) == 4:
             beat["focus_point"] = s["focus"]
         beats.append(beat)

@@ -944,7 +944,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
 
         try:
             tall = False
-            if duo_on:
+            # A beat may ask to be shown whole ("layout": "single"), like the hook's closing cover.
+            if duo_on and seg.get("layout") != "single":
                 from PIL import Image
                 with Image.open(page_image) as im:
                     tall = im.width < DUO_MAX_ASPECT * im.height

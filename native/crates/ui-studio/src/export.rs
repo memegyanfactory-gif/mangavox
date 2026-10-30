@@ -676,7 +676,8 @@ pub(crate) fn watermark_graph(wm: &Watermark, input: &str, out: &str, w: u32, h:
         at = next;
     }
     if let Some((_, pos, size, opacity)) = &wm.text {
-        let fs = ((h as f64 * size).round() as u32).max(8);
+        // Sized on the shorter side, so upright reels keep the text inside the frame.
+        let fs = ((w.min(h) as f64 * size).round() as u32).max(8);
         let (x, y) = place(pos, ("w", "h"), ("text_w", "text_h"), margin);
         if !graph.is_empty() {
             graph.push(';');
@@ -902,6 +903,8 @@ pub(crate) fn resolution_for(h: u32) -> &'static str {
 pub(crate) struct HookJob {
     pub manga_id: String,
     pub manga_title: String,
+    /// The manga's cover: the picture under the hook's closing line.
+    pub cover: Option<PathBuf>,
     /// The made chapters, in order.
     pub chapters: Vec<crate::data::ChapterItem>,
     pub seconds: u32,
@@ -941,13 +944,13 @@ pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Ve
     let lines: Vec<(usize, &Beat, &String)> = script.lines.iter().filter_map(|(id, text)| flat.get(*id).filter(|(_, b)| b.image.is_some()).map(|(c, b)| (*c, *b, text))).collect();
     let (first_chapter, first_beat, _) = lines.first()?;
     let (last, _) = chapters.last()?;
-    // The manga's first page or panel.
-    let opening = chapters.iter().find_map(|(_, beats)| beats.iter().find_map(|b| b.image.clone())).or_else(|| {
+    // The manga's cover, else its first page or panel.
+    let opening = job.cover.as_ref().map(|p| p.to_string_lossy().into_owned()).or_else(|| chapters.iter().find_map(|(_, beats)| beats.iter().find_map(|b| b.image.clone())).or_else(|| {
         let first = &chapters.first()?.0;
         let mut pages: Vec<PathBuf> = std::fs::read_dir(&first.pages_dir).ok()?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["jpg", "jpeg", "png", "webp"].contains(&x.to_ascii_lowercase().as_str()))).collect();
         pages.sort();
         pages.first().map(|p| p.to_string_lossy().into_owned())
-    })?;
+    }))?;
     let voice = mv_studio::voices::voice_for_chapter(&last.id);
     let engine = mv_studio::tts::engine_hint(&voice);
     let score = mv_score::score_wav(&crate::page::chref(&chapters[*first_chapter].0));
@@ -1142,6 +1145,7 @@ impl StudioPage {
             Some(HookJob {
                 manga_id: g.id.clone(),
                 manga_title: g.title.clone(),
+                cover: g.cover.clone().filter(|p| p.is_file()),
                 chapters: videos.iter().map(|(c, _)| c.clone()).collect(),
                 seconds: prefs.hook_secs,
                 model: self.model(cx).map(|m| m.0),
