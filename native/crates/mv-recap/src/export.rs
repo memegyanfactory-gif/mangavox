@@ -4,10 +4,16 @@
 //!   silence for empty pages, so the page numbering and timing stay intact).
 //! * `narration.studio.json` - `{"beats": [...]}` read by `pipeline_worker.load_beats`. `sync_map` aligns
 //!   beats to audio by `min(audio page) - min(beat page)`, so there is a beat for every page (page 0
-//!   included) and numbering is 0-based like the audio files. A passage the user gave a delivery
+//!   included) and numbering is 0-based like the audio files. A page the story leaves out gets one
+//!   `"skip": true` beat, which `sync_map` cuts from the video. A passage the user gave a delivery
 //!   carries it as the beat's `kind` / `intensity`, which the narration follows.
+//!
+//! A passage is shown over its panel's crop. When it names no panel, or that crop is blank (an empty or
+//! nearly black / white panel), the page's most telling panel is used instead: one with characters in
+//! it, the largest first.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -15,12 +21,44 @@ use serde_json::{json, Value};
 use crate::store::*;
 use crate::types::*;
 
+/// Brightness spread (0-255) under which a crop counts as blank.
+const BLANK_SPREAD: f64 = 16.0;
+
 fn abs(p: &Path) -> String {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().trim_start_matches(r"\\?\").to_string()
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().trim_start_matches(r"\?\").to_string()
+}
+
+/// True when the image is (nearly) one flat tone: an empty, black or white panel.
+fn is_blank(path: &Path) -> bool {
+    let Ok(img) = image::open(path) else { return false };
+    let g = img.thumbnail(64, 64).to_luma8();
+    let n = g.pixels().len().max(1) as f64;
+    let mean = g.pixels().map(|p| p.0[0] as f64).sum::<f64>() / n;
+    let var = g.pixels().map(|p| (p.0[0] as f64 - mean).powi(2)).sum::<f64>() / n;
+    var.sqrt() < BLANK_SPREAD
+}
+
+/// The crop shown for a passage on `page` that asked for `wanted` (see the module docs).
+fn pick_panel(ch: &ChapterRef, read: Option<&ChapterRead>, page: usize, wanted: Option<usize>, blank: &mut HashMap<PathBuf, bool>) -> Option<(usize, PathBuf)> {
+    let mut usable = |n: usize| {
+        let p = panel_path(ch, page, n);
+        let ok = p.is_file() && !*blank.entry(p.clone()).or_insert_with(|| is_blank(&p));
+        ok.then_some(p)
+    };
+    if let Some(p) = wanted.and_then(&mut usable) {
+        return Some((wanted.unwrap(), p));
+    }
+    let panels = &read?.pages.iter().find(|p| p.index == page)?.panels;
+    let mut order: Vec<usize> = (0..panels.len()).collect();
+    let rank = |n: &usize| (!panels[*n].characters.is_empty(), panels[*n].bbox.map(|b| b.area()).unwrap_or(0.0));
+    order.sort_by(|a, b| rank(b).partial_cmp(&rank(a)).unwrap_or(std::cmp::Ordering::Equal));
+    order.into_iter().find_map(|n| usable(n).map(|p| (n, p)))
 }
 
 pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
     let pages = list_pages(&ch.pages_dir);
+    let read = load_read(ch);
+    let mut blank = HashMap::new();
     let page_count = pages.len().max(story.segments.iter().map(|s| s.page + 1).max().unwrap_or(0));
     let mut script: Vec<Value> = vec![];
     let mut beats: Vec<Value> = vec![];
@@ -32,12 +70,11 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
         script.push(json!({ "page": page, "text": text }));
 
         if segs.is_empty() {
-            beats.push(json!({ "page": page, "panel": Value::Null, "panel_image": page_img, "text": "" }));
+            beats.push(json!({ "page": page, "panel": Value::Null, "panel_image": page_img, "text": "", "skip": true }));
             continue;
         }
         for s in segs {
-            let crop = s.panel.map(|n| (n, panel_path(ch, page, n))).filter(|(_, p)| p.is_file());
-            let (panel, image) = match crop {
+            let (panel, image) = match pick_panel(ch, read.as_ref(), page, s.panel, &mut blank) {
                 Some((n, p)) => (json!(p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| n.to_string())), Some(abs(&p))),
                 None => (Value::Null, page_img.clone()),
             };

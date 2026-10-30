@@ -1,10 +1,13 @@
-//! STORY phase: turn the chapter's reading (and edited transcript) into an anime-recap voice-over script,
-//! ten pages per model call with a running "story so far" carried between calls.
+//! STORY phase: turn the chapter's reading (and edited transcript) into a story-first recap voice-over.
+//! The writer sees the whole chapter at once (local models with small context windows get it in a few
+//! parts), keeps only what matters to the story, and anchors each passage to the panel shown while it
+//! is spoken; pages it leaves out are cut from the video. The story so far is carried between parts and
+//! chapters, and kept in the brain so a chapter written on its own still knows what came before.
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use mv_ai::{AiMessage, CancellationToken, Registry};
+use mv_ai::{AiMessage, AiProviderId, CancellationToken, Registry};
 use serde_json::Value;
 
 use crate::brain::Brain;
@@ -15,7 +18,33 @@ use crate::store::*;
 use crate::transcript::format_line;
 use crate::types::*;
 
-const CHUNK_PAGES: usize = 10;
+/// Digest characters one story call may carry. A whole chapter (~90k) fits hosted models; local
+/// ones with small context windows get it in a few parts.
+fn part_budget(m: &ModelChoice) -> usize {
+    match m.provider {
+        AiProviderId::Ollama | AiProviderId::Lmstudio | AiProviderId::Llamacpp => 30_000,
+        _ => 180_000,
+    }
+}
+
+/// Splits pages (index, digest size) into as few runs as fit `budget`, of about equal size.
+pub(crate) fn plan_parts(pages: &[(usize, usize)], budget: usize) -> Vec<Vec<usize>> {
+    let total: usize = pages.iter().map(|p| p.1).sum();
+    let n = total.div_ceil(budget.max(1)).max(1);
+    let target = total.div_ceil(n);
+    let mut parts: Vec<Vec<usize>> = vec![vec![]];
+    let mut size = 0;
+    for &(i, s) in pages {
+        if size > 0 && size + s > target && parts.len() < n {
+            parts.push(vec![]);
+            size = 0;
+        }
+        parts.last_mut().unwrap().push(i);
+        size += s;
+    }
+    parts.retain(|p| !p.is_empty());
+    parts
+}
 
 pub fn style_hint(style: &str) -> &'static str {
     match style {
@@ -44,29 +73,42 @@ fn story_system(styles: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let blend = if styles.len() > 1 { "Blend these styles into ONE consistent narrator voice (do not alternate between them page by page). " } else { "" };
+    let blend = if styles.len() > 1 { "Blend these styles into ONE consistent narrator voice (do not alternate between them). " } else { "" };
     format!(
-        r##"You are the voice-over writer for an anime-style recap video of a manga. You receive a digest of manga pages (scene tags, what each panel shows, who is in it, the dialogue) and write the narration that will be spoken over the images, in order.
+        r##"You are the head writer of a top manga / manhwa recap channel. You receive a reading of a chapter (what happens on each page, what each panel shows, who is in it, every line of dialogue) and write the voice-over that tells its STORY, spoken over the most telling panels.
+
+HOW A GREAT RECAP SOUNDS
+- It is a story told by a storyteller, not a description of pages. Third person, present tense, named characters, clear cause and effect: who wants what, what stands in the way, what happens and why it matters.
+- Dialogue is retold, not read out: "Liam explains that only a swordmaster can kill a swordmaster." "She makes him promise to give up on revenge and simply survive." Quote a line word for word only when it is a killer line, and keep it short: "Eat my sword."
+- Short sentences hit hard at the turns ("He was wrong." "The whole massacre took ten minutes."), then the story moves on.
+- Rules of the world, powers, ranks and secrets are explained in one clear sentence the moment they matter.
+- Time jumps and flashbacks are signposted: "One month passes." "Years earlier..." "Back in the present..."
+- First-person narration boxes and inner monologue ("I", "me", "my") are the thoughts of the character they belong to, usually the protagonist: retell them in third person with that character's name. Never say "the narrator".
+- Call characters by name: the CHARACTER BANK, or a name heard in the dialogue anywhere in the chapter (read ahead: a stranger introduced on page 30 is still named when they first appear). The first time someone matters, add a few words on who they are ("Liam Karavan, the legendary founder of the house"). Never call a named character by their looks ("a silver-haired man", "the blond youth"); a nameless extra gets a role ("a bandit", "the old butler").
+
+WHAT TO LEAVE OUT
+- Never describe the artwork: no colours, lighting, clothes, hair, camera angles, backgrounds or effects ("darkness fills the screen", "blue light glows", "in this panel", "the page shows", "we see" are all forbidden). The viewer already sees the picture; you tell what it MEANS for the story.
+- Skip filler completely: sound effects, establishing shots, scenery, reaction shots, repeated beats, small talk that changes nothing, title / credit / author pages, re-tellings of what was already covered. Pages that add nothing to the story get no segment at all and are cut from the video, so never mention them.
+- Never invent events, motives or names the reading does not support.
 
 NARRATION STYLE
 {style_text}
-{blend}Whatever the style, scene depth drives the pacing: fight and action scenes are punchy and fast with short sentences; emotional and sad scenes slow down and turn tender, with longer breaths; comedy gets light timing; reveals build up and then land; tension stays quiet and tight; calm scenes are relaxed; flashbacks are signalled clearly ("Years earlier...").
+{blend}Pacing follows the scene: fights are fast and punchy, emotional moments slow down and breathe, reveals build up and then land, comedy gets light timing.
 
-RULES
-1. Third person, present tense, engaging, like a recap channel narrator. Tell the story; do not describe drawings ("in this panel", "the page shows" are forbidden).
-2. Explain who is who: use the character names from the CHARACTER BANK, and the first time an important character appears give a few words on who they are. If someone only has a descriptive placeholder name, use it naturally.
-3. Do NOT read every line. Paraphrase the key dialogue and keep only a few short, punchy quotes. Skip filler, repeated sound effects and trivia. Never invent plot that the digest does not support.
-4. Cover every page that has content, in order. Each segment is 1-4 sentences of spoken text (about 8-60 words). A busy page may have several segments, tied to a panel; a quiet page may have one. Plain text only: no markdown, emojis, brackets, stage directions or page numbers, because it is read aloud by a text-to-speech voice.
-5. Keep continuity with the STORY SO FAR; do not repeat what was already narrated.
+LENGTH
+Tell everything that matters to the story and nothing else. Length follows the story, not the page count: a chapter packed with events may need 800-1200 words, a quiet one 250-500. Never pad.
+
+SEGMENTS
+The voice-over is a list of segments in story order. Each segment is 1-3 sentences (about 12-45 words) and is shown over ONE panel: pick the panel that best shows what the segment says, preferably one with the characters or the action in it; never a text-only box, an empty or nearly black panel, or a sound effect. A segment may sum up several pages; anchor it to the most telling panel among them. Move to a new panel every segment or two so the picture keeps up with the story. Plain text only: no markdown, emojis, brackets, stage directions or page numbers, because a text-to-speech voice reads it.
 
 OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
 {{"title": "short catchy title for this chapter's recap",
-  "summary_so_far": "3-5 sentences: everything that has happened so far (including earlier parts), used as memory for the next part",
+  "summary_so_far": "6-10 sentences with names: the whole story so far, this chapter included, used as memory for what comes next",
   "segments": [
-    {{"page": 3, "panel": 1, "text": "Ruko stands alone in the rain, sword trembling in his hand."}},
-    {{"page": 3, "panel": null, "text": "..."}}
+    {{"page": 3, "panel": 2, "text": "For one year, Arhan has hunted a single name: Karlos, the man who slaughtered his family."}},
+    {{"page": 7, "panel": 1, "text": "..."}}
   ]}}
-"page" and "panel" use the numbers shown in the digest (both start at 1). Use "panel": null when a segment spans the whole page. Segments must be in story order."##
+"page" and "panel" use the numbers shown in the reading (both start at 1). Segments must be in story order."##
     )
 }
 
@@ -90,7 +132,7 @@ pub(crate) fn digest(read: &ChapterRead, transcript: Option<&Transcript>, brain:
         for (n, pn) in p.panels.iter().enumerate() {
             let mut line = format!("Panel {}:", n + 1);
             if !pn.description.is_empty() {
-                line += &format!(" {}", pn.description);
+                line += &format!(" {}", truncate(&pn.description, 240));
             }
             if !pn.characters.is_empty() {
                 let names: Vec<String> = pn.characters.iter().map(|c| brain.canonical(&c.name)).collect();
@@ -173,8 +215,13 @@ pub(crate) async fn write_story_with(
         let snapshot = brain.lock().unwrap().clone();
         let content: Vec<usize> = read.pages.iter().filter(|p| has_content(p, transcript.as_ref())).map(|p| p.index).collect();
         let mut story = Story { styles: styles.to_vec(), model: label.clone(), ..Default::default() };
-        let chunks: Vec<&[usize]> = content.chunks(CHUNK_PAGES).collect();
+        let sizes: Vec<(usize, usize)> = content.iter().map(|&i| (i, digest(&read, transcript.as_ref(), &snapshot, &[i]).len())).collect();
+        let chunks = plan_parts(&sizes, part_budget(model));
         let mut done = 0;
+        // Run on its own, the chapter starts from the story so far as of the chapter before it.
+        if so_far.is_empty() {
+            so_far = snapshot.recap_before(&ch.label).unwrap_or_default().to_string();
+        }
 
         for (ci, chunk) in chunks.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -182,15 +229,15 @@ pub(crate) async fn write_story_with(
                 return Err(anyhow!("cancelled"));
             }
             let last = ci + 1 == chunks.len();
+            let span = if chunks.len() == 1 {
+                format!("the whole chapter, {} pages", content.len())
+            } else {
+                format!("part {} of {}; pages {}-{} of this chapter's {} pages", ci + 1, chunks.len(), chunk[0] + 1, chunk[chunk.len() - 1] + 1, content.len())
+            };
             let mut prompt = format!(
-                "MANGA: {}\nCHAPTER: {} (part {} of {}; pages {}-{} of this chapter's {} read pages)\nSTYLES: {}\n",
+                "MANGA: {}\nCHAPTER: {} ({span})\nSTYLES: {}\n",
                 snapshot.manga_title,
                 ch.label,
-                ci + 1,
-                chunks.len(),
-                chunk[0] + 1,
-                chunk[chunk.len() - 1] + 1,
-                content.len(),
                 if styles.is_empty() { "Normal narration".to_string() } else { styles.join(", ") }
             );
             prompt += &format!("\nCHARACTER BANK (name, aliases, looks):\n{}\n", roster_text(&snapshot, 40));
@@ -202,12 +249,16 @@ pub(crate) async fn write_story_with(
                 prompt += &format!("\nWORLD / PLOT MEMORY:\n{notes}\n");
             }
             prompt += &format!("\nSTORY SO FAR:\n{}\n", if so_far.is_empty() { "(this is the very beginning of the recap)" } else { &so_far });
-            prompt += &format!("\nDIGEST OF THESE PAGES:\n\n{}", digest(&read, transcript.as_ref(), &snapshot, chunk));
-            prompt += if ci == 0 { "Include a good \"title\". " } else { "Keep the \"title\" the same as before or leave it empty. " };
+            prompt += &format!("\nREADING OF {}:\n\n{}", if chunks.len() == 1 { "THE CHAPTER" } else { "THESE PAGES" }, digest(&read, transcript.as_ref(), &snapshot, chunk));
+            prompt += match (ci, so_far.is_empty()) {
+                (0, true) => "This is the very start of the recap: open with a gripping cold open of 2-4 short sentences (who the protagonist is and what is at stake), then tell the story from the beginning. Include a good \"title\". ",
+                (0, false) => "Open with ONE short sentence that reminds the viewer where the story left off, then go straight on; do not re-introduce what the viewer already knows. Include a good \"title\". ",
+                _ => "Carry straight on from where the previous part ended. Keep the \"title\" the same as before or leave it empty. ",
+            };
             if last {
-                prompt += "This is the final part of the chapter: finish on a line that makes the viewer want the next chapter. ";
+                prompt += "End on the chapter's last turn with a line that makes the viewer need the next chapter. ";
             }
-            prompt += "Write the voice-over now. Reply with the JSON object only.";
+            prompt += "First decide which moments carry the story, then write the voice-over. Reply with the JSON object only.";
 
             let req = request(model, vec![AiMessage::system(system.clone()), AiMessage::user(prompt)], vec![], Some(chapter_dir(ch).join("work")));
             let answer = match ask_json(llm, req, cancel).await {
@@ -233,7 +284,7 @@ pub(crate) async fn write_story_with(
                     story.segments.extend(seg);
                     let s = str_of(&v, "summary_so_far");
                     if !s.is_empty() {
-                        so_far = truncate(&s, 1500);
+                        so_far = truncate(&s, 2500);
                     }
                 }
                 Err(_) => progress(Progress::Log(format!("{}: part {} was not valid JSON, skipped.", ch.label, ci + 1))),
@@ -250,6 +301,11 @@ pub(crate) async fn write_story_with(
             story.title = ch.label.clone();
         }
         save_story(ch, &story)?;
+        if !so_far.is_empty() {
+            let mut b = brain.lock().unwrap();
+            b.set_recap(&ch.label, &so_far);
+            let _ = b.save();
+        }
         results.push((ch.chapter_id.clone(), story));
     }
 

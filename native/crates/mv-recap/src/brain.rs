@@ -23,9 +23,29 @@ pub struct Brain {
     pub characters: Vec<Character>,
     /// Running world / plot memory, one `- ` line per entry, oldest first.
     pub notes: String,
+    /// The story so far as of the end of each narrated chapter, so a chapter written on its own
+    /// still knows what came before it.
+    pub recaps: Vec<ChapterRecap>,
     /// Directory override (tests); `None` = [`Brain::dir`].
     #[serde(skip)]
     pub(crate) root: Option<PathBuf>,
+}
+
+/// The whole story up to the end of one chapter (the STORY phase's `summary_so_far`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChapterRecap {
+    pub label: String,
+    pub summary: String,
+}
+
+/// The chapter number in a label: the first number after "ch" ("Vol. 2 Ch. 12.5" -> 12.5), else
+/// the first number at all.
+pub(crate) fn chapter_number(label: &str) -> Option<f64> {
+    let l = label.to_lowercase();
+    let from = l.find("ch").unwrap_or(0);
+    let digits: String = l[from..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    digits.trim_end_matches('.').parse().ok()
 }
 
 /// Filesystem-safe form of a manga id.
@@ -92,6 +112,23 @@ impl Brain {
 
     pub fn save(&self) -> Result<()> {
         write_json_atomic(&self.root_dir().join("brain.json"), self)
+    }
+
+    /// Remember the story so far at the end of chapter `label` (replacing an older one).
+    pub fn set_recap(&mut self, label: &str, summary: &str) {
+        self.recaps.retain(|r| r.label != label);
+        self.recaps.push(ChapterRecap { label: label.to_string(), summary: summary.trim().to_string() });
+    }
+
+    /// The story so far at the end of the nearest earlier chapter than `label`, if one was narrated.
+    pub fn recap_before(&self, label: &str) -> Option<&str> {
+        let n = chapter_number(label)?;
+        self.recaps
+            .iter()
+            .filter_map(|r| chapter_number(&r.label).filter(|m| *m < n).map(|m| (m, r)))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, r)| r.summary.as_str())
+            .filter(|s| !s.is_empty())
     }
 
     fn idx_of(&self, id: &str) -> Option<usize> {

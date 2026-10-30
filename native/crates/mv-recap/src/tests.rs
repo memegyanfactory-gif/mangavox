@@ -339,3 +339,65 @@ async fn hook_is_written_from_candidates_with_a_json_retry() {
     assert!(user.contains("about 52 words"));
     assert_eq!(seen.len(), 2, "one retry after the non-JSON answer");
 }
+
+#[test]
+fn story_parts_fit_the_budget_and_keep_order() {
+    use crate::story::plan_parts;
+    let pages: Vec<(usize, usize)> = (0..10).map(|i| (i, 100)).collect();
+    assert_eq!(plan_parts(&pages, 5000), vec![(0..10).collect::<Vec<_>>()], "a chapter that fits is sent whole");
+    let parts = plan_parts(&pages, 400);
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts.concat(), (0..10).collect::<Vec<_>>());
+    assert!(parts.iter().all(|p| p.len() >= 3), "parts are about equal: {parts:?}");
+}
+
+#[test]
+fn recap_before_takes_the_nearest_earlier_chapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = Brain::load_in(dir.path().to_path_buf(), "m1", "T");
+    b.set_recap("Chapter 2", "two");
+    b.set_recap("Chapter 10", "ten");
+    b.set_recap("Chapter 1", "one");
+    b.set_recap("Chapter 2", "two again");
+    assert_eq!(b.recap_before("Chapter 3"), Some("two again"));
+    assert_eq!(b.recap_before("Vol. 1 Ch. 11.5"), Some("ten"));
+    assert_eq!(b.recap_before("Chapter 1"), None);
+    assert_eq!(b.recap_before("Prologue"), None);
+}
+
+#[test]
+fn export_skips_silent_pages_and_blank_panels() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 3);
+    std::fs::create_dir_all(panels_for(&ch)).unwrap();
+    image::RgbImage::from_pixel(64, 64, image::Rgb([3, 3, 3])).save(panel_path(&ch, 1, 0)).unwrap();
+    png(&panels_for(&ch), "p0001_01.jpg", 256, 256);
+    let panel = |chars: bool| Panel { bbox: None, description: String::new(), characters: if chars { vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }] } else { vec![] }, lines: vec![] };
+    let read = ChapterRead { pages: vec![PageRead { index: 1, panels: vec![panel(false), panel(true)], ..Default::default() }], ..Default::default() };
+    save_read(&ch, &read).unwrap();
+    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None }], ..Default::default() };
+    export_for_pipeline(&ch, &story).unwrap();
+    let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
+    let b = beats["beats"].as_array().unwrap();
+    assert_eq!(b.len(), 3);
+    assert_eq!((b[0]["skip"].as_bool(), b[2]["skip"].as_bool()), (Some(true), Some(true)));
+    assert!(b[1].get("skip").is_none());
+    assert!(b[1]["panel_image"].as_str().unwrap().ends_with("p0001_01.jpg"), "the black panel is passed over: {}", b[1]);
+}
+
+#[tokio::test]
+async fn story_sees_the_whole_chapter_and_remembers_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 2);
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
+    let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"Ruko meets Kaito.","segments":[{"page":2,"panel":1,"text":"Kaito speaks."}]}"#]);
+    write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    let seen = llm.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one call for the whole chapter");
+    assert!(seen[0].messages[1].content.contains("the whole chapter"));
+    assert!(seen[0].messages[1].content.contains("cold open"));
+    let b = brain.lock().unwrap();
+    assert_eq!(b.recaps[0].summary, "Ruko meets Kaito.");
+    assert_eq!(b.recap_before("Chapter 2"), Some("Ruko meets Kaito."));
+}

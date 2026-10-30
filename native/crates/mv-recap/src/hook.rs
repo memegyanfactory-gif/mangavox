@@ -181,6 +181,7 @@ RULES
 3. About {words} words in total, the outro included. Plain spoken text only: no markdown, emojis, brackets, stage directions or chapter numbers.
 4. End with "outro": ONE short line that invites the viewer in, matched to the manga's feel, e.g. "Let's see how this epic journey begins." Never say "in this video", never ask to like or subscribe.
 5. Only use ids from the candidates.
+6. Tell the story's stakes, never the artwork: no colours, light, darkness, clothes or "the screen". Name the characters; never call them by their looks.
 
 OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
 {{"lines": [{{"id": 42, "text": "One boy stands between the city and the end of the world."}}],

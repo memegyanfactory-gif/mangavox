@@ -65,6 +65,22 @@ def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beat
 
         current_ms += duration_ms
 
+    # Pages the story left out (every beat of the page marked "skip") are cut: no picture, no
+    # silence. Kept when nothing would be left.
+    offset = _beat_offset(segments, beats)
+    skip = _skipped_pages(beats, offset)
+    if skip and any(s["page"] not in skip for s in segments):
+        current_ms = 0
+        kept = []
+        for s in segments:
+            if s["page"] in skip:
+                continue
+            span = s["end_ms"] - s["start_ms"]
+            s["start_ms"], s["end_ms"] = current_ms, current_ms + span
+            current_ms += span
+            kept.append(s)
+        segments = kept
+
     sync_map = {
         "segments": segments,
         "total_duration_ms": current_ms,
@@ -73,7 +89,7 @@ def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beat
     # ── Panel-level beats ───────────────────────────────────────────────────
     # Subdivide each page segment across that page's panels so the video can
     # advance panel-by-panel in step with the narration.
-    beat_segments = _build_beat_segments(segments, beats)
+    beat_segments = _build_beat_segments(segments, beats, offset)
     if beat_segments:
         sync_map["beat_segments"] = beat_segments
         sync_map["has_beats"] = True
@@ -96,16 +112,29 @@ def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beat
     return sync_map
 
 
-def _build_beat_segments(segments, beats):
+def _beat_offset(segments, beats):
+    """Beats may be 1-based while audio pages are 0-based (or vice versa): the uniform offset
+    that lines them up, found before any page is cut."""
+    seg_pages = [int(s["page"]) for s in segments]
+    beat_pages = [int(b.get("page", 0)) for b in beats or []]
+    return (min(seg_pages) - min(beat_pages)) if (seg_pages and beat_pages) else 0
+
+
+def _skipped_pages(beats, offset):
+    """Audio pages whose every beat is marked "skip" (pages the story leaves out)."""
+    flags = {}
+    for b in beats or []:
+        page = int(b.get("page", 0)) + offset
+        flags[page] = flags.get(page, True) and bool(b.get("skip"))
+    return {p for p, all_skip in flags.items() if all_skip}
+
+
+def _build_beat_segments(segments, beats, offset=None):
     """Split each page segment's time window across its panels by text length."""
     if not beats or not segments:
         return []
-
-    # Beats may be 1-based while audio pages are 0-based (or vice versa). Detect
-    # a uniform offset so we can line them up regardless of the convention used.
-    seg_pages = [int(s["page"]) for s in segments]
-    beat_pages = [int(b.get("page", 0)) for b in beats]
-    offset = (min(seg_pages) - min(beat_pages)) if (seg_pages and beat_pages) else 0
+    if offset is None:
+        offset = _beat_offset(segments, beats)
 
     beats_by_page = {}
     for b in beats:
