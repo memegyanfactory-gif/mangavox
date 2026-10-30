@@ -10,14 +10,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, empty_view, icon_button, icon_ph, interactive, muted, ph, segmented, size, switch, tip, ButtonKind, Tokens};
+use mv_ui::{btn, empty_view, icon_button, icon_ph, icon_toggle, interactive, muted, ph, segmented, selected_badge_sized, size, switch, tip, ButtonKind, Tokens};
 
 use crate::data::{ChapterItem, MangaGroup};
 use crate::look::{Effect, Preset};
@@ -26,6 +26,8 @@ use crate::restyle::{place_index, set_place, set_size, PLACES, SIZES};
 use crate::vedit::{self, Beat, ChapterEdit, Clip, Layer, LayerKind, LookEdit, Motion, MusicSource, Placed, Project, Track};
 use crate::vedit_play;
 use crate::video::{self, SubtitleSetting};
+
+mod manga;
 
 /// Track header width, and each lane's height.
 const HEAD_W: f32 = 176.;
@@ -78,6 +80,9 @@ enum Drag {
     LayerEdge { id: u64, head: bool },
     /// A layer moved on the monitor.
     Place { id: u64 },
+    /// The captions moved on the monitor (every caption of the manga); where on the caption it
+    /// was grabbed, in % of the frame from its centre, and where they were before.
+    Caption { grab: (f32, f32), from: Option<(f32, f32)> },
     /// A value bar in the controls.
     Bar(&'static str),
     /// The timeline's scroll bar.
@@ -133,6 +138,14 @@ pub(crate) struct Editor {
     thumbs: RefCell<HashMap<String, Option<PathBuf>>>,
     /// The assistant tools' edit version last loaded (`vedit_tools::version`).
     seen_tools: u64,
+    /// The grid anchor a dragged caption snapped to.
+    cap_lit: Option<usize>,
+    /// Hearted caption templates (shared with the caption studio, see `video::favorites`) and
+    /// when their file was read.
+    favs: Vec<String>,
+    favs_at: Option<SystemTime>,
+    /// The whole-manga timeline ("All chapters") and Re-edit full timeline (see `manga`).
+    whole: manga::Whole,
     _subs: Vec<Subscription>,
 }
 
@@ -165,6 +178,10 @@ impl Default for Editor {
             keys: RefCell::new(HashMap::new()),
             thumbs: RefCell::new(HashMap::new()),
             seen_tools: crate::vedit_tools::version(),
+            cap_lit: None,
+            favs: vec![],
+            favs_at: None,
+            whole: Default::default(),
             _subs: vec![],
         }
     }
@@ -207,6 +224,7 @@ impl StudioPage {
         self.vedit.manga = id;
         self.vedit.seq = None;
         self.vedit.sel = None;
+        self.manga_reset();
         let Some(g) = g else { return };
         let chapters = self.made_chapters(&g);
         if let Some(first) = chapters.first() {
@@ -218,13 +236,14 @@ impl StudioPage {
     /// Opens `item` as the timeline's sequence.
     fn video_open(&mut self, item: ChapterItem) {
         self.video_stop();
+        self.vedit.whole.all = None;
         if let Some(prev) = &self.vedit.seq {
             self.vedit.keys.borrow_mut().remove(&prev.item.id);
         }
         let pages = mv_recap::list_pages(&item.pages_dir);
         let beats = vedit::load_beats(&item.output_dir, &pages);
         let edit = self.vedit.project.chapters.get(&item.id).cloned().unwrap_or_default();
-        let subs = video::subtitle_setting_for(&item);
+        let subs = self.vedit.project.captions(&video::subtitle_setting_for(&item));
         let score = Some(mv_score::score_wav(&crate::page::chref(&item))).filter(|p| p.is_file());
         let reels = self.statuses.get(&item.id).is_some_and(|s| !s.reels.is_empty());
         self.vedit.seq = Some(Seq { item, beats, edit, subs, score, reels });
@@ -276,6 +295,7 @@ impl StudioPage {
             }
             None => {}
         }
+        self.manga_poll(cx);
         let v = crate::vedit_tools::version();
         if v == self.vedit.seen_tools {
             return;
@@ -286,7 +306,7 @@ impl StudioPage {
         let dir = seq.item.output_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| seq.item.output_dir.clone());
         self.vedit.project = Project::load(&dir);
         let fresh = self.vedit.project.chapters.get(&seq.item.id).cloned().unwrap_or_default();
-        seq.subs = video::subtitle_setting_for(&seq.item);
+        seq.subs = self.vedit.project.captions(&video::subtitle_setting_for(&seq.item));
         if fresh != seq.edit {
             self.vedit.undo.push(std::mem::replace(&mut seq.edit, fresh));
             self.vedit.redo.clear();
@@ -298,6 +318,9 @@ impl StudioPage {
 
     /// Zoom so the whole sequence fits the timeline.
     fn video_fit(&mut self) {
+        if self.vedit.whole.all.is_some() {
+            return self.manga_fit();
+        }
         let total = self.vedit.seq.as_ref().map(|s| vedit::total_ms(&s.placed())).unwrap_or(0);
         let w = (f32::from(self.vedit.lanes.get().size.width)).max(400.);
         if total > 0 {
@@ -347,6 +370,7 @@ impl StudioPage {
             Ok(p) => self.vedit.project = p,
             Err(e) => toast::show(cx, Toast::error(format!("Could not save the edit: {e}"))),
         }
+        self.manga_sync(cx);
     }
 
     fn video_undo(&mut self, redo: bool, cx: &mut Context<Self>) {
@@ -365,6 +389,41 @@ impl StudioPage {
         let Some(seq) = self.vedit.seq.as_mut() else { return };
         f(&mut seq.subs);
         video::save_chapter_setting(&seq.item.output_dir, Some(&seq.subs));
+        self.manga_sync(cx);
+        cx.notify();
+    }
+
+    /// Saves where the captions sit (the open chapter's caption setting) as the place of every
+    /// caption in the manga: the project file, which every chapter's render reads.
+    fn video_caption_pos_save(&mut self, cx: &mut Context<Self>) {
+        let Some(seq) = &self.vedit.seq else { return };
+        video::save_chapter_setting(&seq.item.output_dir, Some(&seq.subs));
+        let pos = seq.subs.pos;
+        match vedit::update_project(&Self::manga_dir(&seq.item), |p| p.caption_pos = pos) {
+            Ok(p) => self.vedit.project = p,
+            Err(e) => toast::show(cx, Toast::error(format!("Could not save the caption place: {e}"))),
+        }
+        // Every chapter's render changed.
+        self.vedit.keys.borrow_mut().clear();
+        cx.notify();
+    }
+
+    /// Reads the hearted caption templates again when their file changed (the caption studio
+    /// shares it).
+    fn video_favs_refresh(&mut self) {
+        let at = std::fs::metadata(video::defaults_file()).and_then(|m| m.modified()).ok();
+        if at != self.vedit.favs_at {
+            self.vedit.favs_at = at;
+            self.vedit.favs = video::favorites();
+        }
+    }
+
+    fn video_toggle_fav(&mut self, id: &str, cx: &mut Context<Self>) {
+        let mut favs = video::favorites();
+        vedit::toggle_favorite(&mut favs, id);
+        video::save_favorites(&favs);
+        self.vedit.favs = favs;
+        self.vedit.favs_at = std::fs::metadata(video::defaults_file()).and_then(|m| m.modified()).ok();
         cx.notify();
     }
 
@@ -492,6 +551,7 @@ impl StudioPage {
     // ------------------------------------------------------------------------------ playback
 
     fn video_stop(&mut self) {
+        self.manga_stop();
         if let Some((t0, from)) = self.vedit.playing.take() {
             self.vedit.playhead = from + t0.elapsed().as_millis() as u64;
             vedit_play::stop();
@@ -533,7 +593,7 @@ impl StudioPage {
             (MusicSource::Score, false) => seq.score.clone().map(|p| (p, from, vol * 0.8)),
             (MusicSource::File { path }, false) => Some((path.clone(), from, vol * 0.25)),
         };
-        vedit_play::play(vedit_play::Play { narration, skip_ms, music });
+        vedit_play::play(vedit_play::Play { narration, skip_ms, music, music_parts: vec![] });
         self.vedit.playing = Some((Instant::now(), from));
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -576,6 +636,9 @@ impl StudioPage {
     }
 
     fn seek(&mut self, ms: u64, cx: &mut Context<Self>) {
+        if self.vedit.whole.all.is_some() {
+            return self.manga_seek(ms, cx);
+        }
         let playing = self.vedit.playing.is_some();
         self.video_stop();
         let total = self.vedit.seq.as_ref().map(|s| vedit::total_ms(&s.placed())).unwrap_or(0);
@@ -605,6 +668,10 @@ impl StudioPage {
     pub(crate) fn video_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.vedit.text.as_ref().is_some_and(|t| t.read(cx).focus_handle(cx).is_focused(window)) {
             return false;
+        }
+        if self.vedit.whole.all.is_some() && self.manga_key(ev, cx) {
+            cx.notify();
+            return true;
         }
         let k = &ev.keystroke;
         let m = &k.modifiers;
@@ -653,6 +720,9 @@ impl StudioPage {
 
     fn snap_ms(&mut self, t: i64, skip_layer: Option<u64>) -> i64 {
         self.vedit.snapped = None;
+        if self.vedit.whole.all.is_some() {
+            return if self.vedit.snap { self.manga_snap(t) } else { t };
+        }
         let Some(seq) = &self.vedit.seq else { return t };
         if !self.vedit.snap {
             return t;
@@ -740,6 +810,16 @@ impl StudioPage {
                     }
                 }
             }
+            Drag::Caption { grab, .. } => {
+                let b = self.vedit.monitor.get();
+                let (fx, fy) = (f32::from(pos.x - b.origin.x), f32::from(pos.y - b.origin.y));
+                if let Some((p, lit)) = vedit::caption_drop(fx, fy, f32::from(b.size.width), f32::from(b.size.height), grab) {
+                    self.vedit.cap_lit = lit;
+                    if let Some(seq) = self.vedit.seq.as_mut() {
+                        seq.subs.pos = Some(p);
+                    }
+                }
+            }
             Drag::Bar(name) => {
                 if let Some(f) = self.bar_fraction(name, pos.x) {
                     self.bar_set(name, f, cx);
@@ -748,7 +828,7 @@ impl StudioPage {
             Drag::Scroll => {
                 let b = self.vedit.lanes.get();
                 let w = f32::from(b.size.width);
-                let total = self.vedit.seq.as_ref().map(|s| vedit::total_ms(&s.placed())).unwrap_or(0) as f32 / 1000. * self.vedit.pps;
+                let total = self.timeline_ms() as f32 / 1000. * self.vedit.pps;
                 if w > 0. && total > w {
                     let f = ((f32::from(pos.x) - f32::from(b.origin.x)) / w).clamp(0., 1.);
                     self.vedit.scroll_x = (f * total - w / 2.).clamp(0., total - w);
@@ -788,13 +868,24 @@ impl StudioPage {
                     }
                 }
             }
-            Drag::Bar(_) => {
+            Drag::Caption { from, .. } => {
+                self.vedit.cap_lit = None;
+                // A click (no move) only selects the clip.
+                if self.vedit.seq.as_ref().is_some_and(|s| s.subs.pos != from) {
+                    self.video_caption_pos_save(cx);
+                }
+            }
+            Drag::Bar(name) => {
                 let Some(seq) = &self.vedit.seq else { return };
                 video::save_chapter_setting(&seq.item.output_dir, Some(&seq.subs));
                 if seq.edit != saved {
                     self.vedit.undo.push(saved);
                     self.video_save(cx);
                 }
+                if name == "caption-y" {
+                    self.video_caption_pos_save(cx);
+                }
+                self.manga_sync(cx);
             }
             Drag::Playhead | Drag::Scroll => {}
         }
@@ -844,6 +935,7 @@ impl StudioPage {
             );
         }
         self.sync_text_input(window, cx);
+        self.video_favs_refresh();
         if self.vedit.fit_pending {
             if f32::from(self.vedit.lanes.get().size.width) > 0. {
                 self.vedit.fit_pending = false;
@@ -853,14 +945,15 @@ impl StudioPage {
             }
         }
         let pending = self.unrendered(&g);
+        let all = self.vedit.whole.all.is_some();
         let top = div()
             .flex()
             .flex_1()
             .min_h(px(260.))
             .gap(px(4.))
-            .child(self.panel("Effect Controls", None, self.effect_controls(cx)).w(px(LEFT_W)).flex_none())
-            .child(self.monitor_panel(window, cx))
-            .child(self.panel("Sequence", None, self.sequence_panel(cx)).w(px(RIGHT_W)).flex_none());
+            .child(self.panel("Effect Controls", None, self.effect_controls(window, cx)).w(px(LEFT_W)).flex_none())
+            .child(if all { self.manga_monitor_panel(&g, window, cx) } else { self.monitor_panel(window, cx) })
+            .child(self.panel(if all { "Sequence · every chapter" } else { "Sequence" }, None, self.sequence_panel(window, cx)).w(px(RIGHT_W)).flex_none());
         let bottom = div()
             .flex()
             .flex_none()
@@ -868,7 +961,7 @@ impl StudioPage {
             .gap(px(4.))
             .child(self.panel(&format!("Project: {}", g.title), None, self.bin(&g, &pending, cx)).w(px(LEFT_W)).flex_none())
             .child(self.tools(cx))
-            .child(self.video_timeline(cx));
+            .child(if all { self.manga_timeline(&g, cx) } else { self.video_timeline(cx) });
         div()
             .id("vedit")
             .relative()
@@ -894,6 +987,7 @@ impl StudioPage {
             .child(top)
             .child(bottom)
             .when(self.vedit.export_open, |d| d.child(self.export_dialog(&g, pending, cx)))
+            .when(self.vedit.whole.confirm, |d| d.child(self.reedit_dialog(&g, cx)))
             .into_any_element()
     }
 
@@ -1171,11 +1265,8 @@ impl StudioPage {
     /// The program frame at `now`: the clip's panel, the layers and the caption cue.
     fn frame(&self, seq: &Seq, placed: &[Placed], now: u64, fw: f32, fh: f32, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let cur = vedit::at(placed, now).or(placed.last());
-        let image = cur.and_then(|p| seq.beats.get(p.clip.src)).and_then(|b| b.image.clone());
-        let mut d = div().id("vedit-frame").relative().flex_none().w(px(fw)).h(px(fh)).overflow_hidden().bg(video::paint(hex("#000000"), 1.));
-        if let Some(p) = image {
-            d = d.child(img(p.clone()).absolute().inset_0().size_full().object_fit(ObjectFit::Cover).opacity(0.25)).child(img(p).absolute().inset_0().size_full().object_fit(ObjectFit::Contain));
-        }
+        // The panel as the chapter's look draws it (blurred fill, duo panels, finish).
+        let mut d = div().id("vedit-frame").relative().flex_none().w(px(fw)).h(px(fh)).overflow_hidden().bg(video::paint(hex("#000000"), 1.)).children(self.look_backdrop(seq, placed, now, fw, fh));
         if !seq.edit.flags(Track::Layers).off {
             for l in seq.edit.layers.iter().filter(|l| l.start_ms <= now && now < l.end_ms) {
                 let selected = self.vedit.sel == Some(Sel::Layer(l.id));
@@ -1239,8 +1330,45 @@ impl StudioPage {
                 let (words, active) = vedit::cue_at(&text, per, frac);
                 if !words.is_empty() {
                     d = d.child(video::caption_layer(&words, &st, seq.subs.user_words(), fw, fh, active, true, self.vedit.playing.is_some(), window));
+                    // Grab the caption to move every caption of the manga (snaps to the 3x3 grid);
+                    // a click also selects its clip, to edit the text.
+                    if let Some((x, y, w, h)) = video::caption_box(&words, &st, seq.subs.user_words(), fw, fh, window) {
+                        let dragging = matches!(self.vedit.drag, Some(Drag::Caption { .. }));
+                        let on = dragging || self.vedit.sel == Some(Sel::Clip(p.index));
+                        let (index, centre) = (p.index, st.pos);
+                        d = d.child(
+                            div()
+                                .id("vedit-caption-on-frame")
+                                .absolute()
+                                .left(px(x))
+                                .top(px(y))
+                                .w(px(w))
+                                .h(px(h))
+                                .rounded(px(radius::SM))
+                                .border_1()
+                                .border_color(if on { Tokens::accent() } else { soft(Tokens::accent(), 0.) })
+                                .hover(|d| d.border_color(Tokens::accent()))
+                                .cursor(if dragging { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+                                .tooltip(tip("Drag to move every caption (snaps to the grid). Click to edit the text."))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.vedit.sel = Some(Sel::Clip(index));
+                                    if !this.locked(Track::Captions) {
+                                        let b = this.vedit.monitor.get();
+                                        let at = vedit::frame_percent(f32::from(ev.position.x - b.origin.x), f32::from(ev.position.y - b.origin.y), f32::from(b.size.width), f32::from(b.size.height));
+                                        let grab = at.map(|(x, y)| (x - centre.0, y - centre.1)).unwrap_or((0., 0.));
+                                        let from = this.vedit.seq.as_ref().and_then(|s| s.subs.pos);
+                                        this.vedit.drag = Some(Drag::Caption { grab, from });
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
                 }
             }
+        }
+        if matches!(self.vedit.drag, Some(Drag::Caption { .. })) {
+            d = d.child(video::grid_overlay(fw, fh, self.vedit.cap_lit));
         }
         let mon = self.vedit.monitor.clone();
         d.child(canvas(move |b, _, _| mon.set(b), |_, _, _, _| {}).absolute().inset_0())
@@ -1249,7 +1377,7 @@ impl StudioPage {
     // ------------------------------------------------------------------------------ panels
 
     /// Top left: what the selection can change.
-    fn effect_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn effect_controls(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(seq) = &self.vedit.seq else { return div().into_any_element() };
         let body = div().id("vedit-fx").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(space::MD)).p(px(space::MD));
         let body = match self.vedit.sel {
@@ -1293,6 +1421,11 @@ impl StudioPage {
                     ))
                     .child(self.prop("Caption text", self.text_field()))
                     .child(muted("The voice keeps the narration; only the caption changes."))
+                    .child(self.caption_preview(seq, &c, window))
+                    .child(self.prop(
+                        "Caption style",
+                        div().id("vedit-clip-styles").flex().gap(px(6.)).pb(px(4.)).overflow_x_scroll().children(self.style_cards("vedit-clip-style", 96., 54., window, cx)).into_any_element(),
+                    ))
                     .child(
                         div()
                             .flex()
@@ -1429,6 +1562,95 @@ impl StudioPage {
         div().flex().flex_col().gap(px(6.)).child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(label.to_string())).child(control)
     }
 
+    /// The caption templates as live thumbnails (`w` x `h`), favourites first: each draws its
+    /// look, hearts with a click and picks the template for the chapter's captions.
+    fn style_cards(&self, key: &'static str, w: f32, h: f32, window: &Window, cx: &Context<Self>) -> Vec<AnyElement> {
+        let Some(seq) = &self.vedit.seq else { return vec![] };
+        let favs = &self.vedit.favs;
+        vedit::favorites_first(video::styles(), |st| st.id.as_str(), favs)
+            .into_iter()
+            .map(|st| {
+                let selected = st.id == seq.subs.style;
+                let fav = favs.contains(&st.id);
+                let (id, fid) = (st.id.clone(), st.id.clone());
+                div()
+                    .id(SharedString::from(format!("{key}-{}", st.id)))
+                    .flex()
+                    .flex_none()
+                    .flex_col()
+                    .gap(px(3.))
+                    .w(px(w + 8.))
+                    .p(px(2.))
+                    .rounded(px(radius::MD))
+                    .border_2()
+                    .border_color(if selected { Tokens::accent() } else { Tokens::border() })
+                    .bg(if selected { Tokens::accent_soft() } else { Tokens::surface_2() })
+                    .cursor_pointer()
+                    .when(!selected, |d| d.hover(|d| d.bg(Tokens::hover())))
+                    .tooltip(tip(st.summary()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let id = id.clone();
+                        this.video_subs(|s| s.style = id, cx)
+                    }))
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(w))
+                            .h(px(h))
+                            .rounded(px(radius::SM))
+                            .overflow_hidden()
+                            .child(video::style_thumb(st, w, h, window))
+                            .child(
+                                div().absolute().top(px(1.)).right(px(1.)).rounded(px(radius::SM)).bg(Tokens::scrim()).child(
+                                    icon_toggle(SharedString::from(format!("{key}-fav-{}", st.id)), ph::HEART, fav, Tokens::danger(), "Remove from favourites", "Add to favourites")
+                                        .size(12.)
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.video_toggle_fav(&fid, cx)
+                                        })),
+                                ),
+                            )
+                            .when(selected, |d| d.child(div().absolute().top(px(4.)).left(px(4.)).child(selected_badge_sized(14.)))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.))
+                            .px(px(2.))
+                            .when(fav, |d| d.child(icon_ph(ph::HEART, Tokens::danger(), 10.)))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(size::XS)).text_color(if selected { Tokens::text_1() } else { Tokens::text_2() }).child(st.label.clone()))
+                            .when(st.dynamic.is_some(), |d| d.child(icon_ph(ph::LIGHTNING, Tokens::text_3(), 10.))),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// The selected clip's caption (its first cue, as typed) in the chapter's caption style and
+    /// place, over the clip's panel: the text and the style seen together while editing.
+    fn caption_preview(&self, seq: &Seq, clip: &Clip, window: &Window) -> Div {
+        let w = LEFT_W - 2. * space::MD - 8.;
+        let (fw, fh) = if seq.reels { (112., 200.) } else { (w, w * 9. / 16.) };
+        let beat = seq.beats.get(clip.src);
+        let text = clip.text.clone().or_else(|| beat.map(|b| b.text.clone())).unwrap_or_default();
+        let st = seq.subs.effective_style();
+        let (words, _) = vedit::cue_at(&text, video::words_per_cue(&st, seq.subs.user_words()), 0.);
+        let shown = seq.subs.enabled && !seq.edit.flags(Track::Captions).off;
+        let frame = div()
+            .relative()
+            .flex_none()
+            .w(px(fw))
+            .h(px(fh))
+            .rounded(px(radius::MD))
+            .overflow_hidden()
+            .bg(video::paint(hex("#000000"), 1.))
+            .when_some(beat.and_then(|b| b.image.clone()), |d, p| d.child(img(p).absolute().inset_0().size_full().object_fit(ObjectFit::Contain).opacity(0.6)))
+            .when(shown && !words.is_empty(), |d| d.child(video::caption_layer(&words, &st, seq.subs.user_words(), fw, fh, 1.min(words.len() - 1), false, true, window)));
+        let note = if shown { format!("{} · drag the caption on the Program monitor to move every caption", video::find_style(&seq.subs.style).label) } else { "Captions are off (Sequence → Captions).".to_string() };
+        div().flex().flex_col().gap(px(6.)).child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Preview")).child(div().flex().justify_center().child(frame)).child(muted(note))
+    }
+
     /// A draggable value bar (`f` 0..1).
     fn bar(&self, name: &'static str, label: &str, f: f32, value: String, cx: &Context<Self>) -> Div {
         let bars = self.vedit.bars.clone();
@@ -1492,6 +1714,14 @@ impl StudioPage {
                             },
                             cx,
                         );
+                        // The Program monitor shows the edited caption in its style.
+                        let span = this.vedit.seq.as_ref().and_then(|s| s.placed().into_iter().find(|p| p.index == i)).map(|p| (p.start_ms, p.end_ms()));
+                        if let Some((a, b)) = span {
+                            let now = this.playhead_now();
+                            if this.vedit.playing.is_none() && (now < a || now >= b) {
+                                this.seek(a, cx);
+                            }
+                        }
                     }
                 }
                 Some(Sel::Layer(id)) => {
@@ -1537,7 +1767,7 @@ impl StudioPage {
     }
 
     /// Top right: the sequence's captions, music and look.
-    fn sequence_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn sequence_panel(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(seq) = &self.vedit.seq else { return div().into_any_element() };
         let tabs = segmented("vedit-side", [(Some(ph::CLOSED_CAPTIONING), "Captions"), (Some(ph::MUSIC_NOTES), "Music"), (Some(ph::MAGIC_WAND), "Look")], self.vedit.side_tab).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
             this.vedit.side_tab = *ix;
@@ -1548,30 +1778,14 @@ impl StudioPage {
             0 => {
                 let s = &seq.subs;
                 let off = seq.edit.flags(Track::Captions).off;
-                let styles = video::styles().iter().map(|st| {
-                    let on = st.id == s.style;
-                    let id = st.id.clone();
-                    div()
-                        .id(SharedString::from(format!("vedit-style-{}", st.id)))
-                        .px(px(space::SM))
-                        .py(px(6.))
-                        .rounded(px(radius::SM))
-                        .text_size(px(size::SM))
-                        .cursor_pointer()
-                        .border_1()
-                        .border_color(if on { Tokens::accent() } else { Tokens::border() })
-                        .bg(if on { Tokens::accent_soft() } else { Tokens::surface_2() })
-                        .text_color(Tokens::text_1())
-                        .hover(|d| d.bg(Tokens::hover()))
-                        .child(st.label.clone())
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            let id = id.clone();
-                            this.video_subs(|s| s.style = id, cx)
-                        }))
-                });
+                // Two thumbnails a row in the panel.
+                let tw = ((RIGHT_W - 2. * space::MD - 12. - 6.) / 2. - 8.).floor();
+                let styles = self.style_cards("vedit-style", tw, (tw * 9. / 16.).round(), window, cx);
+                let nfav = video::styles().iter().filter(|st| self.vedit.favs.contains(&st.id)).count();
                 let place = segmented("vedit-place", PLACES.iter().map(|p| (None, p.0)), place_index(s.pos)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
                     let ix = *ix;
-                    this.video_subs(|s| set_place(s, ix), cx)
+                    this.video_subs(|s| set_place(s, ix), cx);
+                    this.video_caption_pos_save(cx);
                 }));
                 let sizes = segmented("vedit-size", SIZES.iter().map(|p| (None, p.0)), crate::restyle::size_index(s.size)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
                     let v = SIZES[(*ix).min(SIZES.len() - 1)].1;
@@ -1587,8 +1801,18 @@ impl StudioPage {
                         }
                     })),
                 )
-                .child(self.prop("Style", div().flex().flex_wrap().gap(px(6.)).children(styles).into_any_element()))
+                .child(self.prop(
+                    "Style",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(muted(if nfav == 0 { "Heart a style to keep it first.".to_string() } else { format!("{nfav} favourite{} first", if nfav == 1 { "" } else { "s" }) }))
+                        .child(div().flex().flex_wrap().gap(px(6.)).children(styles))
+                        .into_any_element(),
+                ))
                 .child(self.prop("Place", place.into_any_element()))
+                .child(muted("Or drag a caption on the Program monitor: it snaps to the grid and moves every caption in this manga."))
                 .child(self.bar("caption-y", "Height in the frame", y / 100., format!("{y:.0}%"), cx))
                 .child(self.prop("Size", sizes.into_any_element()))
                 .child(
@@ -1597,7 +1821,7 @@ impl StudioPage {
                         this.video_subs(|s| s.emphasis = on, cx)
                     })),
                 )
-                .child(muted("Saved as this chapter's caption style (the caption studio in the Editor shows the same)."))
+                .child(muted("The style is saved as this chapter's caption style (the caption studio in the Editor shows the same); the place applies to every chapter of the manga."))
             }
             1 => {
                 let m = &seq.edit.music;
@@ -2191,7 +2415,7 @@ impl StudioPage {
             }));
 
         let body = div().flex().flex_col().flex_1().min_h_0().child(toolbar).child(div().flex().flex_1().min_h_0().child(heads).child(content)).child(scroll);
-        self.panel(&format!("{} ×", seq.item.label()), None, body).flex_1()
+        self.panel(&format!("{} ×", seq.item.label()), Some(self.chapter_switcher(cx)), body).flex_1()
     }
 
     // ------------------------------------------------------------------------------ export

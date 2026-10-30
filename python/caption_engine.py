@@ -170,6 +170,7 @@ def apply_settings(style: dict, s: dict) -> dict:
         st["highlightColor"] = hc
         if st.get("highlightBox"):
             st["highlightBoxColor"] = hc
+            st.pop("boxColors", None)
         if dyn:
             if dyn.get("fx") in ("marker", "box", "underline"):
                 dyn["accent"] = hc
@@ -180,12 +181,69 @@ def apply_settings(style: dict, s: dict) -> dict:
             st[k] = False
         st["highlightFont"] = None
         st["highlightScale"] = 1.0
+        st["sweep"] = 0
+        st["bounce"] = 0
         if dyn:
             dyn["heroScale"] = 1.0
             dyn["hero"] = dyn.get("ink")
             if dyn.get("fx") in ("marker", "box", "underline", "focus"):
                 dyn["fx"] = None
     return st
+
+
+# Motion options a template may set (all optional, so older catalogues and saved settings load):
+#   "sweep":  the spoken word's highlight wipes in left to right: seconds, or "word" to fill over
+#             the word's whole duration (karaoke fill). Default: 0.12 s for karaoke-highlight
+#             templates, "word" for fill-as-spoken ones, off otherwise.
+#   "bounce": strength of the little spring on emphasis words (punch words, "!", numbers, SHOUTED
+#             words) when they are said. Default by category: calm templates 0, dynamic 0.6, else 1.
+#   "trail":  number of motion-blur ghosts behind a word while it flies in (kinetic templates).
+#   "fadeOut": seconds the cue takes to fade out when nothing follows it straight away.
+_CALM = {"Clean", "Cinematic"}
+
+
+def style_sweep(st: dict):
+    """Seconds of the highlight sweep, "word" (fill across the word) or 0."""
+    v = st.get("sweep")
+    if v is None:
+        if st.get("dynamic") or not st.get("highlightWords"):
+            return 0
+        return "word" if st.get("progressiveHighlight") else 0.12
+    if v == "word":
+        return v
+    try:
+        return max(0.0, float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def style_bounce(st: dict) -> float:
+    v = st.get("bounce")
+    if v is None:
+        if st.get("category") in _CALM or st.get("bgOn"):
+            return 0.0
+        return 0.6 if st.get("dynamic") else 1.0
+    try:
+        return max(0.0, min(3.0, float(v)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def is_emphasis(word: str) -> bool:
+    """Punch words, exclamations, numbers and SHOUTED words get the emphasis bounce."""
+    bare = _bare(word)
+    if not bare:
+        return False
+    letters = re.sub(r"[^A-Za-z]", "", word)
+    return (bare in PUNCH or word.rstrip("\"'”’)").endswith("!") or any(ch.isdigit() for ch in bare)
+            or (len(letters) >= 2 and letters.isupper()))
+
+
+def bounce_curve(u: float) -> float:
+    """Damped spring 0 -> peak 1 -> small undershoot -> 0 over u in [0, 1]."""
+    if u <= 0 or u >= 1:
+        return 0.0
+    return math.exp(-4.5 * u) * math.sin(2.6 * math.pi * u) / 0.45
 
 
 # ----------------------------------------------------------------------------- colours
@@ -381,8 +439,10 @@ _FROM = {
     "bounce": lambda k: {"opacity": 0, "dy": -0.9 * k},
     "slide-l": lambda k: {"opacity": 0, "dx": 1.6 * k},
     "slide-r": lambda k: {"opacity": 0, "dx": -1.6 * k},
-    "pop": lambda k: {"opacity": 0, "scale": max(0.0, 1 - 0.85 * k)},
-    "balloon": lambda k: {"opacity": 0, "scale": max(0.0, 1 - 0.85 * k)},
+    # Pop from ~35-60 % (not from a point): with the overshoot ease the word lands at ~108-112 %
+    # and settles, which reads as a snappy pop instead of a jolt.
+    "pop": lambda k: {"opacity": 0, "scale": _clamp(1 - 0.42 * k, 0.3, 0.9)},
+    "balloon": lambda k: {"opacity": 0, "scale": _clamp(1 - 0.5 * k, 0.25, 0.9)},
     "inflate": lambda k: {"opacity": 0, "scale": 0.01, "rot": -4 * k},
     "blur": lambda k: {"opacity": 0, "blur": 14 * k, "scale": 1 + 0.06 * k},
     "mask-up": lambda k: {"dy": 1.12, "clip": "line"},
@@ -799,6 +859,21 @@ def _fit_factor(cue, style, W, H) -> float:
     return min(1.0, 1.0 / worst) if worst > 0 else 1.0
 
 
+def _rewrap(cue, style, W, H, fit) -> dict:
+    """A cue that would have to shrink a lot to fit on its lines (a 4-word line on a 9:16 frame)
+    takes one more line instead, when the template allows another line."""
+    if fit >= 0.8 or (style.get("dynamic") and not style.get("_userWords")):
+        return style
+    n = len(cue["words"])
+    wpl = max(1, int(style.get("wordsPerLine") or 4))
+    rows = math.ceil(n / wpl)
+    if n < 2 or rows >= max(1, int(style.get("maxLines") or 2)):
+        return style
+    st = dict(style)
+    st["wordsPerLine"] = math.ceil(n / (rows + 1))
+    return st
+
+
 # ----------------------------------------------------------------------------- ASS writer
 
 
@@ -819,12 +894,18 @@ def _f(v: float) -> str:
     return s[:-2] if s.endswith(".0") else s
 
 
-def _rrect(w: float, h: float, r: float) -> str:
+def _rrect(w: float, h: float, r: float, tail=None) -> str:
+    """Rounded rectangle drawing; `tail` = (x0, x1, tip_x, tip_y) adds a speech-bubble tail on the
+    bottom edge as part of the same contour (so a border outlines bubble + tail as one shape)."""
     r = max(0.0, min(r, w / 2, h / 2))
     k = r * 0.4477
+    bottom = [f"l {_f(r)} {_f(h)}"]
+    if tail:
+        x0, x1, tx, ty = tail
+        bottom = [f"l {_f(x1)} {_f(h)}", f"l {_f(tx)} {_f(ty)}", f"l {_f(x0)} {_f(h)}", f"l {_f(r)} {_f(h)}"]
     p = [f"m {_f(r)} 0", f"l {_f(w - r)} 0", f"b {_f(w - k)} 0 {_f(w)} {_f(k)} {_f(w)} {_f(r)}",
          f"l {_f(w)} {_f(h - r)}", f"b {_f(w)} {_f(h - k)} {_f(w - k)} {_f(h)} {_f(w - r)} {_f(h)}",
-         f"l {_f(r)} {_f(h)}", f"b {_f(k)} {_f(h)} 0 {_f(h - k)} 0 {_f(h - r)}",
+         *bottom, f"b {_f(k)} {_f(h)} 0 {_f(h - k)} 0 {_f(h - r)}",
          f"l 0 {_f(r)}", f"b 0 {_f(k)} {_f(k)} 0 {_f(r)} 0"]
     return " ".join(p)
 
@@ -858,13 +939,18 @@ class _Writer:
                 fh.write(f"Dialogue: {layer},{_ts(a)},{_ts(b)},W,,0,0,0,,{{{tags}}}{text}\n")
 
 
-L_CHIP, L_CARD, L_3D, L_SHADOW, L_GLOW, L_TEXT, L_BAND = 0, 1, 2, 3, 4, 5, 6
+L_CHIP, L_CARD, L_3D, L_SHADOW, L_GLOW, L_TEXT, L_BAND, L_SWEEP = 0, 1, 2, 3, 4, 5, 6, 8
 
 
 class _CueRenderer:
     def __init__(self, cue, style, W, H, out: _Writer):
         self.cue, self.st, self.W, self.H, self.out = cue, style, W, H, out
         st = style
+        # Snap every time to the ASS centisecond grid, so a piece that starts on a word's end
+        # really is past it (else the last word's highlight / box hangs on into the next piece).
+        cue["start"], cue["end"] = round(cue["start"], 2), round(cue["end"], 2)
+        for w in cue["words"]:
+            w["start"], w["end"] = round(w["start"], 2), round(w["end"], 2)
         upper = st.get("uppercase")
         cue["_display"] = [w["text"].upper() if upper else w["text"] for w in cue["words"]]
         self.n = len(cue["words"])
@@ -884,10 +970,45 @@ class _CueRenderer:
         # around the hero word instead of leaving holes for words still to come.
         self.rolling = bool(self.dyn and self.dyn.get("window") == "rolling" and preset != "none")
         self.fit = _fit_factor(cue, st, W, H)
+        st = self.st = _rewrap(cue, st, W, H, self.fit)
+        if st is not style:
+            self.fit = _fit_factor(cue, st, W, H)
         self.layouts = {}
         self.scale1080 = H / 1080.0
         self.stateful = bool(self.dyn or st.get("highlightWords") or st.get("karaokePop") or st.get("highlightBox")
                              or st.get("progressiveHighlight") or st.get("highlightFont"))
+        self.sweep = style_sweep(st)
+        self.bounce = style_bounce(st)
+        self.trail = max(0, min(4, int(st.get("trail") or 0)))
+        self.fade_out = _clamp(float(st.get("fadeOut", 0.18) or 0.0), 0.0, 0.6)
+        # Back-to-back cues cut (the next cue's words pop in); a cue followed by a pause fades out.
+        self.gap_after = bool(cue.get("gapAfter", True))
+        self.emph = [self.bounce > 0 and is_emphasis(w["text"]) for w in cue["words"]]
+
+    def bounce_t0(self, i):
+        w = self.cue["words"][i]
+        t0 = w["start"]
+        if self.preset != "none" and self.unit != "none":
+            # Let the entrance land first, then the spring.
+            t0 = max(t0, self.appear(i) + self.dur * 0.75)
+        return t0
+
+    def sweep_dur(self, i):
+        if self.sweep == "word":
+            w = self.cue["words"][i]
+            return _clamp((w["end"] - w["start"]) * 0.9, 0.08, 0.6)
+        return float(self.sweep or 0)
+
+    def sweep_progress(self, i, t):
+        """Highlight sweep progress of word i at t (None = no sweep running)."""
+        if not self.sweep:
+            return None
+        w = self.cue["words"][i]
+        d = self.sweep_dur(i)
+        if d <= 0.02 or t < w["start"] - 1e-6 or not self.highlighted(i, t):
+            return None
+        p = (t - w["start"]) / d
+        return None if p >= 1 else _clamp(p, 0.0, 1.0)
 
     # -- state -------------------------------------------------------------
     def active_at(self, t):
@@ -961,10 +1082,17 @@ class _CueRenderer:
         hl = self.highlighted(i, t)
         if hl and st.get("highlightScale", 1) and abs(float(st.get("highlightScale", 1)) - 1) > 0.01:
             scale *= _clamp(float(st["highlightScale"]), 0.7, 1.5)
+        bdy = 0.0
+        if self.emph[i]:
+            f = bounce_curve((t - self.bounce_t0(i)) / 0.36)
+            scale *= 1 + 0.1 * self.bounce * f
+            bdy = -0.07 * self.bounce * max(f, 0.0)
         opacity = p["opacity"]
         rem = self.cue["end"] - t
-        if rem < 0.12:
-            opacity *= ease("slowdown", _clamp(rem / 0.12, 0, 1), 1)
+        if self.gap_after and self.fade_out > 0 and rem < self.fade_out:
+            e_out = ease("smooth", _clamp(rem / self.fade_out, 0, 1), 0.6)
+            opacity *= e_out
+            scale *= 0.94 + 0.06 * e_out
         blur = p["blur"]
         if self.dyn and self.dyn.get("fx") == "focus" and not act:
             blur += 2.2
@@ -977,7 +1105,7 @@ class _CueRenderer:
         if self.dyn and self.dyn.get("fx") == "cards":
             rot += CARD_THEMES[i % 3][2]
         return {
-            "x": x + p["dx"] * em, "y": y + p["dy"] * em, "em": em, "w": w,
+            "x": x + p["dx"] * em, "y": y + (p["dy"] + bdy) * em, "em": em, "w": w,
             "sx": scale * p["scaleX"], "sy": scale * p["scaleY"], "rot": rot,
             "op": _clamp(opacity, 0, 1), "blur": blur * self.scale1080 * 0.8,
             "clipX": p["clipX"], "clipY": p["clipY"], "origin": p["origin"], "clip": p["clip"],
@@ -991,11 +1119,12 @@ class _CueRenderer:
         return w["start"] <= t < w["end"]
 
     # -- look (colours per state) ---------------------------------------------
-    def look(self, i, t):
+    def look(self, i, t, plain=False):
+        """Colours of word i at t; `plain` = as if not yet highlighted (under a sweep)."""
         st = self.st
         w = self.cue["words"][i]
         act = w["start"] <= t < w["end"]
-        hl = self.highlighted(i, t)
+        hl = self.highlighted(i, t) and not plain
         base = parse_color(st.get("color"))
         fill = base
         grad = None
@@ -1033,7 +1162,9 @@ class _CueRenderer:
                 grad = (parse_color(d["ink"]), parse_color(d["accent"]))
         else:
             if st.get("highlightBox") and act:
-                box = parse_color(st.get("highlightBoxColor"))
+                cyc = st.get("boxColors")
+                k = self.cue.get("_w0", 0) + i
+                box = parse_color(cyc[k % len(cyc)] if isinstance(cyc, list) and cyc else st.get("highlightBoxColor"))
                 fill = parse_color(st.get("highlightTextColor") or "#0a0d05")
             elif st.get("wordAlt"):
                 fill = parse_color(st.get("color2")) if i % 2 else base
@@ -1077,7 +1208,17 @@ class _CueRenderer:
             ts.update((w["start"], w["end"]))
         if self.st.get("karaokePop"):
             ts.update((w["start"] + 0.03, w["start"] + 0.06, w["start"] + 0.08, w["end"] - 0.08, w["end"] - 0.04, w["end"]))
-        ts.update((cue["end"] - 0.12, cue["end"] - 0.06))
+        if self.emph[i]:
+            b0 = self.bounce_t0(i)
+            ts.update(b0 + 0.36 * s / 9 for s in range(10))
+        if self.sweep:
+            d = self.sweep_dur(i)
+            steps = max(2, min(6, int(round(d / 0.04))))
+            ts.update(w["start"] + d * s / steps for s in range(steps + 1))
+        if self._box_intro():
+            ts.update(w["start"] + 0.13 * s / 4 for s in range(5))
+        if self.gap_after and self.fade_out > 0:
+            ts.update(cue["end"] - self.fade_out * s / 4 for s in range(5))
         cs = sorted({_cs(t) for t in ts if t0 - 1e-6 <= t <= cue["end"] + 1e-6})
         return cs
 
@@ -1102,14 +1243,49 @@ class _CueRenderer:
                 stag = float(self.anim.get("stagger") or 0.045)
                 t0 = self.appear(i)
                 vis = sum(1 for j in range(len(self.cue["_display"][i])) if t0 + j * stag <= ta + 1e-4)
+            sweeping = self.sweep_progress(i, ta + 1e-4) is not None
             # Merge static pieces with the previous one.
-            if pieces and pieces[-1][5] == vis and pieces[-1][4] == lk and pieces[-1][3] == pa and pa == pb and pieces[-1][2] == pieces[-1][3]:
+            if (pieces and not sweeping and not pieces[-1][6] and pieces[-1][5] == vis and pieces[-1][4] == lk
+                    and pieces[-1][3] == pa and pa == pb and pieces[-1][2] == pieces[-1][3]):
                 pieces[-1][1] = b
                 continue
-            pieces.append([a, b, pa, pb, lk, vis])
+            pieces.append([a, b, pa, pb, lk, vis, sweeping])
         text = self.cue["_display"][i]
-        for a, b, pa, pb, lk, vis in pieces:
+        for a, b, pa, pb, lk, vis, _ in pieces:
             self.emit_word(i, a, b, pa, pb, lk, text, vis)
+        if self.trail and self.preset != "none" and self.unit == "word":
+            self.render_trail(i, text)
+
+    def render_trail(self, i, text):
+        """Motion-blur ghosts: copies of the word a few frames behind it while it flies in."""
+        t0 = self.appear(i)
+        lag = 0.03
+        end = t0 + self.dur + lag * self.trail
+        steps = max(3, int(round((end - t0) / 0.03)))
+        cs = sorted({_cs(t0 + (end - t0) * s / steps) for s in range(steps + 1)})
+        cs = [c for c in cs if c <= _cs(self.cue["end"])]
+        for g in range(1, self.trail + 1):
+            for a, b in zip(cs, cs[1:]):
+                ta, tb = a / 100.0 - lag * g, b / 100.0 - lag * g
+                ga, gb = self.pose(i, ta + 1e-4), self.pose(i, tb - 1e-4)
+                if ga is None or gb is None:
+                    continue
+                lk = self.look(i, a / 100.0 + 1e-4)
+                fill = lk["grad"][1] if lk["grad"] else lk["fill"]
+                f = font(lk["font"], lk["italic"])
+                em = gb["em"]
+                ital = "\\i1" if lk["italic"] and not catalog()["fonts"].get(lk["font"], {}).get("italicFile") else "\\i0"
+                pos, s0, s1, _ = self._xform(ga, gb)
+                # Ghosts thin out as the word lands, so nothing lingers once it is at rest.
+                fa = 0.42 / g * (1 - _clamp((ta - t0) / self.dur, 0, 1))
+                fb = 0.42 / g * (1 - _clamp((tb - t0) / self.dur, 0, 1))
+                if fa < 0.01 and fb < 0.01:
+                    continue
+                blur = em * 0.05 * g
+                tags = (f"\\an5\\fn{f.ass_name}\\fs{_f(em * f.fs_per_em)}\\b{1 if f.bold else 0}{ital}\\shad0\\bord0{pos}"
+                        f"\\1c{ass_bgr(fill)}\\blur{_f(ga['blur'] + blur)}\\1a{ass_alpha(ga['op'] * fill[3] * fa)}{s0}"
+                        f"\\t(\\blur{_f(gb['blur'] + blur)}\\1a{ass_alpha(gb['op'] * fill[3] * fb)}{s1})")
+                self.out.add(L_SHADOW, a, b, tags, _esc(text))
 
     def _xform(self, pa, pb, dx=0.0, dy=0.0, extra_scale=1.0, em_ref=None):
         """\\move + scale/rotation/blur start values and the \\t to the end values."""
@@ -1177,6 +1353,8 @@ class _CueRenderer:
         outline = st.get("outline") and float(st.get("outlineW", 1) or 0) > 0.05
         bord = max(1.5, em * 0.1 * float(st.get("outlineW", 1) or 1)) / 2 if outline else 0.0
         oc = parse_color(st.get("outlineColor"), (0, 0, 0, 1))
+        acc = self._accel(i, a, b, pa, pb)
+        tacc = f"{_f(acc)}," if abs(acc - 1) > 0.05 else ""
 
         def piece(layer, c1, c3, bw, extra_blur=0.0, dx=0.0, dy=0.0, a1=1.0, a3=1.0, clipx=None):
             p_pos, p_s0, p_s1, _ = self._xform(pa, pb, dx, dy)
@@ -1184,7 +1362,7 @@ class _CueRenderer:
             tags = (f"{head}{p_pos}\\1c{ass_bgr(c1)}\\3c{ass_bgr(c3)}"
                     f"\\bord{_f(bw * smin_a)}\\blur{_f(bl_a + extra_blur)}"
                     f"\\1a{ass_alpha(op_a * c1[3] * a1)}\\3a{ass_alpha(op_a * c3[3] * a3)}{p_s0}{ca}"
-                    f"\\t(\\bord{_f(bw * smin_b)}\\blur{_f(bl_b + extra_blur)}"
+                    f"\\t({tacc}\\bord{_f(bw * smin_b)}\\blur{_f(bl_b + extra_blur)}"
                     f"\\1a{ass_alpha(op_b * c1[3] * a1)}\\3a{ass_alpha(op_b * c3[3] * a3)}{p_s1}{cb})")
             self.out.add(layer, a, b, tags, body)
 
@@ -1194,10 +1372,17 @@ class _CueRenderer:
             if fxd in ("cards", "stickers"):
                 bw_, bh_, rad = pb["w"] + em * 0.5, em * 1.32, em * 0.16
             else:
-                bw_, bh_, rad = pb["w"] + em * 0.52, em * 1.36, em * 0.42
+                bw_, bh_, rad = pb["w"] + em * 0.52, em * 1.36, em * float(st.get("boxRadius", 0.42))
             if fxd == "marker":
                 rad = em * 0.12
-            self._drawing(L_CARD, a, b, pa, pb, bw_, bh_, rad, lk["box"], 0.0)
+            xs = None
+            if self._box_intro():
+                # The box snaps open from 55 % width with a slight overshoot as the word is said.
+                w0 = self.cue["words"][i]["start"]
+                sa = _clamp((a / 100.0 - w0) / 0.13, 0, 1)
+                sb = _clamp((b / 100.0 - w0) / 0.13, 0, 1)
+                xs = (0.55 + 0.45 * ease("overshoot", sa, 0.9), 0.55 + 0.45 * ease("overshoot", sb, 0.9))
+            self._drawing(L_CARD, a, b, pa, pb, bw_, bh_, rad, lk["box"], 0.0, xscale=xs, acc=tacc)
         if lk["underline"]:
             w0 = pb["w"]
             sinceA = _clamp((a / 100.0 - self.cue["words"][i]["start"]) / 0.2, 0, 1)
@@ -1227,7 +1412,29 @@ class _CueRenderer:
         if st.get("pixel3d") and outline:
             piece(L_TEXT, lk["fill"], (245, 245, 232, 1), bord + max(1.5, em * 0.045))
         fill = lk["grad"][1] if lk["grad"] else lk["fill"]
-        piece(L_TEXT + (1 if st.get("pixel3d") else 0), fill, oc, bord)
+        ta, tb = a / 100.0 + 1e-4, b / 100.0 - 1e-4
+        sw_a = self.sweep_progress(i, ta)
+        if sw_a is not None:
+            # Highlight sweep: the word in its plain colour, the highlight colour wiping over it.
+            plain = self.look(i, ta, plain=True)
+            pfill = plain["grad"][1] if plain["grad"] else plain["fill"]
+            piece(L_TEXT + (1 if st.get("pixel3d") else 0), pfill, oc, bord)
+            sw_b = self.sweep_progress(i, tb)
+            sw_b = 1.0 if sw_b is None else sw_b
+
+            def sweep_clip(p, prog, base):
+                hw = p["w"] / 2 * p["sx"] + em * 0.2
+                x0, x1 = p["x"] - hw, p["x"] - hw + 2 * hw * ease("slowdown", prog, 0.4)
+                y0, y1 = p["y"] - em * 0.95 * p["sy"], p["y"] + em * 0.95 * p["sy"]
+                if base:
+                    x0, y0 = max(x0, base[0]), max(y0, base[1])
+                    x1, y1 = min(x1, base[2]), min(y1, base[3])
+                x1 = max(x0, x1)
+                return "\\clip(" + ",".join(_f(v) for v in (x0, y0, x1, y1)) + ")"
+
+            piece(L_SWEEP, fill, fill, 0.0, a3=0.0, clipx=(sweep_clip(pa, sw_a, clip_a), sweep_clip(pb, sw_b, clip_b)))
+        else:
+            piece(L_TEXT + (1 if st.get("pixel3d") else 0), fill, oc, bord)
         # Gradient: horizontal bands from colour (top) to colour2 (bottom), each clipped.
         if lk["grad"] and not clip0:
             c_top, c_bot = lk["grad"]
@@ -1248,7 +1455,29 @@ class _CueRenderer:
 
                 piece(L_BAND + 1, col, col, 0.0, clipx=(band(pa), band(pb)))
 
-    def _drawing(self, layer, a, b, pa, pb, w, h, r, col, dy, xscale=None):
+    def _box_intro(self):
+        if self.dyn:
+            return self.dyn.get("fx") in ("marker", "box")
+        return bool(self.st.get("highlightBox"))
+
+    def _accel(self, i, a, b, pa, pb):
+        """ASS \\t acceleration that makes one sampled piece follow the easing curve (ease-out
+        pieces get accel < 1) instead of a straight line between its two samples."""
+        if b - a < 2:
+            return 1.0
+        pm = self.pose(i, (a + b) / 200.0)
+        if pm is None:
+            return 1.0
+        for key, eps in (("sx", 0.004), ("op", 0.02), ("blur", 0.2)):
+            d = pb[key] - pa[key]
+            if abs(d) > eps:
+                m = (pm[key] - pa[key]) / d
+                if 0.03 < m < 0.97:
+                    return _clamp(math.log(m) / math.log(0.5), 0.3, 3.0)
+                return 1.0
+        return 1.0
+
+    def _drawing(self, layer, a, b, pa, pb, w, h, r, col, dy, xscale=None, acc=""):
         """A rounded rectangle centred on the word (follows its pose)."""
         path = _rrect(w, h, r)
         sa, sb = pa["sx"], pb["sx"]
@@ -1259,7 +1488,7 @@ class _CueRenderer:
         pos = f"\\pos({_f(xa)},{_f(ya)})" if abs(xa - xb) < .05 and abs(ya - yb) < .05 else f"\\move({_f(xa)},{_f(ya)},{_f(xb)},{_f(yb)})"
         tags = (f"\\an5{pos}\\p1\\bord0\\shad0\\blur0.6\\1c{ass_bgr(col)}\\1a{ass_alpha(pa['op'] * col[3])}"
                 f"\\fscx{_f(xa_scale)}\\fscy{_f(100 * sya)}\\frz{_f(-pa['rot'])}"
-                f"\\t(\\1a{ass_alpha(pb['op'] * col[3])}\\fscx{_f(xb_scale)}\\fscy{_f(100 * syb)}\\frz{_f(-pb['rot'])})")
+                f"\\t({acc}\\1a{ass_alpha(pb['op'] * col[3])}\\fscx{_f(xb_scale)}\\fscy{_f(100 * syb)}\\frz{_f(-pb['rot'])})")
         self.out.add(layer, a, b, tags, path)
 
     def render_chips(self):
@@ -1270,11 +1499,49 @@ class _CueRenderer:
         if col[3] <= 0:
             return
         cue = self.cue
+        rk = float(st.get("bgRadius") if st.get("bgRadius") is not None else 0.22)
+        fo = int(round(self.fade_out * 1000)) if self.gap_after else 0
+        if (st.get("bgMode") == "block" or st.get("bubble")) and not self.dyn:
+            self.render_block_chip(col, rk, fo)
+            return
+        groups = _line_groups(self.n, st)
+        cue_b = _cs(cue["end"])
+        head = f"\\p1\\bord0\\shad0\\blur0.6\\1c{ass_bgr(col)}\\1a{ass_alpha(col[3])}"
+        if not self.dyn and self.preset != "none" and self.unit != "none":
+            # Words come in one by one: each line's chip grows to the right edge of the words said
+            # so far (eased over 0.14 s) instead of showing an empty box for words still to come.
+            lay = self.layout(-1)
+            for li, (lx, ly, lw, lem) in enumerate(lay.lines):
+                if li >= len(groups):
+                    continue
+                padx, pady = lem * 0.42, lem * 0.26
+                h = lem + pady * 2
+                left = lx - lw / 2 - padx
+                edges = []
+                for j in groups[li]:
+                    tok = lay.tokens[j]
+                    edges.append((self.appear(j), tok["x"] + tok["w"] / 2 + padx - left))
+                steps = []  # (time, width)
+                for k_, (t, wk) in enumerate(edges):
+                    w_prev = steps[-1][1] if steps else max(h, wk * 0.72)
+                    t_next = edges[k_ + 1][0] if k_ + 1 < len(edges) else cue["end"]
+                    for s in range(4):
+                        ts_ = t + 0.14 * s / 4
+                        if s == 0 or ts_ < t_next:
+                            steps.append((ts_, w_prev + (wk - w_prev) * ease("slowdown", (s + 1) / 4, 0.8)))
+                pts = []
+                for (t, wk), nxt in zip(steps, steps[1:] + [(cue["end"], None)]):
+                    a, b = _cs(t), min(cue_b, _cs(nxt[0]))
+                    if b > a:
+                        pts.append((a, b, wk))
+                for n_, (a, b, wk) in enumerate(pts):
+                    fin = f"\\fad({90 if n_ == 0 else 0},{fo if n_ == len(pts) - 1 else 0})"
+                    self.out.add(L_CHIP, a, b, f"\\an4\\pos({_f(left)},{_f(ly)}){head}{fin}", _rrect(wk, h, lem * rk))
+            return
         # One chip per line per layout state (static unless a hero word resizes the line).
         bounds = [cue["start"]] + ([w["start"] for w in cue["words"]] if self.dyn else []) + [cue["end"]]
         bounds = sorted({_cs(t) for t in bounds if cue["start"] <= t <= cue["end"]})
-        fade_in = 8
-        groups = _line_groups(self.n, st)
+        fade_in = 80
         for a, b in zip(bounds, bounds[1:]):
             lay = self.layout(self.active_at(a / 100.0 + 1e-4))
             for li, (lx, ly, lw, lem) in enumerate(lay.lines):
@@ -1284,10 +1551,45 @@ class _CueRenderer:
                     continue
                 padx, pady = lem * 0.42, lem * 0.26
                 w, h = lw + padx * 2, lem + pady * 2
-                path = _rrect(w, h, lem * float(st.get("bgRadius", 0.22) if st.get("bgRadius") is not None else 0.22))
-                op = col[3]
-                fin = f"\\fad({fade_in if (a == bounds[0] or a_line > a) else 0},{120 if b == bounds[-1] else 0})"
-                self.out.add(L_CHIP, a_line, b, f"\\an5\\pos({_f(lx)},{_f(ly)})\\p1\\bord0\\shad0\\blur0.6\\1c{ass_bgr(col)}\\1a{ass_alpha(op)}{fin}", path)
+                path = _rrect(w, h, lem * rk)
+                fin = f"\\fad({fade_in if (a == bounds[0] or a_line > a) else 0},{fo if b == bounds[-1] else 0})"
+                self.out.add(L_CHIP, a_line, b, f"\\an5\\pos({_f(lx)},{_f(ly)}){head}{fin}", path)
+
+    def render_block_chip(self, col, rk, fo):
+        """One panel behind the whole cue: a lower-third band (optional accent bar) or a manga
+        speech bubble (border + tail, pops in with a small overshoot)."""
+        st, cue = self.st, self.cue
+        lay = self.layout(-1)
+        cx, cy, bw, bh = lay.block
+        lem = max(l[3] for l in lay.lines)
+        bubble = bool(st.get("bubble"))
+        padx, pady = (lem * 0.7, lem * 0.42) if bubble else (lem * 0.6, lem * 0.3)
+        lh = float(st.get("lineHeight") or 1.3)
+        w = bw + padx * 2
+        h = bh - lem * (lh - 1) + pady * 2   # the block height counts line gaps; trim the last one
+        a, b = _cs(cue["start"]), _cs(cue["end"])
+        tail, th = None, 0.0
+        if bubble:
+            th = lem * 0.62
+            x0 = min(w * 0.3, w - lem * 1.4)
+            tail = (x0, x0 + lem * 0.62, x0 - lem * 0.28, h + th)
+        path = _rrect(w, h, min(h / 2, lem * rk), tail)
+        bord = ""
+        if st.get("bgBorder"):
+            bc = parse_color(st.get("bgBorder"), (0, 0, 0, 1))
+            bord = f"\\bord{_f(max(1.5, lem * float(st.get('bgBorderW', 0.09))))}\\3c{ass_bgr(bc)}\\3a{ass_alpha(bc[3])}"
+        else:
+            bord = "\\bord0"
+        anim = (f"\\fscx72\\fscy72\\t(0,110,0.55,\\fscx105\\fscy105)\\t(110,200,1.6,\\fscx100\\fscy100)\\fad(60,{fo})"
+                if bubble else f"\\fad(140,{fo})")
+        tags = (f"\\an5\\pos({_f(cx)},{_f(cy + th / 2)})\\p1{bord}\\shad0\\blur0.6\\1c{ass_bgr(col)}"
+                f"\\1a{ass_alpha(col[3])}{anim}")
+        self.out.add(L_CHIP, a, b, tags, path)
+        if st.get("bgAccent"):
+            ac = parse_color(st.get("bgAccent"))
+            bar_h = h * 0.62
+            self.out.add(L_CARD, a, b, f"\\an5\\pos({_f(cx - w / 2 + padx * 0.38)},{_f(cy)})\\p1\\bord0\\shad0\\blur0.4"
+                         f"\\1c{ass_bgr(ac)}\\1a{ass_alpha(ac[3])}\\fad(140,{fo})", _rrect(lem * 0.1, bar_h, lem * 0.05))
 
 
 def write_ass(segments: list[dict], path: str, width: int, height: int, settings: dict | None = None) -> str | None:
@@ -1302,6 +1604,12 @@ def write_ass(segments: list[dict], path: str, width: int, height: int, settings
     if not cues:
         return None
     out = _Writer(width, height)
+    w0 = 0
+    for k, cue in enumerate(cues):
+        nxt = cues[k + 1]["start"] if k + 1 < len(cues) else None
+        cue["gapAfter"] = nxt is None or nxt - cue["end"] > 0.1
+        cue["_w0"] = w0
+        w0 += len(cue["words"])
     for cue in cues:
         _CueRenderer(cue, style, width, height, out).render()
     out.write(path, style)

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import struct
 import tempfile
 import unittest
@@ -121,6 +122,86 @@ class AssTests(unittest.TestCase):
             p = ce.write_ass([{"text": "Top caption", "start_ms": 0, "end_ms": 2000}], os.path.join(d, "c.ass"), 1000, 1000, {"style": "clean", "posX": 50, "posY": 20})
             ys = [float(l.split("\\pos(")[1].split(",")[1].split(")")[0]) for l in open(p, encoding="utf-8") if "\\pos(" in l]
             self.assertTrue(ys and all(150 < y < 260 for y in ys), ys)
+
+    def _events(self, style, segs=None, w=1280, h=720, **extra):
+        segs = segs or [{"text": "The hero will never stop the fight!", "start_ms": 0, "end_ms": 3000}]
+        with tempfile.TemporaryDirectory() as d:
+            p = ce.write_ass(segs, os.path.join(d, "c.ass"), w, h, {"style": style, **extra})
+            with open(p, encoding="utf-8") as fh:
+                return [l for l in fh.read().splitlines() if l.startswith("Dialogue:")]
+
+    def test_recap_templates_exist_and_old_ids_still_load(self):
+        ids = ce.style_ids()
+        for sid in ("recapBold", "beastBox", "lowerThird", "mangaBubble", "animeSub", "speedRush"):
+            self.assertIn(sid, ids)
+            self.assertEqual(ce.get_style(sid)["category"], "Recap")
+        self.assertIn("Recap", ce.catalog()["categories"])
+        # Saved settings name templates by id; those ids must keep resolving to themselves.
+        for sid in ("kalakar", "hormozi", "dynHypeDrop", "bubble", "cinemawide", "mukta"):
+            self.assertEqual(ce.get_style(sid)["id"], sid)
+
+    def test_spoken_word_highlight_sweeps_in(self):
+        ev = self._events("recapBold")
+        sweeps = [l for l in ev if l.startswith("Dialogue: 8,") and "\\clip(" in l]
+        self.assertTrue(sweeps)
+        # The clip grows: start narrower than end inside its \t.
+        first = sweeps[0].split("\\clip(")
+        x0a, _, x1a, _ = (float(v) for v in first[1].split(")")[0].split(","))
+        x0b, _, x1b, _ = (float(v) for v in first[2].split(")")[0].split(","))
+        self.assertLess(x1a - x0a, x1b - x0b)
+        self.assertFalse(any(l.startswith("Dialogue: 8,") for l in self._events("recapBold", emphasis=False)))
+
+    def test_entrances_use_eased_transforms(self):
+        ev = self._events("hormozi")
+        self.assertTrue(any(re.search(r"\\t\(0\.\d+,", l) for l in ev), "no ease-out accel on any piece")
+        # The pop starts from a readable size, never from a point.
+        scales = [float(m) for l in ev for m in re.findall(r"\\fscx([\d.]+)", l)]
+        self.assertGreater(min(scales), 25)
+
+    def test_emphasis_words_bounce(self):
+        st = ce.get_style("recapBold")
+        self.assertTrue(ce.is_emphasis("never") and ce.is_emphasis("fight!") and ce.is_emphasis("NOW"))
+        self.assertFalse(ce.is_emphasis("the"))
+        self.assertEqual(ce.bounce_curve(0), 0)
+        self.assertGreater(max(ce.bounce_curve(u / 50) for u in range(50)), 0.9)
+        cue = {"start": 0.0, "end": 3.0, "words": [{"text": "never", "start": 0.0, "end": 3.0}]}
+        r = ce._CueRenderer(cue, st, 1280, 720, ce._Writer(1280, 720))
+        rest = r.pose(0, 2.0)["sx"]
+        peak = max(r.pose(0, r.bounce_t0(0) + k / 100)["sx"] for k in range(36))
+        self.assertGreater(peak, rest * 1.05)
+
+    def test_back_to_back_cues_cut_and_the_last_one_fades(self):
+        st = ce.get_style("animeSub")
+        mk = lambda gap: {"start": 0.0, "end": 1.0, "gapAfter": gap, "words": [{"text": "Hi", "start": 0.0, "end": 1.0}]}
+        cut = ce._CueRenderer(mk(False), st, 1280, 720, ce._Writer(1280, 720))
+        fade = ce._CueRenderer(mk(True), st, 1280, 720, ce._Writer(1280, 720))
+        self.assertAlmostEqual(cut.pose(0, 0.97)["op"], 1.0)
+        self.assertLess(fade.pose(0, 0.97)["op"], 0.6)
+
+    def test_kinetic_trails_and_box_colours(self):
+        ev = self._events("speedRush")
+        self.assertTrue(any(l.startswith("Dialogue: 3,") and "\\bord0" in l for l in ev))
+        boxes = {re.search(r"\\1c(&H[0-9A-F]+&)", l).group(1) for l in self._events("beastBox") if l.startswith("Dialogue: 1,")}
+        self.assertGreaterEqual(len(boxes), 3)
+
+    def test_bubble_and_lower_third_panels(self):
+        bubble = [l for l in self._events("mangaBubble") if l.startswith("Dialogue: 0,")]
+        self.assertTrue(bubble and all("\\bord" in l and "\\3c&H111111&" in l for l in bubble))
+        self.assertTrue(all(l.count(" l ") >= 7 for l in bubble), "bubble path has no tail")
+        lt = self._events("lowerThird")
+        self.assertEqual(len([l for l in lt if l.startswith("Dialogue: 0,")]), 1)
+        self.assertTrue(any(l.startswith("Dialogue: 1,") and "\\p1" in l for l in lt), "no accent bar")
+
+    def test_line_chips_grow_with_the_words(self):
+        chips = [l for l in self._events("bubble") if l.startswith("Dialogue: 0,")]
+        widths = [max(float(v) for v in re.findall(r"l ([\d.]+) 0", l)) for l in chips]
+        self.assertGreater(len(set(widths)), 2)
+        self.assertLess(widths[0], widths[-1])
+
+    def test_a_wide_line_wraps_on_a_vertical_frame(self):
+        ev = self._events("hormozi", [{"text": "Nobody ever saw it.", "start_ms": 0, "end_ms": 2000}], 720, 1280)
+        ys = {round(float(m)) for l in ev if l.startswith("Dialogue: 5,") for m in re.findall(r"\\pos\([\d.]+,([\d.]+)\)", l)}
+        self.assertGreaterEqual(len(ys), 2)
 
     def test_filter_path_escapes_drive_colon(self):
         f = ce.subtitles_filter(r"C:\x\captions.ass")

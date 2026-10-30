@@ -351,7 +351,7 @@ fn timeline(args: &Map<String, Value>) -> Result<Value, String> {
         "manga": g.title, "chapter": c.label(), "seconds": secs(vedit::total_ms(&placed)), "clipCount": placed.len(),
         "clipsShown": format!("{}-{} of {}", from + 1, (from + clips.len()).max(from + 1), placed.len()),
         "clips": clips, "layers": e.layers.iter().map(layer_json).collect::<Vec<_>>(),
-        "captions": captions_of(&video::subtitle_setting_for(&c), &e), "music": music_of(&e), "look": look_of(&e),
+        "captions": captions_of(&vedit::placed_captions(&c.output_dir, &video::subtitle_setting_for(&c)), &e), "music": music_of(&e), "look": look_of(&e),
         "transitions": if e.cuts { "hard cuts" } else { "the look's transitions" }, "tracks": tracks,
         "renderedWithThisEdit": e.rendered.is_some() && e.rendered == vedit::extra_for(&c.output_dir, &c.id, &c.pages_dir, &video::subtitle_setting_for(&c)).map(|x| vedit::render_key(&x)),
     }))
@@ -385,7 +385,7 @@ fn set_captions(args: &Map<String, Value>) -> Result<Value, String> {
     };
     let on = flag(args, "on");
     for c in &chapters {
-        let mut sub = video::subtitle_setting_for(c);
+        let mut sub = vedit::placed_captions(&c.output_dir, &video::subtitle_setting_for(c));
         if let Some(id) = &style {
             sub.style = id.clone();
         }
@@ -405,6 +405,12 @@ fn set_captions(args: &Map<String, Value>) -> Result<Value, String> {
             sub.enabled = true;
         }
         video::save_chapter_setting(&c.output_dir, Some(&sub));
+        // A place is the manga's: every caption of it moves (the Video editor's project file).
+        if place.is_some() || num(args, "height").is_some() {
+            if let Some(manga_dir) = c.output_dir.parent() {
+                vedit::update_project(manga_dir, |p| p.caption_pos = sub.pos).map_err(|e| format!("Could not save the caption place: {e}"))?;
+            }
+        }
     }
     if let Some(on) = on {
         edit_chapters(&chapters, |_, e| {
@@ -414,7 +420,7 @@ fn set_captions(args: &Map<String, Value>) -> Result<Value, String> {
     }
     bump();
     let first = chapters.first().ok_or("No chapter")?;
-    Ok(json!({ "ok": true, "chapters": chapters.len(), "captions": captions_of(&video::subtitle_setting_for(first), &vedit::chapter_edit(&first.output_dir, &first.id).unwrap_or_default()) }))
+    Ok(json!({ "ok": true, "chapters": chapters.len(), "captions": captions_of(&vedit::placed_captions(&first.output_dir, &video::subtitle_setting_for(first)), &vedit::chapter_edit(&first.output_dir, &first.id).unwrap_or_default()) }))
 }
 
 fn set_music(args: &Map<String, Value>) -> Result<Value, String> {

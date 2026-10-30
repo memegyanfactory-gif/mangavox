@@ -107,6 +107,18 @@ pub struct CaptionStyle {
     pub pos: (f32, f32),
     pub anim: String,
     pub pixel3d: bool,
+    /// Active-word box colours cycling word by word (`boxColors`; empty = `hl_box` colour).
+    pub box_colors: Vec<Rgba>,
+    /// Corner radius of the active-word box, in em (`boxRadius`).
+    pub box_radius: f32,
+    /// One background panel behind the whole cue (`bgMode: "block"`, or a speech bubble).
+    pub block: bool,
+    /// Speech-bubble tail under the block panel (`bubble`).
+    pub bubble: bool,
+    /// Border around the background panel: colour and width in em (`bgBorder`, `bgBorderW`).
+    pub bg_border: Option<(Rgba, f32)>,
+    /// Accent bar at the left of a block panel (`bgAccent`, lower thirds).
+    pub bg_accent: Option<Rgba>,
 }
 
 impl CaptionStyle {
@@ -128,8 +140,10 @@ impl CaptionStyle {
         if self.glow.is_some() {
             bits.push("glow".into());
         }
-        if self.bg.is_some() {
-            bits.push("background".into());
+        if self.bubble {
+            bits.push("speech bubble".into());
+        } else if self.bg.is_some() {
+            bits.push(if self.block { "panel".into() } else { "background".into() });
         }
         if self.anim != "none" {
             bits.push(format!("{} in", self.anim));
@@ -220,6 +234,12 @@ fn parse_style(v: &Value) -> Option<CaptionStyle> {
         pos: (f32_of(v, "posX", 50.), f32_of(v, "posY", 76.)),
         anim,
         pixel3d: bool_of(v, "pixel3d"),
+        box_colors: v.get("boxColors").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).filter_map(parse_color).collect()).unwrap_or_default(),
+        box_radius: f32_of(v, "boxRadius", 0.42),
+        block: bg.is_some() && (v.get("bgMode").and_then(Value::as_str) == Some("block") || bool_of(v, "bubble")),
+        bubble: bg.is_some() && bool_of(v, "bubble"),
+        bg_border: v.get("bgBorder").and_then(Value::as_str).and_then(parse_color).map(|c| (c, f32_of(v, "bgBorderW", 0.09))),
+        bg_accent: v.get("bgAccent").and_then(Value::as_str).and_then(parse_color),
         id,
     })
 }
@@ -358,6 +378,7 @@ impl SubtitleSetting {
             st.highlight = c;
             if let Some(b) = st.hl_box.as_mut() {
                 b.0 = c;
+                st.box_colors.clear();
             }
             if let Some(d) = st.dynamic.as_mut() {
                 if matches!(d.fx.as_deref(), Some("marker" | "box" | "underline")) {
@@ -438,7 +459,7 @@ pub fn favorites() -> Vec<String> {
     read_json(&defaults_file()).and_then(|v| v.get("favorites").cloned()).and_then(|f| serde_json::from_value(f).ok()).unwrap_or_default()
 }
 
-fn save_favorites(f: &[String]) {
+pub(crate) fn save_favorites(f: &[String]) {
     let file = defaults_file();
     let mut v = read_json(&file).filter(Value::is_object).unwrap_or_else(|| json!({}));
     v["favorites"] = json!(f);
@@ -664,7 +685,7 @@ fn look(st: &CaptionStyle, words: &[String], i: usize, active: usize) -> Look {
             l.fill = mix(d.ink, d.accent, 0.4);
         }
     } else if let (Some((bx, tx)), true) = (st.hl_box, act) {
-        l.boxed = Some(bx);
+        l.boxed = Some(if st.box_colors.is_empty() { bx } else { st.box_colors[i % st.box_colors.len()] });
         l.fill = tx;
     } else if st.word_alt {
         l.fill = if i % 2 == 1 { st.color2 } else { st.color };
@@ -739,7 +760,7 @@ fn word_el(text: &str, t: Tok, l: &Look, st: &CaptionStyle, fh: f32, cheap: bool
     let mut d = div().absolute().left(px(t.x - t.w / 2.)).top(px(t.y - lh / 2.)).w(px(t.w)).h(px(lh));
     if let Some(bx) = l.boxed {
         let cards = st.dynamic.as_ref().is_some_and(|d| matches!(d.fx.as_deref(), Some("cards" | "stickers")));
-        let (pw, ph_, r) = if cards { (em * 0.25, em * 0.66, em * 0.16) } else { (em * 0.26, em * 0.68, em * 0.42) };
+        let (pw, ph_, r) = if cards { (em * 0.25, em * 0.66, em * 0.16) } else { (em * 0.26, em * 0.68, em * st.box_radius) };
         d = d.child(div().absolute().left(px(-pw)).top(px(lh / 2. - ph_)).w(px(t.w + pw * 2.)).h(px(ph_ * 2.)).rounded(px(r)).bg(paint(bx, a)));
     }
     if let Some(u) = l.underline {
@@ -796,16 +817,47 @@ pub(crate) fn caption_layer(words: &[String], st: &CaptionStyle, user_words: boo
     let mut measure = |text: &str, em: f32| measure_text(window, text, &st.font, st.italic, em);
     let hero = st.dynamic.is_some().then_some(active);
     // Shrink a cue that would overflow the template's max width (Watchfiwn keeps every word).
+    let fit_of = |lay: &Lay| {
+        let widest = lay.lines.iter().map(|l| l.2).fold(0., f32::max);
+        if widest > fw * st.max_width { fw * st.max_width / widest } else { 1. }
+    };
     let probe = layout(&words, st, user_words, fw, fh, hero, upto, 1., &mut measure);
-    let widest = probe.lines.iter().map(|l| l.2).fold(0., f32::max);
-    let fit = if widest > fw * st.max_width { fw * st.max_width / widest } else { 1. };
+    let mut fit = fit_of(&probe);
+    // A cue that would shrink a lot takes one more line instead (mirrors `caption_engine._rewrap`).
+    let rewrapped = (fit < 0.8 && (st.dynamic.is_none() || user_words) && n >= 2 && n.div_ceil(st.words_per_line.max(1)) < st.lines).then(|| {
+        let mut s = st.clone();
+        s.words_per_line = n.div_ceil(n.div_ceil(st.words_per_line.max(1)) + 1);
+        s
+    });
+    let st = rewrapped.as_ref().unwrap_or(st);
+    let probe = if rewrapped.is_some() {
+        let p = layout(&words, st, user_words, fw, fh, hero, upto, 1., &mut measure);
+        fit = fit_of(&p);
+        p
+    } else {
+        probe
+    };
     let lay = if fit < 1. { layout(&words, st, user_words, fw, fh, hero, upto, fit, &mut measure) } else { probe };
     if let Some((bg, radius_k)) = st.bg {
-        for (i, (lx, ly, lw, lem)) in lay.lines.iter().enumerate() {
-            let (padx, pady) = (lem * 0.42, lem * 0.26);
-            let shown = line_groups(upto, st, user_words).get(i).and_then(|g| g.first()).is_some_and(|&f| f < visible);
-            if shown {
-                root = root.child(div().absolute().left(px(lx - lw / 2. - padx)).top(px(ly - lem / 2. - pady)).w(px(lw + padx * 2.)).h(px(lem + pady * 2.)).rounded(px(lem * radius_k)).bg(paint(bg, 1.)));
+        if st.block && st.dynamic.is_none() {
+            root = root.child(block_panel(&lay, st, bg, radius_k));
+        } else {
+            // Words brought in one by one: a line's chip reaches only as far as the words said.
+            let grow = build_up && st.animated() && st.dynamic.is_none();
+            for (i, (lx, ly, lw, lem)) in lay.lines.iter().enumerate() {
+                let (padx, pady) = (lem * 0.42, lem * 0.26);
+                let group = line_groups(upto, st, user_words).get(i).cloned().unwrap_or_default();
+                if !group.first().is_some_and(|&f| f < visible) {
+                    continue;
+                }
+                let left = lx - lw / 2. - padx;
+                let mut w = lw + padx * 2.;
+                if grow {
+                    if let Some(t) = group.iter().filter(|&&j| j < visible).filter_map(|&j| lay.toks[j]).last() {
+                        w = t.x + t.w / 2. + padx - left;
+                    }
+                }
+                root = root.child(div().absolute().left(px(left)).top(px(ly - lem / 2. - pady)).w(px(w)).h(px(lem + pady * 2.)).rounded(px(lem * radius_k)).bg(paint(bg, 1.)));
             }
         }
     }
@@ -823,6 +875,46 @@ pub(crate) fn caption_layer(words: &[String], st: &CaptionStyle, user_words: boo
         root = root.child(word_el(&words[i], t, &l, st, fh, cheap));
     }
     root
+}
+
+/// One panel behind the whole cue (mirrors `_CueRenderer.render_block_chip`): a lower-third band
+/// with an optional accent bar, or a speech bubble with a border and a tail.
+fn block_panel(lay: &Lay, st: &CaptionStyle, bg: Rgba, radius_k: f32) -> Div {
+    let (Some(first), Some(last)) = (lay.lines.first(), lay.lines.last()) else { return div() };
+    let lem = lay.lines.iter().map(|l| l.3).fold(0., f32::max);
+    let bw = lay.lines.iter().map(|l| l.2).fold(0., f32::max);
+    let (top, bottom) = (first.1 - first.3 / 2., last.1 + last.3 / 2.);
+    let (padx, pady) = if st.bubble { (lem * 0.7, lem * 0.42) } else { (lem * 0.6, lem * 0.3) };
+    let (w, h) = (bw + padx * 2., bottom - top + pady * 2.);
+    let (left, y0) = (first.0 - w / 2., top - pady);
+    let border = st.bg_border.map(|(c, k)| (c, (lem * k).max(1.)));
+    let mut d = div().absolute().left(px(left)).top(px(y0)).w(px(w)).h(px(h));
+    if st.bubble {
+        // The tail: a triangle under the bubble, drawn as thin slices (border colour, then fill).
+        let (th, x0) = (lem * 0.62, (w * 0.3).min(w - lem * 1.4));
+        let (x1, tip) = (x0 + lem * 0.62, x0 - lem * 0.28);
+        let slices = 8;
+        for (col, grow, from) in [(border.map(|b| b.0), border.map(|b| b.1).unwrap_or(0.), 0.), (Some(bg), 0., border.map(|b| b.1).unwrap_or(0.))] {
+            let Some(col) = col else { continue };
+            for k in 0..slices {
+                let v = k as f32 / slices as f32;
+                let (l, r) = (x0 + (tip - x0) * v - grow, x1 + (tip - x1) * v + grow);
+                let y = h - from + (th + from) * v;
+                let sh = (th + from) / slices as f32 + 0.6;
+                d = d.child(div().absolute().left(px(l)).top(px(y)).w(px((r - l).max(1.))).h(px(sh)).bg(paint(col, 1.)));
+            }
+        }
+    }
+    let mut panel = div().absolute().inset_0().rounded(px((lem * radius_k).min(h / 2.))).bg(paint(bg, 1.));
+    if let Some((c, bwid)) = border {
+        panel = panel.border_color(paint(c, 1.)).border(px(bwid));
+    }
+    d = d.child(panel);
+    if let Some(ac) = st.bg_accent {
+        let bar_h = h * 0.62;
+        d = d.child(div().absolute().left(px(padx * 0.38 - lem * 0.05)).top(px((h - bar_h) / 2.)).w(px(lem * 0.1)).h(px(bar_h)).rounded(px(lem * 0.05)).bg(paint(ac, 1.)));
+    }
+    d
 }
 
 /// The first caption cue of `text` for this template (what the preview shows).
@@ -976,6 +1068,8 @@ impl VideoStudio {
         }
         self.seen = now;
         self.default = default_setting();
+        // Hearted in the Video editor too (same file).
+        self.favorites = favorites();
         if let Some(c) = &self.ctx {
             let own = chapter_setting(&c.chapter.output_dir);
             if own.is_some() != self.own.is_some() {
@@ -1439,7 +1533,7 @@ impl VideoStudio {
 }
 
 /// The 3x3 guide shown while dragging: thirds lines and the nine anchors (the snapped one lit).
-fn grid_overlay(fw: f32, fh: f32, lit: Option<usize>) -> Div {
+pub(crate) fn grid_overlay(fw: f32, fh: f32, lit: Option<usize>) -> Div {
     let line = |h: bool, at: f32| {
         let d = div().absolute().bg(paint(rgb("#ffffff"), 0.35));
         if h {
@@ -1469,6 +1563,40 @@ fn grid_overlay(fw: f32, fh: f32, lit: Option<usize>) -> Div {
         }
     }
     d
+}
+
+/// A template's look on a small `w` x `h` thumbnail ("Hero steps forward", word 2 spoken), its
+/// words as big as on the gallery's cards whatever the thumbnail's size (a long cue still fits).
+pub(crate) fn style_thumb(st: &CaptionStyle, w: f32, h: f32, window: &Window) -> Div {
+    let mut look = st.clone();
+    look.pos = (50., 54.);
+    look.size *= (99. / h).max(1.);
+    let sample: Vec<String> = ["Hero", "steps", "forward"].iter().map(|w| w.to_string()).collect();
+    div().relative().w(px(w)).h(px(h)).overflow_hidden().bg(paint(rgb("#15161c"), 1.)).child(caption_layer(&sample, &look, false, w, h, 1, false, true, window))
+}
+
+/// The box (left, top, width, height in px) a whole cue drawn by [`caption_layer`] covers on a
+/// `fw` x `fh` frame, with a little room around it (to grab the caption on a monitor).
+pub(crate) fn caption_box(words: &[String], st: &CaptionStyle, user_words: bool, fw: f32, fh: f32, window: &Window) -> Option<(f32, f32, f32, f32)> {
+    let words: Vec<String> = words.iter().map(|w| if st.uppercase { w.to_uppercase() } else { w.clone() }).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let n = words.len();
+    let hero = st.dynamic.is_some().then_some(0);
+    let mut measure = |text: &str, em: f32| measure_text(window, text, &st.font, st.italic, em);
+    let probe = layout(&words, st, user_words, fw, fh, hero, n, 1., &mut measure);
+    let widest = probe.lines.iter().map(|l| l.2).fold(0., f32::max);
+    let lay = if widest > fw * st.max_width { layout(&words, st, user_words, fw, fh, hero, n, fw * st.max_width / widest, &mut measure) } else { probe };
+    let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for (cx, cy, w, em) in &lay.lines {
+        l = l.min(cx - w / 2. - em * 0.5);
+        r = r.max(cx + w / 2. + em * 0.5);
+        t = t.min(cy - em * 0.8);
+        b = b.max(cy + em * 0.8);
+    }
+    let (l, t) = (l.max(0.), t.max(0.));
+    (r > l && b > t).then(|| (l, t, r.min(fw) - l, b.min(fh) - t))
 }
 
 impl Render for VideoStudio {
@@ -1574,6 +1702,27 @@ mod tests {
             assert!(s.size > 2. && s.size < 9., "{} size {}", s.id, s.size);
         }
         assert!(cat.styles.iter().any(|s| s.id == cat.default));
+    }
+
+    #[test]
+    fn recap_templates_parse_their_panels_and_boxes() {
+        let cat = catalog();
+        assert!(cat.categories.iter().any(|c| c == "Recap"));
+        let bubble = find_style("mangaBubble");
+        assert!(bubble.block && bubble.bubble && bubble.bg_border.is_some());
+        let lower = find_style("lowerThird");
+        assert!(lower.block && !lower.bubble && lower.bg_accent.is_some());
+        let beast = find_style("beastBox");
+        assert!(beast.box_colors.len() >= 3 && beast.hl_box.is_some());
+        // A highlight colour override replaces the cycling box colours with that one colour.
+        let one = SubtitleSetting { style: "beastBox".into(), highlight_color: Some("#00ff00".into()), ..Default::default() }.effective_style();
+        assert!(one.box_colors.is_empty());
+        for id in ["recapBold", "animeSub", "speedRush"] {
+            assert_eq!(find_style(id).id, id);
+        }
+        // Templates without the new keys keep their old look.
+        let k = find_style("kalakar");
+        assert!(!k.block && !k.bubble && k.box_colors.is_empty() && (k.box_radius - 0.42).abs() < 1e-4);
     }
 
     #[test]

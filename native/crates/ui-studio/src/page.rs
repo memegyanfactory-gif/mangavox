@@ -272,6 +272,9 @@ pub struct StudioPage {
     pub(crate) run: Option<RunInfo>,
     seen_run: u64,
     pub(crate) side_open: bool,
+    /// The side panel in Video mode (its own switch: Video is a full-width workspace, so the
+    /// panel starts closed there without closing it in the other views).
+    pub(crate) video_side_open: bool,
     pub(crate) side: Side,
     pub(crate) dock: Option<AnyView>,
     pub(crate) model_button: AnyView,
@@ -416,6 +419,7 @@ impl StudioPage {
             run: run::snapshot(),
             seen_run: run::version(),
             side_open: true,
+            video_side_open: false,
             side: Side::Activity,
             dock: None,
             model_button,
@@ -1586,15 +1590,29 @@ impl StudioPage {
             })
             .when(roomy, |d| d.child(self.usage_meter.clone()))
             .child(setup_pill)
-            .child(icon_button("studio-side-toggle", ph::SIDEBAR_SIMPLE, if self.side_open { "Hide the side panel" } else { "Show the side panel (Activity, Issues, Cast, Chat)" }).selected(self.side_open).on_click(cx.listener(
+            .child(icon_button("studio-side-toggle", ph::SIDEBAR_SIMPLE, if self.side_shown() { "Hide the side panel" } else { "Show the side panel (Activity, Issues, Cast, Chat)" }).selected(self.side_shown()).on_click(cx.listener(
                 move |this, _: &ClickEvent, _, cx| {
-                    this.side_open = !this.side_open;
-                    if this.side_open && narrow {
+                    let open = !this.side_shown();
+                    if this.view == View::Video {
+                        this.video_side_open = open;
+                    } else {
+                        this.side_open = open;
+                    }
+                    if open && narrow {
                         this.lib_open = false;
                     }
                     cx.notify();
                 },
             )))
+    }
+
+    /// Whether the side panel shows in the current view (Video mode has its own switch).
+    pub(crate) fn side_shown(&self) -> bool {
+        if self.view == View::Video {
+            self.video_side_open
+        } else {
+            self.side_open
+        }
     }
 
     fn library_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1911,8 +1929,7 @@ impl Render for StudioPage {
         // taking turns, so the work in the middle never gets squeezed below a usable width.
         self.vw = f32::from(window.viewport_size().width);
         let editor = self.view == View::Editor;
-        // Video mode is a full-width workspace: the side panel stays closed behind it.
-        let side_open = self.side_open && self.view != View::Video;
+        let side_open = self.side_shown();
         let show_lib = editor && self.lib_open && !(self.vw < NARROW && side_open);
         self.center_w = self.vw - 12. - if show_lib { LIBRARY_W + 6. } else { 0. } - if side_open { SIDE_W + 6. } else { 0. };
         let queue = &self.queue;

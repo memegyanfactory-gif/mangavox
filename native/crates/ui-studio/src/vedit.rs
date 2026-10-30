@@ -335,6 +335,10 @@ pub struct Project {
     pub version: u32,
     #[serde(default)]
     pub chapters: BTreeMap<String, ChapterEdit>,
+    /// Where every caption of the manga sits (centre, % of the frame), set by dragging a caption
+    /// on the Program monitor; `None`: each chapter's own caption setting decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_pos: Option<(f32, f32)>,
 }
 
 impl Project {
@@ -354,6 +358,15 @@ impl Project {
         let tmp = file.with_extension("json.tmp");
         std::fs::write(&tmp, text)?;
         std::fs::rename(tmp, file)
+    }
+
+    /// A chapter's caption setting with the manga's caption place applied.
+    pub fn captions(&self, subs: &SubtitleSetting) -> SubtitleSetting {
+        let mut s = subs.clone();
+        if self.caption_pos.is_some() {
+            s.pos = self.caption_pos;
+        }
+        s
     }
 }
 
@@ -637,12 +650,59 @@ pub fn render_key(extra: &Value) -> u64 {
     h
 }
 
-/// `video_config` keys for a chapter's render: its edit's, when it has one.
+/// The caption setting of the chapter in `output_dir` with its manga's caption place applied.
+pub fn placed_captions(output_dir: &Path, subs: &SubtitleSetting) -> SubtitleSetting {
+    match output_dir.parent() {
+        Some(manga_dir) => Project::load(manga_dir).captions(subs),
+        None => subs.clone(),
+    }
+}
+
+/// `video_config` keys for a chapter's render: its edit's, when it has one, and the manga's
+/// caption place (every chapter of the manga, edited or not).
 pub fn extra_for(output_dir: &Path, chapter_id: &str, pages_dir: &Path, subs: &SubtitleSetting) -> Option<Value> {
-    let e = chapter_edit(output_dir, chapter_id)?;
-    let pages = mv_recap::list_pages(pages_dir);
-    let beats = load_beats(output_dir, &pages);
-    Some(render_extra(&beats, &e, subs))
+    let project = Project::load(output_dir.parent()?);
+    let subs = project.captions(subs);
+    match project.chapters.get(chapter_id) {
+        Some(e) => {
+            let pages = mv_recap::list_pages(pages_dir);
+            let beats = load_beats(output_dir, &pages);
+            Some(render_extra(&beats, e, &subs))
+        }
+        None => project.caption_pos.map(|_| json!({ "subtitles": subs.to_json() })),
+    }
+}
+
+// ------------------------------------------------------------------------------------ captions
+
+/// Where a caption dragged on the Program monitor goes: the pointer at (`px`, `py`) pixels from
+/// a `fw` x `fh` frame's top left, less where on the caption it was grabbed (`grab`, % of the
+/// frame from its centre), snapped to the 3x3 grid like the caption studio. The caption's centre
+/// in % of the frame and the lit anchor (0..9); `None` for a frame not laid out yet.
+pub fn caption_drop(px: f32, py: f32, fw: f32, fh: f32, grab: (f32, f32)) -> Option<((f32, f32), Option<usize>)> {
+    let (x, y) = frame_percent(px, py, fw, fh)?;
+    Some(crate::video::snap_point((x - grab.0).clamp(0., 100.), (y - grab.1).clamp(0., 100.)))
+}
+
+/// A point `px`, `py` pixels from a `fw` x `fh` frame's top left in % of the frame (clamped).
+pub fn frame_percent(px: f32, py: f32, fw: f32, fh: f32) -> Option<(f32, f32)> {
+    (fw >= 1. && fh >= 1.).then(|| ((px / fw * 100.).clamp(0., 100.), (py / fh * 100.).clamp(0., 100.)))
+}
+
+/// `items` with the favourite ones (`favs`, by id) first, each group in its own order.
+pub fn favorites_first<'a, T>(items: &'a [T], id: impl Fn(&T) -> &str, favs: &[String]) -> Vec<&'a T> {
+    let fav = |t: &&T| favs.iter().any(|f| f == id(t));
+    items.iter().filter(fav).chain(items.iter().filter(|t| !fav(t))).collect()
+}
+
+/// Hearts `id`, or un-hearts it when it is a favourite already.
+pub fn toggle_favorite(favs: &mut Vec<String>, id: &str) {
+    match favs.iter().position(|f| f == id) {
+        Some(i) => {
+            favs.remove(i);
+        }
+        None => favs.push(id.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -804,5 +864,62 @@ mod tests {
         assert_eq!(back.chapters["ch1"], e);
         assert_eq!(back.version, 1);
         assert_eq!(e.next_layer_id(), 4);
+    }
+
+    #[test]
+    fn caption_place_is_kept_for_the_whole_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let manga = dir.path();
+        let (ch1, ch2) = (manga.join("ch1"), manga.join("ch2"));
+        let subs = SubtitleSetting::default();
+        // Nothing edited: no extra keys.
+        assert!(extra_for(&ch2, "ch2", &ch2, &subs).is_none());
+        update_project(manga, |p| {
+            p.chapters.insert("ch1".into(), ChapterEdit::default());
+            p.caption_pos = Some((16.67, 78.));
+        })
+        .unwrap();
+        assert_eq!(Project::load(manga).caption_pos, Some((16.67, 78.)));
+        // The edited chapter and the untouched one both render with it.
+        for (dir, id) in [(&ch1, "ch1"), (&ch2, "ch2")] {
+            let x = extra_for(dir, id, dir, &subs).unwrap();
+            let at = |k: &str| x["subtitles"][k].as_f64().unwrap();
+            assert!((at("posX") - 16.7).abs() < 0.01 && (at("posY") - 78.).abs() < 0.01, "{x}");
+        }
+        assert_eq!(placed_captions(&ch2, &subs).pos, Some((16.67, 78.)));
+        // Without a project place, the chapter's own place stays.
+        let own = SubtitleSetting { pos: Some((50., 20.)), ..SubtitleSetting::default() };
+        assert_eq!(Project::default().captions(&own).pos, Some((50., 20.)));
+    }
+
+    #[test]
+    fn dragged_captions_map_to_the_frame_and_snap() {
+        // The middle of a 1280 x 720 frame, grabbed at the caption's centre: the centre anchor.
+        assert_eq!(caption_drop(640., 360., 1280., 720., (0., 0.)), Some(((50., 50.), Some(4))));
+        // Near the bottom-left anchor: pulled onto it.
+        let ((x, y), lit) = caption_drop(1280. * 0.18, 720. * 0.80, 1280., 720., (0., 0.)).unwrap();
+        assert_eq!((x, y, lit), (16.67, 78., Some(6)));
+        // Away from every anchor: stays where it was dropped, nothing lit.
+        let ((x, y), lit) = caption_drop(1280. * 0.30, 720. * 0.35, 1280., 720., (0., 0.)).unwrap();
+        assert!((x - 30.).abs() < 0.01 && (y - 35.).abs() < 0.01 && lit.is_none());
+        // The grab offset is kept: grabbed 10% right of the centre, the centre lands 10% left.
+        let ((x, _), _) = caption_drop(1280. * 0.40, 720. * 0.35, 1280., 720., (10., 0.)).unwrap();
+        assert!((x - 30.).abs() < 0.01);
+        // Off the frame: clamped to its edge.
+        assert_eq!(frame_percent(-20., 900., 1280., 720.), Some((0., 100.)));
+        assert_eq!(caption_drop(10., 10., 0., 0., (0., 0.)), None);
+    }
+
+    #[test]
+    fn favourites_come_first_and_toggle() {
+        let ids = ["fire", "candy", "flash", "neon"];
+        let mut favs = vec![];
+        toggle_favorite(&mut favs, "neon");
+        toggle_favorite(&mut favs, "candy");
+        assert_eq!(favorites_first(&ids, |s| s, &favs), vec![&"candy", &"neon", &"fire", &"flash"]);
+        toggle_favorite(&mut favs, "neon");
+        assert_eq!(favs, vec!["candy".to_string()]);
+        assert_eq!(favorites_first(&ids, |s| s, &favs), vec![&"candy", &"fire", &"flash", &"neon"]);
+        assert_eq!(favorites_first(&ids, |s| s, &[]).len(), 4);
     }
 }
