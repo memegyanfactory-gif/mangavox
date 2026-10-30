@@ -724,7 +724,7 @@ impl StudioPage {
         let st = self.statuses.get(&c.id).cloned().unwrap_or_default();
         let made: Vec<bool> = Phase::ALL.iter().map(|p| p.done(&st)).collect();
         let tip_text = format!(
-            "{} · {}\n{}\nClick to pick · Shift-click picks a range · Double-click opens it",
+            "{} · {}\n{}\nClick to pick · Shift-click picks a range · Double-click opens it · Right-click for more",
             c.label(),
             word,
             Phase::ALL.iter().map(|p| format!("{} {}", p.label(), if p.done(&st) { "✓" } else { "–" })).collect::<Vec<_>>().join("  ")

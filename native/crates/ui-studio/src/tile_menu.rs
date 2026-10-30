@@ -206,9 +206,8 @@ impl StudioPage {
                     }
                 } else {
                     this.dash_anchor = Some(item.id.clone());
-                    if this.dash_pick.insert(item.id.clone()) {
-                        this.append_if_generating(&item, cx);
-                    }
+                    // Picking only selects: nothing runs until Generate or Redo is pressed.
+                    this.dash_pick.insert(item.id.clone());
                 }
                 cx.notify();
             });
