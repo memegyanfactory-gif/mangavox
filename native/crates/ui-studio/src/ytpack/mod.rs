@@ -411,16 +411,7 @@ impl Render for YtPackage {
             .flex_wrap()
             .items_center()
             .gap(px(space::SM))
-            .child(div().flex().flex_none().items_center().justify_center().size(px(28.)).rounded(px(radius::MD)).bg(Tokens::accent_soft()).child(ph_icon(ph::YOUTUBE_LOGO, Weight::Duotone, Tokens::accent(), icon_px::MD)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(180.))
-                    .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("YouTube package"))
-                    .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(summary)),
-            )
+            .child(div().flex_1().min_w(px(180.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(summary))
             .child(
                 btn("ytp-research", if s.researched_at == 0 { "Research YouTube" } else { "Research again" }, ButtonKind::Secondary)
                     .small()
