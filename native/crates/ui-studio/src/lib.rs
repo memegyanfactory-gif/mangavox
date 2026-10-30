@@ -28,6 +28,7 @@ mod setup_view;
 mod side;
 mod tile_menu;
 pub mod vedit;
+mod vedit_manga;
 mod vedit_play;
 mod vedit_tools;
 mod vedit_view;

@@ -27,6 +27,8 @@ use crate::vedit::{self, Beat, ChapterEdit, Clip, Layer, LayerKind, LookEdit, Mo
 use crate::vedit_play;
 use crate::video::{self, SubtitleSetting};
 
+mod manga;
+
 /// Track header width, and each lane's height.
 const HEAD_W: f32 = 176.;
 const RULER_H: f32 = 26.;
@@ -133,6 +135,8 @@ pub(crate) struct Editor {
     thumbs: RefCell<HashMap<String, Option<PathBuf>>>,
     /// The assistant tools' edit version last loaded (`vedit_tools::version`).
     seen_tools: u64,
+    /// The whole-manga timeline ("All chapters") and Re-edit full timeline (see `manga`).
+    whole: manga::Whole,
     _subs: Vec<Subscription>,
 }
 
@@ -165,6 +169,7 @@ impl Default for Editor {
             keys: RefCell::new(HashMap::new()),
             thumbs: RefCell::new(HashMap::new()),
             seen_tools: crate::vedit_tools::version(),
+            whole: Default::default(),
             _subs: vec![],
         }
     }
@@ -207,6 +212,7 @@ impl StudioPage {
         self.vedit.manga = id;
         self.vedit.seq = None;
         self.vedit.sel = None;
+        self.manga_reset();
         let Some(g) = g else { return };
         let chapters = self.made_chapters(&g);
         if let Some(first) = chapters.first() {
@@ -218,6 +224,7 @@ impl StudioPage {
     /// Opens `item` as the timeline's sequence.
     fn video_open(&mut self, item: ChapterItem) {
         self.video_stop();
+        self.vedit.whole.all = None;
         if let Some(prev) = &self.vedit.seq {
             self.vedit.keys.borrow_mut().remove(&prev.item.id);
         }
@@ -276,6 +283,7 @@ impl StudioPage {
             }
             None => {}
         }
+        self.manga_poll(cx);
         let v = crate::vedit_tools::version();
         if v == self.vedit.seen_tools {
             return;
@@ -298,6 +306,9 @@ impl StudioPage {
 
     /// Zoom so the whole sequence fits the timeline.
     fn video_fit(&mut self) {
+        if self.vedit.whole.all.is_some() {
+            return self.manga_fit();
+        }
         let total = self.vedit.seq.as_ref().map(|s| vedit::total_ms(&s.placed())).unwrap_or(0);
         let w = (f32::from(self.vedit.lanes.get().size.width)).max(400.);
         if total > 0 {
@@ -347,6 +358,7 @@ impl StudioPage {
             Ok(p) => self.vedit.project = p,
             Err(e) => toast::show(cx, Toast::error(format!("Could not save the edit: {e}"))),
         }
+        self.manga_sync(cx);
     }
 
     fn video_undo(&mut self, redo: bool, cx: &mut Context<Self>) {
@@ -365,6 +377,7 @@ impl StudioPage {
         let Some(seq) = self.vedit.seq.as_mut() else { return };
         f(&mut seq.subs);
         video::save_chapter_setting(&seq.item.output_dir, Some(&seq.subs));
+        self.manga_sync(cx);
         cx.notify();
     }
 
@@ -492,6 +505,7 @@ impl StudioPage {
     // ------------------------------------------------------------------------------ playback
 
     fn video_stop(&mut self) {
+        self.manga_stop();
         if let Some((t0, from)) = self.vedit.playing.take() {
             self.vedit.playhead = from + t0.elapsed().as_millis() as u64;
             vedit_play::stop();
@@ -533,7 +547,7 @@ impl StudioPage {
             (MusicSource::Score, false) => seq.score.clone().map(|p| (p, from, vol * 0.8)),
             (MusicSource::File { path }, false) => Some((path.clone(), from, vol * 0.25)),
         };
-        vedit_play::play(vedit_play::Play { narration, skip_ms, music });
+        vedit_play::play(vedit_play::Play { narration, skip_ms, music, music_parts: vec![] });
         self.vedit.playing = Some((Instant::now(), from));
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -576,6 +590,9 @@ impl StudioPage {
     }
 
     fn seek(&mut self, ms: u64, cx: &mut Context<Self>) {
+        if self.vedit.whole.all.is_some() {
+            return self.manga_seek(ms, cx);
+        }
         let playing = self.vedit.playing.is_some();
         self.video_stop();
         let total = self.vedit.seq.as_ref().map(|s| vedit::total_ms(&s.placed())).unwrap_or(0);
@@ -605,6 +622,10 @@ impl StudioPage {
     pub(crate) fn video_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.vedit.text.as_ref().is_some_and(|t| t.read(cx).focus_handle(cx).is_focused(window)) {
             return false;
+        }
+        if self.vedit.whole.all.is_some() && self.manga_key(ev, cx) {
+            cx.notify();
+            return true;
         }
         let k = &ev.keystroke;
         let m = &k.modifiers;
@@ -653,6 +674,9 @@ impl StudioPage {
 
     fn snap_ms(&mut self, t: i64, skip_layer: Option<u64>) -> i64 {
         self.vedit.snapped = None;
+        if self.vedit.whole.all.is_some() {
+            return if self.vedit.snap { self.manga_snap(t) } else { t };
+        }
         let Some(seq) = &self.vedit.seq else { return t };
         if !self.vedit.snap {
             return t;
@@ -748,7 +772,7 @@ impl StudioPage {
             Drag::Scroll => {
                 let b = self.vedit.lanes.get();
                 let w = f32::from(b.size.width);
-                let total = self.vedit.seq.as_ref().map(|s| vedit::total_ms(&s.placed())).unwrap_or(0) as f32 / 1000. * self.vedit.pps;
+                let total = self.timeline_ms() as f32 / 1000. * self.vedit.pps;
                 if w > 0. && total > w {
                     let f = ((f32::from(pos.x) - f32::from(b.origin.x)) / w).clamp(0., 1.);
                     self.vedit.scroll_x = (f * total - w / 2.).clamp(0., total - w);
@@ -795,6 +819,7 @@ impl StudioPage {
                     self.vedit.undo.push(saved);
                     self.video_save(cx);
                 }
+                self.manga_sync(cx);
             }
             Drag::Playhead | Drag::Scroll => {}
         }
@@ -853,14 +878,15 @@ impl StudioPage {
             }
         }
         let pending = self.unrendered(&g);
+        let all = self.vedit.whole.all.is_some();
         let top = div()
             .flex()
             .flex_1()
             .min_h(px(260.))
             .gap(px(4.))
             .child(self.panel("Effect Controls", None, self.effect_controls(cx)).w(px(LEFT_W)).flex_none())
-            .child(self.monitor_panel(window, cx))
-            .child(self.panel("Sequence", None, self.sequence_panel(cx)).w(px(RIGHT_W)).flex_none());
+            .child(if all { self.manga_monitor_panel(&g, window, cx) } else { self.monitor_panel(window, cx) })
+            .child(self.panel(if all { "Sequence · every chapter" } else { "Sequence" }, None, self.sequence_panel(cx)).w(px(RIGHT_W)).flex_none());
         let bottom = div()
             .flex()
             .flex_none()
@@ -868,7 +894,7 @@ impl StudioPage {
             .gap(px(4.))
             .child(self.panel(&format!("Project: {}", g.title), None, self.bin(&g, &pending, cx)).w(px(LEFT_W)).flex_none())
             .child(self.tools(cx))
-            .child(self.video_timeline(cx));
+            .child(if all { self.manga_timeline(&g, cx) } else { self.video_timeline(cx) });
         div()
             .id("vedit")
             .relative()
@@ -894,6 +920,7 @@ impl StudioPage {
             .child(top)
             .child(bottom)
             .when(self.vedit.export_open, |d| d.child(self.export_dialog(&g, pending, cx)))
+            .when(self.vedit.whole.confirm, |d| d.child(self.reedit_dialog(&g, cx)))
             .into_any_element()
     }
 
@@ -1171,11 +1198,8 @@ impl StudioPage {
     /// The program frame at `now`: the clip's panel, the layers and the caption cue.
     fn frame(&self, seq: &Seq, placed: &[Placed], now: u64, fw: f32, fh: f32, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let cur = vedit::at(placed, now).or(placed.last());
-        let image = cur.and_then(|p| seq.beats.get(p.clip.src)).and_then(|b| b.image.clone());
-        let mut d = div().id("vedit-frame").relative().flex_none().w(px(fw)).h(px(fh)).overflow_hidden().bg(video::paint(hex("#000000"), 1.));
-        if let Some(p) = image {
-            d = d.child(img(p.clone()).absolute().inset_0().size_full().object_fit(ObjectFit::Cover).opacity(0.25)).child(img(p).absolute().inset_0().size_full().object_fit(ObjectFit::Contain));
-        }
+        // The panel as the chapter's look draws it (blurred fill, duo panels, finish).
+        let mut d = div().id("vedit-frame").relative().flex_none().w(px(fw)).h(px(fh)).overflow_hidden().bg(video::paint(hex("#000000"), 1.)).children(self.look_backdrop(seq, placed, now, fw, fh));
         if !seq.edit.flags(Track::Layers).off {
             for l in seq.edit.layers.iter().filter(|l| l.start_ms <= now && now < l.end_ms) {
                 let selected = self.vedit.sel == Some(Sel::Layer(l.id));
@@ -2191,7 +2215,7 @@ impl StudioPage {
             }));
 
         let body = div().flex().flex_col().flex_1().min_h_0().child(toolbar).child(div().flex().flex_1().min_h_0().child(heads).child(content)).child(scroll);
-        self.panel(&format!("{} ×", seq.item.label()), None, body).flex_1()
+        self.panel(&format!("{} ×", seq.item.label()), Some(self.chapter_switcher(cx)), body).flex_1()
     }
 
     // ------------------------------------------------------------------------------ export

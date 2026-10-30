@@ -1175,7 +1175,7 @@ impl StudioPage {
     }
 
     /// Plays every made chapter of `g` as one video.
-    fn play_full(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn play_full(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
         let title = format!("{} · Full recap", g.title);
         self.with_joined(
             g,
