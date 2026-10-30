@@ -32,6 +32,7 @@ pub mod vedit;
 mod vedit_history;
 mod vedit_keys;
 mod vedit_media;
+mod vedit_manga;
 mod vedit_play;
 mod vedit_tools;
 mod vedit_view;

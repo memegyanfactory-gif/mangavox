@@ -21,6 +21,13 @@ pub(crate) struct Play {
     pub skip_ms: u64,
     /// The music file, where to start in it, and its volume.
     pub music: Option<(PathBuf, u64, f32)>,
+    /// Instead of `music`: one stretch per chapter (the whole-manga timeline), played in order.
+    pub music_parts: Vec<crate::vedit_manga::MusicPart>,
+}
+
+/// `ms` of silence (keeps the slices after it in sync when a file cannot be played).
+fn silence(ms: u64) -> impl rodio::Source<Item = i16> + Send {
+    rodio::source::Zero::<i16>::new(2, 44_100).take_duration(Duration::from_millis(ms))
 }
 
 enum Cmd {
@@ -46,11 +53,23 @@ fn sender() -> Sender<Cmd> {
                     if let Ok(s) = rodio::Sink::try_new(&handle) {
                         for (i, sl) in p.narration.iter().enumerate() {
                             let skip = if i == 0 { p.skip_ms.min(sl.dur_ms) } else { 0 };
-                            if let Some(src) = open(&sl.file, sl.offset_ms + skip) {
-                                s.append(src.take_duration(Duration::from_millis(sl.dur_ms - skip)));
+                            match open(&sl.file, sl.offset_ms + skip) {
+                                Some(src) => s.append(src.take_duration(Duration::from_millis(sl.dur_ms - skip))),
+                                None => s.append(silence(sl.dur_ms - skip)),
                             }
                         }
                         sinks.push(s);
+                    }
+                    if !p.music_parts.is_empty() {
+                        if let Ok(s) = rodio::Sink::try_new(&handle) {
+                            for part in &p.music_parts {
+                                match part.file.as_deref().and_then(|f| open(f, part.offset_ms)) {
+                                    Some(src) => s.append(src.take_duration(Duration::from_millis(part.dur_ms)).amplify(part.vol)),
+                                    None => s.append(silence(part.dur_ms)),
+                                }
+                            }
+                            sinks.push(s);
+                        }
                     }
                     if let Some((file, at, vol)) = p.music {
                         if let (Some(src), Ok(s)) = (open(&file, at), rodio::Sink::try_new(&handle)) {

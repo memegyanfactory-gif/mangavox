@@ -266,8 +266,14 @@ async fn pump(inner: Arc<Inner>) {
         match rx.recv().await {
             Ok(ev) => {
                 let stage_done = apply(&inner, ev);
-                if let Some((chapter, stage)) = stage_done {
-                    let _ = tokio::task::spawn_blocking(move || crate::data::mark_stage_complete(&chapter, &stage)).await;
+                if let Some((chapter, stage, dir)) = stage_done {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if stage == "video" {
+                            crate::vedit_manga::promote_stamp(&dir);
+                        }
+                        crate::data::mark_stage_complete(&chapter, &stage)
+                    })
+                    .await;
                 }
                 bump();
             }
@@ -277,14 +283,16 @@ async fn pump(inner: Arc<Inner>) {
     }
 }
 
-/// Folds one queue event into the job list. Returns `(chapter, stage)` when a stage completed.
-fn apply(inner: &Inner, ev: JobEvent) -> Option<(String, String)> {
+/// Folds one queue event into the job list. Returns `(chapter, stage, output folder)` when a
+/// stage completed.
+fn apply(inner: &Inner, ev: JobEvent) -> Option<(String, String, PathBuf)> {
     let mut jobs = lock_jobs(inner);
     let id = match &ev {
         JobEvent::Started { id, .. } | JobEvent::Message { id, .. } | JobEvent::Log { id, .. } | JobEvent::Finished { id, .. } => *id,
     };
     let job = jobs.iter_mut().find(|j| j.id == id)?;
-    apply_to(job, ev)
+    let dir = job.output_dir.clone();
+    apply_to(job, ev).map(|(c, s)| (c, s, dir))
 }
 
 fn apply_to(job: &mut JobInfo, ev: JobEvent) -> Option<(String, String)> {
@@ -385,6 +393,10 @@ pub fn enqueue_with(env: &Env, req: &NarrationRequest, chapters: &[ChapterItem],
             }
         }
         let stages = job.stages.clone();
+        if stages.iter().any(|s| s == "video") {
+            // What this render is made with: the video's look stamp once it finishes.
+            crate::vedit_manga::stamp_pending(ch);
+        }
         // Hold the lock across enqueue so the pump cannot see events before the record exists.
         let mut jobs = lock_jobs(&inner);
         let id = inner.queue.enqueue(ch.id.clone(), JobPayload::Pipeline(job));
