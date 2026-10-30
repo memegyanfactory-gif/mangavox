@@ -47,6 +47,82 @@ pub(crate) const HOOK_SECONDS: [u32; 3] = [15, 20, 30];
 /// The font a text watermark is drawn in (from the scripts' `fonts/`).
 const MARK_FONT: &str = "Inter-ExtraBold.ttf";
 
+/// How big an export is: the source as it is, or scaled to a preset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Quality {
+    /// Keep the chapters' own size (a straight copy when nothing else changes).
+    #[default]
+    Source,
+    K4,
+    P1440,
+    P1080,
+    P720,
+}
+
+impl Quality {
+    pub(crate) const ALL: [Quality; 5] = [Quality::Source, Quality::K4, Quality::P1440, Quality::P1080, Quality::P720];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Quality::Source => "Source",
+            Quality::K4 => "4K",
+            Quality::P1440 => "1440p",
+            Quality::P1080 => "1080p",
+            Quality::P720 => "720p",
+        }
+    }
+
+    /// The preset's short side in pixels (2160 for 4K); `None` for the source size.
+    pub(crate) fn short_side(self) -> Option<u32> {
+        match self {
+            Quality::Source => None,
+            Quality::K4 => Some(2160),
+            Quality::P1440 => Some(1440),
+            Quality::P1080 => Some(1080),
+            Quality::P720 => Some(720),
+        }
+    }
+
+    /// The upright reel frame: 1080x1920, larger for 1440p and 4K.
+    pub(crate) fn reel_size(self) -> (u32, u32) {
+        match self {
+            Quality::K4 => (2160, 3840),
+            Quality::P1440 => (1440, 2560),
+            _ => REEL_SIZE,
+        }
+    }
+
+    /// x264 `(preset, crf)`: slower and cleaner the bigger the picture.
+    pub(crate) fn encode(self) -> (&'static str, &'static str) {
+        match self {
+            Quality::K4 => ("medium", "18"),
+            Quality::P1440 => ("fast", "19"),
+            _ => ("veryfast", "20"),
+        }
+    }
+
+    /// The x264 video arguments (no audio).
+    pub(crate) fn video_args(self) -> Vec<String> {
+        let (preset, crf) = self.encode();
+        ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p"].map(String::from).to_vec()
+    }
+}
+
+/// The frame a `w`x`h` video becomes at `short` pixels on its short side (same aspect, even sides).
+pub(crate) fn scaled_size((w, h): (u32, u32), short: u32) -> (u32, u32) {
+    let cur = w.min(h);
+    if cur == 0 {
+        return (w, h);
+    }
+    let side = |s: u32| (((s as u64 * short as u64 + cur as u64 / 2) / cur as u64) as u32) & !1;
+    (side(w), side(h))
+}
+
+/// ffmpeg filter scaling to `w`x`h` with the high-quality Lanczos scaler.
+pub(crate) fn scale_filter(w: u32, h: u32) -> String {
+    format!("scale={w}:{h}:flags=lanczos")
+}
+
 /// The section's choices.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExportPrefs {
@@ -57,11 +133,12 @@ pub(crate) struct ExportPrefs {
     /// A teaser before chapter 1 (one video only).
     pub hook: bool,
     pub hook_secs: u32,
+    pub quality: Quality,
 }
 
 impl Default for ExportPrefs {
     fn default() -> Self {
-        ExportPrefs { kind: 0, parts: 6, music: true, hook: false, hook_secs: 20 }
+        ExportPrefs { kind: 0, parts: 6, music: true, hook: false, hook_secs: 20, quality: Quality::Source }
     }
 }
 
@@ -741,6 +818,8 @@ pub(crate) struct Extras {
     pub watermark: Option<Watermark>,
     /// The watermark text's font file.
     pub font: Option<PathBuf>,
+    /// The size to scale to (source: keep it).
+    pub quality: Quality,
 }
 
 /// Filter joining the hook (input 0, its audio track `hook_track`) and the joined video (input
@@ -756,7 +835,12 @@ pub(crate) fn hook_concat_graph(hook_track: usize, track: usize, w: u32, h: u32,
     )
 }
 
-const H264: [&str; 10] = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac"];
+/// x264 video at `q`'s settings plus AAC audio.
+fn h264(q: Quality) -> Vec<String> {
+    let mut a = q.video_args();
+    a.extend(["-c:a", "aac"].map(String::from));
+    a
+}
 
 /// Writes the export of `j` into `out_dir`: one file, or (for parts and reels) a folder of them,
 /// with the hook before it (one video) and the watermark over it as `extras` say.
@@ -766,7 +850,17 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
     let mark = Mark::prepare(extras.watermark.clone(), extras.font.as_deref())?;
     let cwd = mark.as_ref().and_then(|m| m.dir.clone());
     let hook = if mode == Mode::Whole { extras.hook.as_ref().filter(|h| h.is_file()) } else { None };
-    let size = if mark.is_some() || hook.is_some() { probe(&j.path)?.size } else { (0, 0) };
+    let q = extras.quality;
+    let scaling = q.short_side().is_some();
+    let size = if mark.is_some() || hook.is_some() || scaling { probe(&j.path)?.size } else { (0, 0) };
+    // The output frame (what the watermark is placed on) and the filter that gets the picture there.
+    let (size, scale) = match q.short_side() {
+        Some(s) if size.0 > 0 => {
+            let to = scaled_size(size, s);
+            (to, Some(scale_filter(to.0, to.1)))
+        }
+        _ => (size, None),
+    };
     if mode == Mode::Whole {
         let out = out_dir.join(part_name(name, mode, 1, 1));
         let tmp = out.with_extension("part.mp4");
@@ -785,13 +879,21 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
                 graph.push_str(&watermark_graph(&m.wm, "cv", "v", w, h, 2));
             }
             args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), "[a]".into()]);
-            args.extend(H264.map(String::from));
+            args.extend(h264(q));
             args.extend(["-b:a".into(), "192k".into()]);
         } else if let Some(m) = &mark {
             args = vec!["-i".into(), src.clone()];
             args.extend(m.inputs());
-            args.extend(["-filter_complex".into(), watermark_graph(&m.wm, "0:v:0", "v", w, h, 1), "-map".into(), "[v]".into(), "-map".into(), format!("0:a:{track}")]);
-            args.extend(H264[..8].iter().map(|s| s.to_string()));
+            let graph = match &scale {
+                Some(sc) => format!("[0:v:0]{sc}[sc];{}", watermark_graph(&m.wm, "sc", "v", w, h, 1)),
+                None => watermark_graph(&m.wm, "0:v:0", "v", w, h, 1),
+            };
+            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), format!("0:a:{track}")]);
+            args.extend(q.video_args());
+            args.extend(["-c:a".into(), "copy".into()]);
+        } else if let Some(sc) = &scale {
+            args = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}"), "-vf", sc].map(String::from).to_vec();
+            args.extend(q.video_args());
             args.extend(["-c:a".into(), "copy".into()]);
         } else {
             args = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}"), "-c", "copy"].map(String::from).to_vec();
@@ -829,8 +931,10 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         let (mut graph, base, (w, h)) = if mode == Mode::Reels {
             // A landscape recap keeps the page in the middle: crop to it (a little wider than
             // square, so captions survive) so the page fills the upright frame.
-            let (w, h) = REEL_SIZE;
+            let (w, h) = q.reel_size();
             (format!("[0:v:0]crop=w='min(iw\\,ih*9/10)':h=ih[src];{}", fit_blur("src", "fit", w, h)), "fit", (w, h))
+        } else if let Some(sc) = &scale {
+            (format!("[0:v:0]{sc}[sc]"), "sc", size)
         } else {
             (String::new(), "0:v:0", size)
         };
@@ -846,7 +950,7 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
             None => args.extend(["-map".into(), "0:v:0".into()]),
         }
         args.extend(["-map".into(), format!("0:a:{track}")]);
-        args.extend(H264.map(String::from));
+        args.extend(h264(q));
         args.extend(["-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"].map(String::from));
         args.push(tmp.to_string_lossy().into());
         let label = format!("{} {} of {n}", if mode == Mode::Reels { "Reel" } else { "Part" }, k + 1);
@@ -1075,7 +1179,7 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
     };
     let res = match res {
         Ok(()) => mv_ui::bg::blocking(move || {
-            let extras = Extras { hook: hook_path, watermark: load_watermark(&video_look_path()), font };
+            let extras = Extras { hook: hook_path, watermark: load_watermark(&video_look_path()), font, quality: prefs.quality };
             let out = export(&j, prefs.mode(), prefs.music, &dir, &name, &extras, &r);
             if let Some(d) = hook_dir {
                 let _ = std::fs::remove_dir_all(d);
@@ -1246,6 +1350,10 @@ impl StudioPage {
                                             Mode::Parts(_) => format!("{n} part{}", plural(n)),
                                             Mode::Reels => format!("{n} reel{}", plural(n)),
                                         };
+                                        let what = match prefs.quality {
+                                            Quality::Source => format!("{what} at source quality"),
+                                            q => format!("{what} in {}", q.label()),
+                                        };
                                         let note = if kept > 0 { format!(" · {kept} chapter{} still ha{} music: re-make {} with Redo → Video", plural(kept), if kept == 1 { "s" } else { "ve" }, if kept == 1 { "it" } else { "them" }) } else { String::new() };
                                         toast::show(cx, Toast::success(format!("Exported {what}{note}{hook_note}")).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
                                     }
@@ -1296,6 +1404,10 @@ impl StudioPage {
             this.export_prefs.parts = PART_COUNTS[*ix];
             cx.notify();
         }));
+        let quality_seg = segmented("vid-quality", Quality::ALL.iter().map(|q| (None, q.label())), Quality::ALL.iter().position(|q| *q == prefs.quality).unwrap_or(0)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+            this.export_prefs.quality = Quality::ALL[*ix];
+            cx.notify();
+        }));
         let note = match mode {
             Mode::Whole => "Saves everything as one video file.".to_string(),
             Mode::Parts(p) => format!("{p} videos of about {} each, cut between sentences.", if total > 0. { fmt_duration(total / p as f64) } else { "equal length".into() }),
@@ -1333,6 +1445,7 @@ impl StudioPage {
                     .gap(px(space::SM))
                     .child(kind_seg)
                     .when(matches!(mode, Mode::Parts(_)), |d| d.child(parts_seg))
+                    .child(quality_seg)
                     .children(hook_row)
                     .child(
                         div()
@@ -1355,7 +1468,13 @@ impl StudioPage {
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_export(&group, window, cx))),
                     ),
             )
-            .child(small(if n == 0 { "Every made chapter joins here, in order, as one video.".to_string() } else { note }));
+            .child(small(if n == 0 {
+                "Every made chapter joins here, in order, as one video.".to_string()
+            } else if prefs.quality == Quality::Source {
+                note
+            } else {
+                format!("{note} Scaled to {} (re-encoded, so it takes longer{}).", prefs.quality.label(), if prefs.quality == Quality::K4 { "; 4K is the slowest" } else { "" })
+            }));
 
         let progress = job.map(|(here, (p, label))| {
             div()
@@ -1391,7 +1510,7 @@ impl StudioPage {
 mod tests {
     use super::{
         chapter_beats, chapter_boundaries, concat_list, export, fmt_duration, hook_concat_graph, join, load_watermark, part_name, plan_parts, plan_reels, resolution_for, watermark_graph, Extras,
-        Job, Mode, Watermark,
+        scale_filter, scaled_size, Job, Mode, Quality, Watermark,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -1539,6 +1658,35 @@ mod tests {
     }
 
     #[test]
+    fn quality_presets_pick_size_and_encoder() {
+        assert_eq!(Quality::default(), Quality::Source);
+        assert_eq!(Quality::ALL.map(|q| q.label()), ["Source", "4K", "1440p", "1080p", "720p"]);
+        assert_eq!(Quality::ALL.map(|q| q.short_side()), [None, Some(2160), Some(1440), Some(1080), Some(720)]);
+        // Reels keep 1080x1920, and grow for the big presets.
+        assert_eq!((Quality::Source.reel_size(), Quality::P1080.reel_size(), Quality::P720.reel_size()), ((1080, 1920), (1080, 1920), (1080, 1920)));
+        assert_eq!((Quality::K4.reel_size(), Quality::P1440.reel_size()), ((2160, 3840), (1440, 2560)));
+        assert_eq!(Quality::K4.encode(), ("medium", "18"));
+        assert_eq!(Quality::P1080.encode(), ("veryfast", "20"));
+        let a = Quality::K4.video_args();
+        assert_eq!(&a[2..6], ["-preset", "medium", "-crf", "18"]);
+    }
+
+    #[test]
+    fn scaling_keeps_the_aspect_and_even_sides() {
+        assert_eq!(scaled_size((1920, 1080), 2160), (3840, 2160));
+        assert_eq!(scaled_size((1920, 1080), 720), (1280, 720));
+        assert_eq!(scaled_size((1920, 1080), 1440), (2560, 1440));
+        assert_eq!(scaled_size((1920, 1080), 1080), (1920, 1080));
+        // Upright chapter videos scale by their short side.
+        assert_eq!(scaled_size((1080, 1920), 2160), (2160, 3840));
+        // Odd aspect ratios still come out even.
+        let (w, h) = scaled_size((1000, 563), 720);
+        assert_eq!((w % 2, h % 2, h), (0, 0, 720));
+        assert_eq!(scaled_size((0, 0), 720), (0, 0));
+        assert_eq!(scale_filter(3840, 2160), "scale=3840:2160:flags=lanczos");
+    }
+
+    #[test]
     fn hook_joins_before_the_video_on_its_frame_and_sound() {
         let g = hook_concat_graph(1, 0, 1920, 1080, "v");
         assert!(g.starts_with("[0:v:0]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:"));
@@ -1583,6 +1731,8 @@ mod tests {
             hook: std::env::var("MV_EXPORT_HOOK").ok().map(PathBuf::from),
             watermark: std::env::var("MV_EXPORT_LOOK").ok().and_then(|f| load_watermark(&PathBuf::from(f))),
             font: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../python/fonts/Inter-ExtraBold.ttf")),
+            // MV_EXPORT_QUALITY=4k|1440p|1080p|720p: scale to that size.
+            quality: Quality::ALL.into_iter().find(|q| std::env::var("MV_EXPORT_QUALITY").is_ok_and(|v| v.eq_ignore_ascii_case(q.label()))).unwrap_or_default(),
         };
         println!("watermark: {:?}", extras.watermark);
         for mode in modes {

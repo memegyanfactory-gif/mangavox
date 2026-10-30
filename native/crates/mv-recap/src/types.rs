@@ -213,6 +213,10 @@ pub struct PhaseStatus {
 pub const FORMAT_LANDSCAPE: &str = "landscape";
 pub const FORMAT_REELS: &str = "reels";
 
+/// Chapter-video sizes the renderer understands (`get_resolution` in `video_generator.py`),
+/// smallest first. 4K takes noticeably longer to render.
+pub const RESOLUTIONS: [&str; 4] = ["720p", "1080p", "1440p", "4k"];
+
 /// Global Studio preferences (`~/.mangavox/studio/prefs.json`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

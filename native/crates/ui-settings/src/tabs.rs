@@ -14,7 +14,7 @@ use crate::ui::{divided, icon_row, path_row};
 use crate::{data, SettingsView};
 
 /// Resolutions Studio renders (`StudioPrefs::resolution`).
-const RESOLUTIONS: [&str; 2] = ["720p", "1080p"];
+const RESOLUTIONS: [&str; 4] = ["720p", "1080p", "1440p", "4k"];
 
 /// Studio's default speaking-rate slider: 0.5× to 2×, in 0.05 steps.
 pub fn speed_slider(_window: &mut Window, cx: &mut Context<SettingsView>) -> Entity<SliderState> {
