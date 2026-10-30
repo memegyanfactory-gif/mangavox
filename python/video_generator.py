@@ -779,6 +779,112 @@ class _Progress:
             self.cb("video", value, 1000)
 
 
+# Clip motions the Video editor can pick per clip (anything else: the look decides).
+EDIT_MOTIONS = ("still", "zoom", "shake")
+# Font a text overlay is drawn in (python/fonts).
+OVERLAY_FONT = "Inter-ExtraBold.ttf"
+
+
+def _num(v, default, lo, hi):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return default if not math.isfinite(x) else min(hi, max(lo, x))
+
+
+def apply_edit_clips(items, clips):
+    """The render items of a Video editor edit: `clips` lists, in their new order, which item
+    (`src`, an index into `items`) plays, trimmed by `trim_in_ms` / `trim_out_ms` off its audio
+    slice, with an optional caption `text`, a `motion` from EDIT_MOTIONS and `cut` (a hard cut
+    into it). Unknown sources and clips trimmed below 0.1 s are dropped."""
+    out = []
+    for c in clips or []:
+        if not isinstance(c, dict):
+            continue
+        try:
+            src = int(c.get("src"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= src < len(items):
+            continue
+        seg = dict(items[src])
+        dur = seg.get("duration_ms") or (int(seg.get("end_ms") or 0) - int(seg.get("start_ms") or 0))
+        tin = int(_num(c.get("trim_in_ms"), 0, 0, 1e9))
+        tout = int(_num(c.get("trim_out_ms"), 0, 0, 1e9))
+        left = int(dur) - tin - tout
+        if left < 100:
+            continue
+        seg["audio_offset_ms"] = int(seg.get("audio_offset_ms") or 0) + tin
+        seg["duration_ms"] = left
+        if isinstance(c.get("text"), str):
+            seg["text"] = c["text"]
+        if c.get("motion") in EDIT_MOTIONS:
+            seg["motion"] = c["motion"]
+        if c.get("cut"):
+            seg["cut"] = True
+        out.append(seg)
+    return out
+
+
+def overlay_graph(overlays, w, h, total, src, out, first_input, work_dir):
+    """Image and text layers from the Video editor drawn over [src] (a w x h picture) into
+    [out]. Each overlay: kind "image" (path, scale = width share of the frame) or "text" (text,
+    size = height share of the frame, color, box), centred at x/y percent, with opacity, shown
+    from start to end seconds. Images become ffmpeg inputs from `first_input` on; text is read
+    from files in `work_dir`. Returns (extra input args, filter string)."""
+    from caption_engine import FONTS_DIR, ffmpeg_filter_path
+    inputs, parts = [], []
+    cur = src
+    font = os.path.join(FONTS_DIR, OVERLAY_FONT)
+    for i, o in enumerate(overlays or []):
+        if not isinstance(o, dict):
+            continue
+        start = _num(o.get("start"), 0.0, 0.0, total)
+        end = _num(o.get("end"), total, 0.0, total)
+        if end - start < 0.05:
+            continue
+        x = _num(o.get("x"), 50.0, 0.0, 100.0) / 100.0
+        y = _num(o.get("y"), 50.0, 0.0, 100.0) / 100.0
+        alpha = _num(o.get("opacity"), 1.0, 0.0, 1.0)
+        enable = f"enable='between(t,{start:.3f},{end:.3f})'"
+        nxt = f"{out}_o{i}"
+        if o.get("kind") == "image":
+            path = o.get("path")
+            if not isinstance(path, str) or not os.path.isfile(path):
+                continue
+            ow = max(2, round(w * _num(o.get("scale"), 0.2, 0.02, 1.0)) // 2 * 2)
+            idx = first_input + len(inputs) // 6
+            inputs += ["-loop", "1", "-t", f"{total:.3f}", "-i", path]
+            parts.append(
+                f"[{idx}:v]scale={ow}:-2,format=rgba,colorchannelmixer=aa={alpha:.2f}[{nxt}_i];"
+                f"[{cur}][{nxt}_i]overlay=x='{x:.4f}*W-w/2':y='{y:.4f}*H-h/2':{enable}[{nxt}]"
+            )
+        elif o.get("kind") == "text":
+            text = o.get("text")
+            if not isinstance(text, str) or not text.strip() or not os.path.isfile(font):
+                continue
+            os.makedirs(work_dir, exist_ok=True)
+            tf = os.path.join(work_dir, f"overlay_{i}.txt")
+            with open(tf, "w", encoding="utf-8") as f:
+                f.write(text)
+            fs = max(8, round(h * _num(o.get("size"), 0.06, 0.01, 0.3)))
+            color = o.get("color")
+            if not (isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color)):
+                color = "#ffffff"
+            box = f":box=1:boxcolor=black@{0.55 * alpha:.2f}:boxborderw={max(4, fs // 4)}" if o.get("box") else ""
+            parts.append(
+                f"[{cur}]drawtext=fontfile={ffmpeg_filter_path(font)}:textfile={ffmpeg_filter_path(tf)}:expansion=none:"
+                f"fontsize={fs}:fontcolor=0x{color[1:]}@{alpha:.2f}:shadowcolor=black@{0.6 * alpha:.2f}:shadowx=2:shadowy=2{box}:"
+                f"x='{x:.4f}*w-text_w/2':y='{y:.4f}*h-text_h/2':{enable}[{nxt}]"
+            )
+        else:
+            continue
+        cur = nxt
+    parts.append(f"[{cur}]null[{out}]")
+    return inputs, ";".join(parts)
+
+
 def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=None):
     """
     Generate a narrated manga video.
@@ -803,6 +909,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
               size, posX, posY, wordsPerLine, lines, uppercase, color, highlightColor,
               emphasis, enabled); falls back to <output_dir>/subtitles.json, then the
               Studio default. Words are timed against each clip's audio.
+            - edit: the Studio Video editor's edit: clips (see apply_edit_clips),
+              overlays (see overlay_graph) and narration_mute
         progress_cb: function(stage, current, total)
 
     With music the video carries two audio tracks: "Narration + music" (the default) and
@@ -846,6 +954,10 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     segments = sync_map.get("segments", [])
     use_beats = bool(beat_segments)
     render_items = beat_segments if use_beats else segments
+    edit = config.get("edit") if isinstance(config.get("edit"), dict) else {}
+    if isinstance(edit.get("clips"), list):
+        render_items = apply_edit_clips(render_items, edit["clips"])
+        use_beats = True
     if not render_items:
         raise RuntimeError("No segments in sync map — nothing to render")
 
@@ -942,10 +1054,12 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             continue
         duration = round(duration, 3)
 
+        override = seg.get("motion") if seg.get("motion") in EDIT_MOTIONS else None
         try:
             tall = False
-            # A beat may ask to be shown whole ("layout": "single"), like the hook's closing cover.
-            if duo_on and seg.get("layout") != "single":
+            # A beat may ask to be shown whole ("layout": "single"), like the hook's closing cover,
+            # and an editor motion other than a shake moves the panel on its own.
+            if duo_on and seg.get("layout") != "single" and override not in ("still", "zoom"):
                 from PIL import Image
                 with Image.open(page_image) as im:
                     tall = im.width < DUO_MAX_ASPECT * im.height
@@ -973,11 +1087,20 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             duo_prev = {"duo": duo, "source": source_image, "focus": focus_point}
         else:
             duo_prev = None
-            if effect != "none":
+            if override == "still":
+                motion = "still"
+            elif override == "zoom":
+                motion = "push"
+            elif effect != "none":
                 motion = pick_motion(images["aspect"], images["box_aspect"], turn, prev_motion)
                 turn += 1
                 prev_motion = motion
-        impact = look["impact"] and len(clips) - last_impact >= IMPACT_GAP and is_impact(seg.get("text", ""))
+            if override == "shake" and motion == "still":
+                motion = "push"
+        if override:
+            impact = override == "shake"
+        else:
+            impact = look["impact"] and len(clips) - last_impact >= IMPACT_GAP and is_impact(seg.get("text", ""))
         if impact:
             last_impact = len(clips)
 
@@ -986,7 +1109,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             "duo": duo, "impact": impact, "push": look["push"],
             "source": source_image, "focus": focus_point,
             "audio_path": audio_path, "offset": audio_offset,
-            "start": timeline, "duration": duration,
+            "start": timeline, "duration": duration, "cut": bool(seg.get("cut")),
         })
         caption_segments.append({
             "text": seg.get("text", ""),
@@ -1010,7 +1133,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     # A duo clip that follows another slides in by itself (a cut), and a punch flashes in.
     joins = [None]
     for k in range(1, len(clips)):
-        if clips[k]["duo"] and clips[k - 1]["duo"]:
+        if clips[k]["cut"] or (clips[k]["duo"] and clips[k - 1]["duo"]):
             joins.append("cut")
         elif clips[k]["impact"]:
             joins.append("impact")
@@ -1078,7 +1201,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     # ── Step 4: Burn captions + mix narration and music + move to final location ──
     bg_music = config.get("bg_music")
     bg_music_volume = float(config.get("bg_music_volume") or 0.15)
-    narration_volume = float(config.get("narration_volume") or 1.0)
+    narration_volume = _num(config.get("narration_volume"), 1.0, 0.0, 4.0)
+    if edit.get("narration_mute"):
+        narration_volume = 0.0
     bg_music_loop = bool(config.get("bg_music_loop", True))
     try:
         music_volume = max(0.0, float(config.get("music_volume", 1.0)))
@@ -1096,7 +1221,10 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     except Exception as e:
         print(f"[video] Failed to generate styled captions: {e}", file=sys.stderr)
 
-    video = {"inputs": video_inputs, "starts": video_starts, "trans": video_trans, "look": look}
+    video = {
+        "inputs": video_inputs, "starts": video_starts, "trans": video_trans, "look": look,
+        "overlays": edit.get("overlays") or [], "work_dir": video_dir,
+    }
     on_final = lambda f: report("finalize", f)
     success = _finalize_video_with_audio_mix_and_captions(
         video, narration, final_video, ass_path, bg_music,
@@ -1106,7 +1234,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     if not success:
         print("[video] Finalization failed, retrying without captions, music and finish", file=sys.stderr)
         success = _finalize_video_with_audio_mix_and_captions(
-            dict(video, look=None), narration, final_video, None, None,
+            dict(video, look=None, overlays=[]), narration, final_video, None, None,
             narration_volume, 0.0, False, w, h, timeline,
             score=None, music_volume=0.0, on_fraction=on_final,
         )
@@ -1229,12 +1357,16 @@ def _finalize_video_with_audio_mix_and_captions(
         graph.append(look_filters(video["look"], w, h, "vraw", "vx"))
     else:
         graph.append("[vraw]null[vx]")
+    # The editor's image and text layers, over the picture and under the captions.
+    first_overlay = n_video + audio_inputs.count("-i")
+    overlay_inputs, overlays = overlay_graph(video.get("overlays"), w, h, total, "vx", "vo", first_overlay, video.get("work_dir") or ".")
+    graph.append(overlays)
     has_subs = bool(ass_path) and os.path.exists(ass_path)
     if has_subs:
         from caption_engine import subtitles_filter
-        graph.append(f"[vx]{subtitles_filter(ass_path)},format=yuv420p[v]")
+        graph.append(f"[vo]{subtitles_filter(ass_path)},format=yuv420p[v]")
     else:
-        graph.append("[vx]format=yuv420p[v]")
+        graph.append("[vo]format=yuv420p[v]")
 
     # 2. Audio: mix, one measured gain, limiter (and the narration alone, when there is music)
     graph.append(_audio_mix_graph(n_video, has_music, narration_vol, music_vol, solo=has_music))
@@ -1250,7 +1382,7 @@ def _finalize_video_with_audio_mix_and_captions(
 
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        *inputs, *audio_inputs,
+        *inputs, *audio_inputs, *overlay_inputs,
         "-filter_complex", ";".join(graph),
         *maps,
         "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", str(FPS),

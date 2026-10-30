@@ -172,6 +172,10 @@ pub fn app_tools() -> Vec<AppTool> {
             Risk::Act,
         ),
     ]
+    .into_iter()
+    // Tools other crates registered (Studio's Video editor, ...).
+    .chain(crate::ext::tools())
+    .collect()
 }
 
 pub fn tool_specs() -> Vec<AiToolSpec> {
@@ -266,7 +270,7 @@ pub fn phrases(name: &str, args: &Map<String, Value>) -> Phrases {
         "youtube_video" => p("Read", "Reading", "Read", "the video's details"),
         "youtube_update_video" => p("Update", "Updating", "Updated", &titled("title", "the video on YouTube")),
         "youtube_schedule" => p("Schedule the video for", "Scheduling the video for", "Scheduled the video for", a("at")),
-        other => p("Run", "Running", "Ran", other),
+        other => crate::ext::phrases(other, args).unwrap_or_else(|| p("Run", "Running", "Ran", other)),
     }
 }
 
@@ -489,7 +493,10 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
             )
         }
         name if name.starts_with("youtube_") => crate::youtube::execute(name, args).await.map(ToolOutput::Value),
-        other => Err(format!("Unknown tool {other}")),
+        other => match crate::ext::run(other, args) {
+            Some(f) => f.await,
+            None => Err(format!("Unknown tool {other}")),
+        },
     }
 }
 
