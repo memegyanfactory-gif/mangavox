@@ -22,5 +22,5 @@ pub mod util;
 pub mod webtoon;
 
 pub use registry::{builtin_for_host, SourceRegistry};
-pub use source::{set_smart_bypass, smart_bypass, Result, Source, SourceCtx, SourceError, WallSolver};
+pub use source::{chapter_language, set_chapter_language, set_smart_bypass, smart_bypass, Result, Source, SourceCtx, SourceError, WallSolver};
 pub use types::{ChapterInfo, MangaDetails, MangaSearchResult, SourceInfo, Tag};

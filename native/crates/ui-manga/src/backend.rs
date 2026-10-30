@@ -21,12 +21,14 @@ static CTX: OnceLock<SourceCtx> = OnceLock::new();
 /// page opens. Returns false when one was already set / created.
 pub fn set_source_ctx(ctx: SourceCtx) -> bool {
     mv_sources::set_smart_bypass(smart_bypass());
+    mv_sources::set_chapter_language(&preferred_language());
     CTX.set(ctx).is_ok()
 }
 
 pub fn ctx() -> SourceCtx {
     CTX.get_or_init(|| {
         mv_sources::set_smart_bypass(smart_bypass());
+        mv_sources::set_chapter_language(&preferred_language());
         SourceCtx::new(Http::with_defaults().expect("http client"))
     })
     .clone()

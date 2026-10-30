@@ -441,6 +441,7 @@ impl Render for SourcesPanel {
                         filter_chip(SharedString::from(format!("lang-{code}")), name, active).on_click(cx.listener(move |this, _, _, cx| {
                             this.lang = code.to_string();
                             backend::set_config_str("chapterLanguage", code);
+                            mv_sources::set_chapter_language(code);
                             backend::bump_data();
                             cx.notify();
                         }))

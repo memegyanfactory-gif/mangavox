@@ -364,6 +364,14 @@ fn mangafire_parsers() {
     assert_eq!(mangafire::browse_path("views_total:desc", 2, Some("one piece"), Some("1")), "/browse?keyword=one%20piece&sort=views_total%3Adesc&genres_in=1&page=2");
     assert_eq!(mangafire::slug("Slice of Life"), "slice-of-life");
     assert!(mangafire::api_chapters_js("abc").contains("'/titles/' + \"abc\" + '/chapters'"));
+    assert!(mangafire::api_chapters_js("abc").contains("language: \"en\""));
+    assert!(mangafire::api_chapters_js_in("abc", "pt-br").contains("language: \"pt-br\""));
+    // The preferred language first (or its base), then every other one.
+    assert_eq!(mangafire::language_order(None)[0], "en");
+    assert_eq!(&mangafire::language_order(Some("fr"))[..2], &["fr", "en"]);
+    assert_eq!(mangafire::language_order(Some("pt-BR"))[0], "pt-br");
+    assert_eq!(mangafire::language_order(Some("id"))[0], "en");
+    assert_eq!(mangafire::language_order(Some("ja")).len(), mangafire::LANGUAGES.len());
 }
 
 // ── Source plumbing: registry, WallSolver hand-off ────────────────────

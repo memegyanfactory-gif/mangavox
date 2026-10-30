@@ -23,6 +23,24 @@ pub fn smart_bypass() -> bool {
     SMART_BYPASS.load(Ordering::Relaxed)
 }
 
+static CHAPTER_LANGUAGE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Preferred chapter language (Settings › Sources; ISO code, "all" for any). Sources that can
+/// filter by language server-side ask for this one first.
+pub fn set_chapter_language(code: &str) {
+    *CHAPTER_LANGUAGE.write().unwrap_or_else(|e| e.into_inner()) = code.trim().to_string();
+}
+
+/// [`set_chapter_language`]'s code, "en" when none was set; `None` for "all".
+pub fn chapter_language() -> Option<String> {
+    let l = CHAPTER_LANGUAGE.read().unwrap_or_else(|e| e.into_inner()).clone();
+    match l.as_str() {
+        "" => Some("en".into()),
+        "all" => None,
+        _ => Some(l),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
     #[error(transparent)]

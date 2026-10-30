@@ -289,8 +289,25 @@ pub fn parse_genres(json: &Value) -> Vec<(u32, String)> {
 /// its own ES module, then pulls every chapter page of `/api/titles/{hid}/chapters` (200 per page).
 /// Resolves to `{items, total}` or `{error}`.
 pub fn api_chapters_js(hid: &str) -> String {
-    let hid_json = serde_json::to_string(hid).unwrap_or_else(|_| "\"\"".into());
-    format!("{API_CHAPTERS_JS_HEAD}{hid_json}{API_CHAPTERS_JS_TAIL}")
+    api_chapters_js_in(hid, "en")
+}
+
+/// [`api_chapters_js`] for the chapters in `lang` (a code from [`LANGUAGES`]).
+pub fn api_chapters_js_in(hid: &str, lang: &str) -> String {
+    let json = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
+    format!("{API_CHAPTERS_JS_HEAD}{}{}", json(hid), API_CHAPTERS_JS_TAIL.replace("__MV_LANG__", &json(lang)))
+}
+
+/// Chapter languages MangaFire serves, most common first.
+pub const LANGUAGES: [&str; 7] = ["en", "es", "es-la", "fr", "ja", "pt", "pt-br"];
+
+/// The order to try MangaFire's languages in: the preferred one (or its base, "pt" for "pt-br")
+/// first, then the rest.
+pub fn language_order(pref: Option<&str>) -> Vec<&'static str> {
+    let pref = pref.unwrap_or("en").to_ascii_lowercase();
+    let base = pref.split(['-', '_']).next().unwrap_or("").to_string();
+    let first = LANGUAGES.iter().find(|l| **l == pref).or_else(|| LANGUAGES.iter().find(|l| **l == base));
+    first.into_iter().chain(LANGUAGES.iter().filter(|l| Some(*l) != first)).copied().collect()
 }
 
 const API_CHAPTERS_JS_HEAD: &str = r##"(async () => {
@@ -327,7 +344,7 @@ const API_CHAPTERS_JS_HEAD: &str = r##"(async () => {
     const path = '/titles/' + "##;
 
 const API_CHAPTERS_JS_TAIL: &str = r##" + '/chapters';
-    const base = { language: 'en', sort: 'number', order: 'desc', limit: 200 };
+    const base = { language: __MV_LANG__, sort: 'number', order: 'desc', limit: 200 };
     const first = await get(path, Object.assign({ page: 1 }, base));
     const pages = [first.items || []];
     const last = Math.min((first.meta && first.meta.lastPage) || 1, 200);
@@ -367,12 +384,14 @@ impl Source for MangaFire {
         let page = format!("{BASE}/title/{manga_id}");
         let hid = manga_id.split('-').next().unwrap_or("");
         if !hid.is_empty() && hid.chars().all(|c| c.is_ascii_alphanumeric()) {
-            if let Ok(v) = solver.eval_json(&page, &api_chapters_js(hid)).await {
-                if let Some(items) = v.get("items").and_then(Value::as_array) {
-                    let list = parse_chapter_items(manga_id, items);
-                    if !list.is_empty() {
-                        return Ok(list);
-                    }
+            // The preferred chapter language first; a title with none in it lists another.
+            for lang in language_order(crate::source::chapter_language().as_deref()) {
+                let Ok(v) = solver.eval_json(&page, &api_chapters_js_in(hid, lang)).await else { break };
+                let Some(items) = v.get("items").and_then(Value::as_array) else { break };
+                let mut list = parse_chapter_items(manga_id, items);
+                if !list.is_empty() {
+                    list.iter_mut().for_each(|c| c.language = lang.into());
+                    return Ok(list);
                 }
             }
         }

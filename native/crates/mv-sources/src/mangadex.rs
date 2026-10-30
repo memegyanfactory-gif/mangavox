@@ -44,6 +44,38 @@ impl MangaDex {
         self.ctx.fetch_json(ID, &format!("{API}{path}"), &opts).await
     }
 
+    /// Every readable chapter of a title, in `lang` or any language. 500 per page; external-only
+    /// chapters (externalUrl, pages = 0) cannot be read in-app.
+    async fn feed(&self, manga_id: &str, lang: Option<&str>) -> Result<Vec<Value>> {
+        const PAGE_SIZE: usize = 500;
+        let mut all: Vec<Value> = Vec::new();
+        let mut offset = 0usize;
+        let mut total = usize::MAX;
+        while offset < total && offset < 20_000 {
+            let mut q = vec![
+                ("limit".to_string(), PAGE_SIZE.to_string()),
+                ("offset".to_string(), offset.to_string()),
+                ("order[volume]".into(), "asc".into()),
+                ("order[chapter]".into(), "asc".into()),
+                ("includes[]".into(), "scanlation_group".into()),
+                ("includeExternalUrl".into(), "0".into()),
+            ];
+            if let Some(l) = lang {
+                q.push(("translatedLanguage[]".into(), l.into()));
+            }
+            q.extend(RATINGS.iter().map(|r| ("contentRating[]".to_string(), r.to_string())));
+            let json = self.json(q, &format!("/manga/{manga_id}/feed")).await?;
+            let data = json.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+            total = json.get("total").and_then(Value::as_u64).map(|t| t as usize).unwrap_or(offset + data.len());
+            if data.is_empty() {
+                break;
+            }
+            offset += data.len();
+            all.extend(data);
+        }
+        Ok(all)
+    }
+
     async fn manga_list(&self, q: ListQuery) -> Result<Vec<MangaSearchResult>> {
         let json = self.json(list_query(&q), "/manga").await?;
         let items = parse_manga_list(&json);
@@ -54,20 +86,23 @@ impl MangaDex {
         }
     }
 
-    /// Drop titles whose English chapters are all external (unreadable in-app). Fails open.
+    /// Drop titles with no chapter readable in-app in the preferred chapter language (all
+    /// external, or none at all). Fails open.
     async fn filter_readable(&self, items: Vec<MangaSearchResult>) -> Vec<MangaSearchResult> {
         let ids: Vec<String> = items.iter().map(|i| i.source_id.clone()).collect();
+        let lang = crate::source::chapter_language();
         let keep: Vec<bool> = stream::iter(ids)
-            .map(|id| async move {
-                let mut q = vec![
-                    ("limit".to_string(), "1".to_string()),
-                    ("includeExternalUrl".to_string(), "0".to_string()),
-                    ("translatedLanguage[]".to_string(), "en".to_string()),
-                ];
+            .map(|id| {
+                let mut q = vec![("limit".to_string(), "1".to_string()), ("includeExternalUrl".to_string(), "0".to_string())];
+                if let Some(l) = &lang {
+                    q.push(("translatedLanguage[]".to_string(), l.clone()));
+                }
                 q.extend(RATINGS.iter().map(|r| ("contentRating[]".to_string(), r.to_string())));
-                match self.json(q, &format!("/manga/{id}/feed")).await {
-                    Ok(j) => j.get("total").and_then(Value::as_i64) != Some(0),
-                    Err(_) => true,
+                async move {
+                    match self.json(q, &format!("/manga/{id}/feed")).await {
+                        Ok(j) => j.get("total").and_then(Value::as_i64) != Some(0),
+                        Err(_) => true,
+                    }
                 }
             })
             .buffered(4)
@@ -161,31 +196,11 @@ impl Source for MangaDex {
     }
 
     async fn get_chapter_list(&self, manga_id: &str) -> Result<Vec<ChapterInfo>> {
-        // 500 per page. External-only chapters (externalUrl, pages = 0) cannot be read in-app.
-        const PAGE_SIZE: usize = 500;
-        let mut all: Vec<Value> = Vec::new();
-        let mut offset = 0usize;
-        let mut total = usize::MAX;
-        while offset < total && offset < 20_000 {
-            let mut q = vec![
-                ("limit".to_string(), PAGE_SIZE.to_string()),
-                ("offset".to_string(), offset.to_string()),
-                ("translatedLanguage[]".into(), "en".into()),
-                ("order[volume]".into(), "asc".into()),
-                ("order[chapter]".into(), "asc".into()),
-                ("includes[]".into(), "scanlation_group".into()),
-                ("includeExternalUrl".into(), "0".into()),
-            ];
-            q.extend(RATINGS.iter().map(|r| ("contentRating[]".to_string(), r.to_string())));
-            let json = self.json(q, &format!("/manga/{manga_id}/feed")).await?;
-            let data = json.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
-            total = json.get("total").and_then(Value::as_u64).map(|t| t as usize).unwrap_or(offset + data.len());
-            if data.is_empty() {
-                break;
-            }
-            offset += data.len();
-            all.extend(data);
-        }
+        // The preferred chapter language first; a title translated only into other languages
+        // (e.g. Polish alone) lists those instead of nothing.
+        let lang = crate::source::chapter_language();
+        let all = self.feed(manga_id, lang.as_deref()).await?;
+        let all = if all.is_empty() && lang.is_some() { self.feed(manga_id, None).await? } else { all };
         Ok(build_chapter_list(&all))
     }
 

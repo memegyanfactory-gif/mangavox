@@ -49,6 +49,22 @@ impl Comick {
         let opts = Opts::new().header("Accept", "application/json").referer(format!("{WEB}/"));
         self.ctx.fetch_json(ID, &url, &opts).await
     }
+
+    /// Every chapter of a title, in `lang` or any language (300 per page).
+    async fn chapters(&self, manga_id: &str, lang: Option<&str>) -> Result<Vec<Value>> {
+        let filter = lang.map(|l| format!("lang={}&", crate::util::encode_component(l))).unwrap_or_default();
+        let mut raw: Vec<Value> = Vec::new();
+        for page in 1..40 {
+            let j = self.api(&format!("comic/{manga_id}/chapters?{filter}limit=300&page={page}&chap-order=1")).await?;
+            let chapters = j.get("chapters").and_then(Value::as_array).cloned().unwrap_or_default();
+            let n = chapters.len();
+            raw.extend(chapters);
+            if n < 300 {
+                break;
+            }
+        }
+        Ok(raw)
+    }
 }
 
 fn cover_of(c: &Value) -> Option<String> {
@@ -255,16 +271,10 @@ impl Source for Comick {
     }
 
     async fn get_chapter_list(&self, manga_id: &str) -> Result<Vec<ChapterInfo>> {
-        let mut raw: Vec<Value> = Vec::new();
-        for page in 1..40 {
-            let j = self.api(&format!("comic/{manga_id}/chapters?lang=en&limit=300&page={page}&chap-order=1")).await?;
-            let chapters = j.get("chapters").and_then(Value::as_array).cloned().unwrap_or_default();
-            let n = chapters.len();
-            raw.extend(chapters);
-            if n < 300 {
-                break;
-            }
-        }
+        // The preferred chapter language first, every language when it has none.
+        let lang = crate::source::chapter_language();
+        let raw = self.chapters(manga_id, lang.as_deref()).await?;
+        let raw = if raw.is_empty() && lang.is_some() { self.chapters(manga_id, None).await? } else { raw };
         Ok(build_chapter_list(&raw))
     }
 
