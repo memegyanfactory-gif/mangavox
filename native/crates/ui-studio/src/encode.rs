@@ -175,9 +175,18 @@ fn s(v: &[&str]) -> Vec<String> {
 /// encoder, rate control, audio and `+faststart`. Add `-af loudnorm_filter(..)` and the output path
 /// yourself.
 pub fn preset_args(preset: Preset, quality: Quality, enc: &Encoders) -> Vec<String> {
+    let mut a = s(&["-vf", preset.scale()]);
+    a.extend(video_codec_args(preset, quality, enc));
+    a.extend(s(&["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]));
+    a
+}
+
+/// Only the video encoder's arguments of [`preset_args`] (codec, rate control, tag and pixel
+/// format), for an export that brings its own filters and audio.
+pub fn video_codec_args(preset: Preset, quality: Quality, enc: &Encoders) -> Vec<String> {
     let encoder = enc.pick(preset.wants_hevc());
     let q = quality.idx();
-    let mut a = s(&["-vf", preset.scale(), "-c:v", encoder.name()]);
+    let mut a = s(&["-c:v", encoder.name()]);
     let ten_bit = preset == Preset::Youtube4k && encoder.is_hevc();
     let mbit = preset.bitrate_m();
     match encoder {
@@ -221,8 +230,17 @@ pub fn preset_args(preset: Preset, quality: Quality, enc: &Encoders) -> Vec<Stri
         (Encoder::Libx265, true) => a.extend(s(&["-profile:v", "main10", "-pix_fmt", "yuv420p10le"])),
         _ => a.extend(s(&["-pix_fmt", "yuv420p"])),
     }
-    a.extend(s(&["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]));
     a
+}
+
+/// The encoders an export may use: everything detected, or only the software ones.
+pub fn usable(gpu: bool) -> Encoders {
+    let all = detect_encoders();
+    if gpu {
+        all.clone()
+    } else {
+        Encoders { available: all.available.iter().copied().filter(|e| !e.is_gpu()).collect() }
+    }
 }
 
 /// EBU R128 loudness normalisation to `lufs` (YouTube plays at -14), true peak -1.5 dB.
@@ -298,5 +316,13 @@ mod tests {
         assert!(gpu().has_hevc() && !cpu().has_hevc());
         assert_eq!(Preset::ALL.len(), 4);
         assert!(!Preset::Shorts.label().is_empty());
+    }
+
+    #[test]
+    fn codec_args_leave_filters_and_audio_out() {
+        let v = video_codec_args(Preset::Youtube1080, Quality::High, &gpu());
+        assert_eq!(&v[..2], ["-c:v", "h264_nvenc"]);
+        assert!(!v.iter().any(|a| a == "-vf" || a == "-c:a" || a == "+faststart"));
+        assert!(has(&v, ["-pix_fmt", "yuv420p"]));
     }
 }

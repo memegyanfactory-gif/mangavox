@@ -39,6 +39,15 @@ pub enum Command {
     VolumeUp,
     DefaultTransition,
     Export,
+    SelectTool,
+    RazorTool,
+    ToggleSnap,
+    ZoomIn,
+    ZoomOut,
+    ZoomFit,
+    PrevChapter,
+    NextChapter,
+    Shortcuts,
 }
 
 /// One row of the command table.
@@ -89,7 +98,33 @@ pub const COMMANDS: &[Entry] = &[
     e!(VolumeUp, "volume_up", "Volume up 1 dB", "Audio", ["]"]),
     e!(DefaultTransition, "default_transition", "Apply default transition", "Editing", ["ctrl-d"]),
     e!(Export, "export", "Export", "File", ["ctrl-m"]),
+    e!(SelectTool, "select_tool", "Selection tool", "Tools", ["v"]),
+    e!(RazorTool, "razor_tool", "Razor tool", "Tools", ["c"]),
+    e!(ToggleSnap, "toggle_snap", "Snap on / off (hold Shift to invert while dragging)", "Tools", ["s"]),
+    e!(ZoomIn, "zoom_in", "Zoom in", "View", ["=", "shift-="]),
+    e!(ZoomOut, "zoom_out", "Zoom out", "View", ["-"]),
+    e!(ZoomFit, "zoom_fit", "Zoom to the whole sequence", "View", ["\\"]),
+    e!(PrevChapter, "prev_chapter", "Previous chapter (All chapters)", "View", ["pageup"]),
+    e!(NextChapter, "next_chapter", "Next chapter (All chapters)", "View", ["pagedown"]),
+    e!(Shortcuts, "shortcuts", "Keyboard shortcuts", "View", ["shift-/"]),
 ];
+
+/// The keystroke a key event makes, in the table's form (`ctrl-shift-z`). A typed `?` (some
+/// layouts report it unshifted) counts as `shift-/`.
+pub fn stroke_of(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> String {
+    if key == "?" {
+        return "shift-/".into();
+    }
+    let mut s = String::new();
+    for (on, m) in [(ctrl || cmd, "ctrl"), (alt, "alt"), (shift, "shift")] {
+        if on {
+            s.push_str(m);
+            s.push('-');
+        }
+    }
+    s.push_str(&key.to_lowercase());
+    normalize(&s)
+}
 
 /// Playback speed for the `n`th consecutive J or L press: 1x, 2x, 4x, then 8x.
 pub fn shuttle_speed(presses: u32) -> f32 {
@@ -293,6 +328,23 @@ mod tests {
         let back = load_overrides_from(&p);
         assert_eq!(back.len(), 1);
         assert_eq!(Keymap::new(&back).lookup("ctrl-u"), Some(Command::Undo));
+    }
+
+    #[test]
+    fn key_events_map_to_commands() {
+        let k = Keymap::defaults();
+        let look = |key: &str, ctrl, alt, shift| k.lookup(&stroke_of(key, ctrl, alt, shift, false));
+        assert_eq!(look("k", true, false, false), Some(Command::Split));
+        assert_eq!(look("K", false, false, false), Some(Command::ShuttlePause));
+        assert_eq!(look("delete", false, false, true), Some(Command::RippleDelete));
+        assert_eq!(look("z", true, false, true), Some(Command::Redo));
+        assert_eq!(look("left", false, true, false), Some(Command::NudgeLeft));
+        assert_eq!(look("s", false, false, false), Some(Command::ToggleSnap));
+        assert_eq!(look("?", false, false, true), Some(Command::Shortcuts));
+        assert_eq!(look("/", false, false, true), Some(Command::Shortcuts));
+        assert_eq!(look("-", false, false, false), Some(Command::ZoomOut));
+        assert_eq!(look("\\", false, false, false), Some(Command::ZoomFit));
+        assert_eq!(k.lookup(&stroke_of("m", true, false, false, true)), Some(Command::Export));
     }
 
     #[test]

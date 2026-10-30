@@ -34,6 +34,7 @@ mod vedit_keys;
 mod vedit_media;
 mod vedit_manga;
 mod vedit_play;
+mod vedit_tl;
 mod vedit_tools;
 mod vedit_view;
 pub mod video;

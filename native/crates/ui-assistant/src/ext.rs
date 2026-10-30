@@ -23,6 +23,20 @@ pub trait ToolProvider: Send + Sync + 'static {
 }
 
 static PROVIDERS: RwLock<Vec<(&'static str, Arc<dyn ToolProvider>)>> = RwLock::new(Vec::new());
+/// The chat turn running now: a number that changes every turn, and the user's message.
+static TURN: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
+static TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The chat turn whose tools are running (so a provider can fold one turn's edits into one undo
+/// step, labelled with what was asked). Set when a turn starts; the last turn stays until the next.
+pub fn current_turn() -> Option<(u64, String)> {
+    TURN.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub(crate) fn begin_turn(prompt: &str) {
+    let n = TURNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    *TURN.lock().unwrap_or_else(|e| e.into_inner()) = Some((n, prompt.to_string()));
+}
 
 /// Adds (or replaces) the provider registered as `id`.
 pub fn register(id: &'static str, provider: Arc<dyn ToolProvider>) {

@@ -33,7 +33,16 @@ pub(crate) fn version() -> u64 {
 }
 
 fn bump() {
+    *TURN.lock().unwrap_or_else(|e| e.into_inner()) = ui_assistant::ext::current_turn();
     VERSION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The chat turn of the last tool edit: its number and what the user asked (the Video mode folds
+/// one turn's edits into one undo step labelled with it).
+static TURN: Mutex<Option<(u64, String)>> = Mutex::new(None);
+
+pub(crate) fn last_turn() -> Option<(u64, String)> {
+    TURN.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 pub(crate) fn set_current(manga: &str, chapter: &str) {

@@ -105,6 +105,16 @@ impl<P: Clone> History<P> {
         true
     }
 
+    /// What Undo would undo.
+    pub fn undo_label(&self) -> Option<&str> {
+        self.can_undo().then(|| self.steps[self.cursor].label.as_str())
+    }
+
+    /// What Redo would redo.
+    pub fn redo_label(&self) -> Option<&str> {
+        self.steps.get(self.cursor + 1).map(|s| s.label.as_str())
+    }
+
     /// Index of the current step; use as the `since` mark before an AI turn.
     pub fn mark(&self) -> usize {
         self.cursor
@@ -234,12 +244,26 @@ mod tests {
         assert!(h.squash_turn(m, "tighten the intro"));
         assert_eq!(h.labels(), ["Open", "AI: tighten the intro"]);
         assert_eq!(h.current(), &p(2));
+        assert_eq!(h.undo_label(), Some("AI: tighten the intro"));
+        assert_eq!(h.redo_label(), None);
+
+        // A turn folded as it goes (one step after every tool call) stays one step.
+        let m2 = h.mark();
+        for v in 10..13 {
+            h.commit("AI: edit", p(v));
+            assert!(h.squash_turn(m2, "AI: \"x\""));
+        }
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.undo().as_deref(), Some("AI: \"x\""));
+        assert_eq!(h.current(), &p(2));
+        assert_eq!(h.redo_label(), Some("AI: \"x\""));
+        assert!(h.redo().is_some());
 
         let m = h.mark();
         h.commit("AI: a", p(3));
         h.commit("Move clip", p(4));
         assert!(!h.squash_turn(m, "x"));
-        assert_eq!(h.len(), 4);
+        assert_eq!(h.len(), 5);
         assert!(!h.squash_turn(h.mark(), "nothing"));
     }
 }
