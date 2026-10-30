@@ -186,6 +186,8 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
         "transition_duration": 0.5,
         "effect": "ken_burns",
     });
+    // The Studio-wide look (preset and effects; see `look`).
+    job.video_config["look"] = crate::look::video_config();
     // The chapter's own score (Music step), when it is on and matches the narration.
     let r = crate::page::chref(ch);
     let music = mv_score::load_settings(&r);
@@ -487,6 +489,7 @@ mod tests {
         assert_eq!(job.video_config["resolution"], "720p");
         assert_eq!(job.video_config["format"], "reels");
         assert!(job.video_config["subtitles"].is_object(), "a render carries the chapter's caption setting");
+        assert!(job.video_config["look"]["preset"].is_string(), "a render carries the Studio look");
         assert_eq!(job.output_dir, PathBuf::from("/lib/m/c1/pipeline"));
         assert!(!job.ollama_url.is_empty());
 
