@@ -24,6 +24,6 @@ pub use icons::{glyphs, icon_ph, ph, ph_icon, Ph, Weight};
 pub use interact::{focus_ring_shadow, interactive, kbd, kbd_label, tip, tip_kbd, IconSrc, Interactive};
 pub use menu::{menu_button, menu_row, overflow_menu, popup_surface, MenuButton, MenuItem, MenuRow};
 pub use motion::{appear, dot_trail, progress_bar, pulse_dot, scan_overlay, shimmer, spinner};
-pub use nav::{back_target, local_back, navigate, set_local_back, Route};
+pub use nav::{back_target, current_route, local_back, navigate, set_local_back, Route};
 pub use theme::{size, Hue, RampExt, Tokens};
 pub use toast::Toast;

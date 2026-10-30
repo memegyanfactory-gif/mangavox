@@ -624,7 +624,7 @@ function viewManga(ctx, id) {
       } catch (e) { toast(e.message, 'err'); refresh.classList.remove('busy'); refresh.disabled = false; }
     } }, icon('refresh'), 'Refresh');
     const list = h('div', { class: 'chlist' });
-    const fillList = () => list.replaceChildren(...(desc ? chs.slice().reverse() : chs).map(c => chRow(c)));
+    const fillList = () => list.replaceChildren(...(desc ? chs.slice().reverse() : chs).map(c => chRow(c, false, () => recapSheet(m, c))));
     const sortLbl = h('span', null, desc ? 'Newest first' : 'Oldest first');
     const sortBtn = h('button', { class: 'sortbtn', type: 'button', 'aria-label': 'Change chapter order', onclick: () => {
       desc = !desc; LS.set('mv.chsort', desc ? 'desc' : 'asc'); sortLbl.textContent = desc ? 'Newest first' : 'Oldest first'; fillList();
@@ -662,10 +662,14 @@ function viewManga(ctx, id) {
   ctx.refresh = load;
   load();
 }
-function chRow(c, current) {
+/** A chapter row. `onRecap` (title page) is called instead of opening the reader when Studio made
+ *  a recap of the chapter, to offer it. */
+function chRow(c, current, onRecap) {
   const pct = Math.round((c.progress || 0) * 100);
   const partial = !c.read && pct > 0 && pct < 100;
-  return h('a', { class: 'chrow' + (c.read ? ' read' : '') + (current ? ' cur' : ''), href: '#/read/' + enc(c.id), 'aria-current': current ? 'true' : null },
+  const rc = c.recap || null;
+  const onclick = rc && (rc.video || rc.aloud) && onRecap ? e => { e.preventDefault(); onRecap(); } : null;
+  return h('a', { class: 'chrow' + (c.read ? ' read' : '') + (current ? ' cur' : ''), href: '#/read/' + enc(c.id), 'aria-current': current ? 'true' : null, onclick },
     h('div', { class: 'chrow-main' },
       h('div', { class: 'chrow-t' }, chLabel(c)),
       h('div', { class: 'chrow-s' }, [current ? 'Reading now' : '', c.pages ? c.pages + ' pages' : '', c.read ? 'Read' : partial ? pct + '% read' : ''].filter(Boolean).join(' · ') || ' '),
@@ -673,15 +677,42 @@ function chRow(c, current) {
     h('div', { class: 'chrow-b' },
       c.read && h('span', { title: 'Read', 'aria-label': 'Read' }, icon('check')),
       c.downloaded && h('span', { title: 'Downloaded', 'aria-label': 'Downloaded' }, icon('download')),
-      c.audio && h('span', { class: 'b-ac', title: 'Narration audio', 'aria-label': 'Has narration audio' }, icon('wave')),
-      c.video && h('span', { class: 'b-ac', title: 'Narrated video', 'aria-label': 'Has narrated video' }, icon('video'))));
+      (c.audio || (rc && rc.aloud)) && h('span', { class: 'b-ac', title: 'Narration audio', 'aria-label': 'Has narration audio' }, icon('wave')),
+      (c.video || (rc && rc.video)) && h('span', { class: 'b-ac', title: 'Narrated video', 'aria-label': 'Has narrated video' }, icon('video'))));
+}
+
+/* Read aloud plays through one shared element: the tap that picks "Read aloud" touches it, which
+   lets iPhones start it after the reader has loaded. */
+const raAudio = new Audio();
+raAudio.preload = 'auto';
+
+/** A chapter Studio made a recap of: watch the video, read along with the narration, or just read. */
+function recapSheet(m, c) {
+  const rc = c.recap || {};
+  const nav = href => { if (sheets.length) location.replace(href); else location.hash = href; };
+  const opt = (ic, title, sub, onclick, primary) => h('button', { class: 'rc-opt' + (primary ? ' primary' : ''), type: 'button', onclick },
+    h('span', { class: 'rc-ic' }, icon(ic)), h('span', { class: 'rc-tx' }, h('b', null, title), h('small', null, sub)), icon('chev'));
+  openSheet(p => {
+    p.append(h('div', { class: 'grip', 'aria-hidden': 'true' }),
+      h('h2', { class: 'sheet-h' }, chLabel(c)),
+      h('p', { class: 'muted small rc-lead' }, 'Studio made a recap of this chapter.'),
+      rc.aloud && opt('headphones', 'Read aloud', 'Hear the narration while the pages scroll along', () => {
+        try { raAudio.load(); } catch { /* best effort */ }
+        nav('#/read/' + enc(c.id) + '?aloud=1');
+      }, true),
+      rc.video && opt('video', 'Watch recap video', 'Play the narrated recap on this phone', () => {
+        startWatch({ kind: 'recap', chapter: c.id, manga: m.id, title: m.title, ept: 'Recap · ' + chLabel(c), bg: m.cover });
+      }, !rc.aloud),
+      opt('book', 'Read', 'Open the chapter in the reader', () => nav('#/read/' + enc(c.id))));
+  }, { label: 'Recap of ' + chLabel(c) });
 }
 
 /* ======================================================================
    Reader: vertical (webtoon) scroll or one page at a time
    ====================================================================== */
 let readerJump = null; // { id, page | 'last' } for the next reader render
-async function viewReader(ctx, chId) {
+async function viewReader(ctx, chId, q) {
+  const wantAloud = !!q && q.get('aloud') === '1';
   document.documentElement.classList.add('reading');
   ctx.onLeave(() => document.documentElement.classList.remove('reading'));
   const root = h('div', { class: 'reader' }, spinner('Loading chapter'));
@@ -720,9 +751,13 @@ async function viewReader(ctx, chId) {
   const prevBtn = iconBtn('prev', 'Previous chapter', () => go(ch.prev));
   const nextBtn = iconBtn('next', 'Next chapter', () => go(ch.next));
   prevBtn.disabled = ch.prev == null; nextBtn.disabled = ch.next == null;
+  let ra = null; // the read-aloud controller while narration is on
+  const aloudBtn = iconBtn('headphones', 'Read aloud', () => { if (ra) ra.close(); else startAloud(); });
+  aloudBtn.hidden = true;
   const top = h('div', { class: 'r-ov r-top' },
     iconBtn('back', 'Back to chapters', () => goBack(mangaHref)),
     h('div', { class: 'r-ttl' }, h('b', null, chLabel(ch)), ttlS),
+    aloudBtn,
     ch.manga_id != null && iconBtn('list', 'Chapters', () => chaptersSheet()),
     iconBtn('settings', 'Reading settings', () => settingsSheet()));
   const bot = h('div', { class: 'r-ov r-bot' }, prevBtn, slider, pgLbl, nextBtn);
@@ -741,9 +776,15 @@ async function viewReader(ctx, chId) {
   };
   ctx.onLeave(() => clearTimeout(hideT));
 
-  if (!ttlS.textContent && ch.manga_id != null) {
-    getManga(ch.manga_id).then(m => { if (ctx.alive && m && m.title) ttlS.textContent = m.title; }).catch(() => {});
-  }
+  // The title, and whether this chapter has a narration to read along with.
+  const fromManga = m => {
+    if (!ctx.alive || !m) return;
+    if (!ttlS.textContent && m.title) ttlS.textContent = m.title;
+    const c = arr(m.chapters).find(x => String(x.id) === String(chId));
+    if (c && c.recap && c.recap.aloud) aloudBtn.hidden = false;
+  };
+  if (hit) fromManga(hit.data);
+  else if (ch.manga_id != null) getManga(ch.manga_id).then(fromManga).catch(() => {});
 
   // ----- progress -----
   let sliding = false, saveT = null, saved = cur, preloaded = false;
@@ -789,7 +830,7 @@ async function viewReader(ctx, chId) {
 
   root.addEventListener('click', e => {
     if (e.target.closest('.r-ov')) { showOv(true); return; }
-    if (e.target.closest('button, a, input')) return;
+    if (e.target.closest('button, a, input, .ra')) return;
     if (engine.swallow && engine.swallow()) return;
     const x = e.clientX / innerWidth, y = e.clientY / innerHeight;
     if (paged) {
@@ -797,6 +838,7 @@ async function viewReader(ctx, chId) {
       if (x > 0.7) { showOv(false); rtl ? engine.prev() : engine.next(); return; }
     } else if (y < 0.2 || y > 0.8) {
       showOv(false);
+      if (ra) ra.nudge();
       scrollBy({ top: (y < 0.2 ? -1 : 1) * innerHeight * 0.8, behavior: 'smooth' });
       return;
     }
@@ -813,7 +855,12 @@ async function viewReader(ctx, chId) {
   ctx.onLeave(() => document.removeEventListener('keydown', onKey));
 
   slider.addEventListener('input', () => { sliding = true; pgLbl.textContent = slider.value + ' / ' + n; setRange(slider); showOv(true); });
-  slider.addEventListener('change', () => { sliding = false; engine.goTo((+slider.value || 1) - 1); });
+  slider.addEventListener('change', () => {
+    sliding = false;
+    const i = (+slider.value || 1) - 1;
+    engine.goTo(i);
+    if (ra) ra.userPage(i);
+  });
 
   const wl = wakeLock();
   wl.on();
@@ -824,6 +871,7 @@ async function viewReader(ctx, chId) {
   updateUi();
   showOv(true);
   engine.start();
+  if (wantAloud && n) startAloud();
 
   // ----- engines -----
   function verticalEngine() {
@@ -884,6 +932,7 @@ async function viewReader(ctx, chId) {
     ctx.onLeave(() => { removeEventListener('scroll', onScroll); cancelAnimationFrame(raf); });
     return {
       els: [list, end],
+      slot: i => slots[i] || null,
       start() {
         if (!n) return;
         for (let k = cur; k <= cur + 3; k++) load(k);
@@ -894,8 +943,8 @@ async function viewReader(ctx, chId) {
         slots[i] && slots[i].scrollIntoView({ block: 'start' });
         setCur(i);
       },
-      next() { scrollBy({ top: innerHeight * 0.8, behavior: 'smooth' }); },
-      prev() { scrollBy({ top: -innerHeight * 0.8, behavior: 'smooth' }); },
+      next() { if (ra) ra.nudge(); scrollBy({ top: innerHeight * 0.8, behavior: 'smooth' }); },
+      prev() { if (ra) ra.nudge(); scrollBy({ top: -innerHeight * 0.8, behavior: 'smooth' }); },
     };
   }
 
@@ -950,10 +999,250 @@ async function viewReader(ctx, chId) {
       swallow: () => swiped,
       start() { if (n) show(cur); },
       goTo(i) { show(i); },
-      next() { if (shown < n) show(shown + 1, 'next'); else if (ch.next != null) go(ch.next); },
-      prev() { if (shown > 0) show(shown - 1, 'prev'); else if (ch.prev != null) go(ch.prev, 'last'); },
+      // Flipping pages by hand also moves the narration to the page.
+      next() { if (shown < n) { show(shown + 1, 'next'); if (ra && shown < n) ra.userPage(shown); } else if (ch.next != null) go(ch.next); },
+      prev() { if (shown > 0) { show(shown - 1, 'prev'); if (ra) ra.userPage(shown); } else if (ch.prev != null) go(ch.prev, 'last'); },
     };
     return api2;
+  }
+
+  // ----- read aloud: the chapter's Studio narration, with the reader following along -----
+  async function startAloud() {
+    if (ra || aloudBtn.classList.contains('busy')) return;
+    aloudBtn.hidden = false;
+    aloudBtn.classList.add('busy');
+    let rc = null;
+    try { rc = await api('/api/chapter/' + enc(chId) + '/recap'); }
+    catch (e) { if (ctx.alive && e.status !== 401) toast(e.status === 404 ? 'This chapter has no narration yet' : e.message, 'err'); }
+    aloudBtn.classList.remove('busy');
+    if (!ctx.alive || ra || !rc) return;
+    if (!rc.aloud || !arr(rc.clips).length || !arr(rc.beats).length) { toast('This chapter has no narration yet', 'err'); return; }
+    ra = readAloud(rc);
+  }
+
+  /** Plays the narration clips back to back as one timeline and keeps the passage being read on
+   *  screen (the PC reader's `recap::Narration::focus` and `recap::scroll_target`, ported). Scrolling
+   *  by hand stops following until ~6 s without touching, or "Back to narration". */
+  function readAloud(rc) {
+    const beats = arr(rc.beats).slice().sort((a, b) => a.start_ms - b.start_ms);
+    const clips = arr(rc.clips).slice().sort((a, b) => a.start_ms - b.start_ms);
+    const total = Math.max(+rc.total_ms || 0, clips[clips.length - 1].end_ms, beats[beats.length - 1].end_ms);
+    const key = 'mv.aloud.' + chId;
+    const audio = raAudio;
+    const next = new Audio(); // warms the next clip
+    next.preload = 'auto';
+    const sig = new AbortController();
+    const on = (t, ev, f, o) => t.addEventListener(ev, f, { ...o, signal: sig.signal });
+    let ci = -1, pending = null, follow = true, lastUser = 0, raf = 0, lastTs = 0, fy = scrollY;
+    let shownBeat = -1, shownSec = -1, lastSave = 0, done = false, snap = true;
+
+    // ----- timeline (ms) -----
+    const pos = () => {
+      if (ci < 0) return 0;
+      const t = pending != null ? pending : audio.currentTime || 0;
+      return Math.min(total, clips[ci].start_ms + t * 1000);
+    };
+    const beatAt = ms => { let lo = 0, hi = beats.length - 1, k = 0; while (lo <= hi) { const mid = (lo + hi) >> 1; if (beats[mid].start_ms <= ms) { k = mid; lo = mid + 1; } else hi = mid - 1; } return k; };
+    const frac = (t, a, z) => (z > a ? (clamp(t, a, z) - a) / (z - a) : 0);
+    const whole = (x, page) => x.page === page && x.y0 <= 0 && x.y1 >= 1;
+    function focus(ms) {
+      const i = beatAt(ms), b = beats[i];
+      if (b.y0 > 0 || b.y1 < 1) return { page: b.page, y: b.y0 + (b.y1 - b.y0) * frac(ms, b.start_ms, b.end_ms) };
+      // Whole-page passages run down the page together, like someone reading along.
+      let a = i, z = i;
+      while (a > 0 && whole(beats[a - 1], b.page)) a--;
+      while (z + 1 < beats.length && whole(beats[z + 1], b.page)) z++;
+      return { page: b.page, y: frac(ms, beats[a].start_ms, beats[z].end_ms) };
+    }
+    /** Where narration of a reader page starts (or of the next narrated page after it). */
+    function pageStart(p) {
+      let best = null;
+      for (const b of beats) if (b.page >= p && (!best || b.page < best.page || (b.page === best.page && b.start_ms < best.start_ms))) best = b;
+      return best ? best.start_ms : null;
+    }
+    function scrollTarget(top, ph, vh, f) {
+      if (ph <= vh) return top - (vh - ph) / 2;
+      return clamp(top + ph * clamp(f, 0, 1) - vh * 0.4, top, top + ph - vh);
+    }
+
+    // ----- mini player -----
+    const playBtn = h('button', { class: 'icon-btn ra-play', type: 'button', 'aria-label': 'Play', onclick: () => toggle() }, icon('play'));
+    const cap = h('div', { class: 'ra-cap' }, beats[0].text || 'Narration');
+    const time = h('div', { class: 'ra-time' }, '0:00 / ' + fmtTime(total / 1000));
+    const bar = h('i');
+    const pills = h('div', { class: 'ra-pills', hidden: true },
+      h('button', { class: 'wp-pill', type: 'button', onclick: () => attach() }, icon('headphones'), 'Back to narration'),
+      h('button', { class: 'wp-pill', type: 'button', onclick: () => fromHere() }, icon('play'), 'Read from here'));
+    const el = h('div', { class: 'ra', role: 'region', 'aria-label': 'Read aloud' }, pills,
+      h('div', { class: 'ra-prog', 'aria-hidden': 'true' }, bar),
+      h('div', { class: 'ra-row' }, playBtn, h('div', { class: 'ra-info' }, cap, time), iconBtn('close', 'Stop reading aloud', () => close())));
+    root.append(el);
+    root.classList.add('aloud');
+    aloudBtn.classList.add('on');
+    aloudBtn.setAttribute('aria-pressed', 'true');
+    if (Player) Player.pause();
+
+    function setIcon() {
+      const playing = !audio.paused;
+      playBtn.replaceChildren(icon(playing ? 'pause' : done ? 'rotl' : 'play'));
+      playBtn.setAttribute('aria-label', playing ? 'Pause' : done ? 'Read again' : 'Play');
+      try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = playing ? 'playing' : 'paused'; } catch { /* ignore */ }
+    }
+    function save(force) {
+      const now = Date.now();
+      if (!force && now - lastSave < 5000) return;
+      lastSave = now;
+      const ms = pos();
+      if (done || ms < 3000 || ms > total - 3000) LS.del(key); else LS.set(key, Math.floor(ms));
+    }
+
+    // ----- playback -----
+    function load(i, off, play) {
+      ci = i; pending = off > 0.05 ? off : null;
+      audio.src = clips[i].url;
+      if (play) audio.play().catch(blocked);
+      const nx = clips[i + 1];
+      if (nx) { next.src = nx.url; try { next.load(); } catch { /* ignore */ } }
+    }
+    function blocked(e) {
+      if (!ctx.alive || !e || e.name !== 'NotAllowedError') return;
+      setIcon();
+      toast('Tap play to start reading aloud', 'info', 3200);
+    }
+    function seek(ms, play) {
+      ms = clamp(ms, 0, Math.max(0, total - 1));
+      done = false;
+      let i = clips.findIndex(c => c.end_ms > ms);
+      if (i < 0) i = clips.length - 1;
+      const off = Math.max(0, (ms - clips[i].start_ms) / 1000);
+      if (i === ci && pending == null && audio.readyState >= 1) {
+        audio.currentTime = off;
+        if (play && audio.paused) audio.play().catch(blocked);
+      } else load(i, off, play);
+      snap = true;
+      setIcon();
+    }
+    function toggle() {
+      if (audio.paused) {
+        if (ci < 0 || done) seek(done ? 0 : pos(), true);
+        else audio.play().catch(e => { blocked(e); if (e && e.name !== 'NotAllowedError') toast('Can’t play: ' + e.message, 'err'); });
+      } else audio.pause();
+    }
+    on(audio, 'loadedmetadata', () => { if (pending != null) { try { audio.currentTime = pending; } catch { /* ignore */ } pending = null; } });
+    on(audio, 'play', setIcon);
+    on(audio, 'pause', () => { setIcon(); save(true); });
+    on(audio, 'ended', () => {
+      if (ci + 1 < clips.length) { load(ci + 1, 0, true); return; }
+      done = true; follow = true; pills.hidden = true;
+      cap.textContent = 'End of the narration';
+      save(true); setIcon();
+    });
+    on(audio, 'error', () => { if (ctx.alive && audio.getAttribute('src')) { toast('Couldn’t play the narration', 'err'); setIcon(); } });
+
+    // ----- following -----
+    function attach() { follow = true; pills.hidden = true; fy = scrollY; snap = true; }
+    function detach() { if (paged || !follow) return; follow = false; pills.hidden = false; }
+    function nudge() { lastUser = performance.now(); detach(); }
+    function fromHere() {
+      const ms = pageStart(cur);
+      if (ms == null) { toast('The narration ends before this page', 'info'); return; }
+      seek(ms, true);
+      attach();
+    }
+    function userPage(i) {
+      const ms = pageStart(i);
+      if (ms == null) { audio.pause(); return; }
+      seek(ms, !audio.paused);
+      attach();
+    }
+    const userKeys = ['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End', ' '];
+    on(window, 'touchmove', e => { if (!sheets.length && !el.contains(e.target)) nudge(); }, { passive: true });
+    on(window, 'wheel', () => { if (!sheets.length) nudge(); }, { passive: true });
+    on(window, 'keydown', e => { if (!paged && userKeys.includes(e.key) && !(e.target.closest && e.target.closest('input'))) nudge(); });
+    // Momentum after the finger lifts still counts as the reader's own scrolling.
+    on(window, 'scroll', () => { if (!follow) lastUser = performance.now(); }, { passive: true });
+
+    function followTo(ms, dt) {
+      const f = focus(ms);
+      if (paged) { if (f.page !== cur) engine.goTo(f.page); return; }
+      const s = engine.slot && engine.slot(f.page);
+      if (!s) return;
+      const r = s.getBoundingClientRect();
+      const vh = innerHeight - el.offsetHeight - 12;
+      const max = Math.max(0, document.documentElement.scrollHeight - innerHeight);
+      const target = clamp(scrollTarget(r.top + scrollY, r.height, vh, f.y), 0, max);
+      // Something else moved the page (an image above it loaded): start from where it is.
+      if (Math.abs(scrollY - fy) > 3) fy = scrollY;
+      // Long jumps go straight there instead of gliding past every page in between.
+      if (snap && Math.abs(target - fy) > innerHeight * 2.5) fy = target;
+      else {
+        const k = 1 - Math.exp(-dt * 5);
+        fy += (target - fy) * k;
+        if (Math.abs(target - fy) < 0.5) fy = target;
+      }
+      snap = false;
+      if (Math.abs(fy - scrollY) >= 0.5) scrollTo({ top: fy, behavior: 'instant' });
+    }
+    function tick(ts) {
+      raf = requestAnimationFrame(tick);
+      const dt = lastTs ? Math.min(0.1, (ts - lastTs) / 1000) : 1 / 60;
+      lastTs = ts;
+      const ms = pos();
+      const sec = Math.floor(ms / 1000);
+      if (sec !== shownSec) {
+        shownSec = sec;
+        time.textContent = fmtTime(sec) + ' / ' + fmtTime(total / 1000);
+        bar.style.width = (total ? clamp(ms / total, 0, 1) * 100 : 0) + '%';
+      }
+      const b = beatAt(ms);
+      if (b !== shownBeat && !done) { shownBeat = b; cap.textContent = beats[b].text || '…'; }
+      const playing = !audio.paused;
+      if (!follow && playing && performance.now() - lastUser > 6000) attach();
+      if (follow && (playing || snap)) followTo(ms, dt);
+      if (playing) save(false);
+    }
+    raf = requestAnimationFrame(tick);
+
+    // ----- lock screen -----
+    if ('mediaSession' in navigator) {
+      const ms = navigator.mediaSession;
+      try {
+        const m = mangaKey && cache.get(mangaKey);
+        const cov = m && m.data.cover ? new URL(m.data.cover, location.href).href : new URL('/icon-512.png', location.href).href;
+        ms.metadata = new MediaMetadata({ title: chLabel(ch), artist: ttlS.textContent || 'MangaVox', album: 'Read aloud', artwork: [{ src: cov, sizes: '512x512' }] });
+      } catch { /* unsupported */ }
+      const set = (a, f) => { try { ms.setActionHandler(a, f); } catch { /* unsupported */ } };
+      set('play', () => toggle());
+      set('pause', () => audio.pause());
+      set('seekbackward', () => seek(pos() - 10000, !audio.paused));
+      set('seekforward', () => seek(pos() + 10000, !audio.paused));
+      set('seekto', d => { if (d && isFinite(d.seekTime)) seek(d.seekTime * 1000, !audio.paused); });
+      set('previoustrack', null);
+      set('nexttrack', null);
+    }
+
+    function close() {
+      if (sig.signal.aborted) return;
+      save(true);
+      sig.abort();
+      cancelAnimationFrame(raf);
+      audio.pause(); audio.removeAttribute('src'); audio.load();
+      next.removeAttribute('src');
+      el.remove();
+      root.classList.remove('aloud');
+      aloudBtn.classList.remove('on');
+      aloudBtn.removeAttribute('aria-pressed');
+      if (ra === api3) ra = null;
+      if (Player) Player.bindSession();
+    }
+    ctx.onLeave(close);
+
+    // Pick up where the narration was left, else from the page on screen.
+    const saved = +LS.get(key, 0) || 0;
+    const startMs = saved > 3000 && saved < total - 3000 ? saved : cur > 0 ? pageStart(cur) || 0 : 0;
+    seek(startMs, true);
+    const api3 = { close, nudge, userPage };
+    return api3;
   }
 
   // ----- sheets -----
@@ -1717,20 +2006,23 @@ function openAnime(it) {
 function viewWatch(ctx, q) {
   const P = {};
   for (const [k, v] of q) P[k] = v;
-  const kind = ['movie', 'series', 'anime'].includes(P.kind) ? P.kind : 'movie';
+  const kind = ['movie', 'series', 'anime', 'recap'].includes(P.kind) ? P.kind : 'movie';
+  // A chapter's Studio recap: a file on the PC, so no sources, "Play on PC" or watch history.
+  const recap = kind === 'recap';
   const season = P.season ? +P.season : null, episode = P.episode ? +P.episode : null;
   const epLabel = kind === 'series' && season != null && episode != null ? 'S' + season + ' · E' + episode : kind === 'anime' && episode != null ? 'Episode ' + episode : '';
-  const fallback = kind === 'anime' ? '#/anime' : '#/movies';
+  const fallback = recap ? (P.manga ? '#/manga/' + enc(P.manga) : '#/library') : kind === 'anime' ? '#/anime' : '#/movies';
+  const recapKey = posKey('recap.' + (P.chapter || ''));
   setTitle(P.title || 'Watch');
   if (Player) Player.pause();
 
   const v = h('video', { playsinline: true, 'webkit-playsinline': true, preload: 'auto', 'x-webkit-airplay': 'allow', 'aria-label': P.title || 'Video' });
   const subsEl = h('div', { class: 'wp-subs', 'aria-live': 'off' });
   const gest = h('div', { class: 'wp-gest' });
-  const loadT = h('b', null, 'Finding the best source…');
+  const loadT = h('b', null, recap ? 'Opening the recap…' : 'Finding the best source…');
   const loadS = h('span');
   const loadPc = h('button', { class: 'btn glass sm', type: 'button', hidden: true, onclick: () => fallbackPc() }, icon('pc'), 'Play on PC instead');
-  const loader = h('div', { class: 'wp-load', role: 'status' }, h('div', { class: 'spin-ring' }), loadT, loadS, loadPc);
+  const loader = h('div', { class: 'wp-load', role: 'status' }, h('div', { class: 'spin-ring' }), loadT, loadS, !recap && loadPc);
   const msg = h('div', { class: 'wp-msg', hidden: true });
   const fxL = h('div', { class: 'wp-fx l', 'aria-hidden': 'true' }, h('b', null, icon('rotl'), h('span')));
   const fxR = h('div', { class: 'wp-fx r', 'aria-hidden': 'true' }, h('b', null, icon('rotr'), h('span')));
@@ -1748,7 +2040,7 @@ function viewWatch(ctx, q) {
   const root = h('div', { class: 'wp ui loading', role: 'region', 'aria-label': 'Video player' },
     bg, v, subsEl, gest, fxL, fxR,
     h('div', { class: 'wp-ui' },
-      h('div', { class: 'wp-top' }, iconBtn('back', 'Close player', () => leave()), ttl, ccBtn, pipBtn, iconBtn('pc', 'Play on PC instead', () => fallbackPc())),
+      h('div', { class: 'wp-top' }, iconBtn('back', 'Close player', () => leave()), ttl, ccBtn, pipBtn, !recap && iconBtn('pc', 'Play on PC instead', () => fallbackPc())),
       h('div', { class: 'wp-mid' }, skipBtn(-10, () => skip(-10)), playBig, skipBtn(10, () => skip(10))),
       h('div', { class: 'wp-bot' },
         h('div', { class: 'wp-scrub' }, scrub),
@@ -1805,6 +2097,7 @@ function viewWatch(ctx, q) {
     const b = msg.querySelector('button'); if (b) b.focus({ preventScroll: true });
   }
   function fail(title, text, canPc, retry) {
+    canPc = canPc && !recap;
     setLoading(false);
     v.pause();
     showUi(true);
@@ -1824,14 +2117,15 @@ function viewWatch(ctx, q) {
   // ----- session -----
   async function begin() {
     msg.hidden = true;
-    setLoading(true, 'Finding the best source…');
+    setLoading(true, recap ? 'Opening the recap…' : 'Finding the best source…');
     const body = { kind, title: P.title || '' };
     if (P.imdb) body.imdb = P.imdb;
     if (P.mal) body.mal = P.mal;
+    if (P.chapter) body.chapter = P.chapter;
     if (season != null) body.season = season;
     if (episode != null) body.episode = episode;
     let s;
-    const slow = setTimeout(() => { if (ctx.alive && !sess) { loadPc.hidden = false; loadT.textContent = 'Still looking… torrents can take a minute to start.'; } }, 12000);
+    const slow = setTimeout(() => { if (ctx.alive && !sess && !recap) { loadPc.hidden = false; loadT.textContent = 'Still looking… torrents can take a minute to start.'; } }, 12000);
     try { s = await post('/api/watch', body); }
     catch (e) {
       clearTimeout(slow);
@@ -1856,7 +2150,8 @@ function viewWatch(ctx, q) {
     scrub.disabled = !dur();
     durT.textContent = dur() ? fmtTime(dur()) : '–:––';
     mediaSession();
-    const r = +s.resume || 0, d = +s.duration || 0;
+    // A recap's place is kept on this phone only (it is not watch history on the PC).
+    const r = (recap ? +(LS.get(recapKey, null) || {}).t : +s.resume) || 0, d = +s.duration || 0;
     if (r > 20 && (!d || r < d - 40)) {
       setLoading(false);
       card('play', 'Resume watching?', 'You stopped at ' + fmtTime(r) + (d ? ' of ' + fmtTime(d) : '') + '.', [
@@ -1901,6 +2196,7 @@ function viewWatch(ctx, q) {
     const now = Date.now();
     if (!force && now - lastRep < 10000) return;
     lastRep = now;
+    if (recap) { if (!d || p < d - 30) LS.set(recapKey, { t: Math.floor(p), d: Math.floor(d) }); else LS.del(recapKey); return; }
     post('/api/watch/' + sid() + '/progress', { pos: Math.floor(p), duration: Math.floor(d) || 0 }, { keepalive: true }).catch(() => {});
   }
   function stopSession() {

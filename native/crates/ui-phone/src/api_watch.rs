@@ -3,9 +3,10 @@
 //! probes it with ffprobe and streams it to the phone: as is with HTTP Range when the phone can
 //! play the file, else as fragmented MP4 from ffmpeg (video copied or re-encoded to H.264, audio to
 //! AAC stereo). Sessions are random ids tied to the device, end after [`IDLE`] without requests,
-//! and the phone never names a URL or path: only a title id.
+//! and the phone never names a URL or path: only a title id, or a chapter id for that chapter's
+//! Studio recap video (a local file, served as is; not watch history).
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -354,11 +355,15 @@ struct Live {
 
 struct Session {
     device: String,
-    ident: Ident,
+    /// The title's watch history entry; `None` for a Studio recap, whose progress is not recorded.
+    ident: Option<Ident>,
     /// Torrent info-hash, released on stop.
     hash: Option<String>,
-    /// The engine's local URL for the file (`/stream/<hash>/<idx>` or `/direct?url=`).
+    /// The engine's local URL for the file (`/stream/<hash>/<idx>` or `/direct?url=`), or the
+    /// path of [`Session::file`].
     url: String,
+    /// A file on this PC (a Studio recap video), served directly instead of through the engine.
+    file: Option<PathBuf>,
     mode: Mode,
     probe: Probe,
     subs: Vec<Sub>,
@@ -519,6 +524,8 @@ fn guess_mode(file_name: &str) -> Mode {
 struct WatchBody {
     imdb: Option<String>,
     mal: Option<String>,
+    /// `kind: "recap"`: the chapter whose Studio recap video to play.
+    chapter: Option<String>,
     #[serde(default)]
     kind: String,
     #[serde(default)]
@@ -535,6 +542,9 @@ async fn start(Extension(dev): CurrentDevice, Json(b): Json<WatchBody>) -> ApiRe
     let title: String = b.title.trim().chars().take(200).collect();
     let (season, episode) = (b.season.map(|s| s.min(10_000)), b.episode.map(|e| e.clamp(1, 100_000)));
     let anime = b.kind == "anime";
+    if b.kind == "recap" {
+        return start_recap(dev, b.chapter, title).await;
+    }
     let found = match b.kind.as_str() {
         "anime" => {
             let mal = b.mal.as_deref().map(str::trim).filter(|m| mal_ok(m)).ok_or_else(|| ApiError::bad_request("mal must be a MyAnimeList id"))?.to_string();
@@ -544,7 +554,7 @@ async fn start(Extension(dev): CurrentDevice, Json(b): Json<WatchBody>) -> ApiRe
             let imdb = b.imdb.as_deref().map(str::trim).filter(|i| imdb_ok(i)).ok_or_else(|| ApiError::bad_request("imdb must be an IMDb id (tt...)"))?.to_string();
             remote::sources(if title.is_empty() { imdb.clone() } else { title.clone() }, imdb, b.kind == "movie", season, episode).await
         }
-        _ => return Err(ApiError::bad_request("kind must be movie, series or anime")),
+        _ => return Err(ApiError::bad_request("kind must be movie, series, anime or recap")),
     };
     let found = found.map_err(|e| ApiError::not_found(friendly(e)))?;
     if found.is_empty() {
@@ -646,9 +656,10 @@ async fn start(Extension(dev): CurrentDevice, Json(b): Json<WatchBody>) -> ApiRe
     let now = Instant::now();
     let id = insert(Session {
         device: dev.id.clone(),
-        ident,
+        ident: Some(ident),
         hash: o.hash,
         url: o.url,
+        file: None,
         mode,
         probe,
         subs,
@@ -665,6 +676,52 @@ async fn start(Extension(dev): CurrentDevice, Json(b): Json<WatchBody>) -> ApiRe
         "resume": resume,
         "subtitles": subtitles,
         "next": next,
+    })))
+}
+
+/// A chapter's Studio recap video: a local MP4 (H.264 + AAC from Studio), played as is when ffprobe
+/// agrees or is missing. No history, resume, subtitles or next episode.
+async fn start_recap(dev: crate::auth::Device, chapter: Option<String>, title: String) -> ApiResult<Json<Value>> {
+    let chapter = chapter.map(|c| c.trim().to_string()).filter(|c| !c.is_empty() && c.len() <= 200).ok_or_else(|| ApiError::bad_request("chapter must be a chapter id"))?;
+    let (m, ch) = crate::api_manga::load_chapter(chapter).await?;
+    let label = if title.is_empty() { m.title.clone() } else { title };
+    let video = tokio::task::spawn_blocking(move || ui_manga::recap::find(&m.id, &ch.id).and_then(|r| r.video)).await.ok().flatten().ok_or_else(|| ApiError::not_found("This chapter has no recap video"))?;
+    let url = video.to_string_lossy().into_owned();
+    let tools = tools();
+    // A file ffprobe cannot read is still Studio's own MP4: play it as is.
+    let probe = match &tools.ffprobe {
+        Some(ffprobe) => probe(ffprobe, &url).await.ok(),
+        None => None,
+    };
+    let mode = probe.as_ref().map_or(Mode::Direct, |p| decide(p, "video_final.mp4"));
+    if mode != Mode::Direct && tools.ffmpeg.is_none() {
+        return Err(ApiError::unavailable(NO_FFMPEG));
+    }
+    eprintln!("[phone] watch recap on phone ({})", mode.as_str());
+    let probe = probe.unwrap_or_default();
+    let duration = probe.duration;
+    let now = Instant::now();
+    let id = insert(Session {
+        device: dev.id.clone(),
+        ident: None,
+        hash: None,
+        url,
+        file: Some(video),
+        mode,
+        probe,
+        subs: vec![],
+        created: now,
+        live: Mutex::new(Live { last: now, ffmpeg: None, subs: HashMap::new() }),
+    });
+    Ok(Json(json!({
+        "id": id,
+        "title": label,
+        "duration": duration,
+        "mode": mode.as_str(),
+        "url": format!("/api/watch/{id}/stream"),
+        "resume": null,
+        "subtitles": [],
+        "next": null,
     })))
 }
 
@@ -705,7 +762,10 @@ struct StreamQuery {
 async fn stream(Extension(dev): CurrentDevice, UrlPath(id): UrlPath<String>, Query(q): Query<StreamQuery>, headers: HeaderMap) -> ApiResult<Response> {
     let s = session(&id, &dev.id)?;
     match s.mode {
-        Mode::Direct => proxy(&s, &headers).await,
+        Mode::Direct => match &s.file {
+            Some(f) => serve_local(f, &headers).await,
+            None => proxy(&s, &headers).await,
+        },
         _ => piped(s, q.start.filter(|t| t.is_finite()).unwrap_or(0.0).clamp(0.0, 1e6)),
     }
 }
@@ -732,6 +792,20 @@ async fn proxy(s: &Session, headers: &HeaderMap) -> ApiResult<Response> {
     *r.status_mut() = status;
     *r.headers_mut() = out;
     Ok(r)
+}
+
+/// A local file (a recap video) as is, with Range.
+async fn serve_local(path: &Path, headers: &HeaderMap) -> ApiResult<Response> {
+    let mut rq = axum::http::Request::new(Body::empty());
+    for h in [header::RANGE, header::IF_RANGE] {
+        if let Some(v) = headers.get(&h) {
+            rq.headers_mut().insert(h, v.clone());
+        }
+    }
+    let res = tower_http::services::ServeFile::new(path).try_call(rq).await.map_err(|_| ApiError::not_found("This video session has ended"))?;
+    let (mut parts, body) = res.into_parts();
+    parts.headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(Response::from_parts(parts, Body::new(body)))
 }
 
 /// Fragmented MP4 from ffmpeg, from `start` seconds. A newer request for the session (a seek)
@@ -807,11 +881,13 @@ async fn progress(Extension(dev): CurrentDevice, UrlPath(id): UrlPath<String>, J
         return Err(ApiError::bad_request("pos and duration must be seconds"));
     }
     let dur = if b.duration > 0.0 { b.duration } else { s.probe.duration.unwrap_or(0.0) };
+    // A recap is not a title: nothing goes into watch history.
+    let Some(ident) = s.ident.clone() else { return Ok(Json(json!({}))) };
     if dur <= 0.0 {
         return Ok(Json(json!({})));
     }
     let kind = if logic::is_complete(b.pos, dur) { "complete" } else { "progress" };
-    let (ident, pos) = (s.ident.clone(), b.pos.min(dur));
+    let pos = b.pos.min(dur);
     tokio::task::spawn_blocking(move || backend::save_event(&ident, kind, pos, dur)).await.map_err(ApiError::internal)?.map_err(ApiError::from)?;
     Ok(Json(json!({})))
 }
