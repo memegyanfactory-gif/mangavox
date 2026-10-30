@@ -13,6 +13,7 @@ mod delete;
 mod export;
 mod generate;
 mod issues;
+pub mod look;
 mod music;
 pub mod pipeline;
 mod queue_view;
