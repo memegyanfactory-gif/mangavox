@@ -199,7 +199,8 @@ pub fn short_count(n: u64) -> String {
 
 // ---------------------------------------------------------------- thumbnail prompt
 
-/// The characters worth putting on a thumbnail: the most seen, ones with a face first.
+/// The characters worth putting on a thumbnail: the most seen, ones with a face first. Each gets
+/// its biggest face file: a dark or blurry crop compresses small, so size stands in for detail.
 pub fn lead_cast(brain: &mv_recap::Brain, n: usize) -> Vec<(Cast, Option<std::path::PathBuf>)> {
     let mut all: Vec<&mv_recap::Character> = brain.characters.iter().filter(|c| !c.name.trim().is_empty()).collect();
     all.sort_by_key(|c| (c.faces.iter().all(|f| !f.is_file()), std::cmp::Reverse(c.appearances)));
@@ -207,15 +208,40 @@ pub fn lead_cast(brain: &mv_recap::Brain, n: usize) -> Vec<(Cast, Option<std::pa
         .take(n)
         .map(|c| {
             let cast = Cast { name: c.name.clone(), aliases: c.aliases.clone(), description: c.description.clone(), traits: c.traits.clone() };
-            (cast, c.faces.iter().find(|f| f.is_file()).cloned())
+            (cast, c.faces.iter().filter_map(|f| Some((std::fs::metadata(f).ok()?.len(), f))).max_by_key(|(len, _)| *len).map(|(_, f)| f.clone()))
         })
         .collect()
 }
 
-/// The last few lines of the brain's story notes, most recent last.
+/// The last few lines of the brain's story notes, most recent last, without their
+/// "[Chapter 3 p12]" labels.
 pub fn story_so_far(notes: &str, lines: usize) -> Vec<String> {
-    let all: Vec<String> = notes.lines().map(|l| l.trim().trim_start_matches("- ").trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let all: Vec<String> = notes
+        .lines()
+        .map(|l| {
+            let l = l.trim().trim_start_matches("- ").trim();
+            match l.strip_prefix('[').and_then(|r| r.split_once(']')) {
+                Some((_, rest)) => rest.trim().to_string(),
+                None => l.to_string(),
+            }
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
     all[all.len().saturating_sub(lines)..].to_vec()
+}
+
+/// A character's lasting look: the description up to the end of the first clause that is long
+/// enough to describe them (the bank's descriptions go on about what they did on one page).
+pub fn looks(description: &str) -> String {
+    let d = description.trim();
+    let mut end = d.len();
+    for (i, c) in d.char_indices() {
+        if matches!(c, '.' | ';') && i >= 40 {
+            end = i;
+            break;
+        }
+    }
+    clip(&d[..end], 200)
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -239,7 +265,7 @@ pub fn thumbnail_prompt(title: &str, cast: &[Cast], has_refs: &[bool], story: &[
         let role = if i == 0 { "Main subject, large in the foreground" } else { "Supporting, smaller behind" };
         p.push_str(&format!("\n{role}: {}", c.name.trim()));
         if !c.description.trim().is_empty() {
-            p.push_str(&format!(" — {}", clip(&c.description, 220)));
+            p.push_str(&format!(" — {}", looks(&c.description)));
         }
         if !c.traits.is_empty() {
             p.push_str(&format!(" ({})", c.traits.iter().take(4).cloned().collect::<Vec<_>>().join(", ")));
@@ -537,6 +563,17 @@ mod tests {
     #[test]
     fn story_takes_the_latest_lines() {
         assert_eq!(story_so_far("- one\n- two\n\n- three", 2), vec!["two", "three"]);
+        assert_eq!(story_so_far("- [Chapter 30 · Episode 30 p130] Liam teaches Arhan.\n- [x]", 2), vec!["Liam teaches Arhan."]);
+    }
+
+    #[test]
+    fn looks_keep_the_lasting_part() {
+        assert_eq!(
+            looks("Young adult with blond hair with a fringe, blue eyes, beige tunic, smiling while harvesting wheat; appears to be the narrator of the page."),
+            "Young adult with blond hair with a fringe, blue eyes, beige tunic, smiling while harvesting wheat"
+        );
+        assert_eq!(looks("Tall man. Wears a long black coat and a scar over one eye. Shouts."), "Tall man. Wears a long black coat and a scar over one eye");
+        assert_eq!(looks("Short"), "Short");
         assert!(story_so_far("", 3).is_empty());
     }
 

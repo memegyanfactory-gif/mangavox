@@ -537,7 +537,7 @@ impl YtPackage {
                         .flex()
                         .flex_col()
                         .gap(px(4.))
-                        .child(div().flex().items_center().justify_between().child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(label)).child(copy_btn(id, label, value.clone())))
+                        .child(div().flex().items_center().justify_between().child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{}{}", label[..1].to_uppercase(), &label[1..]))).child(copy_btn(id, label, value.clone())))
                         .child(text_box(value))
                 };
                 col.child(field("ytp-copy-title", "title", g.title.clone()))
@@ -617,5 +617,23 @@ mod tests {
         }
         println!("{:#?}", s.prediction);
         assert!(s.names.len() > 1 && !s.comparable().is_empty() && !s.reference_recent.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prompt_check {
+    /// Prints the thumbnail prompt for a real brain: `MV_BRAIN_DIR=<studio/<manga>> cargo test -p ui-studio print_prompt -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_prompt() {
+        let dir = std::path::PathBuf::from(std::env::var("MV_BRAIN_DIR").unwrap());
+        let brain = mv_recap::Brain::load_in(dir, "m", "The Sword-Eating Swordmaster");
+        let cast = super::logic::lead_cast(&brain, 3);
+        let refs: Vec<bool> = cast.iter().map(|(_, f)| f.is_some()).collect();
+        let c: Vec<super::Cast> = cast.iter().map(|(c, _)| c.clone()).collect();
+        println!("{}", super::logic::thumbnail_prompt(&brain.manga_title, &c, &refs, &super::logic::story_so_far(&brain.notes, 4), "HE EATS SWORDS"));
+        for (c, f) in &cast {
+            println!("face for {}: {:?}", c.name, f);
+        }
     }
 }
