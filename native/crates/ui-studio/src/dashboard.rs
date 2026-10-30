@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use mv_recap::{PhaseStatus, Step};
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::Interactive as _;
@@ -788,6 +789,7 @@ impl StudioPage {
                 }
                 cx.notify();
             }))
+            .context_menu(self.tile_menu(c, cx))
             .into_any_element()
     }
 

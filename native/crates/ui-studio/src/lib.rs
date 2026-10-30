@@ -25,6 +25,7 @@ pub mod service;
 pub mod setup;
 mod setup_view;
 mod side;
+mod tile_menu;
 pub mod video;
 mod widgets;
 mod ytpack;
