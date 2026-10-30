@@ -111,3 +111,53 @@ class ResumeAndProgressTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LookTests(unittest.TestCase):
+    def test_presets_and_overrides(self):
+        from python.video_generator import DEFAULT_LOOK, resolve_look
+        self.assertEqual(resolve_look(None)["preset"], DEFAULT_LOOK)
+        self.assertEqual(resolve_look("nope")["preset"], DEFAULT_LOOK)
+        clean = resolve_look("clean")
+        self.assertFalse(clean["duo"] or clean["grade"] or clean["impact"])
+        mixed = resolve_look({"preset": "dynamic", "glow": False, "grain": True, "duo": False})
+        self.assertFalse(mixed["glow"])
+        self.assertTrue(mixed["grain"])
+        # Only the effect switches can be overridden, not the layout.
+        self.assertTrue(mixed["duo"])
+
+    def test_action_beats(self):
+        from python.video_generator import is_impact
+        self.assertTrue(is_impact("He slams the blade down"))
+        self.assertTrue(is_impact("Run!"))
+        self.assertFalse(is_impact("A year has passed since then."))
+        self.assertFalse(is_impact(""))
+
+    def test_duo_halves_sit_apart_and_tall_panels_pan(self):
+        from python.video_generator import duo_geometry
+        w, h = 1920, 1080
+        left = duo_geometry(800, 1290, w, h, 0)
+        right = duo_geometry(800, 1290, w, h, 1)
+        self.assertLess(left["pos"][0] + left["size"][0], right["pos"][0])
+        self.assertLessEqual(right["pos"][0] + right["size"][0], w)
+        self.assertEqual(left["slack"], 0)
+        self.assertEqual(left["vis"], left["size"][1])
+        strip = duo_geometry(400, 2400, w, h, 0)
+        self.assertEqual(strip["vis"], h)
+        self.assertGreater(strip["slack"], 0)
+        self.assertTrue(all(v % 2 == 0 for v in strip["size"] + strip["pos"]))
+
+    def test_duo_cuts_and_impact_flashes(self):
+        starts, trans = plan_transitions([3.0] * 4, [0, 1, 2, 3], names=["zoomin"], joins=[None, "cut", "impact", None])
+        self.assertAlmostEqual(trans[1][1], round(1 / FPS, 3))
+        self.assertEqual(trans[2], ("fade", 0.12))
+        self.assertEqual(trans[3], ("zoomin", 0.5))
+
+    def test_finish_has_only_what_is_on(self):
+        from python.video_generator import look_filters
+        self.assertEqual(look_filters({}, 1280, 720, "a", "b"), "[a]null[b]")
+        full = look_filters({"grade": True, "vignette": True, "grain": True}, 1280, 720, "a", "b")
+        self.assertIn("lutyuv", full)
+        self.assertIn("vignette", full)
+        self.assertIn("noise", full)
+        self.assertTrue(full.startswith("[a]") and full.endswith("[b]"))

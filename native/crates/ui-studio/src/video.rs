@@ -884,6 +884,8 @@ pub(crate) struct VideoStudio {
     /// When the default and chapter files were last read or written here: a newer file (saved by
     /// Generate or the dashboard) is read again instead of being overwritten by a stale copy.
     seen: (Option<SystemTime>, Option<SystemTime>),
+    /// The Look & branding card (Studio-wide; see `look`).
+    look: Entity<crate::look::LookPanel>,
     _subs: Vec<Subscription>,
 }
 
@@ -938,6 +940,7 @@ impl VideoStudio {
             ticking: false,
             shown_at: Rc::new(Cell::new(Instant::now())),
             seen: (modified(&defaults_file()), None),
+            look: cx.new(|cx| crate::look::LookPanel::new(window, cx)),
             _subs: subs,
         }
     }
@@ -1533,6 +1536,7 @@ impl Render for VideoStudio {
             .flex()
             .flex_col()
             .gap(px(space::LG))
+            .child(self.look.clone())
             .child(
                 card()
                     .child(

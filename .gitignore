@@ -57,3 +57,6 @@ downloads/
 *.pem
 *.key
 .claude/settings.local.json
+
+# Agent worktrees (whole checkouts, never committed)
+.claude/worktrees/
