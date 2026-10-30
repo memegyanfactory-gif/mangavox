@@ -459,7 +459,7 @@ pub fn favorites() -> Vec<String> {
     read_json(&defaults_file()).and_then(|v| v.get("favorites").cloned()).and_then(|f| serde_json::from_value(f).ok()).unwrap_or_default()
 }
 
-fn save_favorites(f: &[String]) {
+pub(crate) fn save_favorites(f: &[String]) {
     let file = defaults_file();
     let mut v = read_json(&file).filter(Value::is_object).unwrap_or_else(|| json!({}));
     v["favorites"] = json!(f);
@@ -1068,6 +1068,8 @@ impl VideoStudio {
         }
         self.seen = now;
         self.default = default_setting();
+        // Hearted in the Video editor too (same file).
+        self.favorites = favorites();
         if let Some(c) = &self.ctx {
             let own = chapter_setting(&c.chapter.output_dir);
             if own.is_some() != self.own.is_some() {
@@ -1531,7 +1533,7 @@ impl VideoStudio {
 }
 
 /// The 3x3 guide shown while dragging: thirds lines and the nine anchors (the snapped one lit).
-fn grid_overlay(fw: f32, fh: f32, lit: Option<usize>) -> Div {
+pub(crate) fn grid_overlay(fw: f32, fh: f32, lit: Option<usize>) -> Div {
     let line = |h: bool, at: f32| {
         let d = div().absolute().bg(paint(rgb("#ffffff"), 0.35));
         if h {
@@ -1561,6 +1563,40 @@ fn grid_overlay(fw: f32, fh: f32, lit: Option<usize>) -> Div {
         }
     }
     d
+}
+
+/// A template's look on a small `w` x `h` thumbnail ("Hero steps forward", word 2 spoken), its
+/// words as big as on the gallery's cards whatever the thumbnail's size (a long cue still fits).
+pub(crate) fn style_thumb(st: &CaptionStyle, w: f32, h: f32, window: &Window) -> Div {
+    let mut look = st.clone();
+    look.pos = (50., 54.);
+    look.size *= (99. / h).max(1.);
+    let sample: Vec<String> = ["Hero", "steps", "forward"].iter().map(|w| w.to_string()).collect();
+    div().relative().w(px(w)).h(px(h)).overflow_hidden().bg(paint(rgb("#15161c"), 1.)).child(caption_layer(&sample, &look, false, w, h, 1, false, true, window))
+}
+
+/// The box (left, top, width, height in px) a whole cue drawn by [`caption_layer`] covers on a
+/// `fw` x `fh` frame, with a little room around it (to grab the caption on a monitor).
+pub(crate) fn caption_box(words: &[String], st: &CaptionStyle, user_words: bool, fw: f32, fh: f32, window: &Window) -> Option<(f32, f32, f32, f32)> {
+    let words: Vec<String> = words.iter().map(|w| if st.uppercase { w.to_uppercase() } else { w.clone() }).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let n = words.len();
+    let hero = st.dynamic.is_some().then_some(0);
+    let mut measure = |text: &str, em: f32| measure_text(window, text, &st.font, st.italic, em);
+    let probe = layout(&words, st, user_words, fw, fh, hero, n, 1., &mut measure);
+    let widest = probe.lines.iter().map(|l| l.2).fold(0., f32::max);
+    let lay = if widest > fw * st.max_width { layout(&words, st, user_words, fw, fh, hero, n, fw * st.max_width / widest, &mut measure) } else { probe };
+    let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for (cx, cy, w, em) in &lay.lines {
+        l = l.min(cx - w / 2. - em * 0.5);
+        r = r.max(cx + w / 2. + em * 0.5);
+        t = t.min(cy - em * 0.8);
+        b = b.max(cy + em * 0.8);
+    }
+    let (l, t) = (l.max(0.), t.max(0.));
+    (r > l && b > t).then(|| (l, t, r.min(fw) - l, b.min(fh) - t))
 }
 
 impl Render for VideoStudio {
