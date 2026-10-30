@@ -20,6 +20,9 @@ hound = "3.5"
 mv-ai = { path = "../mv-ai" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 ui-assistant = { path = "../ui-assistant" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url = "2"
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
