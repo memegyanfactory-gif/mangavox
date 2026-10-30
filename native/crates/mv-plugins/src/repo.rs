@@ -76,8 +76,19 @@ pub fn normalize_repo_url(input: &str) -> String {
     if let Some(inner) = deep_link_url(&url) {
         url = inner.trim().trim_end_matches('/').to_string();
     }
+    // A GitHub file link (`github.com/<owner>/<repo>/raw|blob/<branch>/<path>`) is the raw file.
+    if let Some(c) = re(r"^https?://github\.com/([^/]+)/([^/]+)/(?:raw|blob)/(.+)$").captures(&url) {
+        url = format!("https://raw.githubusercontent.com/{}/{}/{}", &c[1], &c[2], &c[3]);
+    }
     if url.ends_with("index.min.json") || url.ends_with("index.json") {
         return url;
+    }
+    // Newer apps take the repo's protobuf index (`index.pb`) or its `repo.json`; the same folder
+    // has the JSON index this app reads (Keiyoushi: a stub `index.min.json`, then `index.json`).
+    for file in ["index.pb", "repo.json"] {
+        if let Some(dir) = url.strip_suffix(file) {
+            return format!("{dir}index.min.json");
+        }
     }
     if let Some(c) = re(r"^https?://github\.com/([^/]+)/([^/]+?)(\.git)?$").captures(&url) {
         return format!("https://raw.githubusercontent.com/{}/{}/repo/index.min.json", &c[1], &c[2]);

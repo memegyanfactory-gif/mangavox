@@ -306,6 +306,12 @@ fn repos_json_roundtrip_and_electron_compat() {
     let deep = "tachiyomi://add-repo?url=https%3A%2F%2Fe.com%2Frepo%2Findex.min.json";
     assert_eq!(repo::add_repo(&root, deep).unwrap(), "https://e.com/repo/index.min.json");
     assert_eq!(repo::normalize_repo_url("mihon://add-repo?url=https://e.com/x/index.json"), "https://e.com/x/index.json");
+    // Links meant for newer apps: the protobuf index (and repo.json), also as GitHub raw/blob links.
+    let kei = "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json";
+    assert_eq!(repo::normalize_repo_url("https://github.com/keiyoushi/extensions/raw/repo/index.pb"), kei);
+    assert_eq!(repo::normalize_repo_url("https://github.com/keiyoushi/extensions/blob/repo/repo.json"), kei);
+    assert_eq!(repo::normalize_repo_url("https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.pb"), kei);
+    assert_eq!(repo::normalize_repo_url("https://github.com/keiyoushi/extensions/raw/repo/index.json"), "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.json");
     assert_eq!(repo::list_repos(&root).len(), 3);
     assert!(repo::add_repo(&root, "   ").is_err());
     assert!(repo::add_repo(&root, "not a url").is_err());
@@ -840,4 +846,15 @@ async fn generated_plugins_cope_with_large_noisy_pages() {
     assert_eq!(pop.as_array().unwrap().len(), 200);
     assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Network: the link newer apps take (Keiyoushi's protobuf `index.pb`) lists its extensions here
+/// too. `cargo test -p mv-plugins keiyoushi -- --ignored`
+#[tokio::test]
+#[ignore]
+async fn keiyoushi_index_pb_link_lists_extensions() {
+    let backend = ReqwestBackend::new();
+    let list = repo::fetch_repo_extensions("https://github.com/keiyoushi/extensions/raw/repo/index.pb", &backend).await.expect("fetch");
+    println!("{} extensions", list.len());
+    assert!(list.len() > 100, "only {} extensions", list.len());
 }
