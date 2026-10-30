@@ -644,6 +644,7 @@ impl StudioPage {
             .pr(px(space::XXL))
             .child(head)
             .child(self.video_section(g, cx))
+            .child(self.youtube_package(g, cx))
             .child(tools)
             .child(body)
             .child(legend)

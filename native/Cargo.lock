@@ -9939,6 +9939,7 @@ name = "ui-studio"
 version = "8.0.5008"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui-kit",
  "hound",
  "image",
@@ -9948,6 +9949,7 @@ dependencies = [
  "mv-score",
  "mv-studio",
  "mv-ui",
+ "reqwest 0.12.28",
  "rodio",
  "rusqlite",
  "serde",
@@ -9955,6 +9957,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "ui-assistant",
+ "url",
 ]
 
 [[package]]

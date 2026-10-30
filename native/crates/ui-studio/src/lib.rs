@@ -27,6 +27,7 @@ mod setup_view;
 mod side;
 pub mod video;
 mod widgets;
+mod ytpack;
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {
