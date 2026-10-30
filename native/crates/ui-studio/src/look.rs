@@ -75,7 +75,7 @@ impl Preset {
             Preset::Clean => Effects::default(),
             Preset::Cinematic => Effects { grade: true, vignette: true, grain: true, glow: true, impact: false },
             Preset::Recap => Effects { grade: true, vignette: true, ..Effects::default() },
-            Preset::Dynamic => Effects { grade: true, vignette: true, grain: true, glow: true, impact: true },
+            Preset::Dynamic => Effects { grade: true, vignette: true, grain: false, glow: true, impact: true },
         }
     }
 }
@@ -109,7 +109,7 @@ impl Effect {
             Effect::Grade => "Colour grade",
             Effect::Glow => "Glow",
             Effect::Vignette => "Vignette",
-            Effect::Grain => "Film grain",
+            Effect::Grain => "Film grain (slower, bigger files)",
             Effect::Impact => "Action punch (zoom + shake + flash)",
         }
     }
@@ -831,7 +831,7 @@ mod tests {
     fn defaults_match_the_contract() {
         let l = Look::default();
         assert_eq!(l.preset, Preset::Dynamic);
-        assert_eq!(l.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, impact: true });
+        assert_eq!(l.effects(), Effects { grade: true, vignette: true, grain: false, glow: true, impact: true });
         assert_eq!((l.logo.pos, l.logo.size, l.logo.opacity), (2, 0.12, 0.85));
         assert_eq!((l.text.pos, l.text.size, l.text.opacity), (0, 0.05, 0.6));
         let v = l.to_json();
@@ -849,7 +849,7 @@ mod tests {
         assert_eq!(Preset::Clean.effects(), Effects::default());
         assert_eq!(Preset::Cinematic.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, impact: false });
         assert_eq!(Preset::Recap.effects(), Effects { grade: true, vignette: true, grain: false, glow: false, impact: false });
-        assert_eq!(Preset::Dynamic.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, impact: true });
+        assert_eq!(Preset::Dynamic.effects(), Effects { grade: true, vignette: true, grain: false, glow: true, impact: true });
     }
 
     #[test]
