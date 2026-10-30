@@ -337,6 +337,10 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
                 }
             }
         }
+        // Buttons were the last thing the reply needed: another round would only repeat its text.
+        if calls.iter().all(|c| c.name == "suggest_replies") && history.last().is_some_and(|m| !m.content.contains("\"error\"")) {
+            return Outcome::Done;
+        }
     }
     // Hit the round cap while still calling tools.
     let _ = tx.unbounded_send(AgentEvent::Delta(StreamEvent::Text { delta: format!("\n\n_Stopped after {MAX_ROUNDS} rounds of actions._") }));
@@ -463,6 +467,23 @@ mod tests {
         assert!(reqs[0].messages[0].content.contains("suggestions: [{label, prompt}]"));
         // The second round sees the result as a tool message.
         assert!(reqs[1].messages.iter().any(|m| m.role == AiRole::Tool && m.tool_name.as_deref() == Some("navigate")));
+    }
+
+    struct SuggestTools;
+    impl ToolRunner for SuggestTools {
+        fn run(&self, _n: String, _a: Map<String, Value>) -> BoxFuture<'static, tools::ToolResult> {
+            async move { Ok(ToolOutput::Suggest(vec![crate::suggest::Suggestion::new("r", "Go", "", "Go")], json!({ "ok": true }))) }.boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_round_of_only_suggestions_ends_the_reply() {
+        let fake = Fake::new(vec![AiStepResult { text: "Done.".into(), tool_calls: vec![call("suggest_replies")], ..Default::default() }, AiStepResult { text: "Done again.".into(), ..Default::default() }]);
+        let (tx, rx) = unbounded();
+        run_agent(&fake, &SuggestTools, params(AiAccessMode::Ask, true), tx, CancellationToken::new()).await;
+        let evs = collect(rx, None).await;
+        assert_eq!(fake.1.lock().unwrap().len(), 1, "no extra round after the buttons");
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::Suggest(l) if l[0].title == "Go")));
     }
 
     #[test]

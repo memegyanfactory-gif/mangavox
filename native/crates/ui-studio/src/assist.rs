@@ -23,9 +23,6 @@ use crate::look::{Effect, Look, Preset, POSITIONS};
 use crate::pipeline::{self, ItemState, QueueItem, StepState};
 use crate::setup::{self, Env};
 
-/// Chapters one suggestion names at most (the rest go in "and N more").
-const SUGGEST_CHAPTERS: usize = 12;
-
 pub fn register() {
     at::register(tools());
     suggest::register("studio", suggestions);
@@ -541,6 +538,14 @@ async fn queue_tool(a: Map<String, Value>) -> ToolResult {
     Ok(ToolOutput::Value(json!({ "action": action, "status": status_json() })))
 }
 
+/// Manga exported by the assistant, with how many chapters were made then: the "ready to
+/// export" card stays away until another chapter is made.
+static EXPORTED: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+
+fn exported_with(manga_id: &str, made: usize) -> bool {
+    EXPORTED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(m, n)| m == manga_id && *n == made)
+}
+
 /// The running assistant export and its manga's title (one at a time).
 static EXPORT: Mutex<Option<(export::Job, String)>> = Mutex::new(None);
 
@@ -610,6 +615,12 @@ async fn export_tool(a: Map<String, Value>) -> ToolResult {
     let res = run_export(g.clone(), made.clone(), prefs, dir.clone(), name, font, env, r).await;
     *EXPORT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let (files, hook_note) = res?;
+    {
+        let mut ex = EXPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        ex.retain(|(m, _)| *m != g.id);
+        ex.push((g.id.clone(), made.len()));
+    }
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let shown = files.first().cloned().unwrap_or_else(|| dir.clone());
     let title = g.title.clone();
     let n = files.len();
@@ -797,10 +808,8 @@ pub(crate) fn suggestions_from(groups: &[MangaGroup], q: &pipeline::Queue, title
         let missing: Vec<&ChapterItem> = g.chapters.iter().filter(|c| !c.has_output() && !busy(c)).collect();
         // Only for manga the user already recaps: new downloads of those are the likely next job.
         if recapped > 0 && !missing.is_empty() {
-            let nums: Vec<f64> = missing.iter().filter_map(|c| c.number).take(SUGGEST_CHAPTERS).collect();
-            let more = missing.len().saturating_sub(nums.len());
-            let list = compress(&nums);
-            let named = if more > 0 { format!("Ch. {list} (and {more} more)") } else { format!("Ch. {list}") };
+            // The prompt names every chapter (ranges keep it short), so the click is the choice.
+            let named = format!("Ch. {}", compress(&missing.iter().filter_map(|c| c.number).collect::<Vec<_>>()));
             out.push(Suggestion::new(
                 format!("studio-new-{}-{}", g.id, missing.len()),
                 format!("{} chapter{} of {} without a recap: generate?", missing.len(), if missing.len() == 1 { "" } else { "s" }, g.title),
@@ -810,7 +819,7 @@ pub(crate) fn suggestions_from(groups: &[MangaGroup], q: &pipeline::Queue, title
         }
         let finished = g.chapters.iter().any(|c| q.for_chapter(&c.id).is_some_and(|i| i.state == ItemState::Done));
         let active = g.chapters.iter().any(|c| q.for_chapter(&c.id).is_some_and(|i| i.state.active()));
-        if finished && !active && recapped > 0 {
+        if finished && !active && recapped > 0 && !exported_with(&g.id, recapped) {
             out.push(Suggestion::new(
                 format!("studio-export-{}-{recapped}", g.id),
                 format!("{} recap{} of {} ready: export the full recap?", recapped, if recapped == 1 { "" } else { "s" }, g.title),
