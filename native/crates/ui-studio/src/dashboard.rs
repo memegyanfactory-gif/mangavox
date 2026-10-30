@@ -522,13 +522,13 @@ impl StudioPage {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(space::LG))
+            .gap(px(space::MD))
             .child(
                 div()
-                    .w(px(72.))
-                    .h(px(102.))
+                    .w(px(56.))
+                    .h(px(78.))
                     .flex_none()
-                    .rounded(px(radius::MD))
+                    .rounded(px(radius::SM))
                     .overflow_hidden()
                     .bg(Tokens::surface_2())
                     .border_1()
@@ -538,7 +538,7 @@ impl StudioPage {
                     .justify_center()
                     .map(|d| match &g.cover {
                         Some(p) => d.child(img(p.clone()).size_full().object_fit(ObjectFit::Cover)),
-                        None => d.child(ph_icon(glyphs::MANGA, Weight::Duotone, Tokens::text_3(), icon_px::XL)),
+                        None => d.child(ph_icon(glyphs::MANGA, Weight::Duotone, Tokens::text_3(), icon_px::LG)),
                     }),
             )
             .child(
@@ -547,14 +547,20 @@ impl StudioPage {
                     .flex_col()
                     .flex_1()
                     .min_w(px(220.))
-                    .gap(px(6.))
-                    .child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).line_clamp(2).child(g.title.clone()))
-                    .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!(
-                        "{n} chapter{} · {done} made{}",
-                        plural(n),
-                        if failed > 0 { format!(" · {failed} failed") } else { String::new() }
-                    )))
-                    .child(div().w(px(260.)).child(progress_bar("dash-manga-progress", p, false))),
+                    .gap(px(space::XS))
+                    .child(div().text_size(px(size::XL)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).truncate().child(g.title.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(space::SM))
+                            .child(div().flex_none().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!(
+                                "{n} chapter{} · {done} made{}",
+                                plural(n),
+                                if failed > 0 { format!(" · {failed} failed") } else { String::new() }
+                            )))
+                            .child(div().w(px(160.)).child(progress_bar("dash-manga-progress", p, false))),
+                    ),
             )
             .child({
                 let made_items: Vec<ChapterItem> = self.made_videos(g).into_iter().map(|(c, _)| c).collect();
@@ -562,9 +568,11 @@ impl StudioPage {
                 div()
                     .flex()
                     .flex_wrap()
-                    .gap(px(space::SM))
+                    .items_center()
+                    .gap(px(space::XS))
                     .child(
                         btn("dash-restyle-all", "Music & subtitles", ButtonKind::Secondary)
+                            .small()
                             .icon(glyphs::MUSIC)
                             .tooltip("Change the music (new, quieter, or muted) and the subtitles of every made chapter, then re-make their videos")
                             .when(made_n == 0, |b| b.disabled("No chapter has a video yet"))
@@ -573,13 +581,14 @@ impl StudioPage {
                                 this.open_restyle(made_items.clone(), scope, true, cx);
                             })),
                     )
-                    .child(btn("dash-back", "All manga", ButtonKind::Ghost).icon(glyphs::BACK).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    .child(btn("dash-back", "All manga", ButtonKind::Ghost).small().icon(glyphs::BACK).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.dash_manga = None;
                         cx.notify();
                     })))
                     .child({
                         let ids = vec![g.id.clone()];
                         icon_button("dash-delete-manga", glyphs::DELETE, "Delete this manga from Studio…")
+                            .small()
                             .when(!self.deleting.is_empty(), |b| b.disabled("Deleting…"))
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.confirm_delete_manga(ids.clone(), window, cx)))
                     })
@@ -588,13 +597,15 @@ impl StudioPage {
         let all_ids: Vec<String> = order.clone();
         let none_ids: Vec<String> = g.chapters.iter().map(|c| c.id.clone()).collect();
         let all_on = !all_ids.is_empty() && all_ids.iter().all(|id| self.dash_pick.contains(id));
+        // The tile legend, folded into a "?" at the end of the row.
+        let legend = "New: not started\n3/6: some steps made\nQueued: waiting in Generate\nA step name, spinning: being made now\nPaused: Generate is paused\n\"Audio failed\" and the like: that step failed\nDone: video made\nThe bar under each number: one segment per step, filled when made.";
         let tools = div()
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(6.))
+            .gap(px(space::XS))
             .children(Filter::ALL.iter().enumerate().map(|(i, &(f, label, icon))| {
-                filter_chip(("dash-filter", i), label, filter == f).icon(icon).count(counts.get(&f).copied().unwrap_or(0)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                filter_chip(("dash-filter", i), label, filter == f).icon(icon).count(counts.get(&f).copied().unwrap_or(0)).h(px(24.)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.dash_filter = f;
                     cx.notify();
                 }))
@@ -622,43 +633,80 @@ impl StudioPage {
                         this.dash_anchor = None;
                         cx.notify();
                     })),
-            );
+            )
+            .child(div().id("dash-legend").flex().items_center().justify_center().size(px(24.)).rounded(px(radius::SM)).hover(|s| s.bg(Tokens::hover())).tooltip(tip(legend)).child(icon_ph(ph::QUESTION, Tokens::text_3(), icon_px::SM)));
 
-        let grid = div().flex().flex_wrap().gap(px(space::SM)).children(shown.iter().map(|(i, c, t)| self.chapter_tile(*i, c, *t, &order, cx)));
-        let body = if shown.is_empty() {
-            div().py(px(space::XXL)).child(empty_view(ph::FUNNEL, "No chapters here", "No chapter of this manga matches the filter.").compact()).into_any_element()
-        } else {
-            grid.into_any_element()
+        let video_summary = {
+            let videos = self.made_videos(g);
+            let secs: f64 = videos.iter().filter_map(|(_, p)| crate::export::video_seconds(p)).sum();
+            let mut s = match videos.len() {
+                0 => "no chapter video yet".to_string(),
+                k => format!("{k} chapter{}", plural(k)),
+            };
+            if secs > 0. {
+                s += &format!(" · {}", crate::export::fmt_duration(secs));
+            }
+            if self.export_job.as_ref().is_some_and(|j| j.manga_id == g.id) {
+                s += " · working…";
+            }
+            s
         };
-        let legend = div().flex().flex_wrap().gap(px(space::MD)).text_size(px(size::XS)).text_color(Tokens::text_3()).children(
-            [Tile::NotStarted, Tile::Partial(3), Tile::Queued, Tile::Running(Step::Audio), Tile::Paused, Tile::Failed(Step::Video), Tile::Done].into_iter().map(|t| {
-                let (_, icon, color, _) = t.look();
-                let word = match t {
-                    Tile::NotStarted => "Not started",
-                    Tile::Partial(_) => "Some steps made",
-                    Tile::Queued => "Waiting",
-                    Tile::Running(_) => "Working",
-                    Tile::Paused => "Paused",
-                    Tile::Failed(_) => "Failed",
-                    Tile::Done => "Video made",
+        let video = self.fold("video", ph::FILM_STRIP, "Full recap video", video_summary, |this, cx| this.video_section(g, cx), cx);
+        let yt_summary = if mv_recap::Brain::dir(&g.id).join("youtube_package.json").is_file() { "researched · open to see it" } else { "not generated yet" };
+        let youtube = self.fold("youtube", ph::YOUTUBE_LOGO, "YouTube package", yt_summary.to_string(), |this, cx| this.youtube_package(g, cx), cx);
+        let chapters_summary = format!(
+            "{n} · {done} made{}{}",
+            if failed > 0 { format!(" · {failed} failed") } else { String::new() },
+            if picked_here.is_empty() { String::new() } else { format!(" · {} picked", picked_here.len()) }
+        );
+        let chapters = self.fold(
+            "chapters",
+            ph::LIST_NUMBERS,
+            "Chapters",
+            chapters_summary,
+            |this, cx| {
+                let grid = div().flex().flex_wrap().gap(px(6.)).children(shown.iter().map(|(i, c, t)| this.chapter_tile(*i, c, *t, &order, cx)));
+                let body = if shown.is_empty() {
+                    div().py(px(space::LG)).child(empty_view(ph::FUNNEL, "No chapters here", "No chapter of this manga matches the filter.").compact()).into_any_element()
+                } else {
+                    grid.into_any_element()
                 };
-                div().flex().items_center().gap(px(4.)).child(icon_ph(icon, color, icon_px::XS)).child(word)
-            }),
+                div().flex().flex_col().gap(px(space::SM)).child(tools).child(body).into_any_element()
+            },
+            cx,
         );
         div()
             .flex()
             .flex_col()
-            .gap(px(space::LG))
-            .p(px(space::XL))
+            .gap(px(space::SM))
+            .p(px(space::LG))
             .pr(px(space::XXL))
             .child(head)
-            .child(self.video_section(g, cx))
-            .child(self.youtube_package(g, cx))
-            .child(tools)
-            .child(body)
-            .child(legend)
+            .child(video)
+            .child(youtube)
+            .child(chapters)
             .child(self.pick_bar(&picked_here, cx))
             .into_any_element()
+    }
+
+    /// A dashboard section that folds to its header row; `body` is only built while open.
+    fn fold(&mut self, key: &'static str, icon: Ph, title: &'static str, summary: String, body: impl FnOnce(&mut Self, &mut Context<Self>) -> AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        let open = !self.dash_collapsed.contains(key);
+        let body = open.then(|| body(self, cx));
+        let head = crate::widgets::fold_head(key, icon, title, summary, open).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if !this.dash_collapsed.remove(key) {
+                this.dash_collapsed.insert(key.to_string());
+            }
+            let mut keys: Vec<String> = this.dash_collapsed.iter().cloned().collect();
+            keys.sort();
+            // Only this key: other parts of Studio and Settings write the same file.
+            let mut on_disk = mv_recap::Prefs::load();
+            on_disk.dash_collapsed = keys.clone();
+            on_disk.save();
+            this.prefs.dash_collapsed = keys;
+            cx.notify();
+        }));
+        div().flex().flex_col().gap(px(space::XS)).child(head).children(body).into_any_element()
     }
 
     /// Picks chapters. Picking only selects: nothing runs until Generate or Redo is pressed.
@@ -690,9 +738,9 @@ impl StudioPage {
             .items_center()
             .justify_center()
             .gap(px(2.))
-            .w(px(84.))
-            .h(px(88.))
-            .rounded(px(radius::LG))
+            .w(px(72.))
+            .h(px(76.))
+            .rounded(px(radius::MD))
             .bg(if picked { Tokens::accent_soft() } else { fill })
             .border_1()
             .border_color(if picked { Tokens::accent() } else { Tokens::border() })
@@ -703,20 +751,20 @@ impl StudioPage {
             .tooltip(tip(tip_text))
             .hover(|s| s.border_color(Tokens::border_strong()))
             .pressable()
-            .child(div().text_size(px(size::XL)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(tile_number(c, i)))
+            .child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(tile_number(c, i)))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(3.))
-                    .max_w(px(76.))
+                    .max_w(px(64.))
                     .text_size(px(size::XS))
                     .text_color(color)
                     .child(if running { spinner(("dash-tile-spin", i), color, icon_px::XS).into_any_element() } else { icon_ph(icon, color, icon_px::XS).into_any_element() })
                     .child(div().truncate().child(word)),
             )
             // One segment per step: filled when made.
-            .child(div().absolute().bottom(px(6.)).left(px(8.)).right(px(8.)).flex().gap(px(2.)).children(made.into_iter().map(|m| div().flex_1().h(px(3.)).rounded(px(2.)).bg(if m { Tokens::success() } else { Tokens::track() }))))
+            .child(div().absolute().bottom(px(5.)).left(px(7.)).right(px(7.)).flex().gap(px(2.)).children(made.into_iter().map(|m| div().flex_1().h(px(3.)).rounded(px(2.)).bg(if m { Tokens::success() } else { Tokens::track() }))))
             .when(picked, |d| d.child(div().absolute().top(px(-6.)).right(px(-6.)).child(selected_badge())))
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 if ev.click_count() >= 2 {
@@ -786,7 +834,8 @@ impl StudioPage {
             .flex_wrap()
             .items_center()
             .gap(px(space::SM))
-            .p(px(space::MD))
+            .px(px(space::MD))
+            .py(px(space::SM))
             .rounded(px(radius::LG))
             .border_1()
             .border_color(if n > 0 { Tokens::accent_border() } else { Tokens::border() })
