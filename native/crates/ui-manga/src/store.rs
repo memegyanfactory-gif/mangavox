@@ -77,28 +77,100 @@ pub fn apply_chapters(conn: &mut Connection, manga_id: &str, source: &str, remot
     chapters(conn, manga_id, lang)
 }
 
-/// A manga's chapters in the preferred language (all languages when none match), ascending.
+/// A manga's chapters in the preferred language (all languages when none match), ascending, one
+/// source per chapter number when several sources have it (see [`one_source_per_number`]).
 pub fn chapters(conn: &Connection, manga_id: &str, lang: &str) -> Result<Vec<Chapter>> {
-    Ok(logic::keep_language(chapter::list(conn, manga_id)?, lang, |c| c.language.as_str()))
+    let list = logic::keep_language(chapter::list(conn, manga_id)?, lang, |c| c.language.as_str());
+    let primary = manga::get(conn, manga_id)?.map(|m| m.source_plugin).unwrap_or_default();
+    Ok(one_source_per_number(list, &primary))
+}
+
+fn number_key(n: f64) -> i64 {
+    (n * 1000.0).round() as i64
+}
+
+/// A title can have chapters from several sources (its own and others found for it). Where more
+/// than one source has a chapter number, that number's chapters come from one of them: the one
+/// it was downloaded from, else the one it was read on, else the source with the most chapters
+/// of the title, else the title's own source. Chapters without a number are all kept.
+pub fn one_source_per_number(list: Vec<Chapter>, primary: &str) -> Vec<Chapter> {
+    let mut per_source: HashMap<String, usize> = HashMap::new();
+    for c in &list {
+        *per_source.entry(c.source_plugin.clone()).or_default() += 1;
+    }
+    if per_source.len() < 2 {
+        return list;
+    }
+    let mut by_number: HashMap<i64, Vec<&Chapter>> = HashMap::new();
+    for c in &list {
+        if let Some(n) = c.number {
+            by_number.entry(number_key(n)).or_default().push(c);
+        }
+    }
+    let winner: HashMap<i64, String> = by_number
+        .into_iter()
+        .map(|(k, cs)| {
+            let best = cs
+                .iter()
+                .max_by_key(|c| {
+                    let all = |f: &dyn Fn(&Chapter) -> bool| cs.iter().any(|x| x.source_plugin == c.source_plugin && f(x));
+                    (
+                        all(&|x| x.download_status == "complete"),
+                        all(&|x| x.is_read || x.read_progress > 0),
+                        per_source.get(&c.source_plugin).copied().unwrap_or(0),
+                        c.source_plugin == primary,
+                    )
+                })
+                .map(|c| c.source_plugin.clone())
+                .unwrap_or_default();
+            (k, best)
+        })
+        .collect();
+    list.into_iter().filter(|c| c.number.is_none_or(|n| winner.get(&number_key(n)) == Some(&c.source_plugin))).collect()
 }
 
 /// Chapter counts per manga for the library grid, using the same language rule as [`chapters`].
 pub fn library_stats(conn: &Connection, lang: &str) -> Result<HashMap<String, LibStats>> {
-    let mut stmt = conn.prepare("SELECT manga_id, language, is_read, download_status FROM chapter")?;
+    let mut stmt = conn.prepare("SELECT manga_id, language, is_read, download_status, number FROM chapter")?;
     let rows = stmt
         .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, i64>(2)? != 0, r.get::<_, Option<String>>(3)?.unwrap_or_default()))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, Option<f64>>(4)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut per: HashMap<String, Vec<(String, bool, bool)>> = HashMap::new();
-    for (mid, l, read, dl) in rows {
-        per.entry(mid).or_default().push((l, read, dl == "complete"));
+    let mut per: HashMap<String, Vec<(String, bool, bool, Option<f64>)>> = HashMap::new();
+    for (mid, l, read, dl, n) in rows {
+        per.entry(mid).or_default().push((l, read, dl == "complete", n));
     }
     Ok(per
         .into_iter()
         .map(|(mid, cs)| {
             let cs = logic::keep_language(cs, lang, |c| c.0.as_str());
-            let st = LibStats { total: cs.len(), unread: cs.iter().filter(|c| !c.1).count(), downloaded: cs.iter().filter(|c| c.2).count() };
+            // One entry per chapter number (several sources can have the same chapter).
+            let mut numbered: HashMap<i64, (bool, bool)> = HashMap::new();
+            let mut st = LibStats::default();
+            for (_, read, dl, n) in cs {
+                match n {
+                    Some(n) => {
+                        let e = numbered.entry(number_key(n)).or_default();
+                        e.0 |= read;
+                        e.1 |= dl;
+                    }
+                    None => {
+                        st.total += 1;
+                        st.unread += usize::from(!read);
+                        st.downloaded += usize::from(dl);
+                    }
+                }
+            }
+            st.total += numbered.len();
+            st.unread += numbered.values().filter(|e| !e.0).count();
+            st.downloaded += numbered.values().filter(|e| e.1).count();
             (mid, st)
         })
         .collect())
@@ -217,6 +289,32 @@ mod tests {
         restore_read(&mut conn, &[(cs[0].id.clone(), true, 7)]).unwrap();
         let c0 = chapter::get(&conn, &cs[0].id).unwrap().unwrap();
         assert!(c0.is_read && c0.read_progress == 7);
+    }
+
+    #[test]
+    fn chapters_from_several_sources_merge_one_per_number() {
+        let (_d, mut conn) = db();
+        let r = MangaSearchResult { source_id: "m1".into(), title: "Sword".into(), ..Default::default() };
+        let m = ensure_manga(&conn, "mangadex", &r, None).unwrap();
+        // The title's own source has chapters 1-3 in Polish; another source has 1-5 in English.
+        let pl: Vec<ChapterInfo> = (1..=3).map(|i| ChapterInfo { language: "pl".into(), ..info(&format!("md{i}"), i as f64) }).collect();
+        apply_chapters(&mut conn, &m.id, "mangadex", &pl, "en").unwrap();
+        let en: Vec<ChapterInfo> = (1..=5).map(|i| info(&format!("ot{i}"), i as f64)).collect();
+        let cs = apply_chapters(&mut conn, &m.id, "other", &en, "en").unwrap();
+        assert_eq!(cs.len(), 5);
+        assert!(cs.iter().all(|c| c.source_plugin == "other"));
+
+        // Same language on both: one chapter per number, from the source with the most chapters,
+        // except where a chapter was already read on the other one.
+        let md_en: Vec<ChapterInfo> = (1..=3).map(|i| info(&format!("mde{i}"), i as f64)).collect();
+        let cs = apply_chapters(&mut conn, &m.id, "mangadex", &md_en, "en").unwrap();
+        assert_eq!(cs.iter().map(|c| c.number.unwrap()).collect::<Vec<_>>(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!(cs.iter().all(|c| c.source_plugin == "other"));
+        let md2 = chapter::list(&conn, &m.id).unwrap().into_iter().find(|c| c.source_id == "mde2").unwrap();
+        save_progress(&conn, &m.id, &md2.id, 1, 10).unwrap();
+        let cs = chapters(&conn, &m.id, "en").unwrap();
+        assert_eq!(cs.iter().map(|c| c.source_id.as_str()).collect::<Vec<_>>(), vec!["ot1", "mde2", "ot3", "ot4", "ot5"]);
+        assert_eq!(library_stats(&conn, "en").unwrap()[&m.id], LibStats { total: 5, unread: 5, downloaded: 0 });
     }
 
     #[test]

@@ -173,3 +173,31 @@ mod tests {
         assert_eq!(abs_url("https://a.test", "x.jpg"), None);
     }
 }
+
+/// Lowercase words only (punctuation dropped), for comparing titles.
+pub fn title_key(s: &str) -> String {
+    s.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// How alike two titles are: 1.0 for the same words, 0.9 when one contains the other (6+
+/// characters), otherwise the share of words they have in common.
+pub fn title_similarity(a: &str, b: &str) -> f64 {
+    let (a, b) = (title_key(a), title_key(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    if (a.len() >= 6 && b.contains(&a)) || (b.len() >= 6 && a.contains(&b)) {
+        return 0.9;
+    }
+    let wa: std::collections::HashSet<&str> = a.split(' ').collect();
+    let wb: std::collections::HashSet<&str> = b.split(' ').collect();
+    wa.intersection(&wb).count() as f64 / wa.len().max(wb.len()) as f64
+}
+
+/// Latin-script text (English and romanized titles, not Korean, Japanese, Thai...).
+pub fn is_latin(s: &str) -> bool {
+    s.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_ascii() || ('\u{00C0}'..='\u{024F}').contains(&c))
+}

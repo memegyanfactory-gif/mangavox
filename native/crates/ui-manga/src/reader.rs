@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::Sizable as _;
@@ -125,30 +125,30 @@ fn local_pages(ch: &Chapter) -> Vec<PathBuf> {
 async fn load_chapter(chapter_id: String, at_end: bool) -> Result<Loaded> {
     let cid = chapter_id.clone();
     let lang = backend::preferred_language();
-    let (m, chapters, ch, recap) = mv_ui::bg::blocking(move || {
+    let (m, chapters, ch, alternates, recap) = mv_ui::bg::blocking(move || {
         backend::with_db(|c| {
             let ch = chapter::get(c, &cid)?.ok_or_else(|| anyhow!("Chapter not found"))?;
             let m = manga::get(c, &ch.manga_id)?.ok_or_else(|| anyhow!("Manga not found"))?;
+            let all = chapter::list(c, &m.id)?;
             let mut list = store::chapters(c, &m.id, &lang)?;
             // The open chapter is always part of the list, even in another language.
             if !list.iter().any(|x| x.id == ch.id) {
-                list = chapter::list(c, &m.id)?;
+                list = all.clone();
             }
+            let alternates = backend::alternate_sources(&all, &ch);
             let recap = recap::find(&m.id, &ch.id);
-            Ok((m, list, ch, recap))
+            Ok((m, list, ch, alternates, recap))
         })
     })
     .await??;
-    let source = if ch.source_plugin.is_empty() { m.source_plugin.clone() } else { ch.source_plugin.clone() };
+    let mut source = if ch.source_plugin.is_empty() { m.source_plugin.clone() } else { ch.source_plugin.clone() };
     let local = local_pages(&ch);
     let pages: Vec<PageEntry> = if !local.is_empty() {
         local.into_iter().map(|p| PageEntry { url: String::new(), state: PageState::Ready(p.clone(), dims(&p)) }).collect()
     } else {
-        let src = backend::source(&source).await?;
-        let urls = src.get_page_urls(&ch.source_id).await.map_err(|e| anyhow!("{e}"))?;
-        if urls.is_empty() {
-            bail!("The source returned no pages for this chapter");
-        }
+        let tries = std::iter::once((source.clone(), ch.source_id.clone())).chain(alternates).collect();
+        let (used, urls) = backend::page_urls(tries).await?;
+        source = used;
         urls.into_iter().map(|url| PageEntry { url, state: PageState::Idle }).collect()
     };
     let start = if at_end {

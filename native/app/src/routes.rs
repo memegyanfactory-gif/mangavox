@@ -96,7 +96,7 @@ pub fn nav_label(section: Section, route: &Route) -> Option<&'static str> {
 /// Studio and YouTube: wide pages of their own (no section, the 60px rail, their own assistant
 /// panel), shown only in Studio mode.
 pub fn is_workspace(route: &Route) -> bool {
-    matches!(route, Route::Studio | Route::YouTube)
+    matches!(route, Route::Studio | Route::YouTube | Route::Suggestions)
 }
 
 /// Full-screen routes hide the sidebar and dock (the welcome setup fills the window too).

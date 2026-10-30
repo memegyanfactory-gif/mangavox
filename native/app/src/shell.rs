@@ -576,6 +576,7 @@ impl Shell {
             Route::Studio => vec![here("Studio")],
             Route::Mobile => vec![here("Mobile")],
             Route::YouTube => vec![here("YouTube")],
+            Route::Suggestions => vec![here("Suggestions")],
             Route::Reader { manga_id, chapter_id } => vec![
                 section_crumb,
                 link(self.manga_names.get(manga_id).cloned().unwrap_or_else(|| "Manga".into()), CrumbTo::Manga(manga_id.clone())).loading(self.looking_up.contains(manga_id)),
@@ -588,6 +589,7 @@ impl Shell {
                     let mut v = match &owner {
                         Some(Route::Studio) => vec![link("Studio".into(), CrumbTo::Up(Route::Studio))],
                         Some(Route::YouTube) => vec![link("YouTube".into(), CrumbTo::Up(Route::YouTube))],
+                        Some(Route::Suggestions) => vec![link("Suggestions".into(), CrumbTo::Up(Route::Suggestions))],
                         Some(o) => vec![section_crumb, link(nav_label(sec, o).unwrap_or("Back").into(), CrumbTo::Up(o.clone()))],
                         None => vec![section_crumb],
                     };
@@ -1163,6 +1165,7 @@ impl Shell {
         let studio = mv_ui::mode::studio_enabled(cx).then(|| {
             let active = owner.as_ref() == Some(&Route::Studio);
             let yt_active = owner.as_ref() == Some(&Route::YouTube);
+            let sg_active = owner.as_ref() == Some(&Route::Suggestions);
             div()
                 .flex()
                 .flex_col()
@@ -1170,6 +1173,7 @@ impl Shell {
                 .map(|d| if rail { d.pt(px(10.)).border_t_1().border_color(Tokens::border()) } else { d.child(section_label("Studio").px(px(10.))) })
                 .child(nav_item("nav-studio", glyphs::STUDIO, "Studio", active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Studio, w, cx))))
                 .child(nav_item("nav-youtube", glyphs::YOUTUBE, "YouTube", yt_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::YouTube, w, cx))))
+                .child(nav_item("nav-suggestions", ph::LIGHTBULB, "Suggestions", sg_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Suggestions, w, cx))))
         });
 
         let settings = nav_item("nav-settings", glyphs::SETTINGS, "Settings", matches!(self.route, Route::Settings { .. }), rail)
@@ -1402,6 +1406,7 @@ fn route_title(route: &Route) -> &'static str {
         Route::Studio => "Studio",
         Route::Mobile => "Mobile",
         Route::YouTube => "YouTube",
+        Route::Suggestions => "Suggestions",
         Route::Settings { .. } => "Settings",
         Route::Welcome => "Welcome",
         _ => "MangaVox",

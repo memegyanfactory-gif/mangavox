@@ -9992,10 +9992,12 @@ dependencies = [
  "mv-ai",
  "mv-core",
  "mv-recap",
+ "mv-sources",
  "mv-ui",
  "mv-youtube",
  "serde_json",
  "ui-assistant",
+ "ui-manga",
  "ui-studio",
 ]
 

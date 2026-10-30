@@ -243,6 +243,34 @@ pub fn local_string(v: &Value) -> String {
     }
 }
 
+/// The name to show: the English title, else the first English other name (a manhwa listed as
+/// "Geom Meokneun Swordmaster" is shown as "The Sword-Eating Swordmaster"), else the main title.
+pub fn display_title(m: &Value) -> String {
+    let title = m.pointer("/attributes/title").unwrap_or(&Value::Null);
+    if let Some(en) = title.get("en").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+        return en.to_string();
+    }
+    let alt_en = m.pointer("/attributes/altTitles").and_then(Value::as_array).into_iter().flatten().find_map(|a| a.get("en").and_then(Value::as_str)).filter(|s| !s.trim().is_empty());
+    alt_en.map(str::to_string).unwrap_or_else(|| local_string(title))
+}
+
+/// The other Latin-script titles of a manga (English, romanized), no repeats of the main title.
+fn alt_titles(m: &Value) -> Vec<String> {
+    let main = crate::util::title_key(&display_title(m));
+    let mut out: Vec<String> = Vec::new();
+    let all = m.pointer("/attributes/title").and_then(Value::as_object).into_iter().flat_map(|o| o.values()).chain(
+        m.pointer("/attributes/altTitles").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_object).flat_map(|o| o.values()),
+    );
+    for t in all.filter_map(Value::as_str) {
+        let key = crate::util::title_key(t);
+        if crate::util::is_latin(t) && !key.is_empty() && key != main && !out.iter().any(|o| crate::util::title_key(o) == key) {
+            out.push(t.to_string());
+        }
+    }
+    out.truncate(8);
+    out
+}
+
 fn rels<'a>(m: &'a Value, ty: &'a str) -> impl Iterator<Item = &'a Value> {
     m.get("relationships").and_then(Value::as_array).into_iter().flatten().filter(move |r| r.get("type").and_then(Value::as_str) == Some(ty))
 }
@@ -264,8 +292,8 @@ fn str_attr(m: &Value, key: &str) -> Option<String> {
 pub fn manga_to_result(m: &Value) -> MangaSearchResult {
     MangaSearchResult {
         source_id: m.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-        title: local_string(m.pointer("/attributes/title").unwrap_or(&Value::Null)),
-        alt_titles: None,
+        title: display_title(m),
+        alt_titles: Some(alt_titles(m)).filter(|t| !t.is_empty()),
         cover_url: cover_url(m),
         author: rel_name(m, "author"),
         status: str_attr(m, "status"),
@@ -303,7 +331,7 @@ pub fn parse_details(json: &Value) -> Result<MangaDetails> {
     }
     Ok(MangaDetails {
         source_id: m.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-        title: local_string(m.pointer("/attributes/title").unwrap_or(&Value::Null)),
+        title: display_title(m),
         author: rel_name(m, "author"),
         artist: rel_name(m, "artist"),
         description: Some(local_string(m.pointer("/attributes/description").unwrap_or(&Value::Null))).filter(|s| !s.is_empty()),

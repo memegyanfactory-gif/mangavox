@@ -277,22 +277,19 @@ impl Downloads {
         cx.spawn(async move |this, cx| {
             let res: Result<bool> = async {
                 let (cid, mid) = (job.chapter_id.clone(), job.manga_id.clone());
-                let (source, chapter_source_id) = mv_ui::bg::blocking(move || {
+                let tries = mv_ui::bg::blocking(move || {
                     backend::with_db(|c| {
                         let ch = chapter::get(c, &cid)?.ok_or_else(|| anyhow!("Chapter no longer exists"))?;
                         let m = manga::get(c, &mid)?.ok_or_else(|| anyhow!("Title no longer exists"))?;
                         chapter::update_download_status(c, &cid, "downloading", None)?;
-                        let src = if ch.source_plugin.is_empty() { m.source_plugin } else { ch.source_plugin };
-                        Ok((src, ch.source_id))
+                        let src = if ch.source_plugin.is_empty() { m.source_plugin.clone() } else { ch.source_plugin.clone() };
+                        // Other sources with the same chapter, for one its own source cannot serve.
+                        let alts = backend::alternate_sources(&chapter::list(c, &m.id)?, &ch);
+                        Ok(std::iter::once((src, ch.source_id)).chain(alts).collect::<Vec<_>>())
                     })
                 })
                 .await??;
-                let src_id = source.clone();
-                let urls = mv_ui::bg::run(async move {
-                    let src = backend::source(&src_id).await?;
-                    src.get_page_urls(&chapter_source_id).await.map_err(|e| anyhow!("{e}"))
-                })
-                .await??;
+                let (source, urls) = mv_ui::bg::run(backend::page_urls(tries)).await??;
                 if urls.is_empty() {
                     bail!("The source returned no pages");
                 }

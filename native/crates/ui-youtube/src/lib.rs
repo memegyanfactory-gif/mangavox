@@ -10,11 +10,13 @@ mod chart;
 mod content;
 pub mod hub;
 mod page;
+mod suggest;
 mod views;
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {
         Route::YouTube => Some(cx.new(|cx| page::YouTubePage::new(window, cx)).into()),
+        Route::Suggestions => Some(cx.new(|cx| suggest::SuggestionsPage::new(window, cx)).into()),
         _ => None,
     }
 }

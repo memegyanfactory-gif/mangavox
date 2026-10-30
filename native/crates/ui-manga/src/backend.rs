@@ -232,6 +232,35 @@ pub async fn source(id: &str) -> Result<Arc<dyn Source>> {
     registry().await.get(id).ok_or_else(|| anyhow!("Source \"{id}\" is not installed"))
 }
 
+/// Page URLs of a chapter from the first of `tries` (`(source, chapter source id)`: the chapter's
+/// own source, then other sources that have the same chapter) that serves any, with the source
+/// used. A chapter its source cannot serve (licensed, taken down) is read from another one.
+pub async fn page_urls(tries: Vec<(String, String)>) -> Result<(String, Vec<String>)> {
+    let mut first_err: Option<anyhow::Error> = None;
+    for (src_id, chapter_source_id) in tries {
+        let got = match source(&src_id).await {
+            Ok(src) => src.get_page_urls(&chapter_source_id).await.map_err(|e| anyhow!("{e}")),
+            Err(e) => Err(e),
+        };
+        match got {
+            Ok(urls) if !urls.is_empty() => return Ok((src_id, urls)),
+            Ok(_) => first_err = first_err.or_else(|| Some(anyhow!("The source returned no pages for this chapter"))),
+            Err(e) => first_err = first_err.or(Some(e)),
+        }
+    }
+    Err(first_err.unwrap_or_else(|| anyhow!("The source returned no pages for this chapter")))
+}
+
+/// `(source, chapter source id)` of the same chapter in a title's other sources (same number,
+/// another source), the preferred language first. For [`page_urls`].
+pub fn alternate_sources(all: &[mv_core::repo::chapter::Chapter], ch: &mv_core::repo::chapter::Chapter) -> Vec<(String, String)> {
+    let lang = preferred_language();
+    let mut alts: Vec<&mv_core::repo::chapter::Chapter> =
+        all.iter().filter(|x| x.id != ch.id && x.source_plugin != ch.source_plugin && x.number.is_some() && x.number == ch.number).collect();
+    alts.sort_by_key(|x| !logic::lang_matches(&x.language, &lang));
+    alts.into_iter().map(|a| (a.source_plugin.clone(), a.source_id.clone())).collect()
+}
+
 /// Ids of builtin sources (everything else in the registry is an installed plugin).
 pub fn is_installed_plugin(id: &str) -> bool {
     mv_plugins::repo::list_installed(&plugins_dir()).iter().any(|m| m.id == id)

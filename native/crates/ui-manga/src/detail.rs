@@ -61,6 +61,12 @@ pub struct DetailPage {
     expanded: bool,
     refreshing: bool,
     auto_refreshed: bool,
+    /// Looking for the title's chapters in the other installed sources.
+    merging: bool,
+    /// The automatic look (on open) was started.
+    merge_checked: bool,
+    /// Every source's name by id (chapters can come from several).
+    source_names: HashMap<String, String>,
     /// Downloads deleted in the UI whose files go after the Undo window.
     pending_delete: HashSet<String>,
     /// Bumped on each toggle so the action tile replays its pop.
@@ -126,6 +132,9 @@ impl DetailPage {
             expanded: false,
             refreshing: false,
             auto_refreshed: false,
+            merging: false,
+            merge_checked: false,
+            source_names: HashMap::new(),
             pending_delete: HashSet::new(),
             fav_pop: 0,
             lib_pop: 0,
@@ -171,15 +180,21 @@ impl DetailPage {
                             this.auto_refreshed = true;
                             this.refresh(true, cx);
                         }
+                        // Once per open: other installed sources may have more of its chapters.
+                        if !this.merge_checked && ops::needs_scan(&this.manga_id) {
+                            this.merge_checked = true;
+                            this.merge(false, true, cx);
+                        }
                     }
                     Err(e) => this.state = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();
             });
             if let Some(src) = source {
-                let name = mv_ui::bg::run(async move { backend::registry().await.get(&src).map(|s| s.info().name) }).await.ok().flatten();
+                let names = mv_ui::bg::run(async move { backend::registry().await.list() }).await.unwrap_or_default();
                 let _ = this.update(cx, |this, cx| {
-                    this.source_name = name;
+                    this.source_name = names.iter().find(|s| s.id == src).map(|s| s.name.clone());
+                    this.source_names = names.into_iter().map(|s| (s.id, s.name)).collect();
                     cx.notify();
                 });
             }
@@ -242,13 +257,18 @@ impl DetailPage {
                             _ => 0,
                         };
                         let added = cs.len().saturating_sub(before);
-                        if !quiet {
-                            toast::show(cx, if added > 0 { Toast::success(plural(added, "new chapter", "new chapters")) } else { Toast::success("Up to date: no new chapters").icon(ph::CHECK_CIRCLE) });
+                        if !quiet && added > 0 {
+                            toast::show(cx, Toast::success(plural(added, "new chapter", "new chapters")));
                         }
                         this.extras = backend::extras(&this.manga_id).unwrap_or_default();
                         this.seen_version = backend::data_version();
                         this.set_data(m, cs);
                         this.maybe_load_recs(cx);
+                        // A refresh the user asked for also looks in the other sources again.
+                        if !quiet {
+                            this.merge_checked = true;
+                            this.merge(true, added > 0, cx);
+                        }
                     }
                     Err(e) => toast::show(
                         cx,
@@ -258,6 +278,42 @@ impl DetailPage {
                     ),
                 }
                 this.list.remeasure_items(0..LEAD.min(this.list.item_count()));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Adds the chapters the other installed sources have for this title (see
+    /// [`ops::sync_other_sources`]). `quiet` only reports when something was added or renamed.
+    fn merge(&mut self, rescan: bool, quiet: bool, cx: &mut Context<Self>) {
+        if self.merging {
+            return;
+        }
+        self.merging = true;
+        cx.notify();
+        let id = self.manga_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::run(ops::sync_other_sources(id, rescan)).await.and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.merging = false;
+                match res {
+                    Ok(n) => {
+                        let from = n.from.join(", ");
+                        match (n.added, &n.renamed) {
+                            (0, None) if !quiet => toast::show(cx, Toast::success("Up to date: no new chapters").icon(ph::CHECK_CIRCLE)),
+                            (0, None) => {}
+                            (a, None) => toast::show(cx, Toast::success(format!("Added {} from {from}", plural(a, "chapter", "chapters")))),
+                            (0, Some(t)) => toast::show(cx, Toast::success(format!("Renamed to \u{201c}{t}\u{201d}, the name {from} uses"))),
+                            (a, Some(t)) => toast::show(cx, Toast::success(format!("Added {} from {from} and renamed it \u{201c}{t}\u{201d}", plural(a, "chapter", "chapters")))),
+                        }
+                        if n.added > 0 || n.renamed.is_some() {
+                            this.reload(cx);
+                        }
+                    }
+                    Err(e) if !quiet => toast::show(cx, Toast::error(format!("Could not check the other sources: {e:#}"))),
+                    Err(_) => {}
+                }
                 cx.notify();
             });
         })
@@ -739,8 +795,8 @@ impl DetailPage {
                 )
             })
             .child(
-                action_tile("act-refresh", glyphs::REFRESH, if self.refreshing { "Refreshing" } else { "Refresh" }, false, Tokens::accent(), self.refreshing, 0)
-                    .tooltip(tip("Check the source for new chapters"))
+                action_tile("act-refresh", glyphs::REFRESH, if self.refreshing { "Refreshing" } else if self.merging { "Finding chapters" } else { "Refresh" }, false, Tokens::accent(), self.refreshing || self.merging, 0)
+                    .tooltip(tip("Check this source and your other installed sources for chapters"))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(false, cx))),
             )
             .when_some(web, |d, url| {
@@ -1006,6 +1062,10 @@ impl DetailPage {
         }
         if let Some(g) = extra.group {
             meta.push(g);
+        }
+        // Chapters another installed source gives say where they come from.
+        if !c.source_plugin.is_empty() && c.source_plugin != m.source_plugin {
+            meta.push(self.source_names.get(&c.source_plugin).cloned().unwrap_or_else(|| c.source_plugin.clone()));
         }
         if !logic::lang_matches(&c.language, &self.lang) {
             meta.push(c.language.to_uppercase());

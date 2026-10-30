@@ -30,6 +30,8 @@ pub enum Route {
     Mobile,
     /// Channel dashboard, uploads, scheduler and insights for the connected YouTube channel.
     YouTube,
+    /// Studio suggestions: trending manga recaps on YouTube, what to recap next, the channel meter.
+    Suggestions,
     // App
     Settings { tab: Option<String> },
     /// First-run setup (full window; also "Run welcome setup again" in Settings › About).

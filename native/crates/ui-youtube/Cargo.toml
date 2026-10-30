@@ -12,6 +12,8 @@ mv-recap = { path = "../mv-recap" }
 mv-ai = { path = "../mv-ai" }
 ui-studio = { path = "../ui-studio" }
 ui-assistant = { path = "../ui-assistant" }
+ui-manga = { path = "../ui-manga" }
+mv-sources = { path = "../mv-sources" }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 chrono = "0.4"

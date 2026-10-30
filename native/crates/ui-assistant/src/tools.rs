@@ -173,6 +173,7 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::Player { .. } => "player",
         Route::Studio => "studio",
         Route::YouTube => "youtube",
+        Route::Suggestions => "suggestions",
         Route::Settings { .. } => "settings",
         Route::Welcome => "welcome",
         Route::Back => "back",
@@ -476,6 +477,7 @@ pub fn route_for_page(page: &str) -> Option<Route> {
         "studio" => Route::Studio,
         "mobile" => Route::Mobile,
         "youtube" => Route::YouTube,
+        "suggestions" => Route::Suggestions,
         "settings" => Route::Settings { tab: None },
         _ => return None,
     })

@@ -14,6 +14,7 @@ pub mod auth;
 pub mod planner;
 pub mod seo;
 pub mod store;
+pub mod trends;
 pub mod types;
 
 pub use api::YouTube;
