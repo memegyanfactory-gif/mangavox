@@ -9833,6 +9833,7 @@ dependencies = [
  "mv-plugins",
  "mv-sources",
  "mv-ui",
+ "rodio",
  "rusqlite",
  "serde",
  "serde_json",

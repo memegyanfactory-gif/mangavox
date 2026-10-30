@@ -24,6 +24,8 @@ use crate::discover::{self, Recs};
 use crate::downloads::{downloads, ChapterDl, Downloads, Job};
 use crate::logic::{self, ChapterView};
 use crate::ops;
+use crate::reader::{open_read_aloud, watch_recap};
+use crate::recap::{self, RecapOutputs};
 use crate::store;
 use crate::tags::MAX_RECS;
 use crate::ui::{action_tile, cover_src, fill_menu, icon_trigger, manga_card, skeleton_cover, spawn_cover_downloads, CardInfo, Entry, Grid, Load};
@@ -53,6 +55,8 @@ pub struct DetailPage {
     /// Chapter the Resume / Start button opens.
     current: Option<usize>,
     extras: HashMap<String, ChapterExtra>,
+    /// Chapters Studio made a recap of (video and / or narration), by chapter id.
+    recaps: HashMap<String, RecapOutputs>,
     lang: String,
     expanded: bool,
     refreshing: bool,
@@ -80,6 +84,7 @@ struct Loaded {
     cover: Option<PathBuf>,
     cats: Vec<LibraryCategory>,
     member: Vec<String>,
+    recaps: HashMap<String, RecapOutputs>,
 }
 
 fn load(id: String, lang: String) -> anyhow::Result<Loaded> {
@@ -89,7 +94,9 @@ fn load(id: String, lang: String) -> anyhow::Result<Loaded> {
         let cover = m.cover_path.as_deref().and_then(mv_core::covers::cached_cover);
         let cats = category::list(c)?;
         let member = category::manga_category_map(c)?.remove(&id).unwrap_or_default();
-        Ok(Loaded { manga: m, chapters: cs, cover, cats, member })
+        // Only downloaded chapters can have been through Studio.
+        let recaps = cs.iter().filter(|c| c.download_status == "complete").filter_map(|c| Some((c.id.clone(), recap::find(&id, &c.id)?))).collect();
+        Ok(Loaded { manga: m, chapters: cs, cover, cats, member, recaps })
     })
 }
 
@@ -105,6 +112,7 @@ impl DetailPage {
         let mut p = Self {
             in_library: !backend::browse_only().contains(&manga_id),
             extras: backend::extras(&manga_id).unwrap_or_default(),
+            recaps: HashMap::new(),
             manga_id,
             state: Load::Loading,
             cover: None,
@@ -155,6 +163,7 @@ impl DetailPage {
                         this.in_library = !backend::browse_only().contains(&this.manga_id);
                         this.cats = l.cats;
                         this.member = l.member;
+                        this.recaps = l.recaps;
                         this.set_data(l.manga, l.chapters);
                         this.maybe_load_recs(cx);
                         // A title without chapters has never been synced: fetch them once.
@@ -920,6 +929,18 @@ impl DetailPage {
         let c = &cs[i];
         let weak = cx.entity().downgrade();
         let mut v = vec![];
+        if let Some(r) = self.recaps.get(&c.id) {
+            v.push(Entry::Heading("Studio recap".into()));
+            if let Some(video) = r.video.clone() {
+                let title = format!("{} · {}", self.title(), logic::chapter_label(c));
+                v.push(Entry::new("Watch recap video", move |w, cx| watch_recap(title.clone(), &video, w, cx)).icon(ph::MONITOR_PLAY));
+            }
+            if r.can_read_aloud() {
+                let (mid, cid) = (self.manga_id.clone(), c.id.clone());
+                v.push(Entry::new("Read aloud", move |w, cx| open_read_aloud(mid.clone(), cid.clone(), w, cx)).icon(ph::SPEAKER_HIGH).hint("Narration, pages follow along"));
+            }
+            v.push(Entry::Separator);
+        }
         {
             let (w, id, read) = (weak.clone(), c.id.clone(), !c.is_read);
             v.push(
@@ -1052,6 +1073,7 @@ impl DetailPage {
             // Row controls appear with the pointer, and on their own when Tab reaches them (the
             // opacity sits on each control so keyboard focus can lift it; an open menu keeps
             // its trigger shown). WCAG 2.4.7: https://www.w3.org/WAI/WCAG22/Understanding/focus-visible.html
+            .children(self.recap_controls(m, c))
             .child(
                 icon_button(SharedString::from(format!("mr-{}", c.id)), if read { ph::ARROW_COUNTER_CLOCKWISE } else { ph::CHECK }, if read { "Mark as unread" } else { "Mark as read" })
                     .small()
@@ -1073,6 +1095,34 @@ impl DetailPage {
             .child(self.download_control(c, dl, cx))
             .context_menu(move |menu, _, _| fill_menu(menu.min_w(px(240.)), &entries))
             .into_any_element()
+    }
+
+    /// Watch / Read aloud on a chapter Studio made a recap of. Always shown (not only on hover):
+    /// they are the row's main actions besides opening it.
+    fn recap_controls(&self, m: &Manga, c: &Chapter) -> Option<Div> {
+        let r = self.recaps.get(&c.id)?;
+        let video = r.video.clone();
+        let title = format!("{} · {}", m.title, logic::chapter_label(c));
+        let (mid, cid) = (m.id.clone(), c.id.clone());
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(2.))
+                .when_some(video, |d, v| {
+                    d.child(icon_button(SharedString::from(format!("rw-{}", c.id)), ph::MONITOR_PLAY, "Watch the recap video").color(Tokens::accent()).on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        watch_recap(title.clone(), &v, w, cx);
+                    }))
+                })
+                .when(r.can_read_aloud(), |d| {
+                    d.child(icon_button(SharedString::from(format!("ra-{}", c.id)), ph::SPEAKER_HIGH, "Read aloud: narration plays, pages follow along").color(Tokens::accent()).on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        open_read_aloud(mid.clone(), cid.clone(), w, cx);
+                    }))
+                }),
+        )
     }
 
     /// Per-chapter download state at the end of a row (Mihon's indicator): download, a flat ring

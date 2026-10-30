@@ -12,7 +12,7 @@ use gpui_kit::component::command::CommandState;
 use gpui_kit::component::{FocusTrapElement as _, TitleBar, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ui::nav::{set_back_target, set_navigator};
+use mv_ui::nav::{set_back_target, set_current_route, set_navigator};
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::update::{version, Status, Updater};
@@ -449,6 +449,7 @@ impl Shell {
     /// the wide Studio page the 60px rail, restoring the user's own sidebar state afterwards.
     fn sync_back(&mut self, cx: &mut App) {
         set_back_target(cx, self.back_route());
+        set_current_route(cx, self.route.clone());
         if is_workspace(&self.route) {
             if self.saved_collapsed.is_none() {
                 self.saved_collapsed = Some(self.collapsed);

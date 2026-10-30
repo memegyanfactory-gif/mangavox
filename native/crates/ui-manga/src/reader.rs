@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -22,6 +23,8 @@ use mv_ui::Interactive as _;
 use crate::backend;
 use crate::downloads::{downloads, ChapterDl, Downloads, Job};
 use crate::logic::{self, Fit, ReaderMode};
+use crate::narrator::Narrator;
+use crate::recap::{self, Narration, RecapOutputs};
 use crate::store;
 use crate::ui::{fill_menu, icon_trigger, menu_trigger, Entry, Load};
 
@@ -41,6 +44,35 @@ const ZOOM_STEP: f32 = 1.25;
 const AUTO_FRAME: Duration = Duration::from_millis(16);
 /// Auto-scroll waits this long at the end of a strip or a tall page before moving on.
 const AUTO_END_HOLD: f32 = 1.5;
+/// Read aloud follows the narration again this long after the user last scrolled by hand.
+const REFOLLOW: Duration = Duration::from_secs(6);
+
+/// Chapter whose reader starts reading aloud as soon as it opens (set by the manga page).
+static PENDING_ALOUD: Mutex<Option<String>> = Mutex::new(None);
+
+/// Opens a chapter in the reader with Studio's narration playing.
+pub(crate) fn open_read_aloud(manga_id: String, chapter_id: String, window: &mut Window, cx: &mut App) {
+    *PENDING_ALOUD.lock().unwrap_or_else(|e| e.into_inner()) = Some(chapter_id.clone());
+    mv_ui::navigate(Route::Reader { manga_id, chapter_id }, window, cx);
+}
+
+/// Plays a chapter's recap video in the app's player.
+pub(crate) fn watch_recap(title: String, video: &Path, window: &mut Window, cx: &mut App) {
+    let request = mv_ui::nav::PlayRequest { title, source: video.display().to_string(), file_idx: None, imdb_id: None, mal_id: None, season: None, episode: None };
+    mv_ui::navigate(Route::Player { request }, window, cx);
+}
+
+/// Read aloud: Studio's narration plays and the reader follows the passage being read.
+struct Aloud {
+    narration: Narration,
+    player: Narrator,
+    /// Page file names in the reader's order (to match Studio's pages).
+    files: Vec<String>,
+    /// The reader follows the narration; scrolling by hand lets go of it for a while.
+    follow: bool,
+    touched: Instant,
+    _task: Task<()>,
+}
 
 #[derive(Clone)]
 enum PageState {
@@ -69,6 +101,7 @@ struct Loaded {
     chapter: Chapter,
     pages: Vec<PageEntry>,
     start: usize,
+    recap: Option<RecapOutputs>,
 }
 
 fn local_pages(ch: &Chapter) -> Vec<PathBuf> {
@@ -92,7 +125,7 @@ fn local_pages(ch: &Chapter) -> Vec<PathBuf> {
 async fn load_chapter(chapter_id: String, at_end: bool) -> Result<Loaded> {
     let cid = chapter_id.clone();
     let lang = backend::preferred_language();
-    let (m, chapters, ch) = mv_ui::bg::blocking(move || {
+    let (m, chapters, ch, recap) = mv_ui::bg::blocking(move || {
         backend::with_db(|c| {
             let ch = chapter::get(c, &cid)?.ok_or_else(|| anyhow!("Chapter not found"))?;
             let m = manga::get(c, &ch.manga_id)?.ok_or_else(|| anyhow!("Manga not found"))?;
@@ -101,7 +134,8 @@ async fn load_chapter(chapter_id: String, at_end: bool) -> Result<Loaded> {
             if !list.iter().any(|x| x.id == ch.id) {
                 list = chapter::list(c, &m.id)?;
             }
-            Ok((m, list, ch))
+            let recap = recap::find(&m.id, &ch.id);
+            Ok((m, list, ch, recap))
         })
     })
     .await??;
@@ -124,7 +158,7 @@ async fn load_chapter(chapter_id: String, at_end: bool) -> Result<Loaded> {
     } else {
         0
     };
-    Ok(Loaded { manga_title: m.title, source, chapters, chapter: ch, pages, start })
+    Ok(Loaded { manga_title: m.title, source, chapters, chapter: ch, pages, start, recap })
 }
 
 /// Records an element's window bounds during prepaint (for click / drag math).
@@ -158,6 +192,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("n", "Next chapter"),
     ("p", "Previous chapter"),
     ("a", "Start or stop auto-scroll"),
+    ("r", "Read aloud (chapters Studio narrated)"),
+    ("k", "Pause or play the narration"),
     ("[", "Auto-scroll slower"),
     ("]", "Auto-scroll faster"),
     ("m", "Change reading mode"),
@@ -220,6 +256,13 @@ pub struct ReaderPage {
     auto_elapsed: f32,
     /// The custom timer field, while it is open.
     auto_custom: Option<(Entity<InputState>, Subscription)>,
+    /// The chapter the reader was opened on (its route, to tell when it is the page on screen).
+    route_chapter: String,
+    /// Studio's recap of the open chapter, when it made one.
+    recap: Option<RecapOutputs>,
+    aloud: Option<Aloud>,
+    aloud_loading: bool,
+    aloud_bar: Rc<Cell<Bounds<Pixels>>>,
     _watch: Subscription,
 }
 
@@ -272,6 +315,11 @@ impl ReaderPage {
             auto_task: None,
             auto_elapsed: 0.,
             auto_custom: None,
+            route_chapter: chapter_id.clone(),
+            recap: None,
+            aloud: None,
+            aloud_loading: false,
+            aloud_bar: Rc::new(Cell::new(Bounds::default())),
             _watch: watch,
         };
         p.open_chapter(chapter_id, false, cx);
@@ -297,6 +345,9 @@ impl ReaderPage {
         self.current = 0;
         self.transition = None;
         self.zoom = 1.0;
+        // The narration belongs to the chapter that was open.
+        self.aloud = None;
+        self.recap = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = mv_ui::bg::run(load_chapter(chapter_id, at_end)).await.and_then(|r| r);
@@ -311,6 +362,15 @@ impl ReaderPage {
                         this.chapters = l.chapters;
                         this.current = l.start;
                         this.dl_pending = this.queue.read(cx).status(&l.chapter.id).is_some();
+                        let pending = {
+                            let mut p = PENDING_ALOUD.lock().unwrap_or_else(|e| e.into_inner());
+                            if p.as_deref() == Some(l.chapter.id.as_str()) {
+                                p.take().is_some()
+                            } else {
+                                false
+                            }
+                        };
+                        this.recap = l.recap;
                         this.chapter = Some(l.chapter);
                         this.pages = Load::Ready(l.pages);
                         this.page_scroll.set_offset(point(px(0.), px(0.)));
@@ -320,6 +380,9 @@ impl ReaderPage {
                         }
                         this.save(cx);
                         this.pump(cx);
+                        if pending {
+                            this.start_aloud(cx);
+                        }
                     }
                     Err(e) => this.pages = Load::Failed(format!("{e:#}")),
                 }
@@ -423,6 +486,7 @@ impl ReaderPage {
             self.strip_scroll.scroll_to_top_of_item(page.min(self.total().saturating_sub(1)));
         }
         self.goto(page, cx);
+        self.aloud_from_page(cx);
     }
 
     fn chapter_index(&self) -> Option<usize> {
@@ -468,6 +532,7 @@ impl ReaderPage {
             }
         } else if self.current + 1 < self.total() {
             self.goto(self.current + 1, cx);
+            self.aloud_from_page(cx);
         } else {
             self.transition = Some(1);
             cx.notify();
@@ -488,6 +553,7 @@ impl ReaderPage {
             }
         } else if self.current > 0 {
             self.goto(self.current - 1, cx);
+            self.aloud_from_page(cx);
         } else {
             self.transition = Some(-1);
             cx.notify();
@@ -495,6 +561,7 @@ impl ReaderPage {
     }
 
     fn scroll_by(&mut self, viewport_fraction: f32, cx: &mut Context<Self>) {
+        self.aloud_touched();
         let h = self.strip_scroll.bounds().size.height;
         let o = self.strip_scroll.offset();
         let max = self.strip_scroll.max_offset().y;
@@ -602,6 +669,8 @@ impl ReaderPage {
         if self.auto {
             return;
         }
+        // The timer and the narration would fight over the scroll.
+        self.aloud = None;
         self.auto = true;
         self.auto_elapsed = 0.;
         // Reading starts: the bars get out of the way.
@@ -801,6 +870,364 @@ impl ReaderPage {
         div().flex().items_center().gap(px(2.)).child(toggle).child(menu).children(field)
     }
 
+    // ------------------------------------------------------------ read aloud
+
+    fn toggle_aloud(&mut self, cx: &mut Context<Self>) {
+        if self.aloud.is_some() {
+            self.aloud = None;
+            cx.notify();
+        } else {
+            self.start_aloud(cx);
+        }
+    }
+
+    /// Loads the chapter's narration and starts it at the page on screen.
+    fn start_aloud(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.recap.as_ref().filter(|r| r.can_read_aloud()).map(|r| r.dir.clone()) else { return };
+        if self.aloud.is_some() || self.aloud_loading {
+            return;
+        }
+        self.aloud_loading = true;
+        let generation = self.generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::blocking(move || Narration::load(&dir).map(|n| (n, dir.join("audio")))).await.and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.aloud_loading = false;
+                if this.generation == generation {
+                    match res {
+                        Ok((n, audio)) => this.begin_aloud(n, audio, cx),
+                        Err(e) => mv_ui::toast::show(cx, mv_ui::toast::Toast::error(format!("Could not read this chapter aloud: {e:#}"))),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn begin_aloud(&mut self, n: Narration, audio: PathBuf, cx: &mut Context<Self>) {
+        let Load::Ready(pages) = &self.pages else { return };
+        let files: Vec<String> = pages
+            .iter()
+            .map(|p| match &p.state {
+                PageState::Ready(path, _) => path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                _ => String::new(),
+            })
+            .collect();
+        self.stop_auto(None, cx);
+        // From the start, or from the page the reader is on.
+        let at = if self.current == 0 { 0 } else { n.page_start(n.studio_page(self.current, &files)).unwrap_or(0) };
+        let player = Narrator::start(audio, n.clips.clone(), at);
+        let task = cx.spawn(async move |this, cx| {
+            let mut last = Instant::now();
+            loop {
+                cx.background_executor().timer(AUTO_FRAME).await;
+                let now = Instant::now();
+                let dt = now.duration_since(last).as_secs_f32().min(0.1);
+                last = now;
+                if this.update(cx, |t, cx| t.aloud_tick(dt, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.aloud = Some(Aloud { narration: n, player, files, follow: true, touched: Instant::now(), _task: task });
+        self.transition = None;
+        self.hide_overlay(cx);
+    }
+
+    /// The reader is the page on screen (it stays alive in history after the user leaves).
+    fn on_screen(&self, cx: &App) -> bool {
+        matches!(mv_ui::current_route(cx), Some(Route::Reader { manga_id, chapter_id }) if manga_id == self.manga_id && chapter_id == self.route_chapter)
+    }
+
+    /// Something else has the reader's attention: following waits.
+    fn aloud_held(&self) -> bool {
+        self.dragging || self.menu_open || self.pan.is_some() || self.zoom > 1. || self.show_keys || !matches!(self.pages, Load::Ready(_))
+    }
+
+    /// One Read aloud frame: keep the passage being read on screen.
+    fn aloud_tick(&mut self, dt: f32, cx: &mut Context<Self>) {
+        let here = self.on_screen(cx);
+        let held = self.aloud_held();
+        let Some(a) = &mut self.aloud else { return };
+        if a.player.failed() {
+            self.aloud = None;
+            mv_ui::toast::show(cx, mv_ui::toast::Toast::error("Could not play the narration. Check that a speaker or headphones are connected."));
+            cx.notify();
+            return;
+        }
+        if !here {
+            // Left the reader: the narration must not keep talking from history.
+            if a.player.playing() {
+                a.player.pause();
+            }
+            return;
+        }
+        if !a.follow && a.touched.elapsed() >= REFOLLOW {
+            a.follow = true;
+        }
+        let target = (a.follow && !held).then(|| a.narration.focus(a.player.position())).flatten().map(|(p, y)| (a.narration.reader_page(p, &a.files), y));
+        let playing = a.player.playing();
+        if let Some((page, frac)) = target {
+            self.follow_to(page, frac, dt, cx);
+        }
+        if playing {
+            cx.notify();
+        }
+    }
+
+    /// Eases the view towards point `frac` (0..1 of its height) of reader page `page`.
+    fn follow_to(&mut self, page: usize, frac: f32, dt: f32, cx: &mut Context<Self>) {
+        let (handle, top, page_h) = if self.strip() {
+            let h = self.strip_scroll.clone();
+            let Some(item) = h.bounds_for_item(page) else { return };
+            // Child bounds are laid out without the scroll offset.
+            (h.clone(), f32::from(item.origin.y - h.bounds().origin.y), f32::from(item.size.height))
+        } else {
+            if self.transition.is_some() || page != self.current {
+                self.goto(page, cx);
+            }
+            let h = self.page_scroll.clone();
+            let content = f32::from(h.max_offset().y + h.bounds().size.height);
+            (h, 0., content)
+        };
+        let (view_h, max) = (f32::from(handle.bounds().size.height), f32::from(handle.max_offset().y));
+        if view_h <= 0. || page_h <= 0. {
+            return;
+        }
+        let o = handle.offset();
+        let cur = -f32::from(o.y);
+        let next = recap::ease(cur, recap::scroll_target(top, page_h, view_h, frac).clamp(0., max.max(0.)), dt);
+        if (next - cur).abs() > 0.01 {
+            handle.set_offset(point(o.x, px(-next)));
+            if self.strip() {
+                self.sync_strip_page(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// The user scrolled by hand: stop following for a while (the narration plays on).
+    fn aloud_touched(&mut self) {
+        if let Some(a) = &mut self.aloud {
+            a.follow = false;
+            a.touched = Instant::now();
+        }
+    }
+
+    /// The user turned or jumped to a page: the narration moves there too.
+    fn aloud_from_page(&mut self, cx: &mut Context<Self>) {
+        let current = self.current;
+        let Some(a) = &mut self.aloud else { return };
+        if let Some(ms) = a.narration.page_start(a.narration.studio_page(current, &a.files)) {
+            a.player.seek(ms);
+        }
+        a.follow = true;
+        cx.notify();
+    }
+
+    fn aloud_seek(&mut self, ms: u64, cx: &mut Context<Self>) {
+        if let Some(a) = &mut self.aloud {
+            a.player.seek(ms.min(a.narration.total_ms));
+            a.follow = true;
+            cx.notify();
+        }
+    }
+
+    /// Previous (-1) or next (1) passage; back restarts the passage when it is under way.
+    fn aloud_step(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let Some(a) = &self.aloud else { return };
+        let pos = a.player.position();
+        let beats = &a.narration.beats;
+        let Some(i) = a.narration.beat_at(pos) else { return };
+        let ms = if dir > 0 {
+            match beats.get(i + 1) {
+                Some(b) => b.start_ms,
+                None => return,
+            }
+        } else if pos > beats[i].start_ms + 2000 || i == 0 {
+            beats[i].start_ms
+        } else {
+            beats[i - 1].start_ms
+        };
+        self.aloud_seek(ms, cx);
+    }
+
+    fn aloud_play_pause(&mut self, cx: &mut Context<Self>) {
+        if let Some(a) = &mut self.aloud {
+            if a.player.playing() {
+                a.player.pause();
+            } else {
+                a.player.play();
+                a.follow = true;
+            }
+            cx.notify();
+        }
+    }
+
+    /// Recap actions in the top bar: watch Studio's video, read the chapter aloud.
+    fn recap_buttons(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let r = self.recap.as_ref()?;
+        let video = r.video.clone();
+        let title = format!("{} · {}", self.title, self.chapter.as_ref().map(logic::chapter_label).unwrap_or_default());
+        let on = self.aloud.is_some();
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(4.))
+                .when_some(video, |d, v| {
+                    d.child(btn("recap-watch", "Watch recap", ButtonKind::Ghost).small().icon(ph::MONITOR_PLAY).tooltip("Play the recap video Studio made of this chapter").on_click(move |_, w, cx| {
+                        watch_recap(title.clone(), &v, w, cx);
+                    }))
+                })
+                .when(r.can_read_aloud(), |d| {
+                    d.child(
+                        btn("recap-aloud", if on { "Stop reading" } else { "Read aloud" }, if on { ButtonKind::Secondary } else { ButtonKind::Primary })
+                            .small()
+                            .icon(if on { ph::SPEAKER_X } else { ph::SPEAKER_HIGH })
+                            .loading(self.aloud_loading)
+                            .kbd("r")
+                            .tooltip("Play the chapter's narration while the pages follow along")
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                this.refocus(w, cx);
+                                this.toggle_aloud(cx);
+                            })),
+                    )
+                }),
+        )
+    }
+
+    /// The Read aloud player: stays on screen while the bars hide.
+    fn aloud_player(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let a = self.aloud.as_ref()?;
+        let (pos, total) = (a.player.position(), a.narration.total_ms.max(1));
+        let ended = a.player.ended();
+        let playing = a.player.playing();
+        let caption = a.narration.beat_at(pos).map(|i| a.narration.beats[i].text.clone()).unwrap_or_default();
+        let frac = (pos as f32 / total as f32).clamp(0., 1.);
+        let bar = self.aloud_bar.clone();
+        let follow = a.follow;
+        let play_icon = if ended {
+            ph::ARROW_COUNTER_CLOCKWISE
+        } else if playing {
+            ph::PAUSE
+        } else {
+            ph::PLAY
+        };
+        let play_tip = if ended {
+            "Play again"
+        } else if playing {
+            "Pause"
+        } else {
+            "Play"
+        };
+        Some(
+            div()
+                .id("aloud")
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(if self.overlay { 140. } else { 16. }))
+                .flex()
+                .justify_center()
+                .px(px(16.))
+                .child(
+                    div()
+                        .id("aloud-panel")
+                        .w_full()
+                        .max_w(px(720.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(radius::XL))
+                        .bg(Tokens::glass_strong())
+                        .border_1()
+                        .border_color(Tokens::glass_border())
+                        .shadow_lg()
+                        .occlude()
+                        .on_hover(cx.listener(|this, h: &bool, _, _| this.over_bars = *h))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(ph_icon(ph::WAVEFORM, Weight::Bold, Tokens::accent(), icon_px::MD))
+                                .child(icon_button("aloud-prev", ph::SKIP_BACK, "Previous passage").small().on_click(cx.listener(|this, _, w, cx| {
+                                    this.refocus(w, cx);
+                                    this.aloud_step(-1, cx);
+                                })))
+                                .child(icon_button("aloud-play", play_icon, play_tip).kbd("k").selected(playing).on_click(cx.listener(|this, _, w, cx| {
+                                    this.refocus(w, cx);
+                                    this.aloud_play_pause(cx);
+                                })))
+                                .child(icon_button("aloud-next", ph::SKIP_FORWARD, "Next passage").small().on_click(cx.listener(|this, _, w, cx| {
+                                    this.refocus(w, cx);
+                                    this.aloud_step(1, cx);
+                                })))
+                                .child(div().flex_none().w(px(44.)).text_right().text_size(px(size::SM)).text_color(Tokens::text_2()).child(recap::fmt_ms(pos)))
+                                .child(
+                                    div()
+                                        .id("aloud-bar")
+                                        .relative()
+                                        .flex_1()
+                                        .h(px(20.))
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .child(bounds_probe(bar.clone()))
+                                        .child(div().w_full().h(px(4.)).rounded_full().bg(Tokens::track()).child(div().h_full().rounded_full().bg(Tokens::accent()).w(relative(frac))))
+                                        // A whole click (not a press), so a press that changed the
+                                        // layout elsewhere can never land here as a seek.
+                                        .on_click(cx.listener(move |this, ev: &ClickEvent, w, cx| {
+                                            cx.stop_propagation();
+                                            this.refocus(w, cx);
+                                            let b = bar.get();
+                                            if b.size.width > px(0.) {
+                                                let f = (f32::from(ev.position().x - b.left()) / f32::from(b.size.width)).clamp(0., 1.);
+                                                this.aloud_seek((f * total as f32) as u64, cx);
+                                            }
+                                        })),
+                                )
+                                .child(div().flex_none().w(px(44.)).text_size(px(size::SM)).text_color(Tokens::text_3()).child(recap::fmt_ms(total)))
+                                .child(icon_button("aloud-close", ph::X, "Stop reading aloud").small().kbd("r").on_click(cx.listener(|this, _, w, cx| {
+                                    this.refocus(w, cx);
+                                    this.aloud = None;
+                                    cx.notify();
+                                }))),
+                        )
+                        // A fixed two-line caption row, so the controls above never move as
+                        // passages change; the follow buttons sit at its end.
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .h(px(40.))
+                                .px(px(4.))
+                                .child(div().flex_1().min_w_0().line_clamp(2).text_size(px(size::SM)).text_color(Tokens::text_1()).child(caption))
+                                .when(!follow, |d| {
+                                    d.child(btn("aloud-here", "Read from here", ButtonKind::Ghost).small().icon(ph::BOOK_OPEN).tooltip("Move the narration to the page on screen").on_click(cx.listener(|this, _, w, cx| {
+                                        this.refocus(w, cx);
+                                        this.aloud_from_page(cx);
+                                    })))
+                                    .child(btn("aloud-follow", "Back to narration", ButtonKind::Primary).small().icon(ph::ARROW_COUNTER_CLOCKWISE).on_click(cx.listener(|this, _, w, cx| {
+                                        this.refocus(w, cx);
+                                        if let Some(a) = &mut this.aloud {
+                                            a.follow = true;
+                                        }
+                                        cx.notify();
+                                    })))
+                                }),
+                        ),
+                ),
+        )
+    }
+
     // ------------------------------------------------------------ overlay
 
     fn show_overlay(&mut self, cx: &mut Context<Self>) {
@@ -932,6 +1359,10 @@ impl ReaderPage {
         let on_control = !self.focus.is_focused(window);
         match k.key.as_str() {
             "space" if on_control => {}
+            // While reading aloud, Space is play / pause like any audio player.
+            "space" if self.aloud.is_some() => self.aloud_play_pause(cx),
+            "k" => self.aloud_play_pause(cx),
+            "r" => self.toggle_aloud(cx),
             "escape" if self.show_keys => {
                 self.show_keys = false;
                 cx.notify();
@@ -1239,6 +1670,7 @@ impl ReaderPage {
             .when(self.total() > 0, |d| {
                 d.child(div().flex_none().mr(px(4.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} / {}", self.current + 1, self.total())))
             })
+            .children(self.recap_buttons(cx))
             .when(!self.chapters.is_empty(), |d| d.child(self.chapter_menu(cx)))
             .child(self.download_button(cx))
             .child(icon_button("reader-keys", ph::KEYBOARD, "Keyboard shortcuts").kbd("?").selected(self.show_keys).on_click(cx.listener(|this, _, w, cx| {
@@ -1573,7 +2005,8 @@ impl Render for ReaderPage {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .on_scroll_wheel(cx.listener(|_, _, window, cx| {
+                    .on_scroll_wheel(cx.listener(|this, _, window, cx| {
+                        this.aloud_touched();
                         // after the scroll has been applied
                         cx.defer_in(window, |this, _, cx| this.sync_strip_page(cx));
                     }))
@@ -1594,6 +2027,8 @@ impl Render for ReaderPage {
                             this.zoom_by(if dy > 0. { 1.1 } else { 1. / 1.1 }, Some(ev.position), cx);
                         }
                         cx.stop_propagation();
+                    } else {
+                        this.aloud_touched();
                     }
                 });
                 let surface: AnyElement = match self.transition {
@@ -1701,6 +2136,7 @@ impl Render for ReaderPage {
                 let f = (self.auto_elapsed / self.auto_secs.max(0.1)).clamp(0., 1.);
                 d.child(div().absolute().bottom_0().left_0().right_0().h(px(3.)).bg(Tokens::track()).child(div().h_full().w(relative(f)).bg(Tokens::accent())))
             })
+            .children(self.aloud_player(cx))
             .when(self.show_keys, |d| d.child(self.keys_panel(cx)))
     }
 }

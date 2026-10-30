@@ -1,11 +1,12 @@
 //! Manga routes (API.md "Manga"): the library, a title's chapters, covers, reader pages and
-//! reading progress. Same data and language rules as the desktop Library and Reader.
-use std::collections::HashMap;
+//! reading progress, and a chapter's Studio recap (its narration timeline and audio, for reading
+//! along). Same data and language rules as the desktop Library and Reader.
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::Path as UrlPath;
+use axum::extract::{Path as UrlPath, Request};
 use axum::http::{header, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -14,6 +15,7 @@ use mv_core::repo::chapter::{self, Chapter};
 use mv_core::repo::manga::{self, Manga};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use ui_manga::recap::{self, Narration, RecapOutputs};
 use ui_manga::{backend, logic, ops, store};
 
 use crate::server::{blocking, ApiError, ApiResult};
@@ -33,6 +35,8 @@ pub fn routes() -> Router {
         .route("/api/chapter/{id}", get(chapter_info))
         .route("/api/chapter/{id}/page/{n}", get(page))
         .route("/api/chapter/{id}/progress", post(progress))
+        .route("/api/chapter/{id}/recap", get(recap_info))
+        .route("/api/chapter/{id}/recap/audio/{file}", get(recap_audio))
 }
 
 /// Percent-encodes an id for use in a URL path segment.
@@ -89,7 +93,7 @@ async fn library() -> ApiResult<Json<Value>> {
 
 // ---------------------------------------------------------------- one title
 
-fn chapter_json(ch: &Chapter) -> Value {
+fn chapter_json(ch: &Chapter, recap: Option<&RecapOutputs>) -> Value {
     let pages = ch.page_count.unwrap_or(0);
     let progress = if ch.is_read {
         1.0
@@ -108,10 +112,19 @@ fn chapter_json(ch: &Chapter) -> Value {
         "downloaded": ch.download_status == "complete",
         "audio": ch.tts_status == "complete",
         "video": ch.video_status == "complete",
+        "recap": recap.map(|r| json!({ "video": r.can_watch(), "aloud": r.can_read_aloud() })),
     })
 }
 
-fn manga_json(m: &Manga, chapters: &[Chapter]) -> Value {
+/// Studio recaps of a title's chapters, by chapter id. Only chapters that have a Studio folder are
+/// looked at, so a long chapter list costs one directory listing.
+fn recaps_of(manga_id: &str, chapters: &[Chapter]) -> HashMap<String, RecapOutputs> {
+    let Ok(rd) = std::fs::read_dir(mv_core::paths::studio_projects().join(mv_core::paths::safe_name(manga_id))) else { return HashMap::new() };
+    let dirs: HashSet<String> = rd.flatten().filter_map(|e| e.file_name().to_str().map(str::to_string)).collect();
+    chapters.iter().filter(|c| dirs.contains(&mv_core::paths::safe_name(&c.id))).filter_map(|c| Some((c.id.clone(), recap::find(manga_id, &c.id)?))).collect()
+}
+
+fn manga_json(m: &Manga, chapters: &[Chapter], recaps: &HashMap<String, RecapOutputs>) -> Value {
     json!({
         "id": m.id,
         "title": m.title,
@@ -120,33 +133,39 @@ fn manga_json(m: &Manga, chapters: &[Chapter]) -> Value {
         "genres": m.genres,
         "status": m.status,
         "cover": cover_url(m),
-        "chapters": chapters.iter().map(chapter_json).collect::<Vec<_>>(),
+        "chapters": chapters.iter().map(|c| chapter_json(c, recaps.get(&c.id))).collect::<Vec<_>>(),
     })
 }
 
-async fn load_manga(id: String) -> ApiResult<(Manga, Vec<Chapter>)> {
+type Loaded = (Manga, Vec<Chapter>, HashMap<String, RecapOutputs>);
+
+async fn load_manga(id: String) -> ApiResult<Loaded> {
     let lang = backend::preferred_language();
     let found = blocking(move || {
-        backend::with_db(|c| {
+        let found = backend::with_db(|c| {
             let Some(m) = manga::get(c, &id)? else { return Ok(None) };
             let list = store::chapters(c, &m.id, &lang)?;
             Ok(Some((m, list)))
-        })
+        })?;
+        Ok(found.map(|(m, list)| {
+            let recaps = recaps_of(&m.id, &list);
+            (m, list, recaps)
+        }))
     })
     .await?;
     found.ok_or_else(|| ApiError::not_found("Manga not found"))
 }
 
 async fn detail(UrlPath(id): UrlPath<String>) -> ApiResult<Json<Value>> {
-    let (m, list) = load_manga(id).await?;
-    Ok(Json(manga_json(&m, &list)))
+    let (m, list, recaps) = load_manga(id).await?;
+    Ok(Json(manga_json(&m, &list, &recaps)))
 }
 
 async fn refresh(UrlPath(id): UrlPath<String>) -> ApiResult<Json<Value>> {
     load_manga(id.clone()).await?;
     ops::refresh_manga(id.clone()).await.map_err(|e| ApiError(axum::http::StatusCode::BAD_GATEWAY, format!("Could not refresh from the source: {e}")))?;
-    let (m, list) = load_manga(id).await?;
-    Ok(Json(manga_json(&m, &list)))
+    let (m, list, recaps) = load_manga(id).await?;
+    Ok(Json(manga_json(&m, &list, &recaps)))
 }
 
 fn image_response(bytes: Vec<u8>, path: &Path) -> Response {
@@ -268,7 +287,7 @@ async fn pages_of(ch: &Chapter, source: &str) -> ApiResult<Arc<Vec<Page>>> {
     Ok(pages)
 }
 
-async fn load_chapter(id: String) -> ApiResult<(Manga, Chapter)> {
+pub(crate) async fn load_chapter(id: String) -> ApiResult<(Manga, Chapter)> {
     let found = blocking(move || {
         backend::with_db(|c| {
             let Some(ch) = chapter::get(c, &id)? else { return Ok(None) };
@@ -358,6 +377,89 @@ async fn progress(UrlPath(id): UrlPath<String>, Json(b): Json<ProgressBody>) -> 
     Ok(Json(json!({})))
 }
 
+// ---------------------------------------------------------------- Studio recap
+
+/// A reader page's file name, to match Studio's pages by name: the downloaded file's, or the last
+/// segment of a source URL.
+fn page_file(p: &Page) -> String {
+    match p {
+        Page::Local(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        Page::Remote(url) => url.split(['?', '#']).next().unwrap_or_default().rsplit('/').next().unwrap_or_default().to_string(),
+    }
+}
+
+/// A narration clip's file name as the phone may ask for it: a plain `.wav` name, nothing that
+/// could name another folder.
+pub(crate) fn clip_name_ok(name: &str) -> bool {
+    name.len() <= 128 && name.len() > 4 && name.ends_with(".wav") && !name.starts_with('.') && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// The recap answer for a chapter: what Studio made, and the narration's timeline with its pages
+/// as indices into `reader_files` (the page list `/api/chapter/<id>` and `/page/<n>` serve).
+pub(crate) fn recap_json(chapter_id: &str, out: &RecapOutputs, narration: Option<&Narration>, reader_files: &[String]) -> Value {
+    let Some(n) = narration else {
+        return json!({ "video": out.can_watch(), "aloud": false, "total_ms": 0, "beats": [], "clips": [] });
+    };
+    let page = |p: usize| if reader_files.is_empty() { p } else { n.reader_page(p, reader_files) };
+    let beats: Vec<Value> = n.beats.iter().map(|b| json!({ "page": page(b.page), "start_ms": b.start_ms, "end_ms": b.end_ms, "y0": b.y0, "y1": b.y1, "text": b.text })).collect();
+    let clips: Vec<Value> = n
+        .clips
+        .iter()
+        .filter(|c| clip_name_ok(&c.file))
+        .map(|c| json!({ "url": format!("/api/chapter/{}/recap/audio/{}", enc(chapter_id), c.file), "start_ms": c.start_ms, "end_ms": c.end_ms }))
+        .collect();
+    json!({ "video": out.can_watch(), "aloud": !clips.is_empty(), "total_ms": n.total_ms, "beats": beats, "clips": clips })
+}
+
+/// A chapter's recap outputs and, when it has one, its narration (`None` outputs: no recap).
+async fn load_recap(m: &Manga, ch: &Chapter) -> ApiResult<Option<(RecapOutputs, Option<Narration>)>> {
+    let (mid, cid) = (m.id.clone(), ch.id.clone());
+    blocking(move || {
+        let Some(out) = recap::find(&mid, &cid) else { return Ok(None) };
+        let n = if out.can_read_aloud() { Narration::load(&out.dir).ok() } else { None };
+        Ok(Some((out, n)))
+    })
+    .await
+}
+
+async fn recap_info(UrlPath(id): UrlPath<String>) -> ApiResult<Json<Value>> {
+    let (m, ch) = load_chapter(id).await?;
+    let (out, narration) = load_recap(&m, &ch).await?.ok_or_else(|| ApiError::not_found("This chapter has no recap"))?;
+    let files: Vec<String> = match &narration {
+        Some(_) => pages_of(&ch, &source_of(&m, &ch)).await?.iter().map(page_file).collect(),
+        None => vec![],
+    };
+    Ok(Json(recap_json(&ch.id, &out, narration.as_ref(), &files)))
+}
+
+/// One narration clip, with Range (the phone's `<audio>` seeks in it). Only files the chapter's
+/// narration names, inside its `audio` folder.
+async fn recap_audio(UrlPath((id, file)): UrlPath<(String, String)>, req: Request) -> ApiResult<Response> {
+    if !clip_name_ok(&file) {
+        return Err(ApiError::bad_request("not a narration clip"));
+    }
+    let (m, ch) = load_chapter(id).await?;
+    let missing = || ApiError::not_found("No such narration clip");
+    let (out, narration) = load_recap(&m, &ch).await?.ok_or_else(missing)?;
+    let n = narration.ok_or_else(missing)?;
+    if !n.clips.iter().any(|c| c.file == file) {
+        return Err(missing());
+    }
+    let audio = out.dir.join("audio");
+    let path = blocking(move || {
+        let real = audio.join(&file).canonicalize().ok();
+        let root = audio.canonicalize().ok();
+        Ok(real.filter(|r| root.is_some_and(|a| r.starts_with(a)) && r.is_file()))
+    })
+    .await?
+    .ok_or_else(missing)?;
+    // ServeFile answers Range / HEAD and sets the type from the extension.
+    let res = tower_http::services::ServeFile::new(&path).try_call(req).await.map_err(|e| ApiError::internal(format!("Could not read the file: {e}")))?;
+    let (mut parts, body) = res.into_parts();
+    parts.headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    Ok(Response::from_parts(parts, axum::body::Body::new(body)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +468,51 @@ mod tests {
     fn ids_are_encoded() {
         assert_eq!(enc("abc-123_x.y~"), "abc-123_x.y~");
         assert_eq!(enc("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn clip_names() {
+        for ok in ["page_0000.wav", "page_0012.wav", "a-b.c_d.wav"] {
+            assert!(clip_name_ok(ok), "{ok}");
+        }
+        for bad in ["", ".wav", "..wav", "../page_0000.wav", "..\\x.wav","audio/page_0000.wav", "C:x.wav", "page_0000.wav:x", "page_0000.WAV", "page 1.wav", "page_0000.mp4", "x.wav\0", "%2e%2e.wav", &format!("{}.wav", "a".repeat(130))] {
+            assert!(!clip_name_ok(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn page_files() {
+        assert_eq!(page_file(&Page::Local(PathBuf::from("C:/lib/m/c/0003.jpg"))), "0003.jpg");
+        assert_eq!(page_file(&Page::Remote("https://cdn.example/data/abc/0004.png?token=1#x".into())), "0004.png");
+    }
+
+    #[test]
+    fn recap_json_maps_pages_to_the_reader() {
+        let map = json!({
+            "total_duration_ms": 20000,
+            "segments": [
+                {"page": 0, "audio_file": "page_0000.wav", "start_ms": 0, "end_ms": 10000},
+                {"page": 1, "audio_file": "../page 1.wav", "start_ms": 10000, "end_ms": 20000}
+            ],
+            "beat_segments": [
+                {"page": 0, "panel": null, "panel_image": "/lib/0001.jpg", "text": "a", "start_ms": 0, "end_ms": 10000},
+                {"page": 1, "panel": null, "panel_image": "/lib/0002.jpg", "text": "b", "start_ms": 10000, "end_ms": 20000}
+            ]
+        });
+        let n = Narration::parse(&map, None);
+        let out = RecapOutputs { dir: PathBuf::from("x"), video: Some(PathBuf::from("x/video_final.mp4")), sync_map: Some(PathBuf::from("x/sync_map.json")) };
+        // The reader lists a cover first: Studio's page 0 is the reader's page 1.
+        let files: Vec<String> = ["cover.jpg", "0001.jpg", "0002.jpg"].map(String::from).to_vec();
+        let v = recap_json("c 1", &out, Some(&n), &files);
+        assert_eq!(v["video"], true);
+        assert_eq!(v["aloud"], true);
+        assert_eq!(v["total_ms"], 20000);
+        assert_eq!(v["beats"][0], json!({ "page": 1, "start_ms": 0, "end_ms": 10000, "y0": 0.0, "y1": 1.0, "text": "a" }));
+        assert_eq!(v["beats"][1]["page"], 2);
+        // Clip names that are not plain .wav names are never offered.
+        assert_eq!(v["clips"], json!([{ "url": "/api/chapter/c%201/recap/audio/page_0000.wav", "start_ms": 0, "end_ms": 10000 }]));
+        let v = recap_json("c1", &RecapOutputs { video: None, ..out }, None, &files);
+        assert_eq!(v, json!({ "video": false, "aloud": false, "total_ms": 0, "beats": [], "clips": [] }));
     }
 
     #[test]
