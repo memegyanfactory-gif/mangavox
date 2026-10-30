@@ -110,7 +110,11 @@ pub fn text_tool_prompt(specs: &[AiToolSpec]) -> String {
             .map(|p| {
                 p.iter()
                     .map(|(k, v)| {
-                        let ty = v.get("enum").and_then(Value::as_array).map(|e| e.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("|")).unwrap_or_else(|| v.get("type").and_then(Value::as_str).unwrap_or("any").to_string());
+                        let ty = v.get("enum").and_then(Value::as_array).map(|e| e.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("|")).unwrap_or_else(|| match v.get("items").and_then(|i| i.get("properties")).and_then(Value::as_object) {
+                            // Lists of objects show their keys: suggestions: [{label, prompt}].
+                            Some(item) => format!("[{{{}}}]", item.keys().cloned().collect::<Vec<_>>().join(", ")),
+                            None => v.get("type").and_then(Value::as_str).unwrap_or("any").to_string(),
+                        });
                         format!("{k}{}: {ty}", if required.contains(&k.as_str()) { "" } else { "?" })
                     })
                     .collect()
@@ -456,6 +460,7 @@ mod tests {
         let reqs = fake.1.lock().unwrap();
         assert!(reqs[0].tools.is_none());
         assert!(reqs[0].messages[0].content.contains(TOOL_FENCE) && reqs[0].messages[0].content.contains("- navigate("));
+        assert!(reqs[0].messages[0].content.contains("suggestions: [{label, prompt}]"));
         // The second round sees the result as a tool message.
         assert!(reqs[1].messages.iter().any(|m| m.role == AiRole::Tool && m.tool_name.as_deref() == Some("navigate")));
     }

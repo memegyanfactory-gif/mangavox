@@ -61,7 +61,11 @@ pub fn parse_replies(v: &Value) -> Vec<Suggestion> {
     items
         .iter()
         .filter_map(|it| {
-            let label = it.get("label").and_then(Value::as_str).unwrap_or("").trim();
+            // A bare string is its own prompt; the button shows its start.
+            if let Some(text) = it.as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                return Some(Suggestion::new(format!("reply-{text}"), truncate(text, 48), "", text));
+            }
+            let label = it.get("label").or_else(|| it.get("title")).and_then(Value::as_str).unwrap_or("").trim();
             let prompt = it.get("prompt").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).unwrap_or(label);
             (!label.is_empty() && !prompt.is_empty()).then(|| Suggestion::new(format!("reply-{label}"), truncate(label, 60), "", prompt))
         })
@@ -100,6 +104,9 @@ mod tests {
         assert_eq!(r[0].prompt, "Generate the recap for Ch. 12 of Solo");
         assert_eq!(r[1].title, "Export");
         assert_eq!(r[1].prompt, "Export");
+        let plain = parse_replies(&json!(["Generate a recap for Solo Leveling Ch. 32 with the default voice and music"]));
+        assert_eq!(plain[0].prompt, "Generate a recap for Solo Leveling Ch. 32 with the default voice and music");
+        assert!(plain[0].title.ends_with('…') && plain[0].title.chars().count() == 48);
         let s = parse_replies(&json!("[{\"label\":\"Go\",\"prompt\":\"Go now\"}]"));
         assert_eq!(s[0].prompt, "Go now");
         assert!(parse_replies(&json!(null)).is_empty());

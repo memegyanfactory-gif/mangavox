@@ -101,16 +101,11 @@ fn tools() -> Vec<ToolDef> {
 }
 
 fn name_of(a: &Map<String, Value>) -> String {
-    [str_arg(a, "manga"), str_arg(a, "title"), str_arg(a, "manga_id")].into_iter().find(|s| !s.is_empty()).unwrap_or("the manga").to_string()
+    [str_arg(a, "title"), str_arg(a, "manga"), str_arg(a, "manga_id")].into_iter().find(|s| !s.is_empty() && !chapters::looks_like_id(s)).unwrap_or("the manga").to_string()
 }
 
 fn chapters_text(a: &Map<String, Value>) -> String {
-    let l = list_arg(a, "chapters");
-    if l.len() == 1 && l[0].eq_ignore_ascii_case("all") {
-        "all chapters".into()
-    } else {
-        format!("Ch. {}", l.join(", "))
-    }
+    chapters::describe(&list_arg(a, "chapters"))
 }
 
 /// How many chapters a spec list names at most (ranges counted by width; "all" counts as big).

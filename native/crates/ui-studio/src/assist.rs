@@ -188,22 +188,16 @@ fn tools() -> Vec<ToolDef> {
 }
 
 fn titled(a: &Map<String, Value>) -> String {
-    let m = str_arg(a, "manga");
-    if m.is_empty() { "the manga".into() } else { m.to_string() }
+    target(a, "the manga")
 }
 
 fn target(a: &Map<String, Value>, fallback: &str) -> String {
     let m = str_arg(a, "manga");
-    if m.is_empty() { fallback.into() } else { m.to_string() }
+    if m.is_empty() || chapters::looks_like_id(m) { fallback.into() } else { m.to_string() }
 }
 
 fn chapters_text(a: &Map<String, Value>) -> String {
-    let l = list_arg(a, "chapters");
-    match l.len() {
-        0 => "chapters".into(),
-        1 if l[0].eq_ignore_ascii_case("all") => "all chapters".into(),
-        _ => format!("Ch. {}", l.join(", ")),
-    }
+    chapters::describe(&list_arg(a, "chapters"))
 }
 
 // ---------------------------------------------------------------- pure helpers
@@ -809,7 +803,7 @@ pub(crate) fn suggestions_from(groups: &[MangaGroup], q: &pipeline::Queue, title
             let named = if more > 0 { format!("Ch. {list} (and {more} more)") } else { format!("Ch. {list}") };
             out.push(Suggestion::new(
                 format!("studio-new-{}-{}", g.id, missing.len()),
-                format!("{} new chapter{} of {} downloaded: generate recaps?", missing.len(), if missing.len() == 1 { "" } else { "s" }, g.title),
+                format!("{} chapter{} of {} without a recap: generate?", missing.len(), if missing.len() == 1 { "" } else { "s" }, g.title),
                 named.clone(),
                 format!("Generate recaps for {named} of {}.", g.title),
             ));

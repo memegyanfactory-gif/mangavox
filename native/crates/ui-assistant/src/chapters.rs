@@ -66,6 +66,35 @@ pub fn pick(items: &[(&str, Option<f64>)], raw: &[String]) -> Result<Vec<usize>,
     Ok(keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect())
 }
 
+/// A spec list for a step label: "Ch. 12, 14-15", "all chapters", or "2 chapters" when the model
+/// passed chapter ids.
+pub fn describe(raw: &[String]) -> String {
+    let specs = parse(raw);
+    if specs.contains(&Spec::All) {
+        return "all chapters".into();
+    }
+    if specs.is_empty() || specs.iter().any(|s| matches!(s, Spec::Id(_))) {
+        return match specs.len() {
+            1 => "1 chapter".into(),
+            n => format!("{n} chapters"),
+        };
+    }
+    let parts: Vec<String> = specs
+        .iter()
+        .map(|s| match s {
+            Spec::Number(n) => fmt_num(*n),
+            Spec::Range(a, b) => format!("{}-{}", fmt_num(*a), fmt_num(*b)),
+            _ => String::new(),
+        })
+        .collect();
+    format!("Ch. {}", parts.join(", "))
+}
+
+/// An id rather than a name (a UUID or a long token without spaces), for labels.
+pub fn looks_like_id(s: &str) -> bool {
+    s.len() >= 16 && !s.contains(' ') && s.chars().filter(|c| c.is_ascii_digit()).count() >= 4
+}
+
 fn fmt_num(n: f64) -> String {
     if n.fract() == 0.0 {
         format!("{}", n as i64)
@@ -113,6 +142,16 @@ mod tests {
         assert_eq!(pick(&items, &s(&["all"])).unwrap(), [0, 1, 2, 3]);
         assert_eq!(pick(&items, &s(&["2", "9", "x"])).unwrap_err(), ["9", "x"]);
         assert_eq!(pick(&items, &[]).unwrap(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn labels_never_show_raw_ids() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(describe(&s(&["12", "14-15"])), "Ch. 12, 14-15");
+        assert_eq!(describe(&s(&["d2cc4e1d-0f79-4c01-95e1-23d089ea048d"])), "1 chapter");
+        assert_eq!(describe(&s(&["all"])), "all chapters");
+        assert!(looks_like_id("bf109451-66c1-41c8-9889-4f19de89c35c"));
+        assert!(!looks_like_id("The Sword-Eating Swordmaster"));
     }
 
     #[test]
