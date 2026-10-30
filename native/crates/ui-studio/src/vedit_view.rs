@@ -188,8 +188,11 @@ impl StudioPage {
     /// The manga the Video mode edits: the dashboard's, else the Editor's chapter's.
     fn video_manga(&self) -> Option<MangaGroup> {
         let Load::Ready(groups) = &self.library else { return None };
-        let id = self.dash_manga.clone().or_else(|| self.focus.as_ref().map(|f| f.item.manga_id.clone()))?;
-        groups.iter().find(|g| g.id == id).cloned()
+        match self.dash_manga.clone().or_else(|| self.focus.as_ref().map(|f| f.item.manga_id.clone())) {
+            Some(id) => groups.iter().find(|g| g.id == id).cloned(),
+            // Nothing picked yet: the first manga with a finished chapter.
+            None => groups.iter().find(|g| g.chapters.iter().any(|c| made(&self.statuses, c))).cloned(),
+        }
     }
 
     fn made_chapters(&self, g: &MangaGroup) -> Vec<ChapterItem> {
@@ -1663,7 +1666,6 @@ impl StudioPage {
                     .rounded(px(radius::SM))
                     .text_size(px(size::SM))
                     .text_color(Tokens::text_1())
-                    .hover(|d| d.bg(Tokens::hover()))
                     .cursor_pointer()
                     .tooltip(tip(hint))
                     .child(icon_ph(icon, Tokens::text_2(), icon_px::SM))
@@ -1713,7 +1715,6 @@ impl StudioPage {
                 .border_1()
                 .border_color(if on { Tokens::accent() } else { Tokens::border() })
                 .bg(if on { Tokens::accent_soft() } else { Tokens::surface_2() })
-                .hover(|d| d.bg(Tokens::hover()))
                 .child(div().flex_none().w(px(64.)).h(px(36.)).rounded(px(2.)).overflow_hidden().bg(Tokens::well()).when_some(thumb, |d, p| d.child(img(p).size_full().object_fit(ObjectFit::Cover))))
                 .child(
                     div()
