@@ -161,3 +161,90 @@ class LookTests(unittest.TestCase):
         self.assertIn("vignette", full)
         self.assertIn("noise", full)
         self.assertTrue(full.startswith("[a]") and full.endswith("[b]"))
+
+
+class NewEffectTests(unittest.TestCase):
+    def test_new_switches_and_colour_default_to_the_preset(self):
+        from python.video_generator import resolve_look
+        dyn = resolve_look("dynamic")
+        self.assertTrue(dyn["leaks"] and dyn["chroma"] and dyn["parallax"] and dyn["ramp"])
+        self.assertFalse(dyn["particles"] or dyn["letterbox"])
+        self.assertIn("burn", dyn["transitions"])
+        self.assertIn("zoomblur", dyn["transitions"])
+        cine = resolve_look("cinematic")
+        self.assertTrue(cine["leaks"] and cine["letterbox"])
+        self.assertEqual(cine["color"], "warm")
+        # An old look file (no new keys) keeps the preset's; junk colours are ignored.
+        old = resolve_look({"preset": "cinematic", "grain": False, "color": "sepia"})
+        self.assertFalse(old["grain"])
+        self.assertTrue(old["letterbox"])
+        self.assertEqual(old["color"], "warm")
+        mixed = resolve_look({"preset": "clean", "particles": True, "letterbox": True, "color": "noir"})
+        self.assertTrue(mixed["particles"] and mixed["letterbox"])
+        self.assertEqual(mixed["color"], "noir")
+
+    def test_colour_presets_share_one_table_with_the_grade(self):
+        from python.video_generator import COLOR_PRESETS, color_lut, look_filters
+        self.assertIsNone(color_lut(False, "none"))
+        for name in COLOR_PRESETS:
+            if name != "none":
+                y, u, v = color_lut(True, name)
+                self.assertIn("val", y)
+        noir = color_lut(True, "noir")
+        self.assertEqual(noir[1:], ("128", "128"))
+        graph = look_filters({"grade": True, "color": "vivid"}, 1280, 720, "a", "b")
+        self.assertEqual(graph.count("lutyuv"), 1)
+
+    def test_letterbox_and_particles_in_the_finish(self):
+        from python.video_generator import letterbox_bar, look_filters
+        self.assertEqual(letterbox_bar(1920, 1080), 138)
+        self.assertEqual(letterbox_bar(1080, 1920), 0)
+        graph = look_filters({"letterbox": True, "particles": True}, 1280, 720, "a", "b", particles="3:v")
+        self.assertEqual(graph.count("drawbox"), 2)
+        self.assertIn("[3:v]overlay", graph)
+        # Particles need their stream; upright frames get no bars.
+        self.assertNotIn("overlay", look_filters({"particles": True}, 1280, 720, "a", "b"))
+        self.assertEqual(look_filters({"letterbox": True}, 720, 1280, "a", "b"), "[a]null[b]")
+
+    def test_clip_drawn_transitions_dissolve_and_both_sides_draw_them(self):
+        from python.video_generator import plan_clip_fx
+        durations = [4.0] * 5
+        pages = [0, 1, 2, 3, 3]
+        starts, trans = plan_transitions(durations, pages, names=["burn", "zoomblur", "fade"])
+        graph = xfade_chain([f"c{i}" for i in range(5)], starts, trans, "v")
+        self.assertNotIn("burn", graph)
+        self.assertNotIn("zoomblur", graph)
+        fx = plan_clip_fx(starts, trans, pages, leaks=True, gap=0)
+        self.assertEqual(fx[0]["burn_out"], (4.0, 0.5))
+        self.assertEqual(fx[1]["burn_in"], 0.5)
+        self.assertEqual(fx[0]["burn_flip"], fx[1]["burn_flip_in"])
+        self.assertEqual(fx[1]["zoomblur_out"], (4.0, 0.5))
+        self.assertEqual(fx[2]["zoomblur_in"], 0.5)
+        self.assertTrue(fx[0]["leak"] and fx[3]["leak"])
+        # Same page: no page-turn effects.
+        self.assertEqual(fx[4], {})
+
+    def test_leaks_are_spaced_and_skip_action_beats(self):
+        from python.video_generator import plan_clip_fx
+        durations = [3.0] * 8
+        pages = list(range(8))
+        starts, trans = plan_transitions(durations, pages, names=["fade"])
+        fx = plan_clip_fx(starts, trans, pages, leaks=True, impacts=[False] * 4 + [True] + [False] * 3, gap=6.0)
+        lit = [k for k, f in enumerate(fx) if f.get("leak")]
+        self.assertEqual(lit, [0, 2, 5, 7])
+        self.assertEqual(plan_clip_fx(starts, trans, pages), [{}] * 8)
+
+    def test_speed_ramp_snaps_short_beats_and_drifts_long_ones(self):
+        from python.video_generator import ramp_ease
+
+        def at(expr, n):
+            env = {"min": min, "pow": pow, "cos": math.cos, "PI": math.pi, "on": n}
+            return eval(expr, {"__builtins__": {}}, env)
+
+        short = ramp_ease("on", 30, True)
+        self.assertGreater(at(short, 7), 0.6)  # most of the move in its first quarter
+        self.assertAlmostEqual(at(short, 29), 1.0)
+        long = ramp_ease("on", 300, True)
+        self.assertGreater(at(long, 15), 0.03)  # already drifting
+        self.assertAlmostEqual(at(long, 299), 1.0)
+        self.assertEqual(ramp_ease("on", 300, False), ramp_ease("on", 300))

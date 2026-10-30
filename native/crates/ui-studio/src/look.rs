@@ -4,9 +4,10 @@
 //!
 //! File: `<data>/studio/video_look.json`. The export reads the same file on its own, so the keys
 //! are a fixed contract:
-//! `{"preset", "grade"?, "vignette"?, "grain"?, "glow"?, "impact"?, "logo": {on, path, pos, size,
-//! opacity}, "text": {on, text, pos, size, opacity}}`. A missing effect key means "the preset's
-//! own default". A picked logo is copied into `<data>/studio/brand/logo.<ext>`: it is the user's
+//! `{"preset", "grade"?, "vignette"?, "grain"?, "glow"?, "impact"?, "leaks"?, "chroma"?,
+//! "parallax"?, "particles"?, "letterbox"?, "color"?: "none|warm|cool|noir|vivid", "logo": {on,
+//! path, pos, size, opacity}, "text": {on, text, pos, size, opacity}}`. A missing effect or colour
+//! key means "the preset's own default" (so files written before a switch existed keep working). A picked logo is copied into `<data>/studio/brand/logo.<ext>`: it is the user's
 //! own data and lives with the app data, never in the repo.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -63,20 +64,72 @@ impl Preset {
     pub fn blurb(self) -> &'static str {
         match self {
             Preset::Clean => "Single panel, gentle Ken Burns.",
-            Preset::Cinematic => "Graded, glow, grain, soft fades.",
+            Preset::Cinematic => "Letterboxed and warm-graded: glow, grain, light leaks, soft fades.",
             Preset::Recap => "Tall panels side by side like the big manhwa recap channels: each new panel slides in.",
-            Preset::Dynamic => "Duo panels plus punch zooms, shakes and white flashes on action beats, varied transitions.",
+            Preset::Dynamic => "Duo panels over a drifting background, punch zooms, shakes, flashes and RGB splits on action beats, film-burn and zoom-blur page turns.",
         }
     }
 
-    /// The effects this preset turns on by itself (mirrors the Python renderer).
+    /// The effects this preset turns on by itself (mirrors the Python renderer's `LOOKS`).
     pub fn effects(self) -> Effects {
         match self {
             Preset::Clean => Effects::default(),
-            Preset::Cinematic => Effects { grade: true, vignette: true, grain: true, glow: true, impact: false },
+            Preset::Cinematic => Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, ..Effects::default() },
             Preset::Recap => Effects { grade: true, vignette: true, ..Effects::default() },
-            Preset::Dynamic => Effects { grade: true, vignette: true, grain: false, glow: true, impact: true },
+            Preset::Dynamic => Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, ..Effects::default() },
         }
+    }
+
+    /// The colour preset this look uses by itself.
+    pub fn color(self) -> ColorPreset {
+        match self {
+            Preset::Cinematic => ColorPreset::Warm,
+            _ => ColorPreset::None,
+        }
+    }
+}
+
+/// A colour treatment over the grade (one lookup table in the renderer, so it costs nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColorPreset {
+    #[default]
+    None,
+    Warm,
+    Cool,
+    Noir,
+    Vivid,
+}
+
+impl ColorPreset {
+    pub const ALL: [ColorPreset; 5] = [ColorPreset::None, ColorPreset::Warm, ColorPreset::Cool, ColorPreset::Noir, ColorPreset::Vivid];
+
+    /// The JSON value.
+    pub fn key(self) -> &'static str {
+        match self {
+            ColorPreset::None => "none",
+            ColorPreset::Warm => "warm",
+            ColorPreset::Cool => "cool",
+            ColorPreset::Noir => "noir",
+            ColorPreset::Vivid => "vivid",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ColorPreset> {
+        ColorPreset::ALL.into_iter().find(|c| c.key() == s.trim().to_ascii_lowercase())
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorPreset::None => "Off",
+            ColorPreset::Warm => "Warm",
+            ColorPreset::Cool => "Cool",
+            ColorPreset::Noir => "Noir",
+            ColorPreset::Vivid => "Vivid",
+        }
+    }
+
+    fn index(self) -> usize {
+        ColorPreset::ALL.iter().position(|c| *c == self).unwrap_or(0)
     }
 }
 
@@ -88,10 +141,19 @@ pub enum Effect {
     Vignette,
     Grain,
     Impact,
+    Leaks,
+    Chroma,
+    Parallax,
+    Particles,
+    Letterbox,
 }
 
+/// How many effect switches there are.
+pub const EFFECT_COUNT: usize = 10;
+
 impl Effect {
-    pub const ALL: [Effect; 5] = [Effect::Grade, Effect::Glow, Effect::Vignette, Effect::Grain, Effect::Impact];
+    pub const ALL: [Effect; EFFECT_COUNT] =
+        [Effect::Grade, Effect::Glow, Effect::Vignette, Effect::Grain, Effect::Impact, Effect::Leaks, Effect::Chroma, Effect::Parallax, Effect::Particles, Effect::Letterbox];
 
     /// The JSON key.
     pub fn key(self) -> &'static str {
@@ -101,6 +163,11 @@ impl Effect {
             Effect::Vignette => "vignette",
             Effect::Grain => "grain",
             Effect::Impact => "impact",
+            Effect::Leaks => "leaks",
+            Effect::Chroma => "chroma",
+            Effect::Parallax => "parallax",
+            Effect::Particles => "particles",
+            Effect::Letterbox => "letterbox",
         }
     }
 
@@ -111,6 +178,11 @@ impl Effect {
             Effect::Vignette => "Vignette",
             Effect::Grain => "Film grain (slower, bigger files)",
             Effect::Impact => "Action punch (zoom + shake + flash)",
+            Effect::Leaks => "Light leaks at page turns",
+            Effect::Chroma => "RGB split on the punch",
+            Effect::Parallax => "Parallax background drift",
+            Effect::Particles => "Floating embers (a little slower)",
+            Effect::Letterbox => "Cinematic bars (2.39:1)",
         }
     }
 
@@ -121,6 +193,11 @@ impl Effect {
             Effect::Vignette => ph::CIRCLE_DASHED,
             Effect::Grain => ph::FILM_STRIP,
             Effect::Impact => ph::LIGHTNING,
+            Effect::Leaks => ph::STAR_FOUR,
+            Effect::Chroma => ph::SQUARE_HALF,
+            Effect::Parallax => ph::STACK,
+            Effect::Particles => ph::FIRE,
+            Effect::Letterbox => ph::FILM_SLATE,
         }
     }
 
@@ -137,6 +214,11 @@ pub struct Effects {
     pub grain: bool,
     pub glow: bool,
     pub impact: bool,
+    pub leaks: bool,
+    pub chroma: bool,
+    pub parallax: bool,
+    pub particles: bool,
+    pub letterbox: bool,
 }
 
 impl Effects {
@@ -147,7 +229,27 @@ impl Effects {
             Effect::Vignette => self.vignette,
             Effect::Grain => self.grain,
             Effect::Impact => self.impact,
+            Effect::Leaks => self.leaks,
+            Effect::Chroma => self.chroma,
+            Effect::Parallax => self.parallax,
+            Effect::Particles => self.particles,
+            Effect::Letterbox => self.letterbox,
         }
+    }
+
+    fn set(&mut self, e: Effect, on: bool) {
+        *match e {
+            Effect::Grade => &mut self.grade,
+            Effect::Glow => &mut self.glow,
+            Effect::Vignette => &mut self.vignette,
+            Effect::Grain => &mut self.grain,
+            Effect::Impact => &mut self.impact,
+            Effect::Leaks => &mut self.leaks,
+            Effect::Chroma => &mut self.chroma,
+            Effect::Parallax => &mut self.parallax,
+            Effect::Particles => &mut self.particles,
+            Effect::Letterbox => &mut self.letterbox,
+        } = on;
     }
 }
 
@@ -255,7 +357,9 @@ impl Watermark {
 pub struct Look {
     pub preset: Preset,
     /// Per effect (in [`Effect::ALL`] order): `None` = the preset's own default.
-    pub overrides: [Option<bool>; 5],
+    pub overrides: [Option<bool>; EFFECT_COUNT],
+    /// `None` = the preset's own colour.
+    pub color: Option<ColorPreset>,
     pub logo: Logo,
     pub text: Watermark,
 }
@@ -263,9 +367,23 @@ pub struct Look {
 impl Look {
     /// The effects a render uses: the preset's, with the user's switches on top.
     pub fn effects(&self) -> Effects {
-        let base = self.preset.effects();
-        let pick = |e: Effect| self.overrides[e.index()].unwrap_or(base.get(e));
-        Effects { grade: pick(Effect::Grade), vignette: pick(Effect::Vignette), grain: pick(Effect::Grain), glow: pick(Effect::Glow), impact: pick(Effect::Impact) }
+        let mut fx = self.preset.effects();
+        for e in Effect::ALL {
+            if let Some(on) = self.overrides[e.index()] {
+                fx.set(e, on);
+            }
+        }
+        fx
+    }
+
+    /// The colour preset a render uses.
+    pub fn color(&self) -> ColorPreset {
+        self.color.unwrap_or(self.preset.color())
+    }
+
+    /// Picks a colour preset (an override only when it differs from the look's own).
+    pub fn set_color(&mut self, c: ColorPreset) {
+        self.color = (self.preset.color() != c).then_some(c);
     }
 
     /// Turns one effect on or off (an override only when it differs from the preset).
@@ -276,7 +394,8 @@ impl Look {
     /// Picks a preset; its effects start from the preset's own defaults.
     pub fn set_preset(&mut self, p: Preset) {
         self.preset = p;
-        self.overrides = [None; 5];
+        self.overrides = [None; EFFECT_COUNT];
+        self.color = None;
     }
 
     pub fn to_json(&self) -> Value {
@@ -287,35 +406,38 @@ impl Look {
                 m.insert(e.key().into(), json!(on));
             }
         }
+        if let Some(c) = self.color {
+            m.insert("color".into(), json!(c.key()));
+        }
         m.insert("logo".into(), self.logo.to_json());
         m.insert("text".into(), self.text.to_json());
         Value::Object(m)
     }
 
     pub fn from_json(v: &Value) -> Self {
-        let mut overrides = [None; 5];
+        let mut overrides = [None; EFFECT_COUNT];
         for e in Effect::ALL {
             overrides[e.index()] = v.get(e.key()).and_then(Value::as_bool);
         }
         Self {
             preset: v.get("preset").and_then(Value::as_str).and_then(Preset::parse).unwrap_or_default(),
             overrides,
+            color: v.get("color").and_then(Value::as_str).and_then(ColorPreset::parse),
             logo: v.get("logo").map(Logo::from_json).unwrap_or_default(),
             text: v.get("text").map(Watermark::from_json).unwrap_or_default(),
         }
     }
 
-    /// `video_config["look"]`: the preset and the effective effect booleans.
+    /// `video_config["look"]`: the preset, the effective effect booleans and the colour.
     pub fn render_config(&self) -> Value {
         let fx = self.effects();
-        json!({
-            "preset": self.preset.key(),
-            "grade": fx.grade,
-            "vignette": fx.vignette,
-            "grain": fx.grain,
-            "glow": fx.glow,
-            "impact": fx.impact,
-        })
+        let mut m = Map::new();
+        m.insert("preset".into(), json!(self.preset.key()));
+        for e in Effect::ALL {
+            m.insert(e.key().into(), json!(fx.get(e)));
+        }
+        m.insert("color".into(), json!(self.color().key()));
+        Value::Object(m)
     }
 
     pub fn load_from(file: &Path) -> Self {
@@ -583,7 +705,29 @@ impl LookPanel {
                     )
                     .child(switch(("look-fx", e.index()), fx.get(e)).on_click(cx.listener(move |this, on: &bool, _, cx| this.edit(|l| l.set_effect(e, *on), cx))))
             }))
-            .child(muted("A dot marks a switch changed from the look's own. Picking a look resets them."))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(size::SM))
+                            .text_color(Tokens::text_2())
+                            .child(icon_ph(ph::SWATCHES, Tokens::text_3(), icon_px::SM))
+                            .child("Colour")
+                            .when(self.look.color.is_some(), |d| d.child(div().size(px(6.)).rounded_full().bg(Tokens::accent()))),
+                    )
+                    .child(
+                        segmented("look-color", ColorPreset::ALL.map(ColorPreset::label), self.look.color().index())
+                            .small()
+                            .on_change(cx.listener(|this, ix: &usize, _, cx| this.edit(|l| l.set_color(ColorPreset::ALL[(*ix).min(4)]), cx))),
+                    ),
+            )
+            .child(muted("A dot marks a setting changed from the look's own. Picking a look resets them."))
     }
 
     fn logo_controls(&self, cx: &mut Context<Self>) -> Div {
@@ -858,14 +1002,15 @@ impl Render for LookPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{import_logo_into, nearest, Effect, Effects, Look, Preset, LOGO_SIZES};
+    use super::{import_logo_into, nearest, ColorPreset, Effect, Effects, Look, Preset, LOGO_SIZES};
     use serde_json::json;
 
     #[test]
     fn defaults_match_the_contract() {
         let l = Look::default();
         assert_eq!(l.preset, Preset::Dynamic);
-        assert_eq!(l.effects(), Effects { grade: true, vignette: true, grain: false, glow: true, impact: true });
+        assert_eq!(l.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, ..Effects::default() });
+        assert_eq!(l.color(), ColorPreset::None);
         assert_eq!((l.logo.pos, l.logo.size, l.logo.opacity), (2, 0.12, 0.85));
         assert_eq!((l.text.pos, l.text.size, l.text.opacity), (0, 0.05, 0.6));
         let v = l.to_json();
@@ -876,14 +1021,17 @@ mod tests {
         for e in Effect::ALL {
             assert!(v.get(e.key()).is_none(), "{} written without an override", e.key());
         }
+        assert!(v.get("color").is_none());
     }
 
     #[test]
     fn preset_effects_mirror_the_renderer() {
         assert_eq!(Preset::Clean.effects(), Effects::default());
-        assert_eq!(Preset::Cinematic.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, impact: false });
-        assert_eq!(Preset::Recap.effects(), Effects { grade: true, vignette: true, grain: false, glow: false, impact: false });
-        assert_eq!(Preset::Dynamic.effects(), Effects { grade: true, vignette: true, grain: false, glow: true, impact: true });
+        assert_eq!(Preset::Cinematic.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, ..Effects::default() });
+        assert_eq!(Preset::Recap.effects(), Effects { grade: true, vignette: true, ..Effects::default() });
+        assert_eq!(Preset::Dynamic.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, ..Effects::default() });
+        assert_eq!(Preset::Cinematic.color(), ColorPreset::Warm);
+        assert_eq!(Preset::Dynamic.color(), ColorPreset::None);
     }
 
     #[test]
@@ -892,20 +1040,38 @@ mod tests {
         l.set_preset(Preset::Recap);
         l.set_effect(Effect::Grain, true);
         l.set_effect(Effect::Grade, false);
-        assert_eq!(l.render_config(), json!({"preset": "recap", "grade": false, "vignette": true, "grain": true, "glow": false, "impact": false}));
+        l.set_effect(Effect::Particles, true);
+        l.set_color(ColorPreset::Noir);
+        assert_eq!(
+            l.render_config(),
+            json!({"preset": "recap", "grade": false, "vignette": true, "grain": true, "glow": false, "impact": false,
+                   "leaks": false, "chroma": false, "parallax": false, "particles": true, "letterbox": false, "color": "noir"})
+        );
         // Setting a switch back to the preset's own value drops the override.
         l.set_effect(Effect::Grade, true);
-        assert_eq!(l.overrides, [None, None, None, Some(true), None]);
+        l.set_effect(Effect::Particles, false);
+        assert_eq!(l.overrides, [None, None, None, Some(true), None, None, None, None, None, None]);
+        l.set_color(ColorPreset::None);
+        assert_eq!(l.color, None);
         // A new preset starts from its own defaults.
+        l.set_color(ColorPreset::Cool);
         l.set_preset(Preset::Clean);
-        assert_eq!(l.render_config(), json!({"preset": "clean", "grade": false, "vignette": false, "grain": false, "glow": false, "impact": false}));
+        assert_eq!(
+            l.render_config(),
+            json!({"preset": "clean", "grade": false, "vignette": false, "grain": false, "glow": false, "impact": false,
+                   "leaks": false, "chroma": false, "parallax": false, "particles": false, "letterbox": false, "color": "none"})
+        );
     }
 
     #[test]
     fn absent_keys_fall_back_and_junk_is_clamped() {
         let l = Look::from_json(&json!({"preset": "cinematic", "impact": true, "logo": {"pos": "zz", "size": 9}, "text": {"pos": "bc", "size": 0.001, "opacity": 3}}));
         assert_eq!(l.preset, Preset::Cinematic);
-        assert!(l.effects().impact && l.effects().grain);
+        assert!(l.effects().impact && l.effects().grain && l.effects().letterbox);
+        assert_eq!(l.color(), ColorPreset::Warm, "absent colour: the preset's own");
+        let old = Look::from_json(&json!({"preset": "dynamic", "glow": false, "color": "sepia"}));
+        assert!(!old.effects().glow && old.effects().parallax, "a file from before the new switches keeps the preset's");
+        assert_eq!(old.color, None, "an unknown colour falls back to the preset's");
         assert_eq!((l.logo.pos, l.logo.size), (2, 0.4));
         assert_eq!((l.text.pos, l.text.size, l.text.opacity), (7, 0.02, 1.0));
         assert_eq!(Look::from_json(&json!({"preset": "nope"})).preset, Preset::Dynamic);
@@ -919,6 +1085,8 @@ mod tests {
         let mut l = Look::default();
         l.set_preset(Preset::Cinematic);
         l.set_effect(Effect::Impact, true);
+        l.set_effect(Effect::Letterbox, false);
+        l.set_color(ColorPreset::Vivid);
         l.logo.on = true;
         l.logo.path = Some(dir.path().join("brand").join("logo.png"));
         l.logo.pos = 8;
@@ -934,6 +1102,8 @@ mod tests {
         let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(raw["preset"], "cinematic");
         assert_eq!(raw["impact"], true);
+        assert_eq!(raw["letterbox"], false);
+        assert_eq!(raw["color"], "vivid");
         assert_eq!(raw["logo"]["pos"], "br");
         assert_eq!(raw["text"]["pos"], "bc");
         assert_eq!(raw["text"]["text"], "@mangavox");
