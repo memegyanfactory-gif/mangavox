@@ -166,41 +166,11 @@ impl StudioPage {
     /// `redo`: make that step and every later one again for all of them.
     pub(crate) fn generate_chapters(&mut self, chapters: &[ChapterItem], a: &Answers, redo: Option<Step>, start: bool, cx: &mut Context<Self>) -> (usize, usize, usize) {
         let default = self.prefs.voice.clone().unwrap_or_default();
-        // A made video whose subtitles or music change is made again (otherwise it is "done").
-        let subs_before: Vec<crate::video::SubtitleSetting> = chapters.iter().map(crate::video::subtitle_setting_for).collect();
-        let mut remake: Vec<bool> = vec![false; chapters.len()];
-        for (i, c) in chapters.iter().enumerate() {
-            if let Some(v) = &a.voice {
-                if let Err(e) = mv_studio::voices::set_chapter_voice(&c.id, (*v != default).then_some(v.as_str())) {
-                    self.fail(format!("Could not save the voice for {}: {e}", c.label()));
-                }
-            }
-            let r = crate::page::chref(c);
-            let mut m = mv_score::load_settings(&r);
-            if m.enabled != a.music {
-                m.enabled = a.music;
-                let _ = mv_score::save_settings(&r, &m);
-                remake[i] = true;
-            }
-        }
-        apply_subtitles(chapters, a);
         self.sync_pipeline(cx);
-        if let Some(r) = redo {
-            return pipeline::enqueue(chapters, Step::Video, Some(r), &a.format, Some(a.captions), start);
-        }
-        let (mut redo, mut rest) = (vec![], vec![]);
-        for (i, c) in chapters.iter().enumerate() {
-            let made = self.statuses.get(&c.id).is_some_and(|s| s.video.is_some());
-            if made && (remake[i] || crate::video::subtitle_setting_for(c) != subs_before[i]) {
-                redo.push(c.clone());
-            } else {
-                rest.push(c.clone());
-            }
-        }
-        let mut n = pipeline::enqueue(&rest, Step::Video, None, &a.format, Some(a.captions), start);
-        if !redo.is_empty() {
-            let m = pipeline::enqueue(&redo, Step::Video, Some(Step::Video), &a.format, Some(a.captions), start);
-            n = (n.0 + m.0, n.1 + m.1, n.2 + m.2);
+        let statuses = &self.statuses;
+        let (n, errors) = queue_generate(chapters, a, redo, start, &default, |c| statuses.get(&c.id).is_some_and(|s| s.video.is_some()));
+        for e in errors {
+            self.fail(e);
         }
         n
     }
@@ -733,6 +703,50 @@ pub(crate) fn question(icon: Ph, title: &'static str, why: &'static str, control
 
 /// Saves the subtitle answer: the Studio default, and the chapters that have their own caption
 /// style keep it but follow the on/off and template picked here.
+/// Applies `a` (voice, music, subtitles) to `chapters` and adds them to the queue: what the
+/// dashboard's Generate does on confirm, and what the assistant's `studio_generate` does. The
+/// pipeline context must be set first. `made`: the chapter already has a video. Returns the
+/// counts [`pipeline::enqueue`] reports and what could not be saved.
+/// `redo`: make that step and every later one again for all of them.
+pub(crate) fn queue_generate(chapters: &[ChapterItem], a: &Answers, redo: Option<Step>, start: bool, default_voice: &str, made: impl Fn(&ChapterItem) -> bool) -> ((usize, usize, usize), Vec<String>) {
+    let mut errors = vec![];
+    // A made video whose subtitles or music change is made again (otherwise it is "done").
+    let subs_before: Vec<crate::video::SubtitleSetting> = chapters.iter().map(crate::video::subtitle_setting_for).collect();
+    let mut remake: Vec<bool> = vec![false; chapters.len()];
+    for (i, c) in chapters.iter().enumerate() {
+        if let Some(v) = &a.voice {
+            if let Err(e) = mv_studio::voices::set_chapter_voice(&c.id, (v != default_voice).then_some(v.as_str())) {
+                errors.push(format!("Could not save the voice for {}: {e}", c.label()));
+            }
+        }
+        let r = crate::page::chref(c);
+        let mut m = mv_score::load_settings(&r);
+        if m.enabled != a.music {
+            m.enabled = a.music;
+            let _ = mv_score::save_settings(&r, &m);
+            remake[i] = true;
+        }
+    }
+    apply_subtitles(chapters, a);
+    if let Some(r) = redo {
+        return (pipeline::enqueue(chapters, Step::Video, Some(r), &a.format, Some(a.captions), start), errors);
+    }
+    let (mut redo, mut rest) = (vec![], vec![]);
+    for (i, c) in chapters.iter().enumerate() {
+        if made(c) && (remake[i] || crate::video::subtitle_setting_for(c) != subs_before[i]) {
+            redo.push(c.clone());
+        } else {
+            rest.push(c.clone());
+        }
+    }
+    let mut n = pipeline::enqueue(&rest, Step::Video, None, &a.format, Some(a.captions), start);
+    if !redo.is_empty() {
+        let m = pipeline::enqueue(&redo, Step::Video, Some(Step::Video), &a.format, Some(a.captions), start);
+        n = (n.0 + m.0, n.1 + m.1, n.2 + m.2);
+    }
+    (n, errors)
+}
+
 fn apply_subtitles(chapters: &[ChapterItem], a: &Answers) {
     let mut d = crate::video::default_setting();
     let style = a.subtitle_style.clone();

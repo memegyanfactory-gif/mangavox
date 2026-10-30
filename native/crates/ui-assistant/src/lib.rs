@@ -4,6 +4,8 @@ use gpui_kit::*;
 use mv_ui::Route;
 
 pub mod agent;
+mod bridge;
+pub mod chapters;
 mod dock;
 pub mod ext;
 mod fit;
@@ -12,18 +14,25 @@ mod picker;
 mod providers;
 mod shared;
 pub mod store;
+pub mod suggest;
 pub mod tools;
 mod ui;
 mod usage_meter;
 mod youtube;
 
 pub use agent::set_studio_context;
+pub use bridge::on_ui;
 pub use picker::ModelPicker;
 pub use tools::set_page_context;
 pub use ui::provider_logo;
 
 pub fn open(_route: &Route, _window: &mut Window, _cx: &mut App) -> Option<AnyView> {
     None
+}
+
+/// Lets assistant tools run on the UI thread ([`on_ui`]). Call once with the main window.
+pub fn start(window: AnyWindowHandle, cx: &mut App) {
+    bridge::install(window, cx);
 }
 
 /// The assistant panel docked left of the page. `None` until implemented.

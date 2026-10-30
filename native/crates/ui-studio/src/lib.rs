@@ -5,6 +5,7 @@
 use gpui_kit::*;
 use mv_ui::Route;
 
+mod assist;
 pub mod audio;
 pub use export::join_full_recap;
 pub mod data;
@@ -33,6 +34,12 @@ mod vedit_view;
 pub mod video;
 mod widgets;
 mod ytpack;
+
+/// Gives the assistant Studio's tools (library, Generate / Redo, queue, export, look, captions,
+/// YouTube package) and its proactive suggestions. Called once at startup.
+pub fn register_assistant_tools() {
+    assist::register();
+}
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     // The assistant's video_* tools work from any page.

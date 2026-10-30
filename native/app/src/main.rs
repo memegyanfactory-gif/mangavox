@@ -131,6 +131,12 @@ fn main() {
         .expect("open window");
         // Phone companion: the UI bridge for its server, and the server when Phone access is on.
         ui_phone::start(main.0, cx);
+        // The assistant's app-wide tools: each area registers its own; they reach GPUI state
+        // through the bridge started here.
+        ui_assistant::start(main.0, cx);
+        ui_manga::register_assistant_tools();
+        ui_media::register_assistant_tools();
+        ui_studio::register_assistant_tools();
         #[cfg(windows)]
         tray::install(main.0, cx);
     });

@@ -3,6 +3,7 @@
 use gpui_kit::*;
 use mv_ui::Route;
 
+mod assist;
 pub mod backend;
 mod browse;
 mod categories;
@@ -24,6 +25,11 @@ mod ui;
 
 pub use backend::set_source_ctx;
 pub use downloads::{downloads, toast as download_toast};
+
+/// Gives the assistant the manga tools (search, chapters, downloads, reader). Called once at startup.
+pub fn register_assistant_tools() {
+    assist::register();
+}
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {

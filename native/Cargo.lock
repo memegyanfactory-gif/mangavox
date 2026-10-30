@@ -9839,6 +9839,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "ui-assistant",
 ]
 
 [[package]]
@@ -9851,10 +9852,13 @@ dependencies = [
  "gpui-kit",
  "mv-core",
  "mv-media",
+ "mv-torrent",
  "mv-ui",
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
+ "ui-assistant",
  "ui-player",
 ]
 
