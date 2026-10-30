@@ -231,6 +231,8 @@ pub struct Prefs {
     pub last_phase: Option<String>,
     pub selected: Vec<String>,
     pub open_groups: Vec<String>,
+    /// Dashboard sections folded away ("video", "youtube", "chapters").
+    pub dash_collapsed: Vec<String>,
 }
 
 impl Default for Prefs {
@@ -247,6 +249,7 @@ impl Default for Prefs {
             last_phase: None,
             selected: vec![],
             open_groups: vec![],
+            dash_collapsed: vec!["youtube".into()],
         }
     }
 }
