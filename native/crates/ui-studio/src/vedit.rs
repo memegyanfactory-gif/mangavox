@@ -357,6 +357,30 @@ impl Project {
     }
 }
 
+static PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read, change and save a manga's project under one lock: the timeline and the assistant's
+/// `video_*` tools both write it, each only the parts it changed. Returns the saved project.
+pub fn update_project(manga_dir: &Path, f: impl FnOnce(&mut Project)) -> std::io::Result<Project> {
+    let _g = PROJECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut p = Project::load(manga_dir);
+    f(&mut p);
+    p.save(manga_dir)?;
+    Ok(p)
+}
+
+/// A picked file copied into `<manga>/media/` (kept with the edit); the copy's path.
+pub fn import_media(src: &Path, manga_dir: &Path) -> std::io::Result<PathBuf> {
+    let dir = manga_dir.join("media");
+    std::fs::create_dir_all(&dir)?;
+    let name = src.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
+    let dest = dir.join(name);
+    if dest != src {
+        std::fs::copy(src, &dest)?;
+    }
+    Ok(dest)
+}
+
 /// The edit of one chapter, from its manga's project file (default when there is none).
 pub fn chapter_edit(output_dir: &Path, chapter_id: &str) -> Option<ChapterEdit> {
     let manga_dir = output_dir.parent()?;

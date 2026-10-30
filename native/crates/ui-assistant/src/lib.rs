@@ -5,6 +5,7 @@ use mv_ui::Route;
 
 pub mod agent;
 mod dock;
+pub mod ext;
 mod fit;
 mod hub;
 mod picker;

@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_recap::Step;
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{btn, empty_view, icon_button, icon_ph, interactive, muted, ph, segmented, size, switch, tip, ButtonKind, Tokens};
@@ -132,6 +131,8 @@ pub(crate) struct Editor {
     /// first-page thumbnails.
     keys: RefCell<HashMap<String, u64>>,
     thumbs: RefCell<HashMap<String, Option<PathBuf>>>,
+    /// The assistant tools' edit version last loaded (`vedit_tools::version`).
+    seen_tools: u64,
     _subs: Vec<Subscription>,
 }
 
@@ -163,6 +164,7 @@ impl Default for Editor {
             redo: vec![],
             keys: RefCell::new(HashMap::new()),
             thumbs: RefCell::new(HashMap::new()),
+            seen_tools: crate::vedit_tools::version(),
             _subs: vec![],
         }
     }
@@ -171,18 +173,6 @@ impl Default for Editor {
 /// A chapter with a finished video.
 fn made(statuses: &HashMap<String, mv_recap::PhaseStatus>, c: &ChapterItem) -> bool {
     statuses.get(&c.id).and_then(|s| s.video.as_ref()).is_some_and(|p| p.is_file())
-}
-
-/// A picked file copied into `<manga>/media/` (kept with the edit); the copy's path.
-fn import_media(src: &Path, manga_dir: &Path) -> std::io::Result<PathBuf> {
-    let dir = manga_dir.join("media");
-    std::fs::create_dir_all(&dir)?;
-    let name = src.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
-    let dest = dir.join(name);
-    if dest != src {
-        std::fs::copy(src, &dest)?;
-    }
-    Ok(dest)
 }
 
 impl StudioPage {
@@ -244,6 +234,66 @@ impl StudioPage {
         self.vedit.undo.clear();
         self.vedit.redo.clear();
         self.vedit.fit_pending = true;
+        self.video_tell_assistant();
+    }
+
+    /// Tells the assistant what the Video mode has open ("this chapter" in the chat).
+    fn video_tell_assistant(&self) {
+        let Some(s) = &self.vedit.seq else { return };
+        crate::vedit_tools::set_current(&s.item.manga_id, &s.item.id);
+        if self.view == View::Video {
+            let placed = s.placed();
+            ui_assistant::set_studio_context(Some(format!(
+                "The user is in Studio's Video editor on \"{}\" {} ({} clips, {}). Use the video_* tools to edit it; chat edits show on their timeline at once.",
+                s.item.manga_title,
+                s.item.label(),
+                placed.len(),
+                vedit::timecode(vedit::total_ms(&placed))
+            )));
+        }
+    }
+
+    /// Called by the page's poll: chat edits (the assistant's `video_*` tools) reach the open
+    /// timeline (the edit before them stays an undo step), and its Open / Export requests run.
+    pub(crate) fn video_poll(&mut self, cx: &mut Context<Self>) {
+        match crate::vedit_tools::take_request() {
+            Some(crate::vedit_tools::Request::Open { manga, chapter }) => {
+                self.view = View::Video;
+                self.dash_manga = Some(manga);
+                self.video_sync();
+                if let Some(c) = self.video_manga().and_then(|g| g.chapters.into_iter().find(|c| c.id == chapter)) {
+                    self.video_open(c);
+                }
+                cx.notify();
+            }
+            Some(crate::vedit_tools::Request::Export { manga, prefs }) => {
+                self.view = View::Video;
+                self.dash_manga = Some(manga);
+                self.export_prefs = prefs;
+                self.video_stop();
+                self.vedit.export_open = true;
+                cx.notify();
+            }
+            None => {}
+        }
+        let v = crate::vedit_tools::version();
+        if v == self.vedit.seen_tools {
+            return;
+        }
+        self.vedit.seen_tools = v;
+        self.vedit.keys.borrow_mut().clear();
+        let Some(seq) = self.vedit.seq.as_mut() else { return };
+        let dir = seq.item.output_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| seq.item.output_dir.clone());
+        self.vedit.project = Project::load(&dir);
+        let fresh = self.vedit.project.chapters.get(&seq.item.id).cloned().unwrap_or_default();
+        seq.subs = video::subtitle_setting_for(&seq.item);
+        if fresh != seq.edit {
+            self.vedit.undo.push(std::mem::replace(&mut seq.edit, fresh));
+            self.vedit.redo.clear();
+            // A selection may point past the new clip list.
+            self.vedit.sel = None;
+        }
+        cx.notify();
     }
 
     /// Zoom so the whole sequence fits the timeline.
@@ -286,11 +336,16 @@ impl StudioPage {
         );
     }
 
+    /// Saves the open chapter's edit (other chapters keep what is on disk: the assistant may have
+    /// changed them).
     fn video_save(&mut self, cx: &mut Context<Self>) {
         let Some(seq) = &self.vedit.seq else { return };
-        self.vedit.project.chapters.insert(seq.item.id.clone(), seq.edit.clone());
-        if let Err(e) = self.vedit.project.save(&Self::manga_dir(&seq.item)) {
-            toast::show(cx, Toast::error(format!("Could not save the edit: {e}")));
+        let (id, edit) = (seq.item.id.clone(), seq.edit.clone());
+        match vedit::update_project(&Self::manga_dir(&seq.item), |p| {
+            p.chapters.insert(id, edit);
+        }) {
+            Ok(p) => self.vedit.project = p,
+            Err(e) => toast::show(cx, Toast::error(format!("Could not save the edit: {e}"))),
         }
     }
 
@@ -403,7 +458,7 @@ impl StudioPage {
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else { return };
             let Some(src) = paths.into_iter().next() else { return };
-            let _ = this.update(cx, |this, cx| match import_media(&src, &dir) {
+            let _ = this.update(cx, |this, cx| match vedit::import_media(&src, &dir) {
                 Ok(path) => this.add_layer(LayerKind::Image { path }, cx),
                 Err(e) => toast::show(cx, Toast::warning(format!("Could not add that image: {e}"))),
             });
@@ -417,7 +472,7 @@ impl StudioPage {
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else { return };
             let Some(src) = paths.into_iter().next() else { return };
-            let _ = this.update(cx, |this, cx| match import_media(&src, &dir) {
+            let _ = this.update(cx, |this, cx| match vedit::import_media(&src, &dir) {
                 Ok(path) => {
                     this.video_edit(
                         |s| {
@@ -1000,31 +1055,20 @@ impl StudioPage {
             return;
         }
         self.video_stop();
-        for c in &chapters {
-            let open = self.vedit.seq.as_ref().filter(|s| s.item.id == c.id);
-            let key = self.render_key_of(c);
-            let mut e = open.map(|s| s.edit.clone()).or_else(|| self.vedit.project.chapters.get(&c.id).cloned()).unwrap_or_default();
-            e.rendered = Some(key);
-            if let Some(s) = self.vedit.seq.as_mut().filter(|s| s.item.id == c.id) {
-                s.edit.rendered = Some(key);
+        self.sync_pipeline(cx);
+        let n = match crate::vedit_tools::render(&chapters) {
+            Ok((n, project)) => {
+                if let Some(s) = self.vedit.seq.as_mut() {
+                    s.edit.rendered = project.chapters.get(&s.item.id).and_then(|e| e.rendered);
+                }
+                self.vedit.project = project;
+                n
             }
-            self.vedit.project.chapters.insert(c.id.clone(), e);
-        }
-        if let Some(c) = chapters.first() {
-            if let Err(e) = self.vedit.project.save(&Self::manga_dir(c)) {
-                toast::show(cx, Toast::error(format!("Could not save the edit: {e}")));
+            Err(e) => {
+                toast::show(cx, Toast::error(e));
                 return;
             }
-        }
-        self.sync_pipeline(cx);
-        let (reels, land): (Vec<ChapterItem>, Vec<ChapterItem>) = chapters.into_iter().partition(|c| self.statuses.get(&c.id).is_some_and(|s| !s.reels.is_empty()));
-        let mut n = 0;
-        for (list, format) in [(land, mv_recap::FORMAT_LANDSCAPE), (reels, mv_recap::FORMAT_REELS)] {
-            if !list.is_empty() {
-                let (a, w, k) = crate::pipeline::enqueue(&list, Step::Video, Some(Step::Video), format, None, true);
-                n += a + w + k;
-            }
-        }
+        };
         toast::show(cx, Toast::success(format!("Rendering {n} chapter video{} with the edit", plural(n))).icon(ph::FILM_STRIP));
         cx.notify();
     }
@@ -2219,7 +2263,8 @@ impl StudioPage {
 
 #[cfg(test)]
 mod tests {
-    use super::{import_media, lane_h, soft, Rgba, Track};
+    use super::{lane_h, soft, Rgba, Track};
+    use crate::vedit::import_media;
 
     #[test]
     fn imported_media_is_copied_into_the_manga_folder() {

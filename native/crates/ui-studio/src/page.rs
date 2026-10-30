@@ -631,6 +631,7 @@ impl StudioPage {
                     this.queue = now;
                     changed = true;
                 }
+                this.video_poll(cx);
                 // The runner reads the model and setup from here while it has work.
                 if this.queue.active() > 0 {
                     this.sync_pipeline(cx);

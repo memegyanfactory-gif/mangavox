@@ -79,6 +79,7 @@ pub fn system_prompt(tools_enabled: bool, page: Option<&str>, section: Option<&s
         lines.push("You can operate the app with tools. When the user asks you to do something in the app (open, find, play, switch, change a setting), do it with the tools rather than explaining how.".into());
         lines.push("Use search tools before naming specific titles or ids — never invent them.".into());
         lines.push("After acting, confirm briefly what happened.".into());
+        lines.extend(crate::ext::prompt());
     } else {
         lines.push("In this mode you cannot control the app; answer conversationally and suggest where in the app to go when useful.".into());
     }
