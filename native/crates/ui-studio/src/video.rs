@@ -46,7 +46,7 @@ static FONT_FILES: [&[u8]; 10] = [
 ];
 static FONTS_READY: AtomicBool = AtomicBool::new(false);
 
-fn ensure_fonts(cx: &App) {
+pub(crate) fn ensure_fonts(cx: &App) {
     if !FONTS_READY.swap(true, Ordering::SeqCst) {
         let _ = cx.text_system().add_fonts(FONT_FILES.iter().map(|b| Cow::Borrowed(*b)).collect());
     }
@@ -145,7 +145,7 @@ pub struct Catalog {
     pub styles: Vec<CaptionStyle>,
 }
 
-fn parse_color(s: &str) -> Option<Rgba> {
+pub(crate) fn parse_color(s: &str) -> Option<Rgba> {
     let s = s.trim().to_ascii_lowercase();
     if s == "transparent" {
         return Some(Rgba { r: 0., g: 0., b: 0., a: 0. });
@@ -385,7 +385,7 @@ impl SubtitleSetting {
         st
     }
 
-    fn user_words(&self) -> bool {
+    pub(crate) fn user_words(&self) -> bool {
         self.words_per_line > 0 || self.lines > 0
     }
 }
@@ -701,7 +701,7 @@ fn measure_text(window: &Window, text: &str, key: &str, italic: bool, em: f32) -
     f32::from(line.width)
 }
 
-fn paint(c: Rgba, alpha: f32) -> Hsla {
+pub(crate) fn paint(c: Rgba, alpha: f32) -> Hsla {
     let mut h: Hsla = c.into();
     h.a *= alpha;
     h
@@ -782,7 +782,7 @@ fn word_el(text: &str, t: Tok, l: &Look, st: &CaptionStyle, fh: f32, cheap: bool
 /// A caption cue drawn on a `fw` x `fh` frame: line chips, then every visible word.
 /// `active` is the word being said; words after it are hidden when the template brings words in
 /// as they are spoken and `build_up` is set.
-fn caption_layer(words: &[String], st: &CaptionStyle, user_words: bool, fw: f32, fh: f32, active: usize, build_up: bool, cheap: bool, window: &Window) -> Div {
+pub(crate) fn caption_layer(words: &[String], st: &CaptionStyle, user_words: bool, fw: f32, fh: f32, active: usize, build_up: bool, cheap: bool, window: &Window) -> Div {
     let words: Vec<String> = words.iter().map(|w| if st.uppercase { w.to_uppercase() } else { w.clone() }).collect();
     let n = words.len();
     let mut root = div().absolute().top_0().left_0().w(px(fw)).h(px(fh));

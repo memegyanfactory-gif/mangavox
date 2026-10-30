@@ -101,12 +101,13 @@ pub(crate) enum Side {
     Chat,
 }
 
-/// Studio's two views: the Dashboard (manga, chapter picking, Generate) and the Editor (one
-/// chapter, step by step).
+/// Studio's views: the Dashboard (manga, chapter picking, Generate), the Editor (one chapter,
+/// step by step) and Video (a Premiere-style editor of the manga's finished recap, `vedit_view`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     Dashboard,
     Editor,
+    Video,
 }
 
 /// Below this window width the chapter list and the side panel do not both fit beside the
@@ -328,6 +329,8 @@ pub struct StudioPage {
     pub(crate) lib_open: bool,
     /// Window width at the last render.
     pub(crate) vw: f32,
+    /// The Video mode's editor.
+    pub(crate) vedit: crate::vedit_view::Editor,
     _subs: Vec<Subscription>,
 }
 
@@ -448,6 +451,7 @@ impl StudioPage {
             dismissed: HashSet::new(),
             lib_open: true,
             vw: 1400.,
+            vedit: Default::default(),
             _subs: subs,
         };
         page.reload_library(cx);
@@ -1394,7 +1398,11 @@ impl StudioPage {
     /// Studio's shortcuts: Alt+1 to Alt+6 open a step (they never type text, so they work while
     /// editing too); Esc closes the open cue, then the Setup sheet. Pro media tools are keyboard
     /// driven (NN/g flexibility and efficiency: <https://www.nngroup.com/articles/flexibility-efficiency-heuristic/>).
-    fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Video && self.sheet.is_none() && self.restyle.is_none() && self.video_key(ev, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let k = &ev.keystroke;
         let m = &k.modifiers;
         if k.key == "escape" && !m.modified() && (self.sheet.take().is_some() || self.restyle.take().is_some()) {
@@ -1485,8 +1493,12 @@ impl StudioPage {
                 cx.notify();
             }));
         let editor = self.view == View::Editor;
-        let views = mv_ui::segmented("studio-view", [(Some(ph::SQUARES_FOUR), "Dashboard"), (Some(glyphs::EDIT), "Editor")], if editor { 1 } else { 0 }).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
-            this.view = if *ix == 1 { View::Editor } else { View::Dashboard };
+        let views = mv_ui::segmented("studio-view", [(Some(ph::SQUARES_FOUR), "Dashboard"), (Some(glyphs::EDIT), "Editor"), (Some(ph::FILM_SLATE), "Video")], self.view as usize).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+            this.view = match *ix {
+                1 => View::Editor,
+                2 => View::Video,
+                _ => View::Dashboard,
+            };
             cx.notify();
         }));
         // Where the user is: the dashboard's manga, or the Editor's chapter.
@@ -1895,13 +1907,19 @@ impl Render for StudioPage {
         // taking turns, so the work in the middle never gets squeezed below a usable width.
         self.vw = f32::from(window.viewport_size().width);
         let editor = self.view == View::Editor;
-        let show_lib = editor && self.lib_open && !(self.vw < NARROW && self.side_open);
-        self.center_w = self.vw - 12. - if show_lib { LIBRARY_W + 6. } else { 0. } - if self.side_open { SIDE_W + 6. } else { 0. };
+        // Video mode is a full-width workspace: the side panel stays closed behind it.
+        let side_open = self.side_open && self.view != View::Video;
+        let show_lib = editor && self.lib_open && !(self.vw < NARROW && side_open);
+        self.center_w = self.vw - 12. - if show_lib { LIBRARY_W + 6. } else { 0. } - if side_open { SIDE_W + 6. } else { 0. };
         let queue = &self.queue;
         self.fixing.retain(|c| queue.items.iter().any(|it| it.chapter.id == *c && it.state.active()));
         self.issues = self.collect_issues(cx);
-        let center = if editor { self.center(window, cx) } else { self.dashboard(cx) };
-        let side = self.side_open.then(|| self.side_panel(window, cx));
+        let center = match self.view {
+            View::Editor => self.center(window, cx),
+            View::Dashboard => self.dashboard(cx),
+            View::Video => self.video_mode(window, cx),
+        };
+        let side = side_open.then(|| self.side_panel(window, cx));
         let generate = self.generate_sheet(cx);
         let restyle = self.restyle_sheet(cx);
         let sheet = self.show_setup.then(|| {
