@@ -32,6 +32,8 @@ pub enum Cmd {
     /// Same as pressing the shortcut.
     Run(Shortcut),
     CheckUpdates,
+    /// Search every installed manga source (Browse).
+    SearchManga(String),
 }
 
 /// The open palette.
@@ -179,15 +181,17 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
     // Titles only while searching, so the empty palette stays a short menu; a title already
     // under Recent is not listed twice.
     let recent_manga = |id: &str| c.recent.iter().any(|(_, _, r)| matches!(r, Route::MangaDetail { manga_id, .. } if manga_id == id));
-    let rows = titles
-        .iter()
-        .filter(|t| searching && !recent_manga(&t.id))
-        .map(|t| {
+    // While searching, the first row searches every installed source for the text.
+    let q = query.trim();
+    let search_all = (q.chars().count() >= 2).then(|| row(format!("Search all manga sources for \u{201c}{q}\u{201d}"), glyphs::SEARCH, Cmd::SearchManga(q.to_string())).keys([q.to_string()]));
+    let rows = search_all
+        .into_iter()
+        .chain(titles.iter().filter(|t| searching && !recent_manga(&t.id)).map(|t| {
             let route = Route::MangaDetail { manga_id: t.id.clone(), source_id: Some(t.source.clone()) };
             row(t.title.clone(), glyphs::MANGA, Cmd::Open(Section::Manga, route)).keys(t.author.clone()).keys(["manga"])
-        })
+        }))
         .collect();
-    out.push(Group { heading: "Your library".into(), rows });
+    out.push(Group { heading: "Manga".into(), rows });
     out
 }
 
@@ -345,10 +349,11 @@ mod tests {
         assert_eq!(heads(&idle), heads(&search));
         assert_eq!(idle[0].heading.as_ref(), "Recent");
         let last = |gs: &[Group]| gs.last().map(|g| g.rows.iter().map(|r| r.cmd.clone()).collect::<Vec<_>>()).unwrap_or_default();
-        assert_eq!(idle.last().map(|g| g.heading.as_ref()), Some("Your library"));
+        assert_eq!(idle.last().map(|g| g.heading.as_ref()), Some("Manga"));
         assert!(last(&idle).is_empty());
         // Berserk is already under Recent, so only One Piece is listed.
-        assert_eq!(last(&search), vec![Cmd::Open(Section::Manga, Route::MangaDetail { manga_id: "m1".into(), source_id: Some("src".into()) })]);
+        // The first row searches every source for the text; Berserk is already under Recent.
+        assert_eq!(last(&search), vec![Cmd::SearchManga("one".into()), Cmd::Open(Section::Manga, Route::MangaDetail { manga_id: "m1".into(), source_id: Some("src".into()) })]);
     }
 
     #[test]

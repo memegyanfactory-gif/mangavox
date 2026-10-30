@@ -42,6 +42,22 @@ enum Mode {
 /// `source \u{1} source_id` -> (manga id, shown in the library).
 type Known = HashMap<String, (String, bool)>;
 
+/// One source's answer to a search of every source.
+struct Hits {
+    info: SourceInfo,
+    results: Load<Vec<MangaSearchResult>>,
+}
+
+/// Results per source, best matches first within each (see [`BrowsePage::search_everywhere`]).
+struct Everywhere {
+    query: String,
+    hits: Vec<Hits>,
+    scroll: ScrollHandle,
+}
+
+/// Results per source shown before "Only this source".
+const HITS_ROWS: usize = 2;
+
 fn known_key(source: &str, source_id: &str) -> String {
     format!("{source}\u{1}{source_id}")
 }
@@ -91,17 +107,22 @@ pub struct BrowsePage {
     tags_open: bool,
     /// A genre clicked on a manga page is being matched to a tag.
     resolving: Option<String>,
+    /// A search of every installed source (the search box's Enter).
+    everywhere: Option<Everywhere>,
     _sub: Subscription,
 }
 
 impl BrowsePage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search this source"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search all your sources"));
         let sub = cx.subscribe_in(&input, window, |this, input, ev: &InputEvent, _, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) {
                 let q = input.read(cx).value().trim().to_string();
-                this.mode = if q.is_empty() { Mode::Popular } else { Mode::Search(q) };
-                this.fetch(cx);
+                if q.is_empty() {
+                    this.set_mode(Mode::Popular, cx);
+                } else {
+                    this.search_everywhere(q, cx);
+                }
             }
         });
         let mut p = Self {
@@ -126,6 +147,7 @@ impl BrowsePage {
             tags_for: None,
             tags_open: false,
             resolving: None,
+            everywhere: None,
             _sub: sub,
         };
         p.load_sources(cx);
@@ -181,8 +203,7 @@ impl BrowsePage {
         }
         backend::set_config_str(SOURCE_KEY, &id);
         self.selected = Some(id);
-        self.mode = Mode::Popular;
-        self.fetch(cx);
+        self.set_mode(Mode::Popular, cx);
     }
 
     fn selected_tags(&self) -> &[Tag] {
@@ -273,8 +294,80 @@ impl BrowsePage {
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        self.everywhere = None;
         self.mode = mode;
         self.fetch(cx);
+    }
+
+    /// Searches every installed source at once; each source's results show as they arrive, the
+    /// closest titles first. One source only: its usual results grid.
+    fn search_everywhere(&mut self, query: String, cx: &mut Context<Self>) {
+        let sources = match &self.sources {
+            Load::Ready(list) if list.len() > 1 => list.clone(),
+            _ => return self.set_mode(Mode::Search(query), cx),
+        };
+        self.generation += 1;
+        let generation = self.generation;
+        self.mode = Mode::Search(query.clone());
+        self.everywhere = Some(Everywhere {
+            query: query.clone(),
+            hits: sources.iter().map(|info| Hits { info: info.clone(), results: Load::Loading }).collect(),
+            scroll: ScrollHandle::new(),
+        });
+        cx.notify();
+        for info in sources {
+            let q = query.clone();
+            cx.spawn(async move |this, cx| {
+                let sid = info.id.clone();
+                let q2 = q.clone();
+                let res = mv_ui::bg::run(async move {
+                    let s = backend::source(&sid).await?;
+                    s.search_manga(&q2, 1).await.map_err(|e| anyhow!("{e}"))
+                })
+                .await
+                .and_then(|r| r)
+                .map(|mut list| {
+                    let score = |r: &MangaSearchResult| {
+                        std::iter::once(&r.title).chain(r.alt_titles.iter().flatten()).map(|t| mv_sources::util::title_similarity(t, &q)).fold(0.0, f64::max)
+                    };
+                    // Stable: equally close titles keep the source's own order.
+                    list.sort_by(|a, b| score(b).total_cmp(&score(a)));
+                    list
+                });
+                let covers = match &res {
+                    Ok(list) => {
+                        let urls: Vec<_> = list.iter().filter_map(|r| r.cover_url.clone().map(|u| (u, Some(info.id.clone())))).collect();
+                        mv_ui::bg::blocking(move || backend::resolve_covers(urls)).await.ok()
+                    }
+                    Err(_) => None,
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return;
+                    }
+                    let Some(e) = &mut this.everywhere else { return };
+                    if let Some(h) = e.hits.iter_mut().find(|h| h.info.id == info.id) {
+                        h.results = match res {
+                            Ok(list) => Load::Ready(list),
+                            Err(err) => Load::Failed(format!("{err:#}")),
+                        };
+                    }
+                    if let Some((have, missing)) = covers {
+                        this.covers.extend(have);
+                        spawn_cover_downloads(cx, missing, |t: &mut Self| &mut t.covers);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// "Only this source": the search on one source, with its full results and paging.
+    fn search_one(&mut self, source_id: String, query: String, cx: &mut Context<Self>) {
+        backend::set_config_str(SOURCE_KEY, &source_id);
+        self.selected = Some(source_id);
+        self.set_mode(Mode::Search(query), cx);
     }
 
     /// Leave a search: clear the field and go back to Popular.
@@ -381,11 +474,10 @@ impl BrowsePage {
         .detach();
     }
 
-    fn open_result(&mut self, r: MangaSearchResult, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_result(&mut self, src: String, r: MangaSearchResult, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
         }
-        let Some(src) = self.selected.clone() else { return };
         // Already in the database: open it straight away.
         if let Some((manga_id, _)) = self.known.get(&known_key(&src, &r.source_id)) {
             mv_ui::navigate(Route::MangaDetail { manga_id: manga_id.clone(), source_id: Some(src) }, window, cx);
@@ -455,10 +547,11 @@ impl BrowsePage {
                         grid.row().children(list.iter().skip(r * grid.cols).take(grid.cols).map(|it| {
                             let item = it.clone();
                             let entity = entity.clone();
+                            let from = src.clone();
                             let in_library = this.known.get(&known_key(&src, &it.source_id)).is_some_and(|k| k.1);
                             let busy = this.busy.as_ref().is_some_and(|b| b.0 == it.source_id);
                             let info = CardInfo { title: it.title.clone().into(), cover: cover_src(&this.covers, it.cover_url.as_deref()), in_library, busy, ..Default::default() };
-                            manga_card(SharedString::from(format!("br-{}", it.source_id)), info, grid).on_click(move |_, w, cx| entity.update(cx, |t, cx| t.open_result(item.clone(), w, cx)))
+                            manga_card(SharedString::from(format!("br-{}", it.source_id)), info, grid).on_click(move |_, w, cx| entity.update(cx, |t, cx| t.open_result(from.clone(), item.clone(), w, cx)))
                         }))
                     })
                     .collect()
@@ -467,6 +560,79 @@ impl BrowsePage {
         .track_scroll(&self.scroll)
         .size_full()
         .into_any_element()
+    }
+
+    /// A search of every source: one block per source with results (closest matches first),
+    /// sources still searching below, then the ones with nothing or an error.
+    fn everywhere_view(&self, grid: Grid, cx: &mut Context<Self>) -> AnyElement {
+        let Some(e) = &self.everywhere else { return div().into_any_element() };
+        let entity = cx.entity();
+        let mut found: Vec<&Hits> = e.hits.iter().filter(|h| matches!(&h.results, Load::Ready(l) if !l.is_empty())).collect();
+        // The source whose best result is closest to the query first.
+        let best = |h: &Hits| match &h.results {
+            Load::Ready(l) => l.first().map(|r| mv_sources::util::title_similarity(&r.title, &e.query)).unwrap_or(0.0),
+            _ => 0.0,
+        };
+        found.sort_by(|a, b| best(b).total_cmp(&best(a)));
+        let searching: Vec<&Hits> = e.hits.iter().filter(|h| matches!(h.results, Load::Loading)).collect();
+        let empty: Vec<String> = e.hits.iter().filter(|h| matches!(&h.results, Load::Ready(l) if l.is_empty())).map(|h| h.info.name.clone()).collect();
+        let failed: Vec<(String, String)> = e.hits.iter().filter_map(|h| match &h.results {
+            Load::Failed(err) => Some((h.info.name.clone(), err.clone())),
+            _ => None,
+        }).collect();
+        let header = |h: &Hits, count: Option<usize>| {
+            let (id, q) = (h.info.id.clone(), e.query.clone());
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(size::PAGE_X))
+                .mb(px(10.))
+                .child(source_avatar(&h.info, 24., false))
+                .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(h.info.name.clone()))
+                .when_some(count, |d, n| d.child(muted(if n == 1 { "1 result".to_string() } else { format!("{n} results") })))
+                .when(h.info.nsfw, |d| d.child(tag("18+", Tone::Danger)))
+                .child(div().flex_1())
+                .when(count.is_some(), |d| {
+                    d.child(
+                        btn(SharedString::from(format!("only-{}", h.info.id)), "Only this source", ButtonKind::Ghost)
+                            .small()
+                            .tooltip("All of this source's results, with more pages")
+                            .on_click(cx.listener(move |this, _, _, cx| this.search_one(id.clone(), q.clone(), cx))),
+                    )
+                })
+        };
+        let mut col = div().flex().flex_col().gap(px(22.)).pb(px(32.));
+        if found.is_empty() && searching.is_empty() {
+            col = col.child(
+                empty_view(glyphs::SEARCH, "No results", format!("None of your sources has a title matching \u{201c}{}\u{201d}. Check the spelling, or add more sources in Settings.", e.query))
+                    .action(btn("everywhere-clear", "Clear search", ButtonKind::Secondary).icon(ph::X).on_click(cx.listener(|this, _, w, cx| this.clear_search(w, cx)))),
+            );
+        }
+        for h in found {
+            let Load::Ready(list) = &h.results else { continue };
+            let src = h.info.id.clone();
+            let rows = list.chunks(grid.cols.max(1)).take(HITS_ROWS).map(|chunk| {
+                grid.row().children(chunk.iter().map(|it| {
+                    let (item, entity, from) = (it.clone(), entity.clone(), src.clone());
+                    let in_library = self.known.get(&known_key(&src, &it.source_id)).is_some_and(|k| k.1);
+                    let busy = self.busy.as_ref().is_some_and(|b| b.0 == it.source_id);
+                    let info = CardInfo { title: it.title.clone().into(), cover: cover_src(&self.covers, it.cover_url.as_deref()), in_library, busy, ..Default::default() };
+                    manga_card(SharedString::from(format!("ev-{src}-{}", it.source_id)), info, grid).on_click(move |_, w, cx| entity.update(cx, |t, cx| t.open_result(from.clone(), item.clone(), w, cx)))
+                }))
+            });
+            col = col.child(div().flex().flex_col().child(header(h, Some(list.len()))).children(rows));
+        }
+        for h in searching {
+            col = col.child(div().flex().flex_col().child(header(h, None)).child(grid.row().children((0..grid.cols).map(|_| skeleton_cover(grid)))));
+        }
+        if !empty.is_empty() {
+            col = col.child(div().px(px(size::PAGE_X)).child(muted(format!("No match on {}.", empty.join(", ")))));
+        }
+        for (name, err) in failed {
+            col = col.child(div().px(px(size::PAGE_X)).child(inline_alert(AlertKind::Error, format!("Could not search {name}"), err).max_w(px(640.))));
+        }
+        div().id("everywhere").size_full().overflow_y_scroll().track_scroll(&e.scroll).child(col).into_any_element()
     }
 
     /// The row after the last results (same height as a grid row, content at the top).
@@ -670,7 +836,8 @@ impl BrowsePage {
             .child(mode_tab("m-popular", ph::FIRE, "Popular", Mode::Popular))
             .child(mode_tab("m-latest", ph::CLOCK, "Latest", Mode::Latest))
             .when_some(search, |d, q| {
-                d.child(tab("m-search", Some(glyphs::SEARCH), format!("\u{201c}{}\u{201d}", short(&q, SEARCH_TAB_CHARS)), None, true).mr(px(4.)).tooltip(mv_ui::tip(format!("Results for \u{201c}{q}\u{201d}"))))
+                let scope = if self.everywhere.is_some() { " in all sources" } else { "" };
+                d.child(tab("m-search", Some(glyphs::SEARCH), format!("\u{201c}{}\u{201d}{scope}", short(&q, SEARCH_TAB_CHARS)), None, true).mr(px(4.)).tooltip(mv_ui::tip(format!("Results for \u{201c}{q}\u{201d}"))))
                     .child(div().mr(px(18.)).child(icon_button("m-search-close", ph::X, "Clear search").small().on_click(cx.listener(|this, _, w, cx| this.clear_search(w, cx)))))
             })
             .when(!self.selected_tags().is_empty(), |d| d.child(tab("m-tags", Some(ph::TAG), "Tags", Some(self.selected_tags().len()), true)))
@@ -704,6 +871,11 @@ impl Render for BrowsePage {
             self.load_sources(cx);
         }
         if matches!(self.sources, Load::Ready(_)) {
+            if let Some(q) = discover::take_search() {
+                self.input.update(cx, |s, cx| s.set_value(q.clone(), window, cx));
+                let page = cx.entity();
+                cx.defer(move |cx| page.update(cx, |this, cx| this.search_everywhere(q, cx)));
+            }
             if let Some(req) = discover::take_request() {
                 let page = cx.entity();
                 cx.defer(move |cx| page.update(cx, |this, cx| this.open_tag_request(req, cx)));
@@ -744,13 +916,17 @@ impl Render for BrowsePage {
         let tabs = self.mode_tabs(current.as_ref(), cx);
         let selected_row = self.selected_row(cx);
         let panel = self.tags_open.then(|| self.tag_panel(current.as_ref(), cx));
-        let body: AnyElement = match &self.results {
+        let body: AnyElement = if self.everywhere.is_some() {
+            self.everywhere_view(grid, cx)
+        } else {
+            match &self.results {
             Load::Loading => skeleton_rows(grid, 3).into_any_element(),
             Load::Failed(e) => error_view(e.clone())
                 .title(format!("{} did not answer", current.as_ref().map(|s| s.name.clone()).unwrap_or_else(|| "The source".into())))
                 .retry(cx.listener(|this, _, _, cx| this.fetch(cx)))
                 .into_any_element(),
             Load::Ready(_) => self.grid(grid, cx),
+            }
         };
         root.child(tabs).children(panel).children(selected_row).child(div().relative().flex_1().min_h_0().child(width_probe(cx, |t: &mut Self| &mut t.width)).child(body))
     }

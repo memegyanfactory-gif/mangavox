@@ -805,6 +805,13 @@ impl Shell {
             }
             Cmd::Go(route) => self.go(route, window, cx),
             Cmd::Run(s) => self.run_shortcut(s, window, cx),
+            Cmd::SearchManga(q) => {
+                ui_manga::request_search(&q);
+                if self.section != Section::Manga {
+                    self.set_section(Section::Manga, window, cx);
+                }
+                self.go(Route::Browse, window, cx);
+            }
             Cmd::CheckUpdates => {
                 let u = mv_ui::update::updater(cx);
                 let status = u.read(cx).status.clone();

@@ -263,3 +263,15 @@ mod live {
         });
     }
 }
+
+static SEARCH: Mutex<Option<String>> = Mutex::new(None);
+
+/// Browse searches every installed source for `query` when it is shown next (the command
+/// palette's "Search all sources").
+pub fn request_search(query: &str) {
+    *SEARCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(query.trim().to_string());
+}
+
+pub fn take_search() -> Option<String> {
+    SEARCH.lock().unwrap_or_else(|e| e.into_inner()).take().filter(|q| !q.is_empty())
+}

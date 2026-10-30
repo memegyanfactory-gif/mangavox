@@ -24,6 +24,7 @@ pub mod tags;
 mod ui;
 
 pub use backend::set_source_ctx;
+pub use discover::request_search;
 pub use downloads::{downloads, toast as download_toast};
 
 /// Gives the assistant the manga tools (search, chapters, downloads, reader). Called once at startup.
