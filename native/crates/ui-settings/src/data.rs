@@ -207,7 +207,7 @@ pub fn load_studio_prefs() -> StudioPrefs {
     StudioPrefs {
         voice: v.get("voice").and_then(Value::as_str).unwrap_or(&d.voice).to_string(),
         speed: v.get("speed").and_then(Value::as_f64).unwrap_or(d.speed),
-        resolution: v.get("resolution").and_then(Value::as_str).filter(|r| *r == "720p" || *r == "1080p").unwrap_or(&d.resolution).to_string(),
+        resolution: v.get("resolution").and_then(Value::as_str).filter(|r| matches!(*r, "720p" | "1080p" | "1440p" | "4k")).unwrap_or(&d.resolution).to_string(),
     }
 }
 

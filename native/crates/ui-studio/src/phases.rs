@@ -24,7 +24,7 @@ use crate::widgets::{ago, card, delivery_preset, feel_icon, field_frame, fmt_sec
 use crate::{audio, run};
 
 const SPEEDS: [f64; 4] = [0.9, 1.0, 1.1, 1.25];
-const RESOLUTIONS: [&str; 2] = ["720p", "1080p"];
+use mv_recap::RESOLUTIONS;
 const FORMATS: [(&str, &str, Ph); 2] = [(mv_recap::FORMAT_LANDSCAPE, "16:9 Landscape", ph::MONITOR), (mv_recap::FORMAT_REELS, "9:16 Reels", ph::DEVICE_MOBILE)];
 const PAGE_MAX_W: f32 = 760.;
 /// Below this centre width the Read notes go under the page instead of beside it
@@ -955,7 +955,7 @@ impl StudioPage {
         let title = format!("{} · {}", f.item.manga_title, f.item.label());
         let res_ix = RESOLUTIONS.iter().position(|r| *r == self.prefs.resolution).unwrap_or(1);
         let res = segmented("video-res", RESOLUTIONS.map(|r| (Some(ph::HIGH_DEFINITION), r)), res_ix).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
-            let r = RESOLUTIONS[(*ix).min(1)].to_string();
+            let r = RESOLUTIONS[(*ix).min(RESOLUTIONS.len() - 1)].to_string();
             this.prefs.resolution = r.clone();
             Prefs::update(|p| p.resolution = r);
             cx.notify();
@@ -982,6 +982,7 @@ impl StudioPage {
                 card()
                     .child(setting(ph::FRAME_CORNERS, "Format", formats.into_any_element()))
                     .child(setting(ph::MONITOR, "Resolution", res.into_any_element()))
+                    .child(muted(crate::generate::RESOLUTION_NOTE))
                     .when(self.prefs.format == mv_recap::FORMAT_REELS, |d| {
                         d.child(muted("Reels render upright (9:16) and cut the recap into parts of about a minute, each ending at a pause in the narration."))
                     }),

@@ -416,6 +416,13 @@ impl StudioPage {
             cx.notify();
         }));
 
+        let res_ix = mv_recap::RESOLUTIONS.iter().position(|r| *r == self.prefs.resolution).unwrap_or(1);
+        let resolution = segmented("gen-res", mv_recap::RESOLUTIONS.map(|r| (None, r)), res_ix).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+            let r = mv_recap::RESOLUTIONS[(*ix).min(mv_recap::RESOLUTIONS.len() - 1)].to_string();
+            this.prefs.resolution = r.clone();
+            Prefs::update(|p| p.resolution = r);
+            cx.notify();
+        }));
         // Q2: format, as two big choices.
         let formats = div().flex().flex_wrap().gap(px(space::SM)).children(FORMATS.iter().enumerate().map(|(i, &(id, label, desc, icon))| {
             let on = a.format == id;
@@ -589,6 +596,7 @@ impl StudioPage {
                     .child(question(ph::MICROPHONE_STAGE, "Narrator voice", "Who reads the recap. Press play to hear a voice first.", div().flex().flex_col().gap(px(space::SM)).child(div().flex().child(langs)).child(voice_rows).children(more_voices).into_any_element()))
                     .child(question(ph::ARROWS_CLOCKWISE, "Make again", "Redo a step even where it is done; every step after it is made again too.", redo_q.into_any_element()))
                     .child(question(ph::FRAME_CORNERS, "Format", "Landscape makes one video; Reels makes upright parts for Shorts, Reels and TikTok.", formats.into_any_element()))
+                    .child(question(ph::MONITOR, "Video quality", RESOLUTION_NOTE, div().flex().child(resolution).into_any_element()))
                     .child(self.subtitle_slot(a.captions, a.subtitle_style.as_deref(), cx))
                     .child(question(glyphs::MUSIC, "Music", "An original score that follows each scene.", music.into_any_element()))
                     .when(needs_ai, |d| {
@@ -676,6 +684,9 @@ impl StudioPage {
 }
 
 /// One question: icon, title, why it is asked, and its control.
+/// What the resolution choice means, shown beside it in the Video step and the Generate sheet.
+pub(crate) const RESOLUTION_NOTE: &str = "4K and 1440p look sharper but take longer to render and make bigger files.";
+
 pub(crate) fn question(icon: Ph, title: &'static str, why: &'static str, control: AnyElement) -> AnyElement {
     div()
         .flex()
