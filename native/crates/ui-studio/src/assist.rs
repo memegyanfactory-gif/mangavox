@@ -19,7 +19,7 @@ use ui_assistant::tools::{self as at, bool_arg, list_arg, num_arg, str_arg, Phra
 use crate::data::{ChapterItem, MangaGroup};
 use crate::export::{self, ExportPrefs, Mode};
 use crate::generate::{self, Answers};
-use crate::look::{Effect, Look, Preset, POSITIONS};
+use crate::look::{ColorPreset, Effect, Look, Preset, POSITIONS};
 use crate::pipeline::{self, ItemState, QueueItem, StepState};
 use crate::setup::{self, Env};
 
@@ -146,11 +146,12 @@ fn tools() -> Vec<ToolDef> {
         .run(|a| async move { export_tool(a).await }.boxed()),
         ToolDef::new(
             "studio_look",
-            "The video look and branding used for new renders and exports: preset (clean, cinematic, recap, dynamic), effects (grade, glow, vignette, grain, impact), text watermark and logo. Call without arguments to read it; pass fields to change them.",
+            "The video look and branding used for new renders and exports: preset (clean, cinematic, recap, dynamic), effects (grade, glow, vignette, grain, impact, leaks, chroma, parallax, particles, letterbox), colour (none, warm, cool, noir, vivid), text watermark and logo. Call without arguments to read it; pass fields to change them.",
             obj(
                 json!({
                     "preset": { "type": "string", "enum": Preset::ALL.map(Preset::key) },
-                    "effects": { "type": "object", "description": "Effect on/off, e.g. {\"grain\": false}", "properties": { "grade": {"type":"boolean"}, "glow": {"type":"boolean"}, "vignette": {"type":"boolean"}, "grain": {"type":"boolean"}, "impact": {"type":"boolean"} } },
+                    "effects": { "type": "object", "description": "Effect on/off, e.g. {\"grain\": false}", "properties": Effect::ALL.iter().map(|e| (e.key().to_string(), json!({"type": "boolean", "description": e.label()}))).collect::<Map<String, Value>>() },
+                    "color": { "type": "string", "enum": ColorPreset::ALL.map(ColorPreset::key), "description": "Colour preset over the grade" },
                     "watermark": { "type": "boolean", "description": "Show the text watermark" },
                     "watermark_text": s("Watermark text, e.g. @mychannel"),
                     "watermark_position": { "type": "string", "enum": POSITIONS },
@@ -693,6 +694,9 @@ pub(crate) fn apply_look(look: &mut Look, a: &Map<String, Value>) -> Result<(), 
             look.set_effect(e, v.as_bool().unwrap_or(false));
         }
     }
+    if let Some(c) = Some(str_arg(a, "color")).filter(|c| !c.is_empty()) {
+        look.set_color(ColorPreset::parse(c).ok_or_else(|| format!("Unknown colour "{c}""))?);
+    }
     if let Some(on) = bool_arg(a, "watermark") {
         look.text.on = on;
     }
@@ -728,6 +732,7 @@ fn look_json(l: &Look) -> Value {
     json!({
         "preset": l.preset.key(),
         "effects": Effect::ALL.iter().map(|e| (e.key().to_string(), Value::Bool(fx.get(*e)))).collect::<Map<String, Value>>(),
+        "color": l.color().key(),
         "watermark": { "on": l.text.on, "text": l.text.text, "position": POSITIONS[l.text.pos.min(8)] },
         "logo": { "on": l.logo.on, "chosen": l.logo.path.is_some(), "position": POSITIONS[l.logo.pos.min(8)] },
         "presets": Preset::ALL.map(Preset::key),
