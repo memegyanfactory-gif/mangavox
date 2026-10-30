@@ -264,6 +264,91 @@ fn probe_duration(p: &Path) -> Result<f64> {
     String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().context("read duration")
 }
 
+// ------------------------------------------------------------------ background loading
+
+/// What the timeline asked for, made off the UI thread by one worker (so a long chapter does not
+/// start fifty ffmpegs at once).
+enum Job {
+    Peaks(PathBuf),
+    Thumb(PathBuf, u32),
+}
+
+enum Slot {
+    Pending,
+    Peaks(Arc<Peaks>),
+    Thumb(PathBuf, f32),
+    Failed,
+}
+
+fn slots() -> &'static Mutex<HashMap<String, Slot>> {
+    static S: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+static LOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped whenever a background load finishes (the page repaints when it moves).
+pub fn loaded_version() -> u64 {
+    LOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn worker() -> &'static Mutex<std::sync::mpsc::Sender<(String, Job)>> {
+    static W: OnceLock<Mutex<std::sync::mpsc::Sender<(String, Job)>>> = OnceLock::new();
+    W.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Job)>();
+        std::thread::Builder::new()
+            .name("vedit-media".into())
+            .spawn(move || {
+                for (key, job) in rx {
+                    let slot = match job {
+                        Job::Peaks(p) => peaks(&p).map(Slot::Peaks).unwrap_or(Slot::Failed),
+                        Job::Thumb(p, h) => thumb(&p, h).map(|t| { let a = ::image::image_dimensions(&t).map(|(w, h)| w as f32 / h.max(1) as f32).unwrap_or(0.75); Slot::Thumb(t, a) }).unwrap_or(Slot::Failed),
+                    };
+                    slots().lock().unwrap().insert(key, slot);
+                    LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .ok();
+        Mutex::new(tx)
+    })
+}
+
+fn request(key: String, job: Job) {
+    let mut s = slots().lock().unwrap();
+    if s.contains_key(&key) {
+        return;
+    }
+    s.insert(key.clone(), Slot::Pending);
+    drop(s);
+    let _ = worker().lock().unwrap().send((key, job));
+}
+
+/// The peaks of `audio` if they are ready; otherwise starts making them and returns `None`.
+pub fn peaks_ready(audio: &Path) -> Option<Arc<Peaks>> {
+    let key = format!("p|{}", audio.display());
+    if let Some(slot) = slots().lock().unwrap().get(&key) {
+        return match slot {
+            Slot::Peaks(p) => Some(p.clone()),
+            _ => None,
+        };
+    }
+    request(key, Job::Peaks(audio.to_path_buf()));
+    None
+}
+
+/// A thumbnail of `image` (`h` px tall) if it is ready; otherwise starts making it.
+pub fn thumb_ready(image: &Path, h: u32) -> Option<(PathBuf, f32)> {
+    let key = format!("t{h}|{}", image.display());
+    if let Some(slot) = slots().lock().unwrap().get(&key) {
+        return match slot {
+            Slot::Thumb(p, a) => Some((p.clone(), *a)),
+            _ => None,
+        };
+    }
+    request(key, Job::Thumb(image.to_path_buf(), h));
+    None
+}
+
 // ------------------------------------------------------------------ painting
 
 /// Draws a waveform in `bounds`: a soft envelope (peak), a brighter core (rms) and a centre line,

@@ -213,6 +213,8 @@ fn tool_message(call: &AiToolCall, content: Value) -> AiMessage {
 /// [`MAX_ROUNDS`] is hit. Always ends by sending [`AgentEvent::Finished`].
 pub async fn run_agent<R: StepRunner, T: ToolRunner>(runner: &R, tools: &T, p: AgentParams, tx: UnboundedSender<AgentEvent>, cancel: CancellationToken) {
     let mut history = p.history.clone();
+    let prompt = history.iter().rev().find(|m| m.role == AiRole::User).map(|m| m.content.clone()).unwrap_or_default();
+    crate::ext::begin_turn(&prompt);
     let outcome = run_loop(runner, tools, &p, &mut history, &tx, &cancel).await;
     let keep = history.len().saturating_sub(80);
     let _ = tx.unbounded_send(AgentEvent::Finished { outcome, history: history.split_off(keep) });

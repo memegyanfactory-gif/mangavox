@@ -7,7 +7,7 @@
 //! and music played by `vedit_play`); Render makes the real video through the Python renderer (see
 //! `vedit::render_extra`), and Export is the dashboard's Full recap export over those videos.
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -24,28 +24,120 @@ use crate::look::{Effect, Preset};
 use crate::page::{plural, Load, StudioPage, View};
 use crate::restyle::{place_index, set_place, set_size, PLACES, SIZES};
 use crate::vedit::{self, Beat, ChapterEdit, Clip, Layer, LayerKind, LookEdit, Motion, MusicSource, Placed, Project, Track};
+use crate::vedit_history::History;
+use crate::vedit_keys::{self, Command};
+use crate::vedit_tl::{self as tl, NavGrip};
 use crate::vedit_play;
 use crate::video::{self, SubtitleSetting};
 
 mod manga;
 
-/// Track header width, and each lane's height.
-const HEAD_W: f32 = 176.;
-const RULER_H: f32 = 26.;
+/// The timeline's measures (bhippi's): track head column, ruler, a clip's label bar.
+const HEAD_W: f32 = 150.;
+const RULER_H: f32 = 34.;
+const LABEL_H: f32 = 15.;
+const NAV_H: f32 = 16.;
 const LEFT_W: f32 = 320.;
 const RIGHT_W: f32 = 300.;
 const TOOLS_W: f32 = 40.;
+/// The bottom row (bin, tools, timeline).
+const BOTTOM_H: f32 = 376.;
 const TICK: Duration = Duration::from_millis(33);
-const UNDO_MAX: usize = 60;
+/// How long the clips an assistant turn changed stay lit.
+const AI_FLASH: Duration = Duration::from_secs(5);
 const SWATCHES: [&str; 6] = ["#ffffff", "#ffe600", "#58d8ff", "#ff2fd2", "#ff9d2e", "#111111"];
 
 fn lane_h(t: Track) -> f32 {
     match t {
-        Track::Captions => 30.,
-        Track::Layers => 34.,
-        Track::Clips => 56.,
-        Track::Narration | Track::Music => 40.,
+        Track::Captions | Track::Layers => 40.,
+        Track::Clips | Track::Narration => 52.,
+        Track::Music => 44.,
     }
+}
+
+/// A track's clip colour (bhippi's palette in the theme's tokens): picture blue, sound green,
+/// captions the accent, layers the second accent.
+fn track_color(t: Track) -> Rgba {
+    match t {
+        Track::Clips => Tokens::info(),
+        Track::Narration | Track::Music => Tokens::success(),
+        Track::Captions => Tokens::accent(),
+        Track::Layers => Tokens::accent_2(),
+    }
+}
+
+/// A clip on a lane `h` tall: 3 px corners, a 1 px border lighter than its fill, and a 15 px label
+/// bar. `ai`: the assistant just changed it.
+fn clip_box(id: SharedString, x: f32, w: f32, h: f32, c: Rgba, selected: bool, ai: bool, icon: Option<mv_ui::Ph>, label: String) -> Stateful<Div> {
+    let border = if selected {
+        Tokens::text_1()
+    } else if ai {
+        Tokens::warning()
+    } else {
+        soft(c, 0.95)
+    };
+    div()
+        .id(id)
+        .absolute()
+        .left(px(x))
+        .top(px(1.))
+        .w(px(w.max(2.)))
+        .h(px(h - 2.))
+        .rounded(px(3.))
+        .overflow_hidden()
+        .bg(soft(c, if ai { 0.55 } else { 0.38 }))
+        .border_1()
+        .border_color(border)
+        .when(selected || ai, |d| d.border_2())
+        .when(w > 18., |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(LABEL_H))
+                    .flex()
+                    .items_center()
+                    .gap(px(3.))
+                    .px(px(4.))
+                    .bg(soft(c, 0.72))
+                    .children(icon.map(|i| icon_ph(i, Tokens::text_1(), 10.)))
+                    .child(div().min_w_0().truncate().text_size(px(10.)).text_color(Tokens::text_1()).child(label)),
+            )
+        })
+}
+
+/// A waveform filling its box (one column per entry of `slice`).
+fn wave(slice: Vec<(f32, f32)>) -> Canvas<()> {
+    canvas(|_, _, _| (), move |b, _, window, _| crate::vedit_media::paint_waveform(b, &slice, window))
+}
+
+/// The visible part of a clip at `x`, `w` wide on lanes `view_w` wide: (from, to) in clip pixels.
+fn visible_part(x: f32, w: f32, view_w: f32) -> Option<(f32, f32)> {
+    let (a, b) = ((-x).max(0.), (view_w - x).min(w));
+    (b - a >= 1.).then_some((a, b))
+}
+
+/// A clip's sound as a waveform under its label bar: `peaks` from `src_s` seconds at the clip's
+/// left edge, at `pps`; only the visible part is drawn.
+fn clip_wave(peaks: &crate::vedit_media::Peaks, src_s: f64, x: f32, w: f32, h: f32, pps: f32, view_w: f32) -> Option<Div> {
+    let (a, b) = visible_part(x, w, view_w)?;
+    let cols = (((b - a) / 2.).ceil() as usize).clamp(1, 1600);
+    let slice = peaks.slice(src_s + a as f64 / pps as f64, src_s + b as f64 / pps as f64, cols);
+    Some(div().absolute().left(px(a)).w(px(b - a)).top(px(LABEL_H)).h(px((h - 4. - LABEL_H).max(4.))).child(wave(slice).size_full()))
+}
+
+/// A panel clip's picture: its thumbnail tiled along the clip (not stretched), visible tiles only.
+fn clip_tiles(image: &Path, x: f32, w: f32, h: f32, view_w: f32) -> Vec<AnyElement> {
+    let body = (h - 4. - LABEL_H).max(8.);
+    let Some((thumb, aspect)) = crate::vedit_media::thumb_ready(image, 90) else { return vec![] };
+    let Some((a, b)) = visible_part(x, w, view_w) else { return vec![] };
+    let tw = (body * aspect).max(8.);
+    let (k0, k1) = ((a / tw).floor() as usize, ((b / tw).ceil() as usize).min((a / tw).floor() as usize + 60));
+    (k0..k1)
+        .map(|k| img(thumb.clone()).absolute().left(px(k as f32 * tw)).top(px(LABEL_H)).w(px(tw)).h(px(body)).object_fit(ObjectFit::Cover).opacity(0.85).into_any_element())
+        .collect()
 }
 
 fn hex(s: &str) -> Rgba {
@@ -85,8 +177,17 @@ enum Drag {
     Caption { grab: (f32, f32), from: Option<(f32, f32)> },
     /// A value bar in the controls.
     Bar(&'static str),
-    /// The timeline's scroll bar.
-    Scroll,
+    /// The navigator under the timeline: panning its thumb, or zooming with a handle; where the
+    /// pointer, zoom and scroll were when it began.
+    Nav { grip: NavGrip, x0: f32, pps0: f32, scroll0: f32 },
+}
+
+/// The assistant turn being folded into one undo step.
+#[derive(Clone, Copy, Debug)]
+struct AiTurn {
+    turn: u64,
+    /// The history step before the turn.
+    mark: usize,
 }
 
 /// The open chapter.
@@ -130,8 +231,34 @@ pub(crate) struct Editor {
     bars: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
     text: Option<Entity<InputState>>,
     text_for: Option<Sel>,
-    undo: Vec<ChapterEdit>,
-    redo: Vec<ChapterEdit>,
+    /// The open chapter's labelled undo history (`vedit_history`).
+    hist: History<ChapterEdit>,
+    /// The assistant turn whose edits fold into one step, and the clips / layers it changed
+    /// (lit for a few seconds).
+    ai: Option<AiTurn>,
+    ai_flash: Option<(Instant, Vec<usize>, Vec<u64>)>,
+    /// Shift held during a drag (inverts snapping).
+    shift: bool,
+    /// In / out points and markers (this session's, on the open timeline).
+    mark_in: Option<u64>,
+    mark_out: Option<u64>,
+    markers: Vec<u64>,
+    /// J / L shuttle: when it began, from where, and the speed (negative: backwards); and the
+    /// last direction with how many presses in a row.
+    shuttle: Option<(Instant, u64, f32)>,
+    shuttle_n: (i8, u32),
+    /// The keyboard shortcuts list is open.
+    keys_open: bool,
+    /// Inspector sections folded shut.
+    collapsed: HashSet<&'static str>,
+    /// The navigator bar's bounds.
+    nav: Rc<Cell<Bounds<Pixels>>>,
+    /// `vedit_media::loaded_version` last painted.
+    seen_media: u64,
+    /// The Video mode export's choices.
+    pub(crate) vexport: crate::export::PresetExport,
+    /// The dashboard's export options are shown in the Export dialog.
+    export_more: bool,
     /// Render keys of the chapters not open (worked out once; see `unrendered`) and the bin's
     /// first-page thumbnails.
     keys: RefCell<HashMap<String, u64>>,
@@ -157,7 +284,7 @@ impl Default for Editor {
             seq: None,
             playhead: 0,
             playing: None,
-            pps: 24.,
+            pps: 60.,
             scroll_x: 0.,
             snap: true,
             snapped: None,
@@ -173,8 +300,21 @@ impl Default for Editor {
             bars: Rc::new(RefCell::new(HashMap::new())),
             text: None,
             text_for: None,
-            undo: vec![],
-            redo: vec![],
+            hist: History::new(ChapterEdit::default()),
+            ai: None,
+            ai_flash: None,
+            shift: false,
+            mark_in: None,
+            mark_out: None,
+            markers: vec![],
+            shuttle: None,
+            shuttle_n: (0, 0),
+            keys_open: false,
+            collapsed: HashSet::new(),
+            nav: Rc::new(Cell::new(Bounds::default())),
+            seen_media: 0,
+            vexport: Default::default(),
+            export_more: false,
             keys: RefCell::new(HashMap::new()),
             thumbs: RefCell::new(HashMap::new()),
             seen_tools: crate::vedit_tools::version(),
@@ -246,12 +386,16 @@ impl StudioPage {
         let subs = self.vedit.project.captions(&video::subtitle_setting_for(&item));
         let score = Some(mv_score::score_wav(&crate::page::chref(&item))).filter(|p| p.is_file());
         let reels = self.statuses.get(&item.id).is_some_and(|s| !s.reels.is_empty());
+        self.vedit.hist = History::new(edit.clone());
+        self.vedit.ai = None;
+        self.vedit.ai_flash = None;
         self.vedit.seq = Some(Seq { item, beats, edit, subs, score, reels });
         self.vedit.playhead = 0;
         self.vedit.scroll_x = 0.;
         self.vedit.sel = None;
-        self.vedit.undo.clear();
-        self.vedit.redo.clear();
+        self.vedit.mark_in = None;
+        self.vedit.mark_out = None;
+        self.vedit.markers.clear();
         self.vedit.fit_pending = true;
         self.video_tell_assistant();
     }
@@ -291,11 +435,20 @@ impl StudioPage {
                 self.export_prefs = prefs;
                 self.video_stop();
                 self.vedit.export_open = true;
+                // The chat chose the dashboard's options (parts, hook, quality): show them.
+                self.vedit.export_more = true;
+                crate::encode::warm();
                 cx.notify();
             }
             None => {}
         }
         self.manga_poll(cx);
+        // Waveforms and thumbnails made in the background since the last paint.
+        let media = crate::vedit_media::loaded_version();
+        if media != self.vedit.seen_media && self.view == View::Video {
+            self.vedit.seen_media = media;
+            cx.notify();
+        }
         let v = crate::vedit_tools::version();
         if v == self.vedit.seen_tools {
             return;
@@ -308,12 +461,62 @@ impl StudioPage {
         let fresh = self.vedit.project.chapters.get(&seq.item.id).cloned().unwrap_or_default();
         seq.subs = self.vedit.project.captions(&video::subtitle_setting_for(&seq.item));
         if fresh != seq.edit {
-            self.vedit.undo.push(std::mem::replace(&mut seq.edit, fresh));
-            self.vedit.redo.clear();
-            // A selection may point past the new clip list.
+            // One undo step per chat turn, labelled with what was asked: every tool edit of the
+            // turn is folded into the step the turn's first edit made.
+            let (turn, prompt) = crate::vedit_tools::last_turn().unwrap_or((0, "chat edit".into()));
+            let (ai, first) = match self.vedit.ai {
+                Some(a) if a.turn == turn && self.vedit.hist.mark() == a.mark + 1 => (a, false),
+                _ => (AiTurn { turn, mark: self.vedit.hist.mark() }, true),
+            };
+            self.vedit.ai = Some(ai);
+            self.vedit.hist.commit("AI: edit", fresh.clone());
+            self.vedit.hist.squash_turn(ai.mark, &tl::ai_label(&prompt));
+            seq.edit = fresh;
             self.vedit.sel = None;
+            self.video_flash_turn(first, cx);
         }
         cx.notify();
+    }
+
+    /// Lights the clips and layers the current assistant turn changed, for a few seconds, and
+    /// offers to revert the turn.
+    fn video_flash_turn(&mut self, toast_it: bool, cx: &mut Context<Self>) {
+        let Some(ai) = self.vedit.ai else { return };
+        let Some(seq) = &self.vedit.seq else { return };
+        // The edit before the turn (its history step), to compare with.
+        let h = &mut self.vedit.hist;
+        let label = h.undo_label().unwrap_or("AI").to_string();
+        let now = h.mark();
+        let before = if h.jump(ai.mark) { h.current().clone() } else { ChapterEdit::default() };
+        h.jump(now);
+        let clips = tl::changed_clips(&before.clips(&seq.beats), &seq.edit.clips(&seq.beats));
+        let layers = tl::changed_layers(&before.layers, &seq.edit.layers);
+        self.vedit.ai_flash = Some((Instant::now(), clips, layers));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AI_FLASH).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+        if !toast_it {
+            return;
+        }
+        let page = cx.entity().downgrade();
+        toast::show(
+            cx,
+            Toast::info(format!("{label} · one undo step")).icon(ph::SPARKLE).action("Revert", move |_, cx| {
+                let _ = page.update(cx, |p, cx| p.video_revert_turn(cx));
+            }),
+        );
+    }
+
+    /// Undoes the last assistant turn (when nothing was edited after it).
+    fn video_revert_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(ai) = self.vedit.ai else { return };
+        if self.vedit.hist.mark() != ai.mark + 1 {
+            toast::show(cx, Toast::info("Undo the edits made after the chat's first"));
+            return;
+        }
+        self.video_undo(false, cx);
     }
 
     /// Zoom so the whole sequence fits the timeline.
@@ -331,25 +534,32 @@ impl StudioPage {
 
     // ------------------------------------------------------------------------------ editing
 
-    /// Applies `f` to the open chapter's edit, keeps an undo step and saves the project.
-    fn video_edit(&mut self, f: impl FnOnce(&mut Seq), cx: &mut Context<Self>) {
+    /// Applies `f` to the open chapter's edit, keeps it as an undo step called `label` and saves
+    /// the project.
+    fn video_edit(&mut self, label: &str, f: impl FnOnce(&mut Seq), cx: &mut Context<Self>) {
         let Some(seq) = self.vedit.seq.as_mut() else { return };
         let before = seq.edit.clone();
         f(seq);
         if seq.edit != before {
-            self.vedit.undo.push(before);
-            if self.vedit.undo.len() > UNDO_MAX {
-                self.vedit.undo.remove(0);
-            }
-            self.vedit.redo.clear();
+            self.vedit.hist.commit(label, seq.edit.clone());
             self.video_save(cx);
         }
         cx.notify();
     }
 
+    /// The edit changed in place (a drag): one undo step for the whole gesture.
+    fn video_commit(&mut self, label: &str, cx: &mut Context<Self>) {
+        let Some(seq) = &self.vedit.seq else { return };
+        if seq.edit != *self.vedit.hist.current() {
+            self.vedit.hist.commit(label, seq.edit.clone());
+            self.video_save(cx);
+        }
+    }
+
     /// Edits the clip list (with the beats it was made on).
-    fn video_clips(&mut self, f: impl FnOnce(&[Beat], &mut Vec<Clip>), cx: &mut Context<Self>) {
+    fn video_clips(&mut self, label: &str, f: impl FnOnce(&[Beat], &mut Vec<Clip>), cx: &mut Context<Self>) {
         self.video_edit(
+            label,
             |s| {
                 let mut clips = s.edit.clips(&s.beats);
                 f(&s.beats, &mut clips);
@@ -373,13 +583,18 @@ impl StudioPage {
         self.manga_sync(cx);
     }
 
+    /// Ctrl+Z / Ctrl+Shift+Z: steps the labelled history and says which step it was.
     fn video_undo(&mut self, redo: bool, cx: &mut Context<Self>) {
-        let Some(seq) = self.vedit.seq.as_mut() else { return };
-        let (from, to) = if redo { (&mut self.vedit.redo, &mut self.vedit.undo) } else { (&mut self.vedit.undo, &mut self.vedit.redo) };
-        if let Some(e) = from.pop() {
-            to.push(std::mem::replace(&mut seq.edit, e));
+        if self.vedit.seq.is_none() {
+            return;
+        }
+        let label = if redo { self.vedit.hist.redo() } else { self.vedit.hist.undo() };
+        if let (Some(label), Some(seq)) = (label, self.vedit.seq.as_mut()) {
+            seq.edit = self.vedit.hist.current().clone();
             self.vedit.sel = None;
+            self.vedit.ai_flash = None;
             self.video_save(cx);
+            toast::show(cx, Toast::info(format!("{} {label}", if redo { "Redid" } else { "Undid" })).icon(if redo { ph::ARROW_CLOCKWISE } else { ph::ARROW_COUNTER_CLOCKWISE }));
         }
         cx.notify();
     }
@@ -434,11 +649,11 @@ impl StudioPage {
     fn video_delete_selection(&mut self, cx: &mut Context<Self>) {
         match self.vedit.sel {
             Some(Sel::Clip(i)) if !self.locked(Track::Clips) => {
-                self.video_clips(|_, c| vedit::delete(c, i), cx);
+                self.video_clips("Delete clip", |_, c| vedit::delete(c, i), cx);
                 self.vedit.sel = None;
             }
             Some(Sel::Layer(id)) if !self.locked(Track::Layers) => {
-                self.video_edit(|s| s.edit.layers.retain(|l| l.id != id), cx);
+                self.video_edit("Delete layer", |s| s.edit.layers.retain(|l| l.id != id), cx);
                 self.vedit.sel = None;
             }
             Some(Sel::Track(t)) => self.video_delete_track(t, cx),
@@ -453,10 +668,118 @@ impl StudioPage {
         }
         match t {
             Track::Clips => toast::show(cx, Toast::info("The panels are the picture: delete or trim clips instead")),
-            Track::Layers => self.video_edit(|s| s.edit.layers.clear(), cx),
-            Track::Music => self.video_edit(|s| s.edit.music.source = MusicSource::None, cx),
-            Track::Captions | Track::Narration => self.video_edit(|s| s.edit.flags_mut(t).off = true, cx),
+            Track::Layers => self.video_edit("Delete layers", |s| s.edit.layers.clear(), cx),
+            Track::Music => self.video_edit("Remove music", |s| s.edit.music.source = MusicSource::None, cx),
+            Track::Captions | Track::Narration => self.video_edit("Turn track off", |s| s.edit.flags_mut(t).off = true, cx),
         }
+    }
+
+    /// Shift+Delete: the selected clip goes and everything after it moves up, the layers too
+    /// (plain Delete leaves the layers where they are in time). A layer's ripple closes its gap.
+    fn video_ripple_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(seq) = &self.vedit.seq else { return };
+        match self.vedit.sel {
+            Some(Sel::Clip(i)) if !self.locked(Track::Clips) => {
+                let Some(p) = seq.placed().into_iter().find(|p| p.index == i) else { return };
+                let shift_layers = !self.locked(Track::Layers);
+                self.video_edit(
+                    "Ripple delete",
+                    |s| {
+                        let mut clips = s.edit.clips(&s.beats);
+                        vedit::delete(&mut clips, i);
+                        s.edit.set_clips(&s.beats, clips);
+                        if shift_layers {
+                            tl::ripple_layers(&mut s.edit.layers, p.end_ms(), p.dur_ms);
+                        }
+                    },
+                    cx,
+                );
+                self.vedit.sel = None;
+            }
+            Some(Sel::Layer(id)) if !self.locked(Track::Layers) => {
+                let Some(l) = seq.edit.layers.iter().find(|l| l.id == id).cloned() else { return };
+                self.video_edit(
+                    "Ripple delete",
+                    |s| {
+                        s.edit.layers.retain(|x| x.id != id);
+                        tl::ripple_layers(&mut s.edit.layers, l.end_ms, l.end_ms - l.start_ms);
+                    },
+                    cx,
+                );
+                self.vedit.sel = None;
+            }
+            _ => self.video_delete_selection(cx),
+        }
+    }
+
+    /// Q / W: trims the clip under the playhead from its start (or to its end) to the playhead;
+    /// the clips after it move up.
+    fn video_ripple_trim(&mut self, head: bool, cx: &mut Context<Self>) {
+        let Some(seq) = &self.vedit.seq else { return };
+        if self.locked(Track::Clips) {
+            return;
+        }
+        let now = self.vedit.playhead;
+        let Some(p) = vedit::at(&seq.placed(), now).cloned() else { return };
+        let delta = if head { now - p.start_ms } else { p.end_ms() - now } as i64;
+        if delta <= 0 {
+            return;
+        }
+        self.video_clips(if head { "Ripple trim start" } else { "Ripple trim end" }, |b, c| vedit::trim(b, c, p.index, head, delta), cx);
+        if head {
+            self.seek(p.start_ms, cx);
+        }
+    }
+
+    /// Alt+Left / Right: a layer moves a frame; a clip swaps with its neighbour.
+    fn video_nudge(&mut self, dir: i64, cx: &mut Context<Self>) {
+        match self.vedit.sel {
+            Some(Sel::Layer(id)) if !self.locked(Track::Layers) => {
+                let f = (1000 / vedit::FPS) as i64 * dir;
+                self.video_edit(
+                    "Nudge layer",
+                    |s| {
+                        if let Some(l) = s.edit.layers.iter_mut().find(|l| l.id == id) {
+                            let d = l.end_ms - l.start_ms;
+                            l.start_ms = (l.start_ms as i64 + f).max(0) as u64;
+                            l.end_ms = l.start_ms + d;
+                        }
+                    },
+                    cx,
+                );
+            }
+            Some(Sel::Clip(i)) if !self.locked(Track::Clips) => {
+                let n = self.vedit.seq.as_ref().map(|s| s.edit.clips(&s.beats).len()).unwrap_or(0);
+                let to = i as i64 + dir;
+                if to < 0 || to as usize >= n {
+                    return;
+                }
+                self.video_clips("Move clip", |_, c| vedit::reorder(c, i, to as usize), cx);
+                self.vedit.sel = Some(Sel::Clip(to as usize));
+            }
+            _ => {}
+        }
+    }
+
+    /// `[` / `]`: the music a decibel down / up.
+    fn video_volume(&mut self, db: f32, cx: &mut Context<Self>) {
+        if self.locked(Track::Music) {
+            return;
+        }
+        self.video_edit(if db > 0. { "Volume up" } else { "Volume down" }, |s| s.edit.music.volume = tl::nudge_db(s.edit.music.volume, db), cx);
+    }
+
+    /// The snap targets of the open timeline: the clip edges, the layers' (but `skip`'s), the
+    /// playhead, the in / out points and the markers.
+    fn snap_targets(&self, skip: Option<u64>) -> Vec<u64> {
+        let Some(seq) = &self.vedit.seq else { return vec![] };
+        let placed = seq.placed();
+        let mut pts = vedit::snap_points(&placed, &seq.edit.layers, self.vedit.playhead, skip);
+        pts.extend(placed.iter().map(|p| p.start_ms));
+        pts.extend(self.vedit.mark_in);
+        pts.extend(self.vedit.mark_out);
+        pts.extend(self.vedit.markers.iter().copied());
+        pts
     }
 
     fn video_split_at_playhead(&mut self, cx: &mut Context<Self>) {
@@ -468,7 +791,7 @@ impl StudioPage {
         let ph_ms = self.vedit.playhead;
         let Some(p) = vedit::at(&placed, ph_ms).cloned() else { return };
         let mut ok = false;
-        self.video_clips(|b, c| ok = vedit::split(b, c, p.index, ph_ms - p.start_ms), cx);
+        self.video_clips("Split clip", |b, c| ok = vedit::split(b, c, p.index, ph_ms - p.start_ms), cx);
         if !ok {
             toast::show(cx, Toast::info("Too close to the clip's edge to cut there"));
         }
@@ -477,7 +800,7 @@ impl StudioPage {
     fn add_layer(&mut self, kind: LayerKind, cx: &mut Context<Self>) {
         let start = self.vedit.playhead;
         let mut id = 0;
-        self.video_edit(
+        self.video_edit("Add layer", 
             |s| {
                 let total = vedit::total_ms(&s.placed());
                 let (dur, x, y, scale, opacity) = match &kind {
@@ -500,7 +823,7 @@ impl StudioPage {
             return;
         };
         let mut id = 0;
-        self.video_edit(
+        self.video_edit("Add logo", 
             |s| {
                 id = s.edit.next_layer_id();
                 let total = vedit::total_ms(&s.placed());
@@ -533,7 +856,7 @@ impl StudioPage {
             let Some(src) = paths.into_iter().next() else { return };
             let _ = this.update(cx, |this, cx| match vedit::import_media(&src, &dir) {
                 Ok(path) => {
-                    this.video_edit(
+                    this.video_edit("Use music file", 
                         |s| {
                             s.edit.music.source = MusicSource::File { path };
                             s.edit.flags_mut(Track::Music).off = false;
@@ -550,7 +873,80 @@ impl StudioPage {
 
     // ------------------------------------------------------------------------------ playback
 
+    /// The playhead of whichever timeline is open (manga time in "All chapters").
+    fn now_any(&self) -> u64 {
+        if self.vedit.whole.all.is_some() {
+            self.manga_now()
+        } else {
+            self.playhead_now()
+        }
+    }
+
+    fn play_any(&mut self, cx: &mut Context<Self>) {
+        self.vedit.shuttle = None;
+        if self.vedit.whole.all.is_some() {
+            self.manga_toggle_play(cx)
+        } else {
+            self.video_toggle_play(cx)
+        }
+    }
+
+    /// J / K / L: J and L shuttle backwards / forwards, faster with each press (1x, 2x, 4x, 8x;
+    /// L once plays with sound), K stops.
+    fn video_shuttle(&mut self, dir: i8, cx: &mut Context<Self>) {
+        if dir == 0 {
+            self.vedit.shuttle_n = (0, 0);
+            self.video_stop();
+            cx.notify();
+            return;
+        }
+        let (d, n) = self.vedit.shuttle_n;
+        let n = if d == dir { n + 1 } else { 1 };
+        self.vedit.shuttle_n = (dir, n);
+        let playing = self.vedit.playing.is_some() || self.vedit.whole.all.as_ref().is_some_and(|m| m.playing.is_some());
+        if dir > 0 && n == 1 {
+            if !playing {
+                self.play_any(cx);
+            }
+            return;
+        }
+        let from = self.now_any();
+        self.video_stop();
+        let speed = vedit_keys::shuttle_speed(n) * dir as f32;
+        let running = self.vedit.shuttle.is_some();
+        self.vedit.shuttle = Some((Instant::now(), from, speed));
+        if running {
+            return;
+        }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(TICK).await;
+            let alive = this.update(cx, |this, cx| {
+                let Some((t0, from, speed)) = this.vedit.shuttle else { return false };
+                let total = this.timeline_ms();
+                let t = (from as f64 + t0.elapsed().as_millis() as f64 * speed as f64).clamp(0., total as f64) as u64;
+                if this.vedit.whole.all.is_some() {
+                    this.manga_set_playhead(t);
+                } else {
+                    this.vedit.playhead = t;
+                    this.follow_playhead();
+                }
+                if t == 0 || t >= total || this.view != View::Video {
+                    this.vedit.shuttle = None;
+                    this.vedit.shuttle_n = (0, 0);
+                }
+                cx.notify();
+                this.vedit.shuttle.is_some()
+            });
+            if !matches!(alive, Ok(true)) {
+                break;
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn video_stop(&mut self) {
+        self.vedit.shuttle = None;
         self.manga_stop();
         if let Some((t0, from)) = self.vedit.playing.take() {
             self.vedit.playhead = from + t0.elapsed().as_millis() as u64;
@@ -663,51 +1059,121 @@ impl StudioPage {
 
     // ------------------------------------------------------------------------------ keys
 
-    /// Video mode shortcuts (Premiere's): Space play, V / C tools, Delete, Ctrl+K cut at the
-    /// playhead, Ctrl+Z / Ctrl+Shift+Z, Home / End, Up / Down between edits, +/- zoom, \ fit.
+    /// Video mode shortcuts: every key goes through the `vedit_keys` command table (the user's
+    /// overrides included); `?` lists them. Esc closes the open dialog.
     pub(crate) fn video_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.vedit.text.as_ref().is_some_and(|t| t.read(cx).focus_handle(cx).is_focused(window)) {
             return false;
         }
-        if self.vedit.whole.all.is_some() && self.manga_key(ev, cx) {
-            cx.notify();
-            return true;
-        }
         let k = &ev.keystroke;
         let m = &k.modifiers;
-        let cmd = m.control || m.platform;
-        match k.key.as_str() {
-            "escape" if self.vedit.export_open => self.vedit.export_open = false,
-            "space" if !cmd => self.video_toggle_play(cx),
-            "v" if !cmd => self.vedit.tool = Tool::Select,
-            "c" if !cmd => self.vedit.tool = Tool::Razor,
-            "k" if cmd => self.video_split_at_playhead(cx),
-            "z" if cmd => self.video_undo(m.shift, cx),
-            "y" if cmd => self.video_undo(true, cx),
-            "delete" | "backspace" => self.video_delete_selection(cx),
-            "home" => self.seek(0, cx),
-            "end" => self.seek(u64::MAX, cx),
-            "up" => self.step_edit(false, cx),
-            "down" => self.step_edit(true, cx),
-            "left" => self.seek(self.playhead_now().saturating_sub(1000 / vedit::FPS), cx),
-            "right" => self.seek(self.playhead_now() + 1000 / vedit::FPS, cx),
-            "=" | "+" => self.zoom(1.5, None),
-            "-" => self.zoom(1. / 1.5, None),
-            "\\" => self.video_fit(),
-            _ => return false,
+        if k.key == "escape" && !m.modified() {
+            let e = &mut self.vedit;
+            let open = e.export_open || e.keys_open || e.whole.confirm;
+            e.export_open = false;
+            e.keys_open = false;
+            e.whole.confirm = false;
+            cx.notify();
+            return open;
         }
+        let stroke = vedit_keys::stroke_of(&k.key, m.control, m.alt, m.shift, m.platform);
+        let Some(command) = vedit_keys::lookup(&stroke) else { return false };
+        self.video_command(command, cx);
         cx.notify();
         true
     }
 
-    /// Zooms the timeline by `k`, keeping `anchor_x` (lane pixels) or the playhead still.
+    /// Runs a keyboard command on the open timeline.
+    fn video_command(&mut self, c: Command, cx: &mut Context<Self>) {
+        let manga = self.vedit.whole.all.is_some();
+        let frame = 1000 / vedit::FPS;
+        if c != Command::ShuttleBack && c != Command::ShuttleForward {
+            self.vedit.shuttle_n = (0, 0);
+        }
+        match c {
+            Command::PlayPause => self.play_any(cx),
+            Command::ShuttleBack => self.video_shuttle(-1, cx),
+            Command::ShuttlePause => self.video_shuttle(0, cx),
+            Command::ShuttleForward => self.video_shuttle(1, cx),
+            Command::FrameBack => self.seek(self.now_any().saturating_sub(frame), cx),
+            Command::FrameForward => self.seek(self.now_any() + frame, cx),
+            Command::Back5Frames => self.seek(self.now_any().saturating_sub(5 * frame), cx),
+            Command::Forward5Frames => self.seek(self.now_any() + 5 * frame, cx),
+            Command::PrevEdit if manga => self.manga_step(false, cx),
+            Command::NextEdit if manga => self.manga_step(true, cx),
+            Command::PrevEdit => self.step_edit(false, cx),
+            Command::NextEdit => self.step_edit(true, cx),
+            Command::GoStart => self.seek(0, cx),
+            Command::GoEnd => self.seek(u64::MAX, cx),
+            Command::MarkIn => {
+                let t = self.now_any();
+                self.vedit.mark_in = Some(t);
+                if self.vedit.mark_out.is_some_and(|o| o <= t) {
+                    self.vedit.mark_out = None;
+                }
+            }
+            Command::MarkOut => {
+                let t = self.now_any();
+                self.vedit.mark_out = Some(t);
+                if self.vedit.mark_in.is_some_and(|i| i >= t) {
+                    self.vedit.mark_in = None;
+                }
+            }
+            Command::AddMarker => {
+                let t = self.now_any();
+                match self.vedit.markers.iter().position(|m| m.abs_diff(t) < frame) {
+                    Some(i) => {
+                        self.vedit.markers.remove(i);
+                    }
+                    None => {
+                        self.vedit.markers.push(t);
+                        self.vedit.markers.sort_unstable();
+                    }
+                }
+            }
+            Command::Split => self.video_split_at_playhead(cx),
+            Command::RippleTrimStart => self.video_ripple_trim(true, cx),
+            Command::RippleTrimEnd => self.video_ripple_trim(false, cx),
+            Command::Delete => self.video_delete_selection(cx),
+            Command::RippleDelete => self.video_ripple_delete(cx),
+            Command::Undo => self.video_undo(false, cx),
+            Command::Redo => self.video_undo(true, cx),
+            Command::NudgeLeft => self.video_nudge(-1, cx),
+            Command::NudgeRight => self.video_nudge(1, cx),
+            // One picture track: nothing to move a clip to.
+            Command::NudgeUp | Command::NudgeDown => {}
+            Command::VolumeDown => self.video_volume(-1., cx),
+            Command::VolumeUp => self.video_volume(1., cx),
+            Command::DefaultTransition => {
+                if let Some(Sel::Clip(i)) = self.vedit.sel {
+                    self.video_clips("Default transition", |_, c| c[i].cut = false, cx);
+                }
+            }
+            Command::Export => {
+                self.video_stop();
+                self.vedit.export_open = true;
+                crate::encode::warm();
+            }
+            Command::SelectTool => self.vedit.tool = Tool::Select,
+            Command::RazorTool => self.vedit.tool = Tool::Razor,
+            Command::ToggleSnap => self.vedit.snap = !self.vedit.snap,
+            Command::ZoomIn => self.zoom(1.5, None),
+            Command::ZoomOut => self.zoom(1. / 1.5, None),
+            Command::ZoomFit => self.video_fit(),
+            Command::PrevChapter if manga => self.manga_chapter_step(false, cx),
+            Command::NextChapter if manga => self.manga_chapter_step(true, cx),
+            Command::PrevChapter | Command::NextChapter => {}
+            Command::Shortcuts => self.vedit.keys_open = !self.vedit.keys_open,
+        }
+    }
+
+    /// Zooms the open timeline by `k`, keeping `anchor_x` (lane pixels) or the playhead still.
     fn zoom(&mut self, k: f32, anchor_x: Option<f32>) {
+        let now = self.now_any();
+        let min = if self.vedit.whole.all.is_some() { tl::MIN_PPS } else { 0.2 };
         let e = &mut self.vedit;
-        let old = e.pps;
-        e.pps = (e.pps * k).clamp(0.2, 400.);
-        let ax = anchor_x.unwrap_or(e.playhead as f32 / 1000. * old - e.scroll_x);
-        let t = (e.scroll_x + ax) / old;
-        e.scroll_x = (t * e.pps - ax).max(0.);
+        let ax = anchor_x.unwrap_or(now as f32 / 1000. * e.pps - e.scroll_x);
+        (e.pps, e.scroll_x) = tl::zoom_at(e.pps, e.scroll_x, ax, k, min, tl::MAX_PPS);
     }
 
     // ------------------------------------------------------------------------------ mouse
@@ -718,22 +1184,45 @@ impl StudioPage {
         (((f32::from(x) - f32::from(b.origin.x) + self.vedit.scroll_x) / self.vedit.pps) * 1000.) as i64
     }
 
+    /// Snapping is on: the S toggle, inverted while Shift is held.
+    fn snapping(&self) -> bool {
+        tl::snap_active(self.vedit.snap, self.vedit.shift)
+    }
+
+    /// `t` snapped (when snapping) to the playhead, clip and layer edges, in / out and markers;
+    /// the snap line shows where.
     fn snap_ms(&mut self, t: i64, skip_layer: Option<u64>) -> i64 {
         self.vedit.snapped = None;
-        if self.vedit.whole.all.is_some() {
-            return if self.vedit.snap { self.manga_snap(t) } else { t };
-        }
-        let Some(seq) = &self.vedit.seq else { return t };
-        if !self.vedit.snap {
+        if !self.snapping() {
             return t;
         }
-        let pts = vedit::snap_points(&seq.placed(), &seq.edit.layers, self.vedit.playhead, skip_layer);
-        let reach = (vedit::SNAP_PX / self.vedit.pps * 1000.) as u64;
-        let (s, hit) = vedit::snap(t, &pts, reach);
-        if hit {
-            self.vedit.snapped = Some(s.max(0) as u64);
+        if self.vedit.whole.all.is_some() {
+            return self.manga_snap(t);
         }
-        s
+        let pts = self.snap_targets(skip_layer);
+        match tl::snap_point(t, &pts, tl::snap_reach(self.vedit.pps)) {
+            Some(p) => {
+                self.vedit.snapped = Some(p);
+                p as i64
+            }
+            None => t,
+        }
+    }
+
+    /// A span `dur` long starting near `start`, snapped by whichever edge is nearer a target.
+    fn snap_span(&mut self, start: i64, dur: u64, skip_layer: Option<u64>) -> i64 {
+        self.vedit.snapped = None;
+        if !self.snapping() {
+            return start;
+        }
+        let pts = self.snap_targets(skip_layer);
+        match tl::snap_span(start, dur, &pts, tl::snap_reach(self.vedit.pps)) {
+            Some((s, line)) => {
+                self.vedit.snapped = Some(line);
+                s
+            }
+            None => start,
+        }
     }
 
     /// A value bar's 0..1 position under window x.
@@ -774,7 +1263,8 @@ impl StudioPage {
             }
             Drag::Layer { id, grab } => {
                 let t = self.time_at(pos.x) - grab;
-                let t = self.snap_ms(t, Some(id)).max(0) as u64;
+                let dur = self.vedit.seq.as_ref().and_then(|s| s.edit.layers.iter().find(|l| l.id == id)).map(|l| l.end_ms - l.start_ms).unwrap_or(0);
+                let t = self.snap_span(t, dur, Some(id)).max(0) as u64;
                 if let Some(seq) = self.vedit.seq.as_mut() {
                     let total = vedit::total_ms(&seq.placed());
                     if let Some(l) = seq.edit.layers.iter_mut().find(|l| l.id == id) {
@@ -825,13 +1315,13 @@ impl StudioPage {
                     self.bar_set(name, f, cx);
                 }
             }
-            Drag::Scroll => {
-                let b = self.vedit.lanes.get();
-                let w = f32::from(b.size.width);
-                let total = self.timeline_ms() as f32 / 1000. * self.vedit.pps;
-                if w > 0. && total > w {
-                    let f = ((f32::from(pos.x) - f32::from(b.origin.x)) / w).clamp(0., 1.);
-                    self.vedit.scroll_x = (f * total - w / 2.).clamp(0., total - w);
+            Drag::Nav { grip, x0, pps0, scroll0 } => {
+                let bar_w = f32::from(self.vedit.nav.get().size.width);
+                let view_w = f32::from(self.vedit.lanes.get().size.width);
+                let total_s = self.timeline_ms() as f32 / 1000.;
+                let min = if self.vedit.whole.all.is_some() { tl::MIN_PPS } else { 0.2 };
+                if bar_w > 0. && view_w > 0. {
+                    (self.vedit.pps, self.vedit.scroll_x) = tl::nav_drag(grip, f32::from(pos.x) - x0, bar_w, total_s, view_w, pps0, scroll0, min);
                 }
             }
         }
@@ -842,7 +1332,7 @@ impl StudioPage {
     fn drag_end(&mut self, cx: &mut Context<Self>) {
         let Some(drag) = self.vedit.drag.take() else { return };
         self.vedit.snapped = None;
-        let saved = self.vedit.project.chapters.get(self.vedit.seq.as_ref().map(|s| s.item.id.as_str()).unwrap_or("")).cloned().unwrap_or_default();
+        self.vedit.shift = false;
         match drag {
             Drag::Clip { index, grab, at } => {
                 let Some(seq) = &self.vedit.seq else { return };
@@ -855,19 +1345,14 @@ impl StudioPage {
                 let mid = at - grab + me.dur_ms as i64 / 2;
                 let others: Vec<&Placed> = placed.iter().filter(|p| p.index != index).collect();
                 let slot = others.iter().position(|p| (p.start_ms + p.dur_ms / 2) as i64 > mid).unwrap_or(others.len());
-                self.video_clips(|_, c| vedit::reorder(c, index, slot), cx);
+                self.video_clips("Move clip", |_, c| vedit::reorder(c, index, slot), cx);
                 self.vedit.sel = Some(Sel::Clip(slot));
             }
-            Drag::Trim { .. } | Drag::Layer { .. } | Drag::LayerEdge { .. } | Drag::Place { .. } => {
-                // The drag edited in place: record it as one step against the saved edit.
-                if let Some(seq) = &self.vedit.seq {
-                    if seq.edit != saved {
-                        self.vedit.undo.push(saved);
-                        self.vedit.redo.clear();
-                        self.video_save(cx);
-                    }
-                }
-            }
+            // The drag edited in place: one undo step for the whole gesture.
+            Drag::Trim { .. } => self.video_commit("Trim clip", cx),
+            Drag::Layer { .. } => self.video_commit("Move layer", cx),
+            Drag::LayerEdge { .. } => self.video_commit("Trim layer", cx),
+            Drag::Place { .. } => self.video_commit("Place layer", cx),
             Drag::Caption { from, .. } => {
                 self.vedit.cap_lit = None;
                 // A click (no move) only selects the clip.
@@ -878,16 +1363,22 @@ impl StudioPage {
             Drag::Bar(name) => {
                 let Some(seq) = &self.vedit.seq else { return };
                 video::save_chapter_setting(&seq.item.output_dir, Some(&seq.subs));
-                if seq.edit != saved {
-                    self.vedit.undo.push(saved);
-                    self.video_save(cx);
-                }
+                self.video_commit(
+                    match name {
+                        "music" => "Music volume",
+                        "opacity" => "Opacity",
+                        "scale" => "Scale",
+                        "x" | "y" => "Position",
+                        _ => "Change",
+                    },
+                    cx,
+                );
                 if name == "caption-y" {
                     self.video_caption_pos_save(cx);
                 }
                 self.manga_sync(cx);
             }
-            Drag::Playhead | Drag::Scroll => {}
+            Drag::Playhead | Drag::Nav { .. } => {}
         }
         cx.notify();
     }
@@ -957,7 +1448,7 @@ impl StudioPage {
         let bottom = div()
             .flex()
             .flex_none()
-            .h(px(330.))
+            .h(px(BOTTOM_H))
             .gap(px(4.))
             .child(self.panel(&format!("Project: {}", g.title), None, self.bin(&g, &pending, cx)).w(px(LEFT_W)).flex_none())
             .child(self.tools(cx))
@@ -975,6 +1466,7 @@ impl StudioPage {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 if this.vedit.drag.is_some() {
                     if ev.pressed_button == Some(MouseButton::Left) {
+                        this.vedit.shift = ev.modifiers.shift;
                         this.drag_move(ev.position, cx);
                     } else {
                         this.drag_end(cx);
@@ -988,6 +1480,7 @@ impl StudioPage {
             .child(bottom)
             .when(self.vedit.export_open, |d| d.child(self.export_dialog(&g, pending, cx)))
             .when(self.vedit.whole.confirm, |d| d.child(self.reedit_dialog(&g, cx)))
+            .when(self.vedit.keys_open, |d| d.child(self.shortcuts_dialog(cx)))
             .into_any_element()
     }
 
@@ -1084,14 +1577,23 @@ impl StudioPage {
                 cx.notify();
             })))
             .child(ws("vedit-ws-export", self.vedit.export_open).child("Export").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.video_stop();
-                this.vedit.export_open = true;
+                this.video_command(Command::Export, cx);
                 cx.notify();
             })))
             .child(div().flex_1().flex().justify_center().min_w_0().child(div().truncate().text_size(px(size::MD)).text_color(Tokens::text_1()).child(title)))
             .child(div().flex_none().text_size(px(size::SM)).text_color(if this_pending { Tokens::warning() } else { Tokens::text_3() }).child(status))
-            .child(icon_button("vedit-undo", ph::ARROW_COUNTER_CLOCKWISE, "Undo (Ctrl+Z)").small().when(self.vedit.undo.is_empty(), |b| b.disabled("Nothing to undo")).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_undo(false, cx))))
-            .child(icon_button("vedit-redo", ph::ARROW_CLOCKWISE, "Redo (Ctrl+Shift+Z)").small().when(self.vedit.redo.is_empty(), |b| b.disabled("Nothing to redo")).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_undo(true, cx))))
+            .child({
+                let undo = self.vedit.hist.undo_label().map(|l| format!("Undo {l} (Ctrl+Z)"));
+                icon_button("vedit-undo", ph::ARROW_COUNTER_CLOCKWISE, undo.clone().unwrap_or_else(|| "Undo (Ctrl+Z)".into())).small().when(undo.is_none(), |b| b.disabled("Nothing to undo")).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_undo(false, cx)))
+            })
+            .child({
+                let redo = self.vedit.hist.redo_label().map(|l| format!("Redo {l} (Ctrl+Shift+Z)"));
+                icon_button("vedit-redo", ph::ARROW_CLOCKWISE, redo.clone().unwrap_or_else(|| "Redo (Ctrl+Shift+Z)".into())).small().when(redo.is_none(), |b| b.disabled("Nothing to redo")).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_undo(true, cx)))
+            })
+            .child(icon_button("vedit-keys", ph::KEYBOARD, "Keyboard shortcuts (?)").small().selected(self.vedit.keys_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.vedit.keys_open = !this.vedit.keys_open;
+                cx.notify();
+            })))
             .child(
                 btn("vedit-reset", "Reset edit", ButtonKind::Ghost)
                     .small()
@@ -1099,7 +1601,7 @@ impl StudioPage {
                     .when(seq.is_none_or(|s| ChapterEdit { rendered: None, ..s.edit.clone() } == ChapterEdit::default()), |b| b.disabled("Nothing edited"))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.vedit.sel = None;
-                        this.video_edit(|s| s.edit = ChapterEdit { rendered: s.edit.rendered, ..ChapterEdit::default() }, cx)
+                        this.video_edit("Reset edit", |s| s.edit = ChapterEdit { rendered: s.edit.rendered, ..ChapterEdit::default() }, cx)
                     })),
             )
             .when_some(item, |d, item| {
@@ -1191,7 +1693,7 @@ impl StudioPage {
         let viewport = window.viewport_size();
         let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
         let room_w = (vw - LEFT_W - RIGHT_W - 60.).max(240.);
-        let room_h = (vh - 52. - 38. - 330. - 30. - 96. - 40.).max(140.);
+        let room_h = (vh - 52. - 38. - BOTTOM_H - 30. - 96. - 40.).max(140.);
         let aspect = if seq.reels { 9. / 16. } else { 16. / 9. };
         let (fw, fh) = if room_w / room_h > aspect { (room_h * aspect, room_h) } else { (room_w, room_w / aspect) };
         let frame = self.frame(seq, &placed, now, fw, fh, window, cx);
@@ -1376,10 +1878,49 @@ impl StudioPage {
 
     // ------------------------------------------------------------------------------ panels
 
-    /// Top left: what the selection can change.
+    /// An Effect Controls section (bhippi's Properties panel): a header that folds it shut and,
+    /// when the section has one, a reset button; then its controls.
+    fn section(&self, key: &'static str, icon: mv_ui::Ph, title: &str, reset: Option<Box<dyn Fn(&mut Self, &mut Context<Self>)>>, body: impl IntoElement, cx: &Context<Self>) -> Div {
+        let open = !self.vedit.collapsed.contains(key);
+        let head = div()
+            .id(SharedString::from(format!("vedit-sec-{key}")))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .h(px(26.))
+            .px(px(4.))
+            .rounded(px(radius::SM))
+            .cursor_pointer()
+            .hover(|d| d.bg(Tokens::hover()))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if !this.vedit.collapsed.remove(key) {
+                    this.vedit.collapsed.insert(key);
+                }
+                cx.notify();
+            }))
+            .child(icon_ph(if open { ph::CARET_DOWN } else { ph::CARET_RIGHT }, Tokens::text_3(), 10.))
+            .child(icon_ph(icon, Tokens::text_2(), icon_px::XS))
+            .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title.to_string()))
+            .when_some(reset, |d, f| {
+                d.child(icon_button(SharedString::from(format!("vedit-reset-{key}")), ph::ARROW_COUNTER_CLOCKWISE, format!("Reset {}", title.to_lowercase())).small().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    f(this, cx);
+                })))
+            });
+        div()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(Tokens::border())
+            .pb(px(if open { 8. } else { 2. }))
+            .child(head)
+            .when(open, |d| d.child(div().flex().flex_col().gap(px(8.)).pt(px(4.)).px(px(4.)).child(body)))
+    }
+
+    /// Top left: what the selection can change, in folding sections with resets.
     fn effect_controls(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(seq) = &self.vedit.seq else { return div().into_any_element() };
-        let body = div().id("vedit-fx").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(space::MD)).p(px(space::MD));
+        let body = div().id("vedit-fx").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(4.)).p(px(space::SM));
         let body = match self.vedit.sel {
             None => body.child(muted("Select a clip or layer in the timeline to change it.")).child(self.add_buttons(cx)),
             Some(Sel::Clip(i)) => {
@@ -1391,7 +1932,7 @@ impl StudioPage {
                 let locked = seq.edit.flags(Track::Clips).locked;
                 let motion = segmented("vedit-motion", Motion::ALL.iter().map(|m| (None, m.label())), Motion::ALL.iter().position(|m| *m == c.motion).unwrap_or(0)).small().on_change(cx.listener(move |this, ix: &usize, _, cx| {
                     let m = Motion::ALL[(*ix).min(3)];
-                    this.video_clips(|_, cl| cl[i].motion = m, cx);
+                    this.video_clips("Clip motion", |_, cl| cl[i].motion = m, cx);
                 }));
                 let trims = |head: bool| {
                     let label = if head { "In" } else { "Out" };
@@ -1401,38 +1942,121 @@ impl StudioPage {
                         .items_center()
                         .gap(px(space::XS))
                         .child(div().w(px(36.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(label))
-                        .child(icon_button(if head { "vedit-in-less" } else { "vedit-out-less" }, ph::MINUS, "0.1 s less trimmed").small().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.video_clips(|b, cl| vedit::trim(b, cl, i, head, -100), cx))))
-                        .child(div().w(px(70.)).text_size(px(size::SM)).font_family(crate::page::MONO).text_color(Tokens::text_1()).child(format!("{:.1} s", v as f32 / 1000.)))
-                        .child(icon_button(if head { "vedit-in-more" } else { "vedit-out-more" }, ph::PLUS, "Trim 0.1 s more").small().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.video_clips(|b, cl| vedit::trim(b, cl, i, head, 100), cx))))
+                        .child(icon_button(if head { "vedit-in-less" } else { "vedit-out-less" }, ph::MINUS, "0.1 s less trimmed").small().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.video_clips("Trim clip", |b, cl| vedit::trim(b, cl, i, head, -100), cx))))
+                        .child(div().w(px(64.)).text_size(px(size::SM)).font_family(crate::page::MONO).text_color(Tokens::text_1()).child(format!("{:.1} s", v as f32 / 1000.)))
+                        .child(icon_button(if head { "vedit-in-more" } else { "vedit-out-more" }, ph::PLUS, "Trim 0.1 s more").small().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.video_clips("Trim clip", |b, cl| vedit::trim(b, cl, i, head, 100), cx))))
                 };
+                let look = match &seq.edit.look {
+                    Some(l) => Preset::parse(&l.preset).unwrap_or_default().label().to_string(),
+                    None => format!("{} (Studio look)", crate::look::Look::load().preset.label()),
+                };
+                let narr_off = seq.edit.flags(Track::Narration).off;
+                let vol = seq.edit.music.volume;
                 body.child(self.prop_head(ph::IMAGE, &format!("Clip {} · page {}", i + 1, b.map(|b| b.page + 1).unwrap_or(0)), p.map(|p| format!("{} – {}", vedit::timecode(p.start_ms), vedit::timecode(p.end_ms()))).unwrap_or_default()))
                     .when(locked, |d| d.child(muted("The Panels track is locked.")))
-                    .child(self.prop("Motion", motion.into_any_element()))
-                    .child(self.prop("Trim", div().flex().flex_col().gap(px(4.)).child(trims(true)).child(trims(false)).into_any_element()))
-                    .child(self.prop(
-                        "Transition in",
-                        switch("vedit-cut", c.cut)
-                            .label("Hard cut instead of the look's transition")
-                            .on_click(cx.listener(move |this, on: &bool, _, cx| {
-                                let on = *on;
-                                this.video_clips(|_, cl| cl[i].cut = on, cx)
-                            }))
-                            .into_any_element(),
+                    .child(self.section(
+                        "motion",
+                        ph::ARROWS_OUT,
+                        "Motion",
+                        (c.motion != Motion::Auto).then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> { Box::new(move |this: &mut Self, cx: &mut Context<Self>| this.video_clips("Reset motion", |_, cl| cl[i].motion = Motion::Auto, cx)) }),
+                        motion,
+                        cx,
                     ))
-                    .child(self.prop("Caption text", self.text_field()))
-                    .child(muted("The voice keeps the narration; only the caption changes."))
-                    .child(self.caption_preview(seq, &c, window))
-                    .child(self.prop(
-                        "Caption style",
-                        div().id("vedit-clip-styles").flex().gap(px(6.)).pb(px(4.)).overflow_x_scroll().children(self.style_cards("vedit-clip-style", 96., 54., window, cx)).into_any_element(),
-                    ))
-                    .child(
+                    .child(self.section(
+                        "timing",
+                        ph::TIMER,
+                        "Timing",
+                        (c.trim_in_ms + c.trim_out_ms > 0).then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> {
+                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
+                                this.video_clips(
+                                    "Reset trim",
+                                    |_, cl| {
+                                        cl[i].trim_in_ms = 0;
+                                        cl[i].trim_out_ms = 0;
+                                    },
+                                    cx,
+                                )
+                            })
+                        }),
                         div()
                             .flex()
-                            .gap(px(space::SM))
-                            .child(btn("vedit-split", "Cut at playhead", ButtonKind::Secondary).small().icon(ph::SCISSORS).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_split_at_playhead(cx))))
-                            .child(btn("vedit-del-clip", "Delete clip", ButtonKind::DangerGhost).small().icon(ph::TRASH).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_delete_selection(cx)))),
-                    )
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(trims(true))
+                            .child(trims(false))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(space::SM))
+                                    .child(btn("vedit-split", "Cut at playhead", ButtonKind::Secondary).small().icon(ph::SCISSORS).tooltip("Ctrl+K").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_split_at_playhead(cx))))
+                                    .child(btn("vedit-del-clip", "Delete", ButtonKind::DangerGhost).small().icon(ph::TRASH).tooltip("Delete · Shift+Delete moves the layers after it up too").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_delete_selection(cx)))),
+                            ),
+                        cx,
+                    ))
+                    .child(self.section(
+                        "effects",
+                        ph::MAGIC_WAND,
+                        "Effects",
+                        c.cut.then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> { Box::new(move |this: &mut Self, cx: &mut Context<Self>| this.video_clips("Reset transition", |_, cl| cl[i].cut = false, cx)) }),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(switch("vedit-cut", c.cut).label("Hard cut in (no transition)").on_click(cx.listener(move |this, on: &bool, _, cx| {
+                                let on = *on;
+                                this.video_clips("Transition", |_, cl| cl[i].cut = on, cx)
+                            })))
+                            .child(muted(format!("Look: {look} · Sequence → Look changes it"))),
+                        cx,
+                    ))
+                    .child(self.section(
+                        "captions",
+                        ph::CLOSED_CAPTIONING,
+                        "Captions",
+                        c.text.is_some().then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> {
+                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
+                                this.video_clips("Reset caption", |_, cl| cl[i].text = None, cx);
+                                this.vedit.text_for = None;
+                            })
+                        }),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(self.text_field())
+                            .child(muted("The voice keeps the narration; only the caption changes."))
+                            .child(self.caption_preview(seq, &c, window))
+                            .child(div().id("vedit-clip-styles").flex().gap(px(6.)).pb(px(4.)).overflow_x_scroll().children(self.style_cards("vedit-clip-style", 96., 54., window, cx))),
+                        cx,
+                    ))
+                    .child(self.section(
+                        "audio",
+                        ph::SPEAKER_HIGH,
+                        "Audio",
+                        (narr_off || (vol - 1.).abs() > 0.001).then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> {
+                            Box::new(|this: &mut Self, cx: &mut Context<Self>| {
+                                this.video_edit(
+                                    "Reset audio",
+                                    |s| {
+                                        s.edit.flags_mut(Track::Narration).off = false;
+                                        s.edit.music.volume = 1.;
+                                    },
+                                    cx,
+                                )
+                            })
+                        }),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(switch("vedit-clip-narr", !narr_off).label("Narration").on_click(cx.listener(|this, on: &bool, _, cx| {
+                                let on = *on;
+                                this.video_edit("Mute narration", |s| s.edit.flags_mut(Track::Narration).off = !on, cx)
+                            })))
+                            .child(self.bar("music", "Music volume ([ / ])", vol / 2., format!("{:.0}%", vol * 100.), cx)),
+                        cx,
+                    ))
             }
             Some(Sel::Layer(id)) => {
                 let Some(l) = seq.edit.layers.iter().find(|l| l.id == id).cloned() else { return div().into_any_element() };
@@ -1441,11 +2065,13 @@ impl StudioPage {
                     LayerKind::Image { .. } => ((l.scale - 0.02) / 0.98, format!("{}% of the width", (l.scale * 100.).round())),
                     LayerKind::Text { .. } => ((l.scale - 0.01) / 0.19, format!("{}% of the height", (l.scale * 1000.).round() / 10.)),
                 };
+                let (dx, dy, ds) = if is_text { (50., 22., 0.06) } else { (50., 50., 0.3) };
                 let set_time = |head: bool| {
                     let label = if head { "Start at playhead" } else { "End at playhead" };
                     btn(if head { "vedit-l-start" } else { "vedit-l-end" }, label, ButtonKind::Secondary).small().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let t = this.playhead_now();
                         this.video_edit(
+                            "Layer timing",
                             |s| {
                                 if let Some(l) = s.edit.layers.iter_mut().find(|l| l.id == id) {
                                     if head {
@@ -1459,20 +2085,63 @@ impl StudioPage {
                         )
                     }))
                 };
+                let moved = (l.x - dx).abs() > 0.01 || (l.y - dy).abs() > 0.01 || (l.scale - ds).abs() > 0.0001;
                 let mut b = body
                     .child(self.prop_head(if is_text { ph::TEXT_T } else { ph::IMAGE }, &l.name(), format!("{} – {}", vedit::timecode(l.start_ms), vedit::timecode(l.end_ms))))
-                    .child(self.bar("x", "Position X", l.x / 100., format!("{:.0}%", l.x), cx))
-                    .child(self.bar("y", "Position Y", l.y / 100., format!("{:.0}%", l.y), cx))
-                    .child(self.bar("scale", "Scale", scale_f, scale_label, cx))
-                    .child(self.bar("opacity", "Opacity", l.opacity, format!("{:.0}%", l.opacity * 100.), cx))
-                    .child(div().flex().flex_wrap().gap(px(space::SM)).child(set_time(true)).child(set_time(false)));
+                    .child(self.section(
+                        "motion",
+                        ph::ARROWS_OUT,
+                        "Motion",
+                        moved.then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> {
+                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
+                                this.video_edit(
+                                    "Reset motion",
+                                    |s| {
+                                        if let Some(l) = s.edit.layers.iter_mut().find(|l| l.id == id) {
+                                            (l.x, l.y, l.scale) = (dx, dy, ds);
+                                        }
+                                    },
+                                    cx,
+                                )
+                            })
+                        }),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .child(self.bar("x", "Position X", l.x / 100., format!("{:.0}%", l.x), cx))
+                            .child(self.bar("y", "Position Y", l.y / 100., format!("{:.0}%", l.y), cx))
+                            .child(self.bar("scale", "Scale", scale_f, scale_label, cx))
+                            .child(muted("Or drag the layer on the Program monitor.")),
+                        cx,
+                    ))
+                    .child(self.section(
+                        "opacity",
+                        ph::SQUARE_HALF,
+                        "Opacity",
+                        (l.opacity < 0.999).then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> {
+                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
+                                this.video_edit(
+                                    "Reset opacity",
+                                    |s| {
+                                        if let Some(l) = s.edit.layers.iter_mut().find(|l| l.id == id) {
+                                            l.opacity = 1.;
+                                        }
+                                    },
+                                    cx,
+                                )
+                            })
+                        }),
+                        self.bar("opacity", "Opacity", l.opacity, format!("{:.0}%", l.opacity * 100.), cx),
+                        cx,
+                    ));
                 if let LayerKind::Text { color, boxed, .. } = &l.kind {
                     let sw = SWATCHES.iter().map(|s| {
                         let s = *s;
                         let on = color.eq_ignore_ascii_case(s);
                         div()
                             .id(SharedString::from(format!("vedit-sw-{s}")))
-                            .size(px(22.))
+                            .size(px(20.))
                             .rounded_full()
                             .bg(video::paint(hex(s), 1.))
                             .border_2()
@@ -1480,6 +2149,7 @@ impl StudioPage {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.video_edit(
+                                    "Text colour",
                                     |sq| {
                                         if let Some(LayerKind::Text { color, .. }) = sq.edit.layers.iter_mut().find(|l| l.id == id).map(|l| &mut l.kind) {
                                             *color = s.to_string();
@@ -1489,26 +2159,60 @@ impl StudioPage {
                                 )
                             }))
                     });
-                    b = b
-                        .child(self.prop("Text", self.text_field()))
-                        .child(self.prop("Colour", div().flex().gap(px(6.)).children(sw).into_any_element()))
-                        .child(
-                            switch("vedit-box", *boxed)
-                                .label("Dark box behind the text")
-                                .on_click(cx.listener(move |this, on: &bool, _, cx| {
-                                    let on = *on;
-                                    this.video_edit(
-                                        |sq| {
-                                            if let Some(LayerKind::Text { boxed, .. }) = sq.edit.layers.iter_mut().find(|l| l.id == id).map(|l| &mut l.kind) {
-                                                *boxed = on;
-                                            }
-                                        },
-                                        cx,
-                                    )
-                                })),
-                        );
+                    let styled = !color.eq_ignore_ascii_case("#ffffff") || *boxed;
+                    b = b.child(self.section(
+                        "text",
+                        ph::TEXT_T,
+                        "Text",
+                        styled.then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> {
+                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
+                                this.video_edit(
+                                    "Reset text style",
+                                    |sq| {
+                                        if let Some(LayerKind::Text { color, boxed, .. }) = sq.edit.layers.iter_mut().find(|l| l.id == id).map(|l| &mut l.kind) {
+                                            *color = "#ffffff".into();
+                                            *boxed = false;
+                                        }
+                                    },
+                                    cx,
+                                )
+                            })
+                        }),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .child(self.text_field())
+                            .child(div().flex().gap(px(6.)).children(sw))
+                            .child(switch("vedit-box", *boxed).label("Dark box behind the text").on_click(cx.listener(move |this, on: &bool, _, cx| {
+                                let on = *on;
+                                this.video_edit(
+                                    "Text box",
+                                    |sq| {
+                                        if let Some(LayerKind::Text { boxed, .. }) = sq.edit.layers.iter_mut().find(|l| l.id == id).map(|l| &mut l.kind) {
+                                            *boxed = on;
+                                        }
+                                    },
+                                    cx,
+                                )
+                            }))),
+                        cx,
+                    ));
                 }
-                b.child(muted("Drag the layer on the Program monitor to move it.")).child(btn("vedit-del-layer", "Delete layer", ButtonKind::DangerGhost).small().icon(ph::TRASH).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_delete_selection(cx))))
+                b.child(self.section(
+                    "timing",
+                    ph::TIMER,
+                    "Timing",
+                    None,
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(space::SM))
+                        .child(set_time(true))
+                        .child(set_time(false))
+                        .child(btn("vedit-del-layer", "Delete", ButtonKind::DangerGhost).small().icon(ph::TRASH).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_delete_selection(cx)))),
+                    cx,
+                ))
             }
             Some(Sel::Track(t)) => body
                 .child(self.prop_head(
@@ -1525,9 +2229,9 @@ impl StudioPage {
                 .child(muted(match t {
                     Track::Captions => "The captions follow the narration. Their style and place are in Sequence → Captions.",
                     Track::Layers => "Image and text layers over the picture. Add one below or with Import.",
-                    Track::Clips => "One clip per narrated panel. Drag to reorder, drag an edge to trim, or cut with the razor (C).",
+                    Track::Clips => "One clip per narrated panel. Drag to reorder, drag an edge to trim, cut with the razor (C) or at the playhead (Ctrl+K).",
                     Track::Narration => "The narration of every clip. Mute it to keep only the music.",
-                    Track::Music => "The chapter's score, your own music, or none. Change it in Sequence → Music.",
+                    Track::Music => "The chapter's score, your own music, or none. Change it in Sequence → Music; [ and ] nudge the volume.",
                 }))
                 .when(t == Track::Layers, |d| d.child(self.add_buttons(cx)))
                 .when(t != Track::Clips, |d| {
@@ -1705,7 +2409,7 @@ impl StudioPage {
                         Some(c.text.clone().or_else(|| s.beats.get(c.src).map(|b| b.text.clone())).unwrap_or_default())
                     });
                     if current.as_deref() != Some(value.as_str()) {
-                        this.video_clips(
+                        this.video_clips("Caption text", 
                             |b, cl| {
                                 if let Some(c) = cl.get_mut(i) {
                                     let own = b.get(c.src).map(|b| b.text.as_str()) == Some(value.as_str());
@@ -1727,7 +2431,7 @@ impl StudioPage {
                 Some(Sel::Layer(id)) => {
                     let same = this.vedit.seq.as_ref().and_then(|s| s.edit.layers.iter().find(|l| l.id == id)).is_some_and(|l| matches!(&l.kind, LayerKind::Text { text, .. } if *text == value));
                     if !same {
-                        this.video_edit(
+                        this.video_edit("Layer text", 
                             |s| {
                                 if let Some(LayerKind::Text { text, .. }) = s.edit.layers.iter_mut().find(|l| l.id == id).map(|l| &mut l.kind) {
                                     *text = value.clone();
@@ -1795,7 +2499,7 @@ impl StudioPage {
                 body.child(
                     switch("vedit-caps-on", s.enabled && !off).label("Captions on").on_click(cx.listener(|this, on: &bool, _, cx| {
                         let on = *on;
-                        this.video_edit(|sq| sq.edit.flags_mut(Track::Captions).off = !on, cx);
+                        this.video_edit("Captions on/off", |sq| sq.edit.flags_mut(Track::Captions).off = !on, cx);
                         if on {
                             this.video_subs(|s| s.enabled = true, cx);
                         }
@@ -1832,7 +2536,7 @@ impl StudioPage {
                     MusicSource::None => 2,
                 };
                 let src = segmented("vedit-music", [(Some(ph::MUSIC_NOTES), "Score"), (Some(ph::FILE_AUDIO), "My file"), (Some(ph::SPEAKER_X), "None")], which).small().on_change(cx.listener(|this, ix: &usize, _, cx| match *ix {
-                    0 => this.video_edit(
+                    0 => this.video_edit("Use the score", 
                         |s| {
                             s.edit.music.source = MusicSource::Score;
                             s.edit.flags_mut(Track::Music).off = false;
@@ -1840,7 +2544,7 @@ impl StudioPage {
                         cx,
                     ),
                     1 => this.import_music(cx),
-                    _ => this.video_edit(|s| s.edit.music.source = MusicSource::None, cx),
+                    _ => this.video_edit("No music", |s| s.edit.music.source = MusicSource::None, cx),
                 }));
                 let what = match &m.source {
                     MusicSource::Score if seq.score.is_none() => "This chapter has no score yet (make it in the Music step).".to_string(),
@@ -1855,13 +2559,13 @@ impl StudioPage {
                     .child(
                         switch("vedit-music-mute", off).label("Mute the music").on_click(cx.listener(|this, on: &bool, _, cx| {
                             let on = *on;
-                            this.video_edit(|s| s.edit.flags_mut(Track::Music).off = on, cx)
+                            this.video_edit("Mute music", |s| s.edit.flags_mut(Track::Music).off = on, cx)
                         })),
                     )
                     .child(
                         switch("vedit-narr-mute", seq.edit.flags(Track::Narration).off).label("Mute the narration").on_click(cx.listener(|this, on: &bool, _, cx| {
                             let on = *on;
-                            this.video_edit(|s| s.edit.flags_mut(Track::Narration).off = on, cx)
+                            this.video_edit("Mute narration", |s| s.edit.flags_mut(Track::Narration).off = on, cx)
                         })),
                     )
             }
@@ -1884,17 +2588,17 @@ impl StudioPage {
                 let own = seq.edit.look.is_some();
                 let scope = segmented("vedit-look-scope", [(None, "Studio look"), (None, "This chapter")], own as usize).small().on_change(cx.listener(move |this, ix: &usize, _, cx| {
                     let own = *ix == 1;
-                    this.video_edit(|s| s.edit.look = own.then(|| LookEdit { preset: crate::look::Look::load().preset.key().into(), effects: Default::default() }), cx)
+                    this.video_edit("Look scope", |s| s.edit.look = own.then(|| LookEdit { preset: crate::look::Look::load().preset.key().into(), effects: Default::default() }), cx)
                 }));
                 let presets = segmented("vedit-preset", Preset::ALL.iter().map(|p| (None, p.label())), Preset::ALL.iter().position(|p| *p == preset).unwrap_or(3)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
                     let p = Preset::ALL[(*ix).min(3)];
-                    this.video_edit(|s| s.edit.look = Some(LookEdit { preset: p.key().into(), effects: Default::default() }), cx)
+                    this.video_edit("Look preset", |s| s.edit.look = Some(LookEdit { preset: p.key().into(), effects: Default::default() }), cx)
                 }));
                 let switches = Effect::ALL.iter().enumerate().map(|(k, e)| {
                     let e = *e;
                     switch(SharedString::from(format!("vedit-fx-{}", e.key())), fx[k]).label(e.label()).on_click(cx.listener(move |this, on: &bool, _, cx| {
                         let on = *on;
-                        this.video_edit(
+                        this.video_edit("Look effect", 
                             |s| {
                                 let mut l = s.edit.look.clone().unwrap_or_else(|| LookEdit { preset: crate::look::Look::load().preset.key().into(), effects: Default::default() });
                                 let base = Preset::parse(&l.preset).unwrap_or_default().effects().get(e);
@@ -1911,7 +2615,7 @@ impl StudioPage {
                 });
                 let cuts = segmented("vedit-trans", [(None, "Look's transitions"), (None, "Hard cuts")], seq.edit.cuts as usize).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
                     let on = *ix == 1;
-                    this.video_edit(|s| s.edit.cuts = on, cx)
+                    this.video_edit("Transitions", |s| s.edit.cuts = on, cx)
                 }));
                 body.child(self.prop("Look for", scope.into_any_element()))
                     .child(self.prop("Preset", presets.into_any_element()))
@@ -1952,13 +2656,13 @@ impl StudioPage {
             };
             let motion = |id: &'static str, m: Motion, hint: &'static str| {
                 item(id, ph::ARROWS_OUT, m.label(), hint).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| match this.vedit.sel {
-                    Some(Sel::Clip(i)) => this.video_clips(|_, c| c[i].motion = m, cx),
+                    Some(Sel::Clip(i)) => this.video_clips("Clip motion", |_, c| c[i].motion = m, cx),
                     _ => toast::show(cx, Toast::info("Select a clip first")),
                 }))
             };
             let look = |id: &'static str, p: Preset| {
                 item(id, ph::PALETTE, p.label(), p.blurb()).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.video_edit(|s| s.edit.look = Some(LookEdit { preset: p.key().into(), effects: Default::default() }), cx);
+                    this.video_edit("Look preset", |s| s.edit.look = Some(LookEdit { preset: p.key().into(), effects: Default::default() }), cx);
                     this.vedit.side_tab = 2;
                 }))
             };
@@ -1974,8 +2678,8 @@ impl StudioPage {
                 .child(motion("vedit-fx-shake", Motion::Shake, "Zoom punch, camera shake and a flash"))
                 .child(motion("vedit-fx-auto", Motion::Auto, "The look decides"))
                 .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("TRANSITIONS"))
-                .child(item("vedit-fx-cuts", ph::SCISSORS, "Hard cuts", "Cut between every clip").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_edit(|s| s.edit.cuts = true, cx))))
-                .child(item("vedit-fx-trans", ph::SPARKLE, "Look's transitions", "Wipes, slides and fades from the look").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_edit(|s| s.edit.cuts = false, cx))))
+                .child(item("vedit-fx-cuts", ph::SCISSORS, "Hard cuts", "Cut between every clip").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_edit("Hard cuts", |s| s.edit.cuts = true, cx))))
+                .child(item("vedit-fx-trans", ph::SPARKLE, "Look's transitions", "Wipes, slides and fades from the look").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.video_edit("Look transitions", |s| s.edit.cuts = false, cx))))
                 .into_any_element();
         }
         let rows = self.made_chapters(g).into_iter().map(|c| {
@@ -2055,6 +2759,220 @@ impl StudioPage {
 
     // ------------------------------------------------------------------------------ timeline
 
+    /// The ruler of the open timeline (`total` ms long, playhead at `now`): labelled ticks from
+    /// the tick-step table (at least 80 px apart) with minor ticks between, the in / out range,
+    /// markers and the playhead's head. Click or drag it to move the playhead.
+    pub(super) fn ruler(&self, id: &'static str, total: u64, now: u64, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (pps, sx) = (self.vedit.pps, self.vedit.scroll_x);
+        let view_w = f32::from(self.vedit.lanes.get().size.width).max(1.);
+        let xof = |ms: u64| ms as f32 / 1000. * pps - sx;
+        let mut r = div()
+            .id(id)
+            .relative()
+            .flex_none()
+            .h(px(RULER_H))
+            .overflow_hidden()
+            .bg(Tokens::surface_2())
+            .border_b_1()
+            .border_color(Tokens::border())
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.vedit.drag = Some(Drag::Playhead);
+                this.vedit.shift = ev.modifiers.shift;
+                this.drag_move(ev.position, cx);
+            }));
+        // In / out: the range, and a bracket at each end.
+        if self.vedit.mark_in.is_some() || self.vedit.mark_out.is_some() {
+            let (a, b) = (xof(self.vedit.mark_in.unwrap_or(0)), xof(self.vedit.mark_out.unwrap_or(total)));
+            r = r.child(div().absolute().left(px(a)).w(px((b - a).max(1.))).top_0().bottom_0().bg(soft(Tokens::accent(), 0.14)));
+            for (t, left) in [(self.vedit.mark_in, true), (self.vedit.mark_out, false)] {
+                if let Some(t) = t {
+                    let x = xof(t);
+                    r = r.child(div().absolute().left(px(if left { x } else { x - 5. })).top(px(4.)).w(px(6.)).h(px(RULER_H - 8.)).border_color(Tokens::accent()).border_t_2().border_b_2().when(left, |d| d.border_l_2()).when(!left, |d| d.border_r_2()));
+                }
+            }
+        }
+        let step = tl::tick_step(pps);
+        let (start_s, end_s) = ((sx / pps) as f64, (((sx + view_w) / pps) as f64).min(total as f64 / 1000. + step));
+        let first = (start_s / step).floor() * step;
+        let mut k = 0;
+        loop {
+            let at = first + k as f64 * step;
+            if at > end_s || k > 400 {
+                break;
+            }
+            let x = (at * pps as f64) as f32 - sx;
+            r = r.child(div().absolute().left(px(x)).bottom_0().w(px(1.)).h(px(10.)).bg(Tokens::text_3()));
+            if x + 56. <= view_w {
+                r = r.child(div().absolute().left(px(x + 3.)).top(px(5.)).text_size(px(10.)).font_family(crate::page::MONO).text_color(Tokens::text_3()).child(tl::tick_label((at * 1000.).round() as u64, step)));
+            }
+            for m in 1..tl::MINOR {
+                let mx = ((at + step * m as f64 / tl::MINOR as f64) * pps as f64) as f32 - sx;
+                r = r.child(div().absolute().left(px(mx)).bottom_0().w(px(1.)).h(px(5.)).bg(Tokens::border_strong()));
+            }
+            k += 1;
+        }
+        for (i, m) in self.vedit.markers.iter().enumerate() {
+            let x = xof(*m);
+            let t = *m;
+            r = r.child(
+                div()
+                    .id(("vedit-marker", i))
+                    .absolute()
+                    .left(px(x - 4.))
+                    .bottom(px(1.))
+                    .w(px(9.))
+                    .h(px(10.))
+                    .rounded_t(px(2.))
+                    .bg(Tokens::favorite())
+                    .tooltip(tip(format!("Marker {} · {} (M at the playhead removes it)", i + 1, vedit::timecode(t))))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.seek(t, cx);
+                    })),
+            );
+        }
+        r.child(div().absolute().left(px(xof(now) - 5.)).top(px(RULER_H - 13.)).w(px(11.)).h(px(12.)).rounded_b(px(3.)).bg(Tokens::accent()))
+    }
+
+    /// The navigator under the timeline: the thumb shows (and pans) the visible part; its handles
+    /// zoom (bhippi's zoom bar).
+    pub(super) fn navigator(&self, id: &'static str, total: u64, cx: &mut Context<Self>) -> Stateful<Div> {
+        let bar = self.vedit.nav.get();
+        let bar_w = f32::from(bar.size.width);
+        let view_w = f32::from(self.vedit.lanes.get().size.width).max(1.);
+        let content = total as f32 / 1000. * self.vedit.pps;
+        let (l, w) = tl::nav_thumb(bar_w, content, view_w, self.vedit.scroll_x);
+        let start = move |grip: NavGrip| {
+            move |this: &mut Self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>| {
+                cx.stop_propagation();
+                this.vedit.drag = Some(Drag::Nav { grip, x0: f32::from(ev.position.x), pps0: this.vedit.pps, scroll0: this.vedit.scroll_x });
+                cx.notify();
+            }
+        };
+        let handle = |hid: &'static str, left: bool| {
+            div()
+                .id(hid)
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(px(7.))
+                .when(left, |d| d.left_0())
+                .when(!left, |d| d.right_0())
+                .rounded(px(3.))
+                .cursor(CursorStyle::ResizeLeftRight)
+                .bg(soft(Tokens::text_2(), 0.35))
+                .hover(|d| d.bg(Tokens::text_2()))
+        };
+        let nav = self.vedit.nav.clone();
+        div()
+            .id(id)
+            .relative()
+            .flex_none()
+            .h(px(NAV_H))
+            .ml(px(HEAD_W))
+            .my(px(2.))
+            .rounded(px(3.))
+            .bg(Tokens::well())
+            .cursor_pointer()
+            .child(canvas(move |b, _, _| nav.set(b), |_, _, _, _| {}).absolute().inset_0())
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                // A click on the bar centres the thumb there, then drags it.
+                let b = this.vedit.nav.get();
+                let bw = f32::from(b.size.width);
+                let vw = f32::from(this.vedit.lanes.get().size.width).max(1.);
+                let content = this.timeline_ms() as f32 / 1000. * this.vedit.pps;
+                if bw > 0. && content > vw {
+                    let ratio = bw / content;
+                    let (_, tw) = tl::nav_thumb(bw, content, vw, 0.);
+                    this.vedit.scroll_x = ((f32::from(ev.position.x - b.origin.x) - tw / 2.) / ratio).clamp(0., content - vw);
+                }
+                this.vedit.drag = Some(Drag::Nav { grip: NavGrip::Move, x0: f32::from(ev.position.x), pps0: this.vedit.pps, scroll0: this.vedit.scroll_x });
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("vedit-nav-thumb")
+                    .absolute()
+                    .top(px(1.))
+                    .bottom(px(1.))
+                    .left(px(l))
+                    .w(px(w))
+                    .rounded(px(3.))
+                    .bg(Tokens::border_strong())
+                    .cursor(CursorStyle::OpenHand)
+                    .on_mouse_down(MouseButton::Left, cx.listener(start(NavGrip::Move)))
+                    .child(handle("vedit-nav-l", true).on_mouse_down(MouseButton::Left, cx.listener(start(NavGrip::Left))))
+                    .child(handle("vedit-nav-r", false).on_mouse_down(MouseButton::Left, cx.listener(start(NavGrip::Right)))),
+            )
+    }
+
+    /// Ctrl / Alt + wheel zooms at the pointer; the wheel alone scrolls the timeline.
+    pub(super) fn timeline_wheel(&mut self, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let d = ev.delta.pixel_delta(px(20.));
+        let (dx, dy) = (f32::from(d.x), f32::from(d.y));
+        if ev.modifiers.control || ev.modifiers.alt {
+            let ax = f32::from(ev.position.x) - f32::from(self.vedit.lanes.get().origin.x);
+            self.zoom(tl::wheel_factor(dy), Some(ax));
+        } else {
+            let total = self.timeline_ms() as f32 / 1000. * self.vedit.pps;
+            let w = f32::from(self.vedit.lanes.get().size.width);
+            self.vedit.scroll_x = (self.vedit.scroll_x - if dx.abs() > dy.abs() { dx } else { dy }).clamp(0., (total - w + 40.).max(0.));
+        }
+        cx.notify();
+    }
+
+    /// The timeline toolbar's shared buttons: snap, zoom, fit and the shortcuts list.
+    pub(super) fn timeline_buttons(&self, cx: &mut Context<Self>) -> Div {
+        let snap = self.vedit.snap;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .child(icon_button("vedit-snap", ph::LINK_SIMPLE, if snap { "Snap: on (S; hold Shift to invert)" } else { "Snap: off (S; hold Shift to invert)" }).small().selected(snap).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.vedit.snap = !this.vedit.snap;
+                cx.notify();
+            })))
+            .child(icon_button("vedit-zoom-out", ph::MAGNIFYING_GLASS_MINUS, "Zoom out (-)").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.zoom(1. / 1.5, None);
+                cx.notify();
+            })))
+            .child(icon_button("vedit-zoom-in", ph::MAGNIFYING_GLASS, "Zoom in (=) · Ctrl+wheel zooms at the pointer").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.zoom(1.5, None);
+                cx.notify();
+            })))
+            .child(icon_button("vedit-zoom-fit", ph::ARROWS_IN_SIMPLE, "Zoom to the whole timeline (\\)").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.video_fit();
+                cx.notify();
+            })))
+            .child(icon_button("vedit-help", ph::QUESTION, "Keyboard shortcuts (?)").small().selected(self.vedit.keys_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.vedit.keys_open = !this.vedit.keys_open;
+                cx.notify();
+            })))
+    }
+
+    /// In / out and markers, as a short note for the toolbar.
+    fn marks_note(&self) -> Option<String> {
+        let mut parts = vec![];
+        if self.vedit.mark_in.is_some() || self.vedit.mark_out.is_some() {
+            let f = |t: Option<u64>| t.map(vedit::timecode).unwrap_or_else(|| "--".into());
+            parts.push(format!("In {} · Out {}", f(self.vedit.mark_in), f(self.vedit.mark_out)));
+        }
+        if !self.vedit.markers.is_empty() {
+            parts.push(format!("{} marker{}", self.vedit.markers.len(), plural(self.vedit.markers.len())));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// The clips and layers the last assistant turn changed, while they are lit.
+    fn flashed(&self) -> (Vec<usize>, Vec<u64>) {
+        match &self.vedit.ai_flash {
+            Some((t, c, l)) if t.elapsed() < AI_FLASH => (c.clone(), l.clone()),
+            _ => (vec![], vec![]),
+        }
+    }
+
     fn video_timeline(&self, cx: &mut Context<Self>) -> Div {
         let Some(seq) = &self.vedit.seq else { return div() };
         let placed = seq.placed();
@@ -2065,6 +2983,7 @@ impl StudioPage {
         let (t0, t1) = ((sx / pps * 1000.) as u64, ((sx + view_w) / pps * 1000.) as u64 + 1);
         let xof = |ms: u64| ms as f32 / 1000. * pps - sx;
         let now = self.playhead_now();
+        let (ai_clips, ai_layers) = self.flashed();
         let toolbar = div()
             .flex()
             .flex_none()
@@ -2075,53 +2994,14 @@ impl StudioPage {
             .border_b_1()
             .border_color(Tokens::border())
             .child(div().text_size(px(size::LG)).font_family(crate::page::MONO).text_color(Tokens::accent()).child(vedit::timecode(now)))
-            .child(div().w(px(space::MD)))
-            .child(icon_button("vedit-snap", ph::LINK_SIMPLE, if self.vedit.snap { "Snap in timeline: on (S)" } else { "Snap in timeline: off (S)" }).small().selected(self.vedit.snap).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.vedit.snap = !this.vedit.snap;
-                cx.notify();
-            })))
-            .child(icon_button("vedit-zoom-out", ph::MAGNIFYING_GLASS_MINUS, "Zoom out (-)").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.zoom(1. / 1.5, None);
-                cx.notify();
-            })))
-            .child(icon_button("vedit-zoom-in", ph::MAGNIFYING_GLASS, "Zoom in (=)").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.zoom(1.5, None);
-                cx.notify();
-            })))
-            .child(icon_button("vedit-zoom-fit", ph::ARROWS_IN_SIMPLE, "Zoom to the whole sequence (\\)").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.video_fit();
-                cx.notify();
-            })))
+            .child(div().w(px(space::SM)))
+            .child(self.timeline_buttons(cx))
+            .when_some(self.vedit.shuttle, |d, (_, _, s)| d.child(div().text_size(px(size::SM)).font_family(crate::page::MONO).text_color(Tokens::accent()).child(format!("{}{}x", if s < 0. { "◀ " } else { "▶ " }, s.abs()))))
             .child(div().flex_1())
+            .children(self.marks_note().map(muted))
             .child(muted(format!("{} clips · {}", placed.len(), vedit::timecode(total))))
             .when(seq.edit.stale(&seq.beats), |d| d.child(div().text_size(px(size::SM)).text_color(Tokens::warning()).child("Re-narrated: clip edits reset")));
-
-        // Ruler.
-        let (major, minor) = vedit::ruler_step(pps);
-        let mut ruler = div()
-            .id("vedit-ruler")
-            .relative()
-            .h(px(RULER_H))
-            .overflow_hidden()
-            .border_b_1()
-            .border_color(Tokens::border())
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                this.vedit.drag = Some(Drag::Playhead);
-                this.drag_move(ev.position, cx);
-            }));
-        let step_ms = (major * 1000.) as u64;
-        let mut t = t0 / step_ms * step_ms;
-        while t <= t1.min(total + step_ms) {
-            let x = xof(t);
-            ruler = ruler.child(div().absolute().left(px(x)).bottom_0().w(px(1.)).h(px(10.)).bg(Tokens::text_3())).child(div().absolute().left(px(x + 3.)).top(px(2.)).text_size(px(size::XS)).font_family(crate::page::MONO).text_color(Tokens::text_3()).child(vedit::timecode(t)));
-            for k in 1..minor {
-                let mx = xof(t + step_ms * k as u64 / minor as u64);
-                ruler = ruler.child(div().absolute().left(px(mx)).bottom_0().w(px(1.)).h(px(4.)).bg(Tokens::border_strong()));
-            }
-            t += step_ms;
-        }
-        ruler = ruler.child(div().absolute().left(px(xof(now) - 5.)).top(px(RULER_H - 12.)).w(px(11.)).h(px(12.)).rounded(px(2.)).bg(Tokens::accent()));
+        let ruler = self.ruler("vedit-ruler", total, now, cx);
 
         // Lanes.
         let sel = self.vedit.sel;
@@ -2132,22 +3012,16 @@ impl StudioPage {
         for t in Track::ALL {
             let h = lane_h(t);
             let flags = seq.edit.flags(t);
-            let mut lane = div().id(SharedString::from(format!("vedit-lane-{}", t.code()))).relative().h(px(h)).overflow_hidden().border_b_1().border_color(Tokens::border()).when(flags.off, |d| d.opacity(0.4));
-            let block = |id: SharedString, x: f32, w: f32, fill: Rgba, edge: Rgba, selected: bool| {
-                div()
-                    .id(id)
-                    .absolute()
-                    .left(px(x))
-                    .top(px(2.))
-                    .w(px(w.max(2.)))
-                    .h(px(h - 4.))
-                    .rounded(px(3.))
-                    .overflow_hidden()
-                    .bg(fill)
-                    .border_1()
-                    .border_color(if selected { Tokens::text_1() } else { edge })
-                    .when(selected, |d| d.border_2())
-            };
+            let color = track_color(t);
+            let mut lane = div()
+                .id(SharedString::from(format!("vedit-lane-{}", t.code())))
+                .relative()
+                .h(px(h))
+                .overflow_hidden()
+                .border_b_1()
+                .border_color(Tokens::border())
+                .when(flags.locked, |d| d.bg(soft(Tokens::text_3(), 0.07)))
+                .when(flags.off, |d| d.opacity(0.4));
             match t {
                 Track::Clips | Track::Narration | Track::Captions => {
                     for p in placed.iter().filter(visible) {
@@ -2156,28 +3030,27 @@ impl StudioPage {
                         let beat = seq.beats.get(p.clip.src);
                         let selected = sel == Some(Sel::Clip(index));
                         let dragging = matches!(drag, Some(Drag::Clip { index: i, .. }) if i == index);
-                        let (fill, edge) = match t {
-                            Track::Clips => (soft(Tokens::info(), 0.32), Tokens::info()),
-                            Track::Narration => (soft(Tokens::success(), 0.30), Tokens::success()),
-                            _ => (soft(Tokens::accent(), 0.28), Tokens::accent()),
-                        };
                         let label = match t {
-                            Track::Clips => format!("p{} · {}", beat.map(|b| b.page + 1).unwrap_or(0), if p.clip.motion == Motion::Auto { String::new() } else { p.clip.motion.label().to_string() }),
-                            Track::Narration => beat.and_then(|b| b.audio.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                            Track::Clips => format!("p{}{}", beat.map(|b| b.page + 1).unwrap_or(0), if p.clip.motion == Motion::Auto { String::new() } else { format!(" · {}", p.clip.motion.label()) }),
+                            Track::Narration => format!("{:.1}s · {}", p.dur_ms as f32 / 1000., beat.and_then(|b| b.audio.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
                             _ => p.clip.text.clone().or_else(|| beat.map(|b| b.text.clone())).unwrap_or_default(),
                         };
-                        let mut el = block(SharedString::from(format!("vedit-{}-{index}", t.code())), x, w, fill, edge, selected).when(dragging, |d| d.opacity(0.35));
-                        if t == Track::Clips && w > 44. {
-                            if let Some(img_p) = beat.and_then(|b| b.image.clone()) {
-                                el = el.child(img(img_p).absolute().left_0().top_0().h_full().w(px((h - 4.) * 0.75)).object_fit(ObjectFit::Cover));
+                        let mut el = clip_box(SharedString::from(format!("vedit-{}-{index}", t.code())), x, w, h, color, selected, ai_clips.contains(&index), None, label).when(dragging, |d| d.opacity(0.35));
+                        match (t, beat) {
+                            (Track::Clips, Some(b)) if w > 12. => {
+                                if let Some(image) = &b.image {
+                                    el = el.children(clip_tiles(image, x, w, h, view_w));
+                                }
                             }
-                        }
-                        if w > 26. {
-                            let pad = if t == Track::Clips && w > 44. { (h - 4.) * 0.75 + 4. } else { 4. };
-                            el = el.child(div().absolute().left(px(pad)).top(px(2.)).right(px(2.)).truncate().text_size(px(size::XS)).text_color(Tokens::text_1()).child(label));
+                            (Track::Narration, Some(b)) if w > 6. => {
+                                if let Some(pk) = crate::vedit_media::peaks_ready(&b.audio) {
+                                    el = el.children(clip_wave(&pk, (b.offset_ms + p.clip.trim_in_ms) as f64 / 1000., x, w, h, pps, view_w));
+                                }
+                            }
+                            _ => {}
                         }
                         if p.clip.cut && t == Track::Clips {
-                            el = el.child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(Tokens::warning()));
+                            el = el.child(div().absolute().left_0().top(px(LABEL_H)).bottom_0().w(px(3.)).bg(Tokens::warning()));
                         }
                         // Trim handles on the picture clips.
                         if t == Track::Clips && !razor && !flags.locked && w > 14. {
@@ -2188,11 +3061,11 @@ impl StudioPage {
                                         .absolute()
                                         .top_0()
                                         .bottom_0()
-                                        .w(px(6.))
+                                        .w(px(7.))
                                         .when(head, |d| d.left_0())
                                         .when(!head, |d| d.right_0())
                                         .cursor(CursorStyle::ResizeLeftRight)
-                                        .hover(|d| d.bg(soft(Tokens::text_1(), 0.35)))
+                                        .hover(|d| d.bg(soft(Tokens::text_1(), 0.3)))
                                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                             cx.stop_propagation();
                                             let from = this.time_at(ev.position.x);
@@ -2207,15 +3080,17 @@ impl StudioPage {
                         let dur = p.dur_ms;
                         lane = lane.child(el.cursor(if razor { CursorStyle::Crosshair } else { CursorStyle::PointingHand }).on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
+                            this.vedit.shift = ev.modifiers.shift;
                             let at = this.time_at(ev.position.x);
                             if this.vedit.tool == Tool::Razor {
                                 if this.locked(Track::Clips) {
                                     return;
                                 }
                                 let cut = this.snap_ms(at, None);
+                                this.vedit.snapped = None;
                                 let into = (cut - start as i64).clamp(0, dur as i64) as u64;
                                 let mut ok = false;
-                                this.video_clips(|b, c| ok = vedit::split(b, c, index, into), cx);
+                                this.video_clips("Razor cut", |b, c| ok = vedit::split(b, c, index, into), cx);
                                 if !ok {
                                     toast::show(cx, Toast::info("Too close to the clip's edge to cut there"));
                                 }
@@ -2235,8 +3110,12 @@ impl StudioPage {
                         let id = l.id;
                         let selected = sel == Some(Sel::Layer(id));
                         let icon = if matches!(l.kind, LayerKind::Text { .. }) { ph::TEXT_T } else { ph::IMAGE };
-                        let mut el = block(SharedString::from(format!("vedit-layer-{id}")), x, w, soft(Tokens::accent_2(), 0.35), Tokens::accent_2(), selected)
-                            .child(div().absolute().left(px(4.)).top(px(2.)).right(px(4.)).flex().items_center().gap(px(4.)).child(icon_ph(icon, Tokens::text_1(), icon_px::XS)).child(div().truncate().text_size(px(size::XS)).text_color(Tokens::text_1()).child(l.name())));
+                        let mut el = clip_box(SharedString::from(format!("vedit-layer-{id}")), x, w, h, color, selected, ai_layers.contains(&id), Some(icon), l.name());
+                        if let LayerKind::Image { path } = &l.kind {
+                            if w > 30. {
+                                el = el.children(clip_tiles(path, x, w.min(h * 2.), h, view_w));
+                            }
+                        }
                         if !flags.locked && w > 14. {
                             for head in [true, false] {
                                 el = el.child(
@@ -2245,13 +3124,14 @@ impl StudioPage {
                                         .absolute()
                                         .top_0()
                                         .bottom_0()
-                                        .w(px(6.))
+                                        .w(px(7.))
                                         .when(head, |d| d.left_0())
                                         .when(!head, |d| d.right_0())
                                         .cursor(CursorStyle::ResizeLeftRight)
-                                        .hover(|d| d.bg(soft(Tokens::text_1(), 0.35)))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        .hover(|d| d.bg(soft(Tokens::text_1(), 0.3)))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                             cx.stop_propagation();
+                                            this.vedit.shift = ev.modifiers.shift;
                                             this.vedit.sel = Some(Sel::Layer(id));
                                             this.vedit.drag = Some(Drag::LayerEdge { id, head });
                                             cx.notify();
@@ -2262,6 +3142,7 @@ impl StudioPage {
                         let start = l.start_ms;
                         lane = lane.child(el.cursor(CursorStyle::PointingHand).on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
+                            this.vedit.shift = ev.modifiers.shift;
                             this.vedit.sel = Some(Sel::Layer(id));
                             if !this.locked(Track::Layers) {
                                 this.vedit.drag = Some(Drag::Layer { id, grab: this.time_at(ev.position.x) - start as i64 });
@@ -2271,47 +3152,47 @@ impl StudioPage {
                     }
                 }
                 Track::Music => {
-                    let name = match &seq.edit.music.source {
-                        MusicSource::Score => seq.score.as_ref().map(|_| "score.wav".to_string()),
-                        MusicSource::File { path } => path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    let src = match &seq.edit.music.source {
+                        MusicSource::Score => seq.score.clone().map(|p| (p, "score".to_string())),
+                        MusicSource::File { path } => Some((path.clone(), path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
                         MusicSource::None => None,
                     };
-                    if let Some(name) = name {
+                    if let Some((path, name)) = src {
                         let selected = sel == Some(Sel::Track(Track::Music));
-                        lane = lane.child(
-                            block("vedit-music-clip".into(), xof(0), total as f32 / 1000. * pps, soft(Tokens::success(), 0.22), Tokens::success(), selected)
-                                .child(div().absolute().left(px(4.).max(px(-xof(0) + 4.))).top(px(2.)).flex().items_center().gap(px(4.)).child(icon_ph(ph::MUSIC_NOTES, Tokens::text_1(), icon_px::XS)).child(div().text_size(px(size::XS)).text_color(Tokens::text_1()).child(format!("{name} · {:.0}%", seq.edit.music.volume * 100.))))
-                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.vedit.sel = Some(Sel::Track(Track::Music));
-                                    this.vedit.side_tab = 1;
-                                    cx.notify();
-                                })),
-                        );
+                        let (x, w) = (xof(0), total as f32 / 1000. * pps);
+                        let mut el = clip_box("vedit-music-clip".into(), x, w, h, color, selected, false, Some(ph::MUSIC_NOTES), format!("{name} · {:.0}%", seq.edit.music.volume * 100.));
+                        if let Some(pk) = crate::vedit_media::peaks_ready(&path) {
+                            el = el.children(clip_wave(&pk, 0., x, w, h, pps, view_w));
+                        }
+                        lane = lane.child(el.on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.vedit.sel = Some(Sel::Track(Track::Music));
+                            this.vedit.side_tab = 1;
+                            cx.notify();
+                        })));
                     }
                 }
             }
             lanes.push(lane.into_any_element());
         }
-        // Where a dragged clip would land, the snap line and the playhead, over every lane.
+        // Where a dragged clip would land, the in / out range, the snap line and the playhead.
         let lanes_h: f32 = Track::ALL.iter().map(|t| lane_h(*t)).sum();
         let mut over = div().absolute().top_0().left_0().right_0().h(px(lanes_h));
         if let Some(Drag::Clip { index, grab, at }) = drag {
             if let Some(me) = placed.iter().find(|p| p.index == index) {
                 let x = (at - grab) as f32 / 1000. * pps - sx;
                 let top: f32 = lane_h(Track::Captions) + lane_h(Track::Layers);
-                over = over.child(div().absolute().left(px(x)).top(px(top + 2.)).w(px(me.dur_ms as f32 / 1000. * pps)).h(px(lane_h(Track::Clips) - 4.)).rounded(px(3.)).border_2().border_color(Tokens::text_1()).bg(soft(Tokens::info(), 0.5)));
+                over = over.child(div().absolute().left(px(x)).top(px(top + 1.)).w(px(me.dur_ms as f32 / 1000. * pps)).h(px(lane_h(Track::Clips) - 2.)).rounded(px(3.)).border_2().border_color(Tokens::text_1()).bg(soft(Tokens::info(), 0.5)));
             }
         }
-        if let Some(s) = self.vedit.snapped {
-            over = over.child(div().absolute().left(px(xof(s))).top_0().bottom_0().w(px(1.)).bg(Tokens::warning()));
-        }
-        over = over.child(div().absolute().left(px(xof(now))).top_0().bottom_0().w(px(1.)).bg(Tokens::accent()));
+        over = over.children(self.lane_overlays(total, now, None));
 
         let lanes_box = self.vedit.lanes.clone();
         let content = div()
             .id("vedit-lanes")
             .relative()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_w_0()
             .overflow_hidden()
@@ -2322,57 +3203,28 @@ impl StudioPage {
                 // Empty timeline: move the playhead and clear the selection.
                 this.vedit.sel = None;
                 this.vedit.drag = Some(Drag::Playhead);
+                this.vedit.shift = ev.modifiers.shift;
                 this.drag_move(ev.position, cx);
             }))
-            .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, cx| {
-                let d = ev.delta.pixel_delta(px(20.));
-                let (dx, dy) = (f32::from(d.x), f32::from(d.y));
-                if ev.modifiers.control || ev.modifiers.alt {
-                    let ax = f32::from(ev.position.x) - f32::from(this.vedit.lanes.get().origin.x);
-                    this.zoom(if dy > 0. { 1.2 } else { 1. / 1.2 }, Some(ax));
-                } else {
-                    let total = this.vedit.seq.as_ref().map(|s| vedit::total_ms(&s.placed())).unwrap_or(0) as f32 / 1000. * this.vedit.pps;
-                    let w = f32::from(this.vedit.lanes.get().size.width);
-                    this.vedit.scroll_x = (this.vedit.scroll_x - if dx.abs() > dy.abs() { dx } else { dy }).clamp(0., (total - w + 40.).max(0.));
-                }
-                cx.notify();
-            }));
+            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| this.timeline_wheel(ev, cx)));
 
-        // Track headers.
-        let mut heads = div().flex().flex_col().flex_none().w(px(HEAD_W)).border_r_1().border_color(Tokens::border()).child(div().h(px(RULER_H)).border_b_1().border_color(Tokens::border()));
+        // Track heads: V3 / V2 / V1 / A1 / A2, lock and eye / mute.
+        let mut heads = div().flex().flex_col().flex_none().w(px(HEAD_W)).border_r_1().border_color(Tokens::border()).child(div().h(px(RULER_H)).bg(Tokens::surface_2()).border_b_1().border_color(Tokens::border()));
         for t in Track::ALL {
             let flags = seq.edit.flags(t);
             let selected = sel == Some(Sel::Track(t));
             let code = t.code();
             heads = heads.child(
-                div()
-                    .id(SharedString::from(format!("vedit-head-{code}")))
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .h(px(lane_h(t)))
-                    .px(px(4.))
-                    .border_b_1()
-                    .border_color(Tokens::border())
-                    .when(selected, |d| d.bg(Tokens::active()))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.vedit.sel = Some(Sel::Track(t));
-                        if t == Track::Captions {
-                            this.vedit.side_tab = 0;
-                        } else if t.audio() {
-                            this.vedit.side_tab = 1;
-                        }
-                        cx.notify();
-                    }))
-                    .child(div().flex_none().w(px(26.)).h(px(20.)).rounded(px(3.)).flex().items_center().justify_center().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).bg(if t.audio() { soft(Tokens::success(), 0.5) } else { soft(Tokens::info(), 0.5) }).text_color(Tokens::text_1()).child(code))
+                self.track_head(SharedString::from(format!("vedit-head-{code}")), t, lane_h(t), selected)
                     .child(icon_button(SharedString::from(format!("vedit-lock-{code}")), if flags.locked { ph::LOCK } else { ph::LOCK_OPEN }, if flags.locked { "Unlock the track" } else { "Lock the track" }).small().selected(flags.locked).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        if let Some(s) = this.vedit.seq.as_mut() {
-                            let f = s.edit.flags_mut(t);
-                            f.locked = !f.locked;
-                        }
-                        this.video_save(cx);
-                        cx.notify();
+                        this.video_edit(
+                            "Lock track",
+                            |s| {
+                                let f = s.edit.flags_mut(t);
+                                f.locked = !f.locked;
+                            },
+                            cx,
+                        );
                     })))
                     .when(t != Track::Clips, |d| {
                         let (icon, label) = match (t.audio(), flags.off) {
@@ -2386,6 +3238,7 @@ impl StudioPage {
                                 return;
                             }
                             this.video_edit(
+                                "Track on/off",
                                 |s| {
                                     let f = s.edit.flags_mut(t);
                                     f.off = !f.off;
@@ -2394,38 +3247,139 @@ impl StudioPage {
                             );
                         })))
                     })
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).text_color(Tokens::text_2()).child(t.label())),
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.vedit.sel = Some(Sel::Track(t));
+                        if t == Track::Captions {
+                            this.vedit.side_tab = 0;
+                        } else if t.audio() {
+                            this.vedit.side_tab = 1;
+                        }
+                        cx.notify();
+                    })),
             );
         }
 
-        // Horizontal scroll bar (drag it like Premiere's zoom bar).
-        let total_px = (total as f32 / 1000. * pps).max(1.);
-        let (bar_l, bar_w) = ((sx / total_px).clamp(0., 1.), (view_w / total_px).clamp(0.02, 1.));
-        let scroll = div()
-            .id("vedit-hscroll")
-            .relative()
-            .flex_none()
-            .h(px(12.))
-            .ml(px(HEAD_W))
-            .cursor_pointer()
-            .child(div().absolute().top(px(3.)).h(px(6.)).left(relative(bar_l)).w(relative(bar_w)).rounded_full().bg(Tokens::border_strong()))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                this.vedit.drag = Some(Drag::Scroll);
-                this.drag_move(ev.position, cx);
-            }));
-
-        let body = div().flex().flex_col().flex_1().min_h_0().child(toolbar).child(div().flex().flex_1().min_h_0().child(heads).child(content)).child(scroll);
+        let nav = self.navigator("vedit-nav", total, cx);
+        let body = div().flex().flex_col().flex_1().min_h_0().child(toolbar).child(div().flex().flex_1().min_h_0().child(heads).child(content)).child(nav);
         self.panel(&format!("{} ×", seq.item.label()), Some(self.chapter_switcher(cx)), body).flex_1()
+    }
+
+    /// A track head: the track's code in its colour, then its name (the buttons follow).
+    pub(super) fn track_head(&self, id: SharedString, t: Track, h: f32, selected: bool) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .h(px(h))
+            .pl(px(6.))
+            .pr(px(2.))
+            .border_b_1()
+            .border_color(Tokens::border())
+            .bg(if selected { Tokens::active() } else { Tokens::surface() })
+            .cursor_pointer()
+            .child(div().flex_none().w(px(24.)).h(px(18.)).rounded(px(3.)).flex().items_center().justify_center().text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).bg(soft(track_color(t), 0.55)).text_color(Tokens::text_1()).child(t.code()))
+            .child(div().flex_1().min_w_0().truncate().text_size(px(size::XS)).text_color(Tokens::text_2()).child(t.label()))
+    }
+
+    /// Over the lanes: the in / out range, chapter `edges`, the snap line and the playhead.
+    pub(super) fn lane_overlays(&self, total: u64, now: u64, edges: Option<&[u64]>) -> Vec<AnyElement> {
+        let (pps, sx) = (self.vedit.pps, self.vedit.scroll_x);
+        let xof = |ms: u64| ms as f32 / 1000. * pps - sx;
+        let mut v: Vec<AnyElement> = vec![];
+        if self.vedit.mark_in.is_some() || self.vedit.mark_out.is_some() {
+            let (a, b) = (xof(self.vedit.mark_in.unwrap_or(0)), xof(self.vedit.mark_out.unwrap_or(total)));
+            v.push(div().absolute().left(px(a)).w(px((b - a).max(1.))).top_0().bottom_0().bg(soft(Tokens::accent(), 0.06)).into_any_element());
+        }
+        for e in edges.unwrap_or_default() {
+            v.push(div().absolute().left(px(xof(*e))).top_0().bottom_0().w(px(1.)).bg(Tokens::border_strong()).into_any_element());
+        }
+        for m in &self.vedit.markers {
+            v.push(div().absolute().left(px(xof(*m))).top_0().bottom_0().w(px(1.)).bg(soft(Tokens::favorite(), 0.5)).into_any_element());
+        }
+        if let Some(s) = self.vedit.snapped {
+            v.push(div().absolute().left(px(xof(s))).top_0().bottom_0().w(px(1.)).bg(Tokens::favorite()).into_any_element());
+        }
+        v.push(div().absolute().left(px(xof(now))).top_0().bottom_0().w(px(1.)).bg(Tokens::accent()).into_any_element());
+        v
+    }
+
+    /// `?`: every Video mode shortcut, by group, as the user's keymap has them.
+    fn shortcuts_dialog(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let rows = vedit_keys::help_rows();
+        let mut groups: Vec<(&str, Vec<(&str, String)>)> = vec![];
+        for (g, label, keys) in rows {
+            match groups.iter_mut().find(|(n, _)| *n == g) {
+                Some((_, v)) => v.push((label, keys)),
+                None => groups.push((g, vec![(label, keys)])),
+            }
+        }
+        let col = |gs: &[(&str, Vec<(&str, String)>)]| {
+            div().flex().flex_col().flex_1().gap(px(space::MD)).children(gs.iter().map(|(g, items)| {
+                div().flex().flex_col().gap(px(3.)).child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(g.to_uppercase())).children(items.iter().map(|(label, keys)| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(space::SM))
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).text_color(Tokens::text_1()).child(label.to_string()))
+                        .child(div().flex_none().px(px(6.)).py(px(1.)).rounded(px(radius::SM)).bg(Tokens::surface_2()).border_1().border_color(Tokens::border()).text_size(px(size::XS)).font_family(crate::page::MONO).text_color(Tokens::text_2()).child(if keys.is_empty() { "—".to_string() } else { keys.clone() }))
+                }))
+            }))
+        };
+        let half = groups.len().div_ceil(2);
+        div()
+            .id("vedit-keys-dialog")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Tokens::scrim())
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.vedit.keys_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("vedit-keys-card")
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::MD))
+                    .w(px(760.))
+                    .max_h(relative(0.88))
+                    .overflow_y_scroll()
+                    .p(px(space::LG))
+                    .rounded(px(radius::LG))
+                    .bg(Tokens::surface())
+                    .border_1()
+                    .border_color(Tokens::border_strong())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(div().flex_1().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Keyboard shortcuts"))
+                            .child(icon_button("vedit-keys-close", ph::X, "Close (Esc)").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.vedit.keys_open = false;
+                                cx.notify();
+                            }))),
+                    )
+                    .child(muted(format!("Change them in {} (command id → keys).", vedit_keys::overrides_path().display())))
+                    .child(div().flex().gap(px(space::LG)).child(col(&groups[..half])).child(col(&groups[half..]))),
+            )
     }
 
     // ------------------------------------------------------------------------------ export
 
-    /// Premiere's Export: the dashboard's Full recap export (whole, parts, reels, hook,
-    /// watermark) over the rendered chapter videos.
+    /// Premiere's Export: the Video mode's presets (YouTube 1080 / 4K, Shorts, Draft) and, folded
+    /// away, the dashboard's Full recap export (parts, hook, source quality), both over the
+    /// rendered chapter videos.
     fn export_dialog(&mut self, g: &MangaGroup, pending: Vec<ChapterItem>, cx: &mut Context<Self>) -> Stateful<Div> {
         let n = pending.len();
         let rendering = self.made_chapters(g).iter().any(|c| self.queue.for_chapter(&c.id).is_some_and(|q| q.state.active()));
-        let section = self.video_section(g, cx);
+        let more = self.vedit.export_more;
+        let presets = self.export_presets(g, cx);
+        let section = more.then(|| self.video_section(g, cx));
         div()
             .id("vedit-export")
             .absolute()
@@ -2480,7 +3434,122 @@ impl StudioPage {
                                 .when(n > 0 && !rendering, |d| d.child(btn("vedit-export-render", "Render first", ButtonKind::Primary).small().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.render_chapters(list.clone(), cx))))),
                         )
                     })
-                    .child(section),
+                    .child(presets)
+                    .child(
+                        div()
+                            .id("vedit-export-more")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.vedit.export_more = !this.vedit.export_more;
+                                cx.notify();
+                            }))
+                            .child(icon_ph(if more { ph::CARET_DOWN } else { ph::CARET_RIGHT }, Tokens::text_3(), 10.))
+                            .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Parts, hook and source-quality export")),
+                    )
+                    .when_some(section, |d, s| d.child(s)),
+            )
+    }
+
+    /// The Video mode's own export: `encode`'s presets, the GPU encoder when one works, loudness
+    /// to -14 LUFS; progress with the time left and Cancel.
+    fn export_presets(&self, g: &MangaGroup, cx: &mut Context<Self>) -> Div {
+        use crate::encode::{Encoder, Preset, Quality as Q};
+        let p = self.vedit.vexport;
+        let busy = self.export_job.is_some();
+        let n = self.made_chapters(g).len();
+        let progress = self.export_progress("vedit-exp-job", g, cx);
+        let card = |preset: Preset, icon: mv_ui::Ph, sub: &'static str| {
+            let on = p.preset == preset;
+            div()
+                .id(SharedString::from(format!("vedit-preset-{preset:?}")))
+                .flex()
+                .flex_col()
+                .flex_1()
+                .gap(px(4.))
+                .p(px(space::SM))
+                .rounded(px(radius::MD))
+                .border_2()
+                .border_color(if on { Tokens::accent() } else { Tokens::border() })
+                .bg(if on { Tokens::accent_soft() } else { Tokens::surface_2() })
+                .cursor_pointer()
+                .hover(|d| d.border_color(Tokens::accent_border()))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.vedit.vexport.preset = preset;
+                    cx.notify();
+                }))
+                .child(icon_ph(icon, if on { Tokens::accent() } else { Tokens::text_2() }, icon_px::SM))
+                .child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(preset.label()))
+                .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(sub))
+        };
+        let quality = segmented("vedit-exp-q", [(None, "Draft"), (None, "Standard"), (None, "High")], p.quality as usize).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+            this.vedit.vexport.quality = [Q::Draft, Q::Standard, Q::High][(*ix).min(2)];
+            cx.notify();
+        }));
+        let gpu_note = match crate::encode::known_encoders() {
+            None => "Checking this PC's encoders…".to_string(),
+            Some(e) => {
+                let gpu: Vec<&str> = e.available.iter().filter(|x| x.is_gpu()).map(|x| match x {
+                    Encoder::H264Nvenc | Encoder::HevcNvenc => "NVIDIA NVENC",
+                    Encoder::H264Qsv => "Intel Quick Sync",
+                    _ => "AMD AMF",
+                }).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                if gpu.is_empty() {
+                    "No GPU encoder works here: x264 / x265 on the CPU".to_string()
+                } else {
+                    let pick = crate::encode::usable(p.gpu).pick(p.preset == Preset::Youtube4k).name();
+                    format!("{} found · this export uses {pick}", gpu.join(", "))
+                }
+            }
+        };
+        let group = g.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::MD))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(space::SM))
+                    .child(card(Preset::Youtube1080, ph::YOUTUBE_LOGO, "1920x1080 · 16 Mb/s"))
+                    .child(card(Preset::Youtube4k, ph::MONITOR, "3840x2160 · HEVC 10-bit when it can"))
+                    .child(card(Preset::Shorts, ph::DEVICE_MOBILE, "1080x1920 reels of up to a minute"))
+                    .child(card(Preset::Draft720, ph::LIGHTNING, "1280x720 · quick to check")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(space::MD))
+                    .child(div().flex().items_center().gap(px(6.)).child(muted("Quality")).child(quality))
+                    .child(switch("vedit-exp-gpu", p.gpu).label("GPU encoding").on_click(cx.listener(|this, on: &bool, _, cx| {
+                        this.vedit.vexport.gpu = *on;
+                        cx.notify();
+                    })))
+                    .child(switch("vedit-exp-loud", p.loudness).label("Loudness -14 LUFS").on_click(cx.listener(|this, on: &bool, _, cx| {
+                        this.vedit.vexport.loudness = *on;
+                        cx.notify();
+                    })))
+                    .child(switch("vedit-exp-music", p.music).label("Music").on_click(cx.listener(|this, on: &bool, _, cx| {
+                        this.vedit.vexport.music = *on;
+                        cx.notify();
+                    }))),
+            )
+            .child(muted(gpu_note))
+            .child(muted("Exports the rendered chapter videos (what Render made from this edit), joined in order, with the Look's watermark."))
+            .child(
+                div().flex().items_center().gap(px(space::SM)).child(div().flex_1().children(progress)).child(
+                    btn("vedit-exp-go", "Export…", ButtonKind::Primary)
+                        .icon(ph::EXPORT)
+                        .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with an export" }))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            let p = this.vedit.vexport;
+                            this.start_preset_export(&group, p, window, cx)
+                        })),
+                ),
             )
     }
 }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -158,11 +158,25 @@ pub(crate) struct Job {
     /// 0..1 and what is happening.
     pub state: Arc<Mutex<(f32, String)>>,
     pub cancel: Arc<AtomicBool>,
+    /// The step being timed (its label) and when it began, for the time left.
+    phase: Mutex<(String, Instant)>,
 }
 
 impl Job {
     pub(crate) fn new(manga_id: &str, label: &str) -> Job {
-        Job { manga_id: manga_id.to_string(), state: Arc::new(Mutex::new((0., label.to_string()))), cancel: Arc::new(AtomicBool::new(false)) }
+        Job { manga_id: manga_id.to_string(), state: Arc::new(Mutex::new((0., label.to_string()))), cancel: Arc::new(AtomicBool::new(false)), phase: Mutex::new((label.to_string(), Instant::now())) }
+    }
+
+    /// Seconds left of the current step, once there is enough progress to tell (each step, e.g.
+    /// joining then saving, is timed on its own).
+    pub(crate) fn eta(&self) -> Option<f32> {
+        let (p, label) = self.snapshot();
+        let mut ph = self.phase.lock().ok()?;
+        if ph.0 != label {
+            *ph = (label, Instant::now());
+            return None;
+        }
+        crate::vedit_tl::eta(ph.1.elapsed().as_secs_f32(), p)
     }
 
     pub(crate) fn reporter(&self) -> Reporter {
@@ -820,6 +834,90 @@ pub(crate) struct Extras {
     pub font: Option<PathBuf>,
     /// The size to scale to (source: keep it).
     pub quality: Quality,
+    /// The video encoder's arguments (an `encode` preset: GPU or x264/x265) instead of
+    /// `quality`'s x264 ones; the picture is always re-encoded then.
+    pub codec: Option<Vec<String>>,
+    /// An audio filter run over the sound (loudness normalisation); the audio is re-encoded.
+    pub loudnorm: Option<String>,
+}
+
+impl Extras {
+    fn video_args(&self) -> Vec<String> {
+        self.codec.clone().unwrap_or_else(|| self.quality.video_args())
+    }
+
+    /// Audio arguments for a stream straight from an input: copied, or filtered and re-encoded.
+    fn audio_args(&self, copy: bool) -> Vec<String> {
+        match &self.loudnorm {
+            Some(f) => vec!["-af".into(), f.clone(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()],
+            None if copy => vec!["-c:a".into(), "copy".into()],
+            None => vec!["-c:a".into(), "aac".into()],
+        }
+    }
+}
+
+/// The Video mode's export: one of `encode`'s presets over the same join and export as the
+/// dashboard's (the rendered chapter videos, so the file is what the preview and Render made).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PresetExport {
+    pub preset: crate::encode::Preset,
+    pub quality: crate::encode::Quality,
+    /// Use a GPU encoder when one works here.
+    pub gpu: bool,
+    /// Normalise to YouTube's -14 LUFS.
+    pub loudness: bool,
+    pub music: bool,
+}
+
+impl Default for PresetExport {
+    fn default() -> Self {
+        PresetExport { preset: crate::encode::Preset::Youtube1080, quality: crate::encode::Quality::Standard, gpu: true, loudness: true, music: true }
+    }
+}
+
+impl PresetExport {
+    /// Shorts / Reels cut the recap into upright reels of up to a minute; the rest make one video.
+    pub(crate) fn mode(&self) -> Mode {
+        if self.preset == crate::encode::Preset::Shorts {
+            Mode::Reels
+        } else {
+            Mode::Whole
+        }
+    }
+
+    /// The frame size, as the dashboard export names it.
+    pub(crate) fn size(&self) -> Quality {
+        match self.preset {
+            crate::encode::Preset::Youtube4k => Quality::K4,
+            crate::encode::Preset::Draft720 => Quality::P720,
+            _ => Quality::P1080,
+        }
+    }
+
+    /// The file name's tag.
+    pub(crate) fn tag(&self) -> &'static str {
+        match self.preset {
+            crate::encode::Preset::Youtube1080 => "1080p",
+            crate::encode::Preset::Youtube4k => "4K",
+            crate::encode::Preset::Shorts => "Shorts",
+            crate::encode::Preset::Draft720 => "Draft 720p",
+        }
+    }
+
+    /// The export settings for `enc` (the encoders usable here).
+    pub(crate) fn extras(&self, enc: &crate::encode::Encoders) -> Extras {
+        Extras {
+            quality: self.size(),
+            codec: Some(crate::encode::video_codec_args(self.preset, self.quality, enc)),
+            loudnorm: self.loudness.then(|| loudness_filter(-14.)),
+            ..Extras::default()
+        }
+    }
+}
+
+/// The loudness filter an export runs: EBU R128 to `lufs`, back at 48 kHz (loudnorm works at 192).
+pub(crate) fn loudness_filter(lufs: f64) -> String {
+    format!("{},aresample=48000", crate::encode::loudnorm_filter(lufs))
 }
 
 /// Filter joining the hook (input 0, its audio track `hook_track`) and the joined video (input
@@ -833,13 +931,6 @@ pub(crate) fn hook_concat_graph(hook_track: usize, track: usize, w: u32, h: u32,
          [1:a:{track}]{af}[ja];\
          [hv][ha][jv][ja]concat=n=2:v=1:a=1[{video}][a]"
     )
-}
-
-/// x264 video at `q`'s settings plus AAC audio.
-fn h264(q: Quality) -> Vec<String> {
-    let mut a = q.video_args();
-    a.extend(["-c:a", "aac"].map(String::from));
-    a
 }
 
 /// Writes the export of `j` into `out_dir`: one file, or (for parts and reels) a folder of them,
@@ -878,9 +969,16 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
                 graph.push(';');
                 graph.push_str(&watermark_graph(&m.wm, "cv", "v", w, h, 2));
             }
-            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), "[a]".into()]);
-            args.extend(h264(q));
-            args.extend(["-b:a".into(), "192k".into()]);
+            let a = match &extras.loudnorm {
+                Some(f) => {
+                    graph.push_str(&format!(";[a]{f}[an]"));
+                    "[an]"
+                }
+                None => "[a]",
+            };
+            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), a.into()]);
+            args.extend(extras.video_args());
+            args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
         } else if let Some(m) = &mark {
             args = vec!["-i".into(), src.clone()];
             args.extend(m.inputs());
@@ -889,14 +987,19 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
                 None => watermark_graph(&m.wm, "0:v:0", "v", w, h, 1),
             };
             args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), format!("0:a:{track}")]);
-            args.extend(q.video_args());
-            args.extend(["-c:a".into(), "copy".into()]);
+            args.extend(extras.video_args());
+            args.extend(extras.audio_args(true));
         } else if let Some(sc) = &scale {
             args = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}"), "-vf", sc].map(String::from).to_vec();
-            args.extend(q.video_args());
-            args.extend(["-c:a".into(), "copy".into()]);
+            args.extend(extras.video_args());
+            args.extend(extras.audio_args(true));
         } else {
-            args = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}"), "-c", "copy"].map(String::from).to_vec();
+            args = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}")].map(String::from).to_vec();
+            match extras.codec {
+                Some(_) => args.extend(extras.video_args()),
+                None => args.extend(["-c:v".into(), "copy".into()]),
+            }
+            args.extend(extras.audio_args(true));
         }
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
         let (from, label) = if hook.is_some() { (0.4, "Saving the video with its hook") } else { (0., "Saving the video") };
@@ -950,7 +1053,8 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
             None => args.extend(["-map".into(), "0:v:0".into()]),
         }
         args.extend(["-map".into(), format!("0:a:{track}")]);
-        args.extend(h264(q));
+        args.extend(extras.video_args());
+        args.extend(extras.audio_args(false));
         args.extend(["-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"].map(String::from));
         args.push(tmp.to_string_lossy().into());
         let label = format!("{} {} of {n}", if mode == Mode::Reels { "Reel" } else { "Part" }, k + 1);
@@ -1179,7 +1283,7 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
     };
     let res = match res {
         Ok(()) => mv_ui::bg::blocking(move || {
-            let extras = Extras { hook: hook_path, watermark: load_watermark(&video_look_path()), font, quality: prefs.quality };
+            let extras = Extras { hook: hook_path, watermark: load_watermark(&video_look_path()), font, quality: prefs.quality, ..Extras::default() };
             let out = export(&j, prefs.mode(), prefs.music, &dir, &name, &extras, &r);
             if let Some(d) = hook_dir {
                 let _ = std::fs::remove_dir_all(d);
@@ -1371,6 +1475,83 @@ impl StudioPage {
             });
         })
         .detach();
+    }
+
+    /// The Video mode's Export: asks for a folder, joins the rendered chapters and saves them with
+    /// `p`'s preset (GPU encoder when one works and `p.gpu`, loudness when asked), with the Look's
+    /// watermark like every export. Progress, time left and Cancel are `export_job`.
+    pub(crate) fn start_preset_export(&mut self, g: &MangaGroup, p: PresetExport, window: &mut Window, cx: &mut Context<Self>) {
+        let videos = self.made_videos(g);
+        if videos.is_empty() || self.export_busy() {
+            return;
+        }
+        let name = format!("{} ({})", export_name(&g.title, &videos.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>()), p.tag());
+        let group = g.clone();
+        let font = mark_font(self.setup.read(cx).env.as_ref());
+        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Export here".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else { return };
+            let Some(dir) = paths.into_iter().next() else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.with_joined(
+                    &group,
+                    "Joining the chapters",
+                    move |_, j, r, window, cx| {
+                        let r = r.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            let res = mv_ui::bg::blocking(move || {
+                                let enc = crate::encode::usable(p.gpu);
+                                let codec = enc.pick(p.preset == crate::encode::Preset::Youtube4k).name();
+                                let extras = Extras { watermark: load_watermark(&video_look_path()), font, ..p.extras(&enc) };
+                                export(&j, p.mode(), p.music, &dir, &name, &extras, &r).map(|files| (files, codec))
+                            })
+                            .await
+                            .and_then(|r| r);
+                            let _ = this.update(cx, |this, cx| {
+                                this.export_job = None;
+                                match res {
+                                    Ok((files, codec)) => {
+                                        let n = files.len();
+                                        let shown = files.first().cloned().unwrap_or_default();
+                                        let what = if p.mode() == Mode::Reels { format!("{n} reel{}", plural(n)) } else { "the video".to_string() };
+                                        toast::show(cx, Toast::success(format!("Exported {what} · {} · {codec}{}", p.preset.label(), if p.loudness { " · -14 LUFS" } else { "" })).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
+                                    }
+                                    Err(e) if e.to_string() == CANCELLED => toast::show(cx, Toast::info("Export cancelled")),
+                                    Err(e) => toast::show(cx, Toast::error(format!("Could not export: {e:#}"))),
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// The export in flight (this manga's or another's): progress, label, time left; and Cancel.
+    pub(crate) fn export_progress(&self, id: &'static str, g: &MangaGroup, cx: &mut Context<Self>) -> Option<Div> {
+        let job = self.export_job.as_ref()?;
+        let (p, label) = job.snapshot();
+        let here = job.manga_id == g.id;
+        let eta = job.eta().map(|s| format!(" · about {} left", fmt_duration(s as f64))).unwrap_or_default();
+        let text = format!("{label}{}{eta}", if here { "" } else { " (another manga)" });
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(space::SM))
+                .child(div().flex_1().child(crate::phases::progress_line(id, p, text)))
+                .child(icon_button(SharedString::from(format!("{id}-cancel")), ph::X, "Cancel").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if let Some(j) = &this.export_job {
+                        j.cancel.store(true, Ordering::Relaxed);
+                    }
+                    cx.notify();
+                }))),
+        )
     }
 
     /// The manga's Video card: the made chapters as one video, to play or export.
@@ -1672,6 +1853,37 @@ mod tests {
     }
 
     #[test]
+    fn video_mode_presets_drive_the_same_export() {
+        use crate::encode::{Encoder, Encoders, Preset};
+        let gpu = Encoders { available: vec![Encoder::H264Nvenc, Encoder::HevcNvenc, Encoder::Libx264] };
+        let p = super::PresetExport::default();
+        assert_eq!((p.mode(), p.size(), p.tag()), (Mode::Whole, Quality::P1080, "1080p"));
+        let x = p.extras(&gpu);
+        assert_eq!(&x.video_args()[..2], ["-c:v", "h264_nvenc"]);
+        assert_eq!(x.audio_args(true)[..2], ["-af".to_string(), super::loudness_filter(-14.)]);
+        assert!(super::loudness_filter(-14.).starts_with("loudnorm=I=-14:TP=-1.5:LRA=11") && super::loudness_filter(-14.).ends_with("aresample=48000"));
+        let k = super::PresetExport { preset: Preset::Youtube4k, loudness: false, ..p };
+        let x = k.extras(&gpu);
+        assert_eq!(x.quality, Quality::K4);
+        assert_eq!(&x.video_args()[..2], ["-c:v", "hevc_nvenc"]);
+        assert_eq!(x.audio_args(true), ["-c:a", "copy"]);
+        assert_eq!(x.audio_args(false), ["-c:a", "aac"]);
+        let s = super::PresetExport { preset: Preset::Shorts, ..p };
+        assert_eq!((s.mode(), s.size().reel_size()), (Mode::Reels, (1080, 1920)));
+        assert_eq!(super::PresetExport { preset: Preset::Draft720, ..p }.size(), Quality::P720);
+        // Without an encode preset the dashboard's x264 settings stay.
+        assert_eq!(Extras::default().video_args(), Quality::Source.video_args());
+    }
+
+    #[test]
+    fn eta_waits_for_progress_and_restarts_each_step() {
+        let job = Job::new("m", "Joining");
+        assert_eq!(job.eta(), None);
+        job.reporter().set(0.5, "Saving");
+        assert_eq!(job.eta(), None, "a new step restarts the clock");
+    }
+
+    #[test]
     fn scaling_keeps_the_aspect_and_even_sides() {
         assert_eq!(scaled_size((1920, 1080), 2160), (3840, 2160));
         assert_eq!(scaled_size((1920, 1080), 720), (1280, 720));
@@ -1733,6 +1945,7 @@ mod tests {
             font: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../python/fonts/Inter-ExtraBold.ttf")),
             // MV_EXPORT_QUALITY=4k|1440p|1080p|720p: scale to that size.
             quality: Quality::ALL.into_iter().find(|q| std::env::var("MV_EXPORT_QUALITY").is_ok_and(|v| v.eq_ignore_ascii_case(q.label()))).unwrap_or_default(),
+            ..Extras::default()
         };
         println!("watermark: {:?}", extras.watermark);
         for mode in modes {
