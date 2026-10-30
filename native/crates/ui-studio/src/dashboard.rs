@@ -113,6 +113,15 @@ pub(crate) fn range(order: &[String], anchor: &str, to: &str) -> Vec<String> {
 }
 
 /// The number on a tile ("12", "3.5", or "#4" for unnumbered chapters).
+/// The chapters a button acts on, by name when there are few: "Ch. 31", "Ch. 4, Ch. 7",
+/// "5 chapters" (a count alone read like a chapter number: "Redo 1 chapter").
+pub(crate) fn chapters_phrase(chapters: &[ChapterItem]) -> String {
+    match chapters.len() {
+        1..=3 => chapters.iter().map(|c| pipeline::short_label(c.number, c.title.as_deref())).collect::<Vec<_>>().join(", "),
+        n => format!("{n} chapters"),
+    }
+}
+
 fn tile_number(c: &ChapterItem, i: usize) -> String {
     match c.number {
         Some(n) if n.fract() == 0.0 => format!("{}", n as i64),
@@ -652,14 +661,10 @@ impl StudioPage {
             .into_any_element()
     }
 
-    /// Picks chapters (and queues them when Generate is running).
+    /// Picks chapters. Picking only selects: nothing runs until Generate or Redo is pressed.
     fn pick_many(&mut self, ids: &[String], cx: &mut Context<Self>) {
-        let Load::Ready(groups) = &self.library else { return };
-        let items: Vec<ChapterItem> = groups.iter().flat_map(|g| g.chapters.iter()).filter(|c| ids.contains(&c.id)).cloned().collect();
-        for c in &items {
-            if self.dash_pick.insert(c.id.clone()) {
-                self.append_if_generating(c, cx);
-            }
+        for id in ids {
+            self.dash_pick.insert(id.clone());
         }
         cx.notify();
     }
@@ -675,7 +680,7 @@ impl StudioPage {
             word,
             Phase::ALL.iter().map(|p| format!("{} {}", p.label(), if p.done(&st) { "✓" } else { "–" })).collect::<Vec<_>>().join("  ")
         );
-        let (id, order, item) = (c.id.clone(), order.to_vec(), c.clone());
+        let (id, order) = (c.id.clone(), order.to_vec());
         let running = matches!(t, Tile::Running(_));
         div()
             .id(("dash-tile", i))
@@ -732,7 +737,6 @@ impl StudioPage {
                 this.dash_anchor = Some(id.clone());
                 if !this.dash_pick.remove(&id) {
                     this.dash_pick.insert(id.clone());
-                    this.append_if_generating(&item, cx);
                 }
                 cx.notify();
             }))
@@ -795,7 +799,6 @@ impl StudioPage {
                 .child(div().flex_1().min_w(px(200.)).child("Pick the chapters to turn into recaps, then press Generate. Shift-click picks a range."))
                 .into_any_element();
         }
-        let generating = self.gen_answers.is_some() && self.queue.active() > 0;
         let queued = picked.iter().filter(|c| self.queue.for_chapter(&c.id).is_some_and(|i| i.state.active())).count();
         let fresh: Vec<ChapterItem> = picked.iter().filter(|c| !self.queue.for_chapter(&c.id).is_some_and(|i| i.state.active())).cloned().collect();
         let made = picked.iter().filter(|c| self.statuses.get(&c.id).is_some_and(|s| s.video.is_some())).count();
@@ -803,7 +806,6 @@ impl StudioPage {
         let names = if names.len() > 8 { format!("{} and {} more", names[..8].join(", "), names.len() - 8) } else { names.join(", ") };
         let note = match (queued, made) {
             _ if self.dash_redo.is_some() => format!("{} made again, even where done", crate::generate::redo_summary(self.dash_redo.unwrap_or(Step::Video))),
-            (q, _) if q > 0 && generating => format!("{q} already in the queue; new picks join it"),
             (q, _) if q > 0 => format!("{q} already in the queue"),
             (_, m) if m > 0 => format!("{m} already ha{} a video; only missing steps run (use Redo to make steps again)", if m == 1 { "s" } else { "ve" }),
             _ => "Read → Transcript → Story → Audio → Music → Video, skipping steps already made".to_string(),
@@ -838,13 +840,13 @@ impl StudioPage {
             .child(self.redo_menu(cx))
             .child(match self.dash_redo {
                 // A redo takes every pick, queued or not (a waiting chapter gets the redo added).
-                Some(r) => btn("dash-generate", format!("Redo {} from {}", if n == 1 { "1 chapter".to_string() } else { format!("{n} chapters") }, r.label()), ButtonKind::Primary)
+                Some(r) => btn("dash-generate", format!("Redo {} from {}", chapters_phrase(picked), r.label()), ButtonKind::Primary)
                     .icon(ph::ARROWS_CLOCKWISE)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let redo = this.dash_redo;
                         this.open_generate(to_open.clone(), redo, cx);
                     })),
-                None => btn("dash-generate", if fresh.is_empty() { "Already queued".to_string() } else { format!("Generate {}", if fresh.len() == 1 { "1 chapter".to_string() } else { format!("{} chapters", fresh.len()) }) }, ButtonKind::Primary)
+                None => btn("dash-generate", if fresh.is_empty() { "Already queued".to_string() } else { format!("Generate {}", chapters_phrase(&fresh)) }, ButtonKind::Primary)
                     .icon(ph::ROCKET_LAUNCH)
                     .when(fresh.is_empty(), |b| b.disabled("Every picked chapter is already in the queue"))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -880,6 +882,29 @@ mod tests {
         assert_eq!(tile_state("a", Some(&part), &q, None), Tile::Failed(Step::Audio));
         assert!(Filter::Failed.matches(Tile::Failed(Step::Audio)));
         assert!(Filter::InProgress.matches(Tile::Queued) && !Filter::InProgress.matches(Tile::Done));
+    }
+
+    #[test]
+    fn buttons_name_the_picked_chapters() {
+        use super::chapters_phrase;
+        use crate::data::ChapterItem;
+        let ch = |n: f64| ChapterItem {
+            id: format!("c{n}"),
+            manga_id: "m".into(),
+            manga_title: "M".into(),
+            number: Some(n),
+            title: None,
+            pages_dir: Default::default(),
+            output_dir: Default::default(),
+            page_count: 0,
+            has_text: false,
+            video: None,
+            audio_files: 0,
+        };
+        // One picked chapter 31 reads "Ch. 31", never "1 chapter" (which read like chapter 1).
+        assert_eq!(chapters_phrase(&[ch(31.)]), "Ch. 31");
+        assert_eq!(chapters_phrase(&[ch(4.), ch(7.)]), "Ch. 4, Ch. 7");
+        assert_eq!(chapters_phrase(&[ch(1.), ch(2.), ch(3.), ch(4.)]), "4 chapters");
     }
 
     #[test]
