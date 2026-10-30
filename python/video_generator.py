@@ -48,7 +48,106 @@ FG_WINDOW = {
     "pan_right": ("{e}", "0.5"), "pan_left": ("(1-{e})", "0.5"),
 }
 # Bumped whenever the look of a rendered clip changes, so cached clips are not reused.
-CLIP_VERSION = 3
+CLIP_VERSION = 4
+
+# Looks (Studio → Video → Look): how panels are laid out and move, which transitions turn the
+# page, and what the finished picture gets. "duo" puts tall panels side by side like the big
+# manhwa recap channels: each new one slides into the older one's place while the other stays.
+# "punch" snaps action beats in with a zoom, a shake and a white flash.
+LOOKS = {
+    "clean": {
+        "duo": False, "punch": False, "push": FG_PUSH, "transitions": PAGE_TRANSITIONS,
+        "grade": False, "vignette": False, "grain": False, "glow": False, "impact": False,
+    },
+    "cinematic": {
+        "duo": False, "punch": False, "push": 0.06, "transitions": ["fade", "fadeblack", "smoothleft", "fade"],
+        "grade": True, "vignette": True, "grain": True, "glow": True, "impact": False,
+    },
+    "recap": {
+        "duo": True, "punch": False, "push": FG_PUSH, "transitions": ["smoothleft", "smoothup", "fade", "smoothright"],
+        "grade": True, "vignette": True, "grain": False, "glow": False, "impact": False,
+    },
+    "dynamic": {
+        "duo": True, "punch": True, "push": 0.08,
+        "transitions": ["smoothleft", "zoomin", "smoothup", "circleopen", "smoothright", "slidedown"],
+        "grade": True, "vignette": True, "grain": False, "glow": True, "impact": True,
+    },
+}
+DEFAULT_LOOK = "dynamic"
+# Effects the user can switch on or off over a look.
+LOOK_EFFECTS = ("grade", "vignette", "grain", "glow", "impact")
+# Duo layout: panels narrower than this (w/h) pair up; frame edge and middle gap (of the
+# width); the narrowest a panel is drawn (of its half), taller ones pan down instead.
+DUO_MAX_ASPECT = 0.9
+DUO_OUTER = 0.04
+DUO_GAP = 0.025
+DUO_MIN_FILL = 0.72
+# How the new panel arrives (seconds, and how far it slides as a share of the frame width)
+# and how long the background takes to turn into the new panel's.
+DUO_SLIDE = 0.45
+DUO_SLIDE_DIST = 0.06
+DUO_BG_FADE = 0.5
+# Action beats: at most one in this many clips gets the punch, which lasts this long.
+IMPACT_GAP = 4
+IMPACT_SEC = 0.4
+IMPACT_WORDS = re.compile(
+    r"\b(explo\w*|blast\w*|strik\w*|slam\w*|smash\w*|punch\w*|crash\w*|roar\w*|scream\w*|"
+    r"shatter\w*|clash\w*|slash\w*|attack\w*|erupt\w*|thunder\w*|kill\w*|destroy\w*|rage|charg\w*)\b",
+    re.I,
+)
+
+
+def resolve_look(value):
+    """The look a render uses: a preset name, or {"preset": ..., <effect>: bool, ...} with
+    the user's effect switches over the preset's own. Unknown presets fall back to the default."""
+    if isinstance(value, str):
+        value = {"preset": value}
+    value = value if isinstance(value, dict) else {}
+    name = value.get("preset") if value.get("preset") in LOOKS else DEFAULT_LOOK
+    look = dict(LOOKS[name], preset=name)
+    for k in LOOK_EFFECTS:
+        if isinstance(value.get(k), bool):
+            look[k] = value[k]
+    return look
+
+
+def is_impact(text):
+    """An action beat: an exclamation or a word of violence or force in its narration."""
+    return bool(text) and ("!" in text or IMPACT_WORDS.search(text) is not None)
+
+
+def duo_geometry(iw, ih, w, h, slot):
+    """Where a panel of iw x ih sits in a w x h frame's left (slot 0) or right (slot 1) half:
+    drawn at `size`, with `vis` rows visible from `pos`; `slack` rows (a tall panel) pan by."""
+    outer = round(w * DUO_OUTER)
+    slot_w = (w - 2 * outer - round(w * DUO_GAP)) // 2
+    dw = min(slot_w, max(round(slot_w * DUO_MIN_FILL), round(iw * h / ih))) // 2 * 2
+    dh = max(2, round(ih * dw / iw) // 2 * 2)
+    vis = min(dh, h)
+    cx = outer + slot_w / 2 if slot == 0 else w - outer - slot_w / 2
+    return {"size": (dw, dh), "vis": vis, "pos": (int(cx - dw / 2) // 2 * 2, (h - vis) // 4 * 2), "slack": dh - vis}
+
+
+def look_filters(look, w, h, src, out):
+    """Finishing filters for `look` on [src] (a w x h picture), labelled [out]: a gentle grade,
+    a vignette and fine film grain, each only when the look has it on. (The glow is baked into
+    each still instead: it would cost more than the rest together per frame.)"""
+    parts = []
+    cur = src
+    if look.get("grade"):
+        # One lookup table (fast): a little contrast around the mid-darks, richer and warmer colour.
+        parts.append(
+            f"[{cur}]lutyuv=y='clip((val-100)*1.08+100,0,255)':"
+            f"u='clip(126+(val-128)*1.18,0,255)':v='clip(130+(val-128)*1.18,0,255)'[{out}_g]"
+        )
+        cur = f"{out}_g"
+    tail = []
+    if look.get("vignette"):
+        tail.append("vignette=angle=PI/6")
+    if look.get("grain"):
+        tail.append("noise=alls=4:allf=t")
+    parts.append(f"[{cur}]{','.join(tail) if tail else 'null'}[{out}]")
+    return ";".join(parts)
 
 
 def check_ffmpeg():
@@ -185,16 +284,20 @@ def combine_audio_files(audio_paths, output_path):
 
 # ── Timeline planning (pure helpers) ──
 
-def plan_transitions(durations, pages, kind="crossfade", base=0.5):
+def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, joins=None):
     """Plan crossfades between clips of `durations` seconds without moving the narration.
 
     Returns (starts, trans): starts[k] is when clip k's narration begins (running sum)
     and trans[k] = (xfade transition, seconds) for the change into clip k (trans[0] is
     None). Each clip's video runs on for trans[k + 1] seconds past its narration, so the
     fade into clip k begins exactly at starts[k] and the total stays sum(durations).
-    Same-page beats dissolve quickly, page changes rotate through PAGE_TRANSITIONS, short
-    clips get shorter fades, and kind "none" gives one-frame (hard) cuts.
+    Same-page beats dissolve quickly, page changes rotate through `names` (default
+    PAGE_TRANSITIONS), short clips get shorter fades, and kind "none" gives one-frame (hard)
+    cuts. joins[k] "cut" cuts into clip k (it animates its own entrance: a duo slide) and
+    "impact" makes it a quick dissolve (the clip flashes in itself).
     """
+    names = names or PAGE_TRANSITIONS
+    joins = joins or [None] * len(durations)
     starts = []
     t = 0.0
     for d in durations:
@@ -204,12 +307,14 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5):
     trans = [None]
     turn = 0
     for k in range(1, len(durations)):
-        if kind == "none":
+        if kind == "none" or joins[k] == "cut":
             name, dur = "fade", frame
+        elif joins[k] == "impact":
+            name, dur = "fade", 0.12
         elif pages[k] == pages[k - 1]:
             name, dur = SAME_PAGE_TRANSITION[0], min(SAME_PAGE_TRANSITION[1], base)
         else:
-            name, dur = PAGE_TRANSITIONS[turn % len(PAGE_TRANSITIONS)], base
+            name, dur = names[turn % len(names)], base
             turn += 1
         dur = max(frame, min(dur, 0.45 * durations[k - 1], 0.45 * durations[k]))
         trans.append((name, round(dur, 3)))
@@ -344,12 +449,53 @@ def _crop_to_focus(page_image, focus_point, aspect, out_path):
     return out_path
 
 
-def _prepare_clip_images(src, idx, w, h, fill, work_dir):
+def _blurred_fill(img, w, h):
+    """The frame-sized background: `img` zoomed in past "cover", blurred, desaturated, darkened."""
+    from PIL import Image, ImageEnhance, ImageFilter
+    iw, ih = img.size
+    # Blur at 1/8 size (much cheaper, and smoother once scaled back up).
+    sw, sh = max(16, w // 8), max(16, h // 8)
+    cover = max(sw / iw, sh / ih) * BG_ZOOM
+    small = img.resize((max(sw, round(iw * cover)), max(sh, round(ih * cover))), Image.BOX)
+    left = (small.width - sw) // 2
+    top = (small.height - sh) // 2
+    small = small.crop((left, top, left + sw, top + sh))
+    small = small.filter(ImageFilter.GaussianBlur(radius=max(2.0, sw * 0.03)))
+    small = ImageEnhance.Color(small).enhance(0.6)
+    small = ImageEnhance.Brightness(small).enhance(0.55)
+    return small.resize((w, h), Image.BICUBIC).filter(ImageFilter.GaussianBlur(radius=max(2, w // 400)))
+
+
+def _bloom(img):
+    """A soft glow on a still: a blurred quarter-size copy screened over it, the highlights most."""
+    from PIL import Image, ImageChops, ImageEnhance, ImageFilter
+    small = img.resize((max(1, img.width // 4), max(1, img.height // 4)), Image.BOX)
+    small = small.filter(ImageFilter.GaussianBlur(radius=max(2.0, small.width / 60)))
+    glow = ImageEnhance.Brightness(small.resize(img.size, Image.BICUBIC)).enhance(0.14)
+    return ImageChops.screen(img, glow)
+
+
+def _prepare_duo_images(src, idx, w, h, slot, work_dir, glow=False):
+    """Stills for a duo clip: the panel at its drawn size for `slot`, and the blurred fill."""
+    from PIL import Image
+    img = Image.open(src)
+    img.load()
+    img = img.convert("RGB")
+    geo = duo_geometry(img.width, img.height, w, h, slot)
+    fg_path = os.path.join(work_dir, f"dfg_{idx:04d}.jpg")
+    fg = img.resize(geo["size"], Image.LANCZOS)
+    (_bloom(fg) if glow else fg).save(fg_path, "JPEG", quality=95)
+    bg_path = os.path.join(work_dir, f"dbg_{idx:04d}.jpg")
+    _blurred_fill(img, w, h).save(bg_path, "JPEG", quality=92)
+    return {"fg": fg_path, "bg": bg_path, "geo": geo}
+
+
+def _prepare_clip_images(src, idx, w, h, fill, work_dir, glow=False):
     """Write this clip's stills: the upscaled panel and the frame-sized background it sits on.
     For the blurred fill the background is the panel zoomed in past "cover", blurred, darkened
     and desaturated, with the panel's soft drop shadow baked in; otherwise black. The
     background never moves, so it is composed once here. Returns where everything goes."""
-    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+    from PIL import Image, ImageDraw, ImageFilter
 
     img = Image.open(src)
     img.load()
@@ -365,21 +511,12 @@ def _prepare_clip_images(src, idx, w, h, fill, work_dir):
     fy = (h - fh) // 4 * 2
 
     fg_path = os.path.join(work_dir, f"fg_{idx:04d}.jpg")
-    img.resize((fw, fh), Image.LANCZOS).save(fg_path, "JPEG", quality=95)
+    fg = img.resize((fw, fh), Image.LANCZOS)
+    (_bloom(fg) if glow else fg).save(fg_path, "JPEG", quality=95)
 
     bg_path = os.path.join(work_dir, f"bg_{idx:04d}.jpg")
     if blur:
-        # Blur at 1/8 size (much cheaper, and smoother once scaled back up).
-        sw, sh = max(16, w // 8), max(16, h // 8)
-        cover = max(sw / iw, sh / ih) * BG_ZOOM
-        small = img.resize((max(sw, round(iw * cover)), max(sh, round(ih * cover))), Image.BOX)
-        left = (small.width - sw) // 2
-        top = (small.height - sh) // 2
-        small = small.crop((left, top, left + sw, top + sh))
-        small = small.filter(ImageFilter.GaussianBlur(radius=max(2.0, sw * 0.03)))
-        small = ImageEnhance.Color(small).enhance(0.6)
-        small = ImageEnhance.Brightness(small).enhance(0.55)
-        bg = small.resize((w, h), Image.BICUBIC).filter(ImageFilter.GaussianBlur(radius=max(2, w // 400)))
+        bg = _blurred_fill(img, w, h)
         # Soft drop shadow where the panel sits.
         pad = max(8, round(min(w, h) * 0.04))
         mask = Image.new("L", (fw + 2 * pad, fh + 2 * pad), 0)
@@ -409,23 +546,24 @@ def clip_key(src, focus, motion, frames, w, h, fill):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
-def _render_clip(clip, frames, w, h, out_path):
-    """Render one clip's video (no audio): the still background with the Ken Burns panel on it."""
-    imgs = clip["images"]
-    motion = clip["motion"]
-    # Short clips move proportionally less, so a half-second beat never lurches.
-    k = min(1.0, frames / (3.0 * FPS))
-    fg_zoom = _motion_zoom(motion, round(FG_PUSH * k, 4), round(1 + (FG_PAN_ZOOM - 1) * k, 4))
-    fx, fy = imgs["fg_pos"]
-    graph = [
-        f"[0:v]format=yuv420p,setsar=1,loop=loop={max(0, frames - 1)}:size=1:start=0,setpts=N/{FPS}/TB[bg]",
-        f"[1:v]{_warp(FG_WINDOW[motion], fg_zoom, frames, 'cubic')},format=yuv420p,setsar=1[fg]",
-        f"[bg][fg]overlay={fx}:{fy},format=yuv420p[v]",
-    ]
+def _shake(amount, axis):
+    """Overlay offset (pixels, of overlay time t) for a camera jolt that dies out in IMPACT_SEC."""
+    if amount <= 0:
+        return "0"
+    f = "sin" if axis == "x" else "cos"
+    return f"{amount}*{f}(2*PI*t*{13 if axis == 'x' else 11})*exp(-t*{round(3.5 / IMPACT_SEC, 2)})"
+
+
+def _flash(impact):
+    """A white flash fading into the picture at an action beat."""
+    return f",eq=brightness='0.35*pow(max(0,1-t/{IMPACT_SEC}),2)':eval=frame" if impact else ""
+
+
+def _encode_clip(inputs, graph, frames, out_path):
     tmp = out_path + ".part.mp4"
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", imgs["bg"], "-i", imgs["fg"],
+        *inputs,
         "-filter_complex", ";".join(graph),
         "-map", "[v]", "-frames:v", str(frames), "-r", str(FPS),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
@@ -435,6 +573,100 @@ def _render_clip(clip, frames, w, h, out_path):
     if result.returncode != 0 or not os.path.exists(tmp):
         raise RuntimeError(f"clip render failed: {result.stderr[:300]}")
     os.replace(tmp, out_path)
+
+
+def _render_clip(clip, frames, w, h, out_path):
+    """Render one clip's video (no audio): the still background with the Ken Burns panel on it.
+    An action beat ("punch") snaps in from a zoom, jolts and flashes white."""
+    if clip.get("duo"):
+        return _render_duo_clip(clip, frames, w, h, out_path)
+    imgs = clip["images"]
+    motion = clip["motion"]
+    impact = clip.get("impact", False)
+    # Short clips move proportionally less, so a half-second beat never lurches.
+    k = min(1.0, frames / (3.0 * FPS))
+    push = round(clip.get("push", FG_PUSH) * k, 4)
+    fg_zoom = _motion_zoom(motion, push, round(1 + (FG_PAN_ZOOM - 1) * k, 4))
+    window = FG_WINDOW[motion]
+    if impact and motion != "still":
+        n = max(2, round(IMPACT_SEC * FPS * 0.6))
+        fg_zoom = f"1+0.12*pow(1-min(1,on/{n}),3)+{push}*{{e}}"
+        window = FG_WINDOW["push"]
+    fx, fy = imgs["fg_pos"]
+    jolt = round(h * 0.012) if impact else 0
+    graph = [
+        f"[0:v]format=yuv420p,setsar=1,loop=loop={max(0, frames - 1)}:size=1:start=0,setpts=N/{FPS}/TB[bg]",
+        f"[1:v]{_warp(window, fg_zoom, frames, 'cubic')},format=yuv420p,setsar=1[fg]",
+        f"[bg][fg]overlay=x='{fx}+{_shake(jolt, 'x')}':y='{fy}+{_shake(jolt, 'y')}':eval=frame{_flash(impact)},format=yuv420p[v]",
+    ]
+    _encode_clip(["-i", imgs["bg"], "-i", imgs["fg"]], graph, frames, out_path)
+
+
+def _render_duo_clip(clip, frames, w, h, out_path):
+    """Render a duo clip: two tall panels side by side over a blurred fill. The new panel slides
+    and fades into its half (panning down if it is taller than the frame) while the background
+    turns into its blur; the other half keeps the previous panel where it stopped. A "hold"
+    (the same panel again) shows it still; an action beat arrives faster, jolts and flashes."""
+    d = clip["duo"]
+    impact = clip.get("impact", False)
+    loop = f"loop=loop={max(0, frames - 1)}:size=1:start=0,setpts=N/{FPS}/TB"
+    inputs, graph = [], []
+
+    def add(path):
+        inputs.extend(["-i", path])
+        return len(inputs) // 2 - 1
+
+    hold = d.get("hold", False)
+    b = add(d["bg"])
+    if d.get("bg_prev") and not hold:
+        p = add(d["bg_prev"])
+        # The old background fades out over the new one, blended only while it shows.
+        graph.append(f"[{b}:v]format=yuv420p,setsar=1,{loop}[b1]")
+        graph.append(f"[{p}:v]format=yuva420p,setsar=1,{loop},fade=t=out:st=0:d={DUO_BG_FADE}:alpha=1[b0]")
+        graph.append(f"[b1][b0]overlay=0:0:enable='lt(t,{DUO_BG_FADE})'[bg]")
+    else:
+        graph.append(f"[{b}:v]format=yuv420p,setsar=1,{loop}[bg]")
+    cur = "bg"
+    jolt = round(h * 0.012) if impact else 0
+    sx, sy = _shake(jolt, "x"), _shake(jolt, "y")
+
+    partner = d.get("partner")
+    if partner:
+        g = partner["geo"]
+        i = add(partner["fg"])
+        dw, _ = g["size"]
+        graph.append(f"[{i}:v]format=yuv420p,setsar=1,crop={dw}:{g['vis']}:0:{g['slack']},{loop}[pp]")
+        px, py = g["pos"]
+        graph.append(f"[{cur}][pp]overlay=x='{px}+{sx}':y='{py}+{sy}':eval=frame[c1]")
+        cur = "c1"
+
+    g = d["geo"]
+    dw, _ = g["size"]
+    x0, y0 = g["pos"]
+    i = add(d["fg"])
+    move = max(2, d.get("move_frames", frames))
+    if hold or g["slack"] <= 0:
+        fg = f"[{i}:v]format=yuv420p,setsar=1,crop={dw}:{g['vis']}:0:{g['slack'] if hold else 0},{loop}"
+    else:
+        e = f"(0.5-0.5*cos(PI*min(on,{move - 1})/{move - 1}))"
+        y = f"{g['slack']}*{e}"
+        fg = (
+            f"[{i}:v]format=yuv420p,setsar=1,{loop},"
+            f"perspective=x0=0:y0='{y}':x1=W:y1='{y}':x2=0:y2='{y}+H':x3=W:y3='{y}+H':interpolation=cubic:eval=frame,"
+            f"crop={dw}:{g['vis']}:0:0"
+        )
+    if hold:
+        graph.append(f"{fg}[fg]")
+        graph.append(f"[{cur}][fg]overlay={x0}:{y0}[c2]")
+    else:
+        slide = DUO_SLIDE * (0.55 if impact else 1.0)
+        dist = round(w * DUO_SLIDE_DIST * (1.6 if impact else 1.0)) * (-1 if d["slot"] == 0 else 1)
+        graph.append(f"{fg},format=yuva420p,fade=t=in:st=0:d={round(slide * 0.7, 3)}:alpha=1[fg]")
+        graph.append(
+            f"[{cur}][fg]overlay=x='{x0}+({dist})*pow(1-min(1,t/{slide}),3)+{sx}':y='{y0}+{sy}':eval=frame[c2]"
+        )
+    graph.append(f"[c2]format=yuv420p{_flash(impact)}[v]")
+    _encode_clip(inputs, graph, frames, out_path)
 
 
 def run_ffmpeg_progress(cmd, seconds, on_fraction=None, timeout=7200):
@@ -599,6 +831,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     fmt = "reels" if config.get("format") == "reels" else "landscape"
     w, h = get_resolution(resolution, fmt)
     fill = "black" if config.get("fill") == "black" else "blur"
+    look = resolve_look(config.get("look"))
+    # Side-by-side panels need the wide frame and the blurred fill.
+    duo_on = look["duo"] and fmt == "landscape" and fill == "blur" and effect != "none"
     reels_dir = os.path.join(output_dir, "reels")
 
     video_dir = os.path.join(output_dir, "video_parts")
@@ -642,6 +877,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     box_aspect = (w - 2 * round(w * FG_MARGIN)) / (h - 2 * round(h * FG_MARGIN)) if fill == "blur" else w / h
     turn = 0
     prev_motion = None
+    # The duo clip before this one (its panel stays in the other half), and the last punch.
+    duo_prev = None
+    last_impact = -IMPACT_GAP
 
     for idx, seg in enumerate(render_items):
         report("prepare", idx / total)
@@ -670,12 +908,21 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             continue
         source_image = page_image
 
-        # Crop to focus point if present (aspect matched to the panel box)
+        # Crop to focus point if present (aspect matched to the panel box, or to a half of
+        # the frame when a tall focus goes side by side)
         focus_point = seg.get("focus_point")
         if focus_point and len(focus_point) == 4:
             try:
+                aspect = box_aspect
+                if duo_on:
+                    from PIL import Image
+                    with Image.open(page_image) as im:
+                        fw_, fh_ = im.size
+                    ymin, xmin, ymax, xmax = focus_point
+                    if (xmax - xmin) * fw_ < DUO_MAX_ASPECT * (ymax - ymin) * fh_:
+                        aspect = 0.75
                 page_image = _crop_to_focus(
-                    page_image, focus_point, box_aspect,
+                    page_image, focus_point, aspect,
                     os.path.join(video_dir, f"crop_{idx:04d}.jpg"),
                 )
             except Exception as e:
@@ -696,19 +943,46 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         duration = round(duration, 3)
 
         try:
-            images = _prepare_clip_images(page_image, idx, w, h, fill, video_dir)
+            tall = False
+            if duo_on:
+                from PIL import Image
+                with Image.open(page_image) as im:
+                    tall = im.width < DUO_MAX_ASPECT * im.height
+            if tall:
+                same = duo_prev is not None and duo_prev["source"] == source_image and duo_prev["focus"] == focus_point
+                if same:
+                    duo = dict(duo_prev["duo"], hold=True, bg_prev=None)
+                else:
+                    slot = 0 if duo_prev is None else 1 - duo_prev["duo"]["slot"]
+                    duo = _prepare_duo_images(page_image, idx, w, h, slot, video_dir, look["glow"])
+                    duo["slot"] = slot
+                    duo["bg_prev"] = duo_prev["duo"]["bg"] if duo_prev else None
+                    duo["partner"] = {"fg": duo_prev["duo"]["fg"], "geo": duo_prev["duo"]["geo"]} if duo_prev else None
+                images = None
+            else:
+                duo = None
+                images = _prepare_clip_images(page_image, idx, w, h, fill, video_dir, look["glow"])
         except Exception as e:
             print(f"[video] Skipping unreadable image for page {page_num}: {e}", file=sys.stderr)
             continue
 
         motion = "still"
-        if effect != "none":
-            motion = pick_motion(images["aspect"], images["box_aspect"], turn, prev_motion)
-            turn += 1
-            prev_motion = motion
+        if duo:
+            motion = "duo"
+            duo_prev = {"duo": duo, "source": source_image, "focus": focus_point}
+        else:
+            duo_prev = None
+            if effect != "none":
+                motion = pick_motion(images["aspect"], images["box_aspect"], turn, prev_motion)
+                turn += 1
+                prev_motion = motion
+        impact = look["impact"] and len(clips) - last_impact >= IMPACT_GAP and is_impact(seg.get("text", ""))
+        if impact:
+            last_impact = len(clips)
 
         clips.append({
             "idx": idx, "page": page_num, "images": images, "motion": motion,
+            "duo": duo, "impact": impact, "push": look["push"],
             "source": source_image, "focus": focus_point,
             "audio_path": audio_path, "offset": audio_offset,
             "start": timeline, "duration": duration,
@@ -732,14 +1006,32 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
 
     # ── Step 2: Render each clip's video (with a tail that the next crossfade eats) ──
     durations = [c["duration"] for c in clips]
-    starts, trans = plan_transitions(durations, [c["page"] for c in clips], trans_kind, trans_dur)
+    # A duo clip that follows another slides in by itself (a cut), and a punch flashes in.
+    joins = [None]
+    for k in range(1, len(clips)):
+        if clips[k]["duo"] and clips[k - 1]["duo"]:
+            joins.append("cut")
+        elif clips[k]["impact"]:
+            joins.append("impact")
+        else:
+            joins.append(None)
+    starts, trans = plan_transitions(
+        durations, [c["page"] for c in clips], trans_kind, trans_dur, look["transitions"], joins,
+    )
     frame_counts = [clip_frames(starts, trans, k, durations[-1]) for k in range(len(clips))]
     all_frames = max(1, sum(frame_counts))
     rendered = 0
     clip_paths = []
     for k, c in enumerate(clips):
         frames = frame_counts[k]
-        key = clip_key(c["source"], c["focus"], c["motion"], frames, w, h, fill)
+        spec = [c["motion"], c["impact"], c["push"], look["glow"]]
+        if c["duo"]:
+            # The pan ends where the next clip cuts in, so the panel left behind does not jump.
+            nxt = round(starts[k + 1] * FPS) if k + 1 < len(starts) else round(starts[k] * FPS) + frames
+            c["duo"]["move_frames"] = nxt - round(starts[k] * FPS)
+            d = c["duo"]
+            spec += [d["slot"], d.get("hold", False), d["move_frames"], d.get("bg_prev"), (d.get("partner") or {}).get("fg")]
+        key = clip_key(c["source"], c["focus"], spec, frames, w, h, fill)
         path = os.path.join(video_dir, f"clip_{c['idx']:04d}_{key}.mp4")
         # Reuse a clip an interrupted run already rendered.
         if not (os.path.exists(path) and os.path.getsize(path) > 100):
@@ -747,7 +1039,11 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 _render_clip(c, frames, w, h, path)
             except Exception as e:
                 print(f"[video] {e} (page {c['page']}); retrying as a still", file=sys.stderr)
+                if c["duo"]:
+                    c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"])
+                    c["duo"] = None
                 c["motion"] = "still"
+                c["impact"] = False
                 _render_clip(c, frames, w, h, path)
         clip_paths.append(path)
         rendered += frames
@@ -799,7 +1095,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     except Exception as e:
         print(f"[video] Failed to generate styled captions: {e}", file=sys.stderr)
 
-    video = {"inputs": video_inputs, "starts": video_starts, "trans": video_trans}
+    video = {"inputs": video_inputs, "starts": video_starts, "trans": video_trans, "look": look}
     on_final = lambda f: report("finalize", f)
     success = _finalize_video_with_audio_mix_and_captions(
         video, narration, final_video, ass_path, bg_music,
@@ -807,9 +1103,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         score=score, music_volume=music_volume, on_fraction=on_final,
     )
     if not success:
-        print("[video] Finalization failed, retrying without captions and music", file=sys.stderr)
+        print("[video] Finalization failed, retrying without captions, music and finish", file=sys.stderr)
         success = _finalize_video_with_audio_mix_and_captions(
-            video, narration, final_video, None, None,
+            dict(video, look=None), narration, final_video, None, None,
             narration_volume, 0.0, False, w, h, timeline,
             score=None, music_volume=0.0, on_fraction=on_final,
         )
@@ -926,7 +1222,12 @@ def _finalize_video_with_audio_mix_and_captions(
     for i in range(n_video):
         graph.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[p{i}]")
         labels.append(f"p{i}")
-    graph.append(xfade_chain(labels, video["starts"], video["trans"], "vx"))
+    graph.append(xfade_chain(labels, video["starts"], video["trans"], "vraw"))
+    # The look's finish (grade, bloom, vignette, grain) under the captions.
+    if video.get("look"):
+        graph.append(look_filters(video["look"], w, h, "vraw", "vx"))
+    else:
+        graph.append("[vraw]null[vx]")
     has_subs = bool(ass_path) and os.path.exists(ass_path)
     if has_subs:
         from caption_engine import subtitles_filter
