@@ -368,7 +368,7 @@ fn video_row(id: (&'static str, usize), v: &Video) -> Stateful<Div> {
                 .bg(Tokens::surface_2())
                 .child(img(SharedString::from(v.thumb())).size_full().object_fit(ObjectFit::Cover))
                 .when(!v.length.is_empty(), |d| {
-                    d.child(div().absolute().right(px(4.)).bottom(px(4.)).px(px(4.)).rounded(px(3.)).bg(rgba(0x000000cc)).text_size(px(size::XS)).text_color(rgb(0xffffff)).child(v.length.clone()))
+                    d.child(div().absolute().right(px(4.)).bottom(px(4.)).px(px(4.)).rounded(px(3.)).bg(Tokens::scrim()).text_size(px(size::XS)).text_color(Tokens::text_1()).child(v.length.clone()))
                 }),
         )
         .child(
