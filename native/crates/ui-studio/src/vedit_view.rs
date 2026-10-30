@@ -113,6 +113,8 @@ pub(crate) struct Editor {
     scroll_x: f32,
     snap: bool,
     snapped: Option<u64>,
+    /// Zoom to fit once the timeline has been laid out (its width is known).
+    fit_pending: bool,
     tool: Tool,
     sel: Option<Sel>,
     drag: Option<Drag>,
@@ -145,6 +147,7 @@ impl Default for Editor {
             scroll_x: 0.,
             snap: true,
             snapped: None,
+            fit_pending: false,
             tool: Tool::Select,
             sel: None,
             drag: None,
@@ -240,7 +243,7 @@ impl StudioPage {
         self.vedit.sel = None;
         self.vedit.undo.clear();
         self.vedit.redo.clear();
-        self.video_fit();
+        self.vedit.fit_pending = true;
     }
 
     /// Zoom so the whole sequence fits the timeline.
@@ -786,6 +789,14 @@ impl StudioPage {
             );
         }
         self.sync_text_input(window, cx);
+        if self.vedit.fit_pending {
+            if f32::from(self.vedit.lanes.get().size.width) > 0. {
+                self.vedit.fit_pending = false;
+                self.video_fit();
+            } else {
+                cx.notify();
+            }
+        }
         let pending = self.unrendered(&g);
         let top = div()
             .flex()
