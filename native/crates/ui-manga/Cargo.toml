@@ -10,6 +10,7 @@ mv-core = { path = "../mv-core" }
 mv-sources = { path = "../mv-sources" }
 mv-plugins = { path = "../mv-plugins" }
 mv-net = { path = "../mv-net" }
+ui-assistant = { path = "../ui-assistant" }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }

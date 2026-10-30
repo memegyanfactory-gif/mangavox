@@ -6,14 +6,15 @@ use std::sync::{Arc, Mutex};
 use futures::channel::{mpsc::UnboundedSender, oneshot};
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use mv_ai::{emit_fn, AiAccessMode, AiEffort, AiMessage, AiProviderId, AiRole, AiStepRequest, AiStepResult, AiToolCall, CancellationToken, Emit, Registry, StreamEvent};
+use mv_ai::{emit_fn, AiAccessMode, AiEffort, AiMessage, AiProviderId, AiRole, AiStepRequest, AiStepResult, AiToolCall, AiToolSpec, CancellationToken, Emit, Registry, StreamEvent};
 use mv_ui::Route;
 use serde_json::{json, Value};
 
 use crate::store::{new_id, StepState, ToolStep};
 use crate::tools::{self, needs_approval, ToolOutput, ToolRunner};
 
-pub const MAX_ROUNDS: usize = 8;
+/// Enough for a chain like search → add → download → generate → export with a check between.
+pub const MAX_ROUNDS: usize = 16;
 
 /// Runs one model step. Production uses the mv-ai [`Registry`]; tests use a fake.
 pub trait StepRunner: Send + Sync + 'static {
@@ -45,6 +46,8 @@ pub enum AgentEvent {
     /// The UI must answer through `reply` (true = allow).
     Approval { step_id: String, reply: oneshot::Sender<bool> },
     Navigate(Route),
+    /// Buttons to show under the reply (`suggest_replies`).
+    Suggest(Vec<crate::suggest::Suggestion>),
     /// Always the last event; carries the model-side history to persist.
     Finished { outcome: Outcome, history: Vec<AiMessage> },
 }
@@ -58,6 +61,9 @@ pub struct AgentParams {
     pub system: String,
     pub history: Vec<AiMessage>,
     pub tools_enabled: bool,
+    /// The provider takes tool definitions. Without (the CLI agents), the tools are described in
+    /// the prompt and called with ```mangavox blocks in the reply (see [`text_tool_prompt`]).
+    pub native_tools: bool,
     /// Images attached to the user's message; sent with the first round only.
     pub images: Vec<std::path::PathBuf>,
 }
@@ -65,7 +71,7 @@ pub struct AgentParams {
 /// System prompt with live app context (port of `systemPrompt`).
 pub fn system_prompt(tools_enabled: bool, page: Option<&str>, section: Option<&str>, library: Option<usize>, today: &str) -> String {
     let mut lines = vec![
-        "You are the MangaVox assistant, built into the MangaVox desktop app: a manga reader and library, anime / movie / series streaming, downloads and a discovery feed.".to_string(),
+        "You are the MangaVox assistant, built into the MangaVox desktop app: a manga reader and library with chapter downloads, anime / movie / series streaming, a discovery feed, and Studio, which turns downloaded manga chapters into narrated recap videos (Read → Transcript → Story → Audio → Music → Video), joins them into a full recap with a hook intro and watermark, and prepares a YouTube package.".to_string(),
         format!("Today is {today}."),
     ];
     if let Some(p) = page {
@@ -77,13 +83,91 @@ pub fn system_prompt(tools_enabled: bool, page: Option<&str>, section: Option<&s
     }
     if tools_enabled {
         lines.push("You can operate the app with tools. When the user asks you to do something in the app (open, find, play, switch, change a setting), do it with the tools rather than explaining how.".into());
-        lines.push("Use search tools before naming specific titles or ids — never invent them.".into());
-        lines.push("After acting, confirm briefly what happened.".into());
+        lines.push("Use search and list tools before naming specific titles, chapters or ids — never invent them.".into());
+        lines.push("Only act on the manga and chapters the user named or clearly agreed to. Never widen a request to other chapters (\"all\" only when the user said all). If it is unclear which chapters they mean, list them and ask.".into());
+        lines.push("Studio work goes through the same queue as the Studio dashboard: list chapters with studio_library, then studio_generate for exactly those chapters (use redo_from only when the user wants a step made again). Check progress with studio_status.".into());
+        lines.push("Deletes, overwrites and big downloads ask the user for confirmation in the chat; if they decline, do not retry.".into());
+        lines.push("After acting, confirm briefly what happened. When there is an obvious next step, end with suggest_replies so the user can click it.".into());
     } else {
         lines.push("In this mode you cannot control the app; answer conversationally and suggest where in the app to go when useful.".into());
     }
     lines.push("Be concise and friendly. Use markdown (short lists, tables, code) only when it helps.".into());
     lines.join("\n")
+}
+
+/// The fence a model without native tool calling uses to call an app tool.
+pub const TOOL_FENCE: &str = "```mangavox";
+
+/// The tools as instructions, for providers that take no tool definitions (the CLI agents).
+pub fn text_tool_prompt(specs: &[AiToolSpec]) -> String {
+    let mut out = String::from(
+        "App actions: you control MangaVox only through the actions below (not with your own shell, file or web tools). To run actions, put one block per action in your reply, exactly like this, and nothing after the blocks:\n\n```mangavox\n{\"tool\": \"studio_status\", \"args\": {}}\n```\n\nThe app runs them (asking the user where needed) and sends the results back as \"Tool result\" messages; then continue. Never claim an action happened before its result came back. Reply without blocks when you are done.\n\nActions (name(arguments): what it does):",
+    );
+    for t in specs {
+        let props = t.parameters.get("properties").and_then(Value::as_object);
+        let required: Vec<&str> = t.parameters.get("required").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let args: Vec<String> = props
+            .map(|p| {
+                p.iter()
+                    .map(|(k, v)| {
+                        let ty = v.get("enum").and_then(Value::as_array).map(|e| e.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("|")).unwrap_or_else(|| v.get("type").and_then(Value::as_str).unwrap_or("any").to_string());
+                        format!("{k}{}: {ty}", if required.contains(&k.as_str()) { "" } else { "?" })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push_str(&format!("\n- {}({}): {}", t.name, args.join(", "), t.description));
+    }
+    out
+}
+
+/// The ```mangavox blocks of a reply as tool calls (`{"tool": name, "args": {...}}`, or a list
+/// of those). Blocks that are not valid JSON are skipped.
+pub fn parse_text_calls(text: &str) -> Vec<AiToolCall> {
+    let mut calls = vec![];
+    let mut rest = text;
+    while let Some(start) = rest.find(TOOL_FENCE) {
+        let body_start = start + TOOL_FENCE.len();
+        let Some(len) = rest[body_start..].find("```") else { break };
+        let body = rest[body_start..body_start + len].trim();
+        rest = &rest[body_start + len + 3..];
+        let items = match serde_json::from_str::<Value>(body) {
+            Ok(Value::Array(a)) => a,
+            Ok(v) => vec![v],
+            Err(_) => continue,
+        };
+        for v in items {
+            let name = v.get("tool").or_else(|| v.get("name")).and_then(Value::as_str).unwrap_or("").trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let args = v.get("args").or_else(|| v.get("arguments")).and_then(Value::as_object).cloned().unwrap_or_default();
+            calls.push(AiToolCall { id: new_id("t"), name, args });
+        }
+    }
+    calls
+}
+
+/// A reply without its ```mangavox blocks (also one still streaming), for display.
+pub fn visible_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(TOOL_FENCE) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(TOOL_FENCE) {
+        out.push_str(&rest[..start]);
+        let after = start + TOOL_FENCE.len();
+        match rest[after..].find("```") {
+            Some(len) => rest = &rest[after + len + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out.trim().to_string())
 }
 
 static STUDIO_CONTEXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -138,6 +222,8 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
     cancel: &CancellationToken,
 ) -> Outcome {
     let specs = tools::tool_specs();
+    let text_tools = p.tools_enabled && !p.native_tools;
+    let system = if text_tools { format!("{}\n\n{}", p.system, text_tool_prompt(&specs)) } else { p.system.clone() };
     for round in 0..MAX_ROUNDS {
         if cancel.is_cancelled() {
             return Outcome::Stopped;
@@ -147,14 +233,14 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
         let emit = emit_fn(move |ev| {
             let _ = delta_tx.unbounded_send(AgentEvent::Delta(ev));
         });
-        let mut messages = vec![AiMessage::system(p.system.clone())];
+        let mut messages = vec![AiMessage::system(system.clone())];
         messages.extend(history.iter().cloned());
         let req = AiStepRequest {
             request_id: new_id("step"),
             provider_id: p.provider,
             model: p.model.clone(),
             messages,
-            tools: p.tools_enabled.then(|| specs.clone()),
+            tools: (p.tools_enabled && p.native_tools).then(|| specs.clone()),
             effort: Some(p.effort),
             access: Some(*p.access.lock().unwrap_or_else(|e| e.into_inner())),
             images: if round == 0 { p.images.clone() } else { vec![] },
@@ -168,18 +254,21 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
         if let Some(e) = result.error {
             return Outcome::Error(e);
         }
+        // The reply's text keeps its ```mangavox blocks: a CLI agent reads its own calls back
+        // from the transcript next round.
+        let calls = if text_tools { parse_text_calls(&result.text) } else { result.tool_calls.clone() };
         let mut assistant = AiMessage::assistant(result.text.clone());
-        if !result.tool_calls.is_empty() {
-            assistant.tool_calls = Some(result.tool_calls.clone());
+        if !calls.is_empty() && !text_tools {
+            assistant.tool_calls = Some(calls.clone());
         }
         assistant.raw = result.raw.clone();
         history.push(assistant);
-        if result.tool_calls.is_empty() {
+        if calls.is_empty() {
             return Outcome::Done;
         }
 
-        for call in &result.tool_calls {
-            let Some(risk) = tools::risk_of(&call.name) else {
+        for call in &calls {
+            let Some(risk) = tools::risk_for(&call.name, &call.args) else {
                 history.push(tool_message(call, json!({ "error": format!("Unknown tool {}", call.name) })));
                 continue;
             };
@@ -226,6 +315,10 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
                         ToolOutput::Value(v) => v,
                         ToolOutput::Navigate(route, v) => {
                             let _ = tx.unbounded_send(AgentEvent::Navigate(route));
+                            v
+                        }
+                        ToolOutput::Suggest(list, v) => {
+                            let _ = tx.unbounded_send(AgentEvent::Suggest(list));
                             v
                         }
                     };
@@ -299,6 +392,7 @@ mod tests {
             system: "sys".into(),
             history: vec![AiMessage::user("hi")],
             tools_enabled,
+            native_tools: true,
             images: vec![],
         }
     }
@@ -342,6 +436,50 @@ mod tests {
         let (tx, _rx) = unbounded();
         run_agent(&fake, &FakeTools, params(AiAccessMode::Ask, false), tx, CancellationToken::new()).await;
         assert!(fake.1.lock().unwrap()[0].tools.is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_providers_call_tools_with_text_blocks() {
+        let reply = "Opening it.
+```mangavox
+{\"tool\": \"navigate\", \"args\": {\"page\": \"library\"}}
+```";
+        let fake = Arc::new(Fake::new(vec![AiStepResult { text: reply.into(), ..Default::default() }, AiStepResult { text: "Done.".into(), ..Default::default() }]));
+        let (tx, rx) = unbounded();
+        let mut p = params(AiAccessMode::Full, true);
+        p.native_tools = false;
+        let f2 = fake.clone();
+        let task = tokio::spawn(async move { run_agent(&*f2, &FakeTools, p, tx, CancellationToken::new()).await });
+        let evs = collect(rx, Some(true)).await;
+        task.await.unwrap();
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::Navigate(Route::Library))));
+        let reqs = fake.1.lock().unwrap();
+        assert!(reqs[0].tools.is_none());
+        assert!(reqs[0].messages[0].content.contains(TOOL_FENCE) && reqs[0].messages[0].content.contains("- navigate("));
+        // The second round sees the result as a tool message.
+        assert!(reqs[1].messages.iter().any(|m| m.role == AiRole::Tool && m.tool_name.as_deref() == Some("navigate")));
+    }
+
+    #[test]
+    fn text_blocks_parse_and_hide() {
+        let t = "Sure.
+```mangavox
+{\"tool\": \"studio_status\"}
+```
+```mangavox
+[{\"name\": \"a\", \"args\": {\"x\": 1}}, {\"tool\": \"\"}]
+```
+```mangavox
+not json
+```";
+        let calls = parse_text_calls(t);
+        assert_eq!(calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["studio_status", "a"]);
+        assert_eq!(calls[1].args["x"], 1);
+        assert_eq!(visible_text(t), "Sure.");
+        assert_eq!(visible_text("Working…
+```mangavox
+{\"tool\": \"stu"), "Working…");
+        assert_eq!(visible_text("plain"), "plain");
     }
 
     #[tokio::test]

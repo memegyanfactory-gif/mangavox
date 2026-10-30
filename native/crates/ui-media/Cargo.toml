@@ -7,6 +7,8 @@ version.workspace = true
 gpui-kit = { workspace = true }
 mv-ui = { path = "../mv-ui" }
 ui-player = { path = "../ui-player" }
+ui-assistant = { path = "../ui-assistant" }
+mv-torrent = { path = "../mv-torrent" }
 mv-media = { path = "../mv-media" }
 mv-core = { path = "../mv-core" }
 anyhow = { workspace = true }
@@ -15,3 +17,6 @@ futures = "0.3"
 chrono = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

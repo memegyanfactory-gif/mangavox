@@ -78,6 +78,9 @@ pub struct ChatItem {
     /// How long the model reasoned before it started answering ("Thought for 12s").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_ms: Option<u64>,
+    /// Next-step buttons the model offered under this reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<crate::suggest::Suggestion>,
     pub created_at: u64,
 }
 
@@ -87,7 +90,7 @@ fn done_status() -> ItemStatus {
 
 impl ChatItem {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { id: new_id("u"), role: ItemRole::User, text: text.into(), reasoning: None, activity: vec![], steps: vec![], status: ItemStatus::Done, error: None, model: None, reasoning_ms: None, created_at: now_ms() }
+        Self { id: new_id("u"), role: ItemRole::User, text: text.into(), reasoning: None, activity: vec![], steps: vec![], status: ItemStatus::Done, error: None, model: None, reasoning_ms: None, suggestions: vec![], created_at: now_ms() }
     }
     pub fn assistant(model: &str) -> Self {
         Self {
@@ -101,6 +104,7 @@ impl ChatItem {
             error: None,
             model: Some(model.to_string()),
             reasoning_ms: None,
+            suggestions: vec![],
             created_at: now_ms(),
         }
     }

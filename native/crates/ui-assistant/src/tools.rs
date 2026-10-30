@@ -1,6 +1,6 @@
 //! App-control tools the assistant can call (port of src/renderer/assistant/tools.ts).
 //! Each tool has a JSON schema and a risk level that is checked against the access mode.
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -31,6 +31,113 @@ pub fn needs_approval(mode: AiAccessMode, risk: Risk) -> bool {
         AiAccessMode::Ask => risk != Risk::Read,
         AiAccessMode::Auto => risk == Risk::Destructive,
         AiAccessMode::Full => false,
+    }
+}
+
+// ── Registered tools (other crates add theirs at startup) ────────────────────────────
+
+pub type RunFn = Arc<dyn Fn(Map<String, Value>) -> BoxFuture<'static, ToolResult> + Send + Sync>;
+pub type PhrasesFn = Arc<dyn Fn(&Map<String, Value>) -> Phrases + Send + Sync>;
+pub type RiskFn = Arc<dyn Fn(&Map<String, Value>) -> Risk + Send + Sync>;
+
+/// A tool another crate gives the assistant (Studio, manga, media, the video editor). The handler
+/// runs on the tokio runtime; it reaches GPUI state through [`crate::on_ui`], so what it changes is
+/// the same state the pages show.
+#[derive(Clone)]
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: String,
+    pub parameters: Value,
+    pub risk: Risk,
+    /// Raises the risk for one call (a big download, an overwrite).
+    pub risk_for: Option<RiskFn>,
+    pub phrases: Option<PhrasesFn>,
+    pub run: RunFn,
+}
+
+impl ToolDef {
+    pub fn new(name: &'static str, description: impl Into<String>, parameters: Value, risk: Risk) -> Self {
+        let run: RunFn = Arc::new(move |_| async move { Err(format!("{name} has no handler")) }.boxed());
+        Self { name, description: description.into(), parameters, risk, risk_for: None, phrases: None, run }
+    }
+
+    pub fn run(mut self, f: impl Fn(Map<String, Value>) -> BoxFuture<'static, ToolResult> + Send + Sync + 'static) -> Self {
+        self.run = Arc::new(f);
+        self
+    }
+
+    pub fn phrases(mut self, f: impl Fn(&Map<String, Value>) -> Phrases + Send + Sync + 'static) -> Self {
+        self.phrases = Some(Arc::new(f));
+        self
+    }
+
+    pub fn risk_for(mut self, f: impl Fn(&Map<String, Value>) -> Risk + Send + Sync + 'static) -> Self {
+        self.risk_for = Some(Arc::new(f));
+        self
+    }
+}
+
+static REGISTERED: RwLock<Vec<ToolDef>> = RwLock::new(Vec::new());
+
+/// Adds tools to the assistant. A name that is already registered is replaced, so a crate can
+/// register again without duplicates.
+pub fn register(defs: Vec<ToolDef>) {
+    let mut g = REGISTERED.write().unwrap_or_else(|e| e.into_inner());
+    for d in defs {
+        if builtin_tools().iter().any(|t| t.name == d.name) {
+            eprintln!("[assistant] tool {} clashes with a built-in tool; skipped", d.name);
+            continue;
+        }
+        g.retain(|t| t.name != d.name);
+        g.push(d);
+    }
+}
+
+pub fn registered(name: &str) -> Option<ToolDef> {
+    REGISTERED.read().unwrap_or_else(|e| e.into_inner()).iter().find(|t| t.name == name).cloned()
+}
+
+fn registered_all() -> Vec<ToolDef> {
+    REGISTERED.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Every arg the model may pass as a list ("chapters": [12, 13] or "12-14, 20").
+pub fn list_arg(args: &Map<String, Value>, k: &str) -> Vec<String> {
+    match args.get(k) {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| match v {
+            Value::String(s) => Some(s.trim().to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
+        .collect(),
+        Some(Value::String(s)) => s.split(',').map(|p| p.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Some(Value::Number(n)) => vec![n.to_string()],
+        _ => vec![],
+    }
+}
+
+pub fn str_arg<'a>(args: &'a Map<String, Value>, k: &str) -> &'a str {
+    arg(args, k)
+}
+
+pub fn bool_arg(args: &Map<String, Value>, k: &str) -> Option<bool> {
+    match args.get(k) {
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub fn num_arg(args: &Map<String, Value>, k: &str) -> Option<f64> {
+    match args.get(k) {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
     }
 }
 
@@ -104,7 +211,14 @@ pub struct AppTool {
     pub risk: Risk,
 }
 
+/// Built-in tools plus every registered one.
 pub fn app_tools() -> Vec<AppTool> {
+    let mut all = builtin_tools();
+    all.extend(registered_all().into_iter().map(|d| AppTool { name: d.name, description: d.description, parameters: d.parameters, risk: d.risk }));
+    all
+}
+
+fn builtin_tools() -> Vec<AppTool> {
     let t = |name, description: String, parameters, risk| AppTool { name, description, parameters, risk };
     vec![
         t("get_app_state", "Current page, media section and library size. Call this when you need to know where the user is.".into(), obj(json!({}), &[]), Risk::Read),
@@ -171,6 +285,16 @@ pub fn app_tools() -> Vec<AppTool> {
             obj(json!({ "id": s("Queue item id or video id"), "at": s("Local time YYYY-MM-DD HH:MM") }), &["id", "at"]),
             Risk::Act,
         ),
+        t(
+            "suggest_replies",
+            "Show 1-4 clickable buttons under your reply with the next steps the user is likely to want (\"Generate recaps for Ch. 12-14\", \"Export the full recap\"). Each prompt is sent as the user's message when clicked, so word it as their request and name the exact titles and chapters. Call it last, at most once per reply.".into(),
+            obj(
+                json!({ "suggestions": { "type": "array", "description": "Buttons", "items": obj(json!({ "label": s("Short button text"), "prompt": s("The message sent when clicked") }), &["label", "prompt"]) } }),
+                &["suggestions"],
+            ),
+            Risk::Read,
+        ),
+        t("app_suggestions", "What the app suggests right now: failed Studio chapters to retry, new downloads without recaps, recaps ready to export, YouTube titles to write. Use when the user asks what to do next.".into(), obj(json!({}), &[]), Risk::Read),
     ]
 }
 
@@ -180,6 +304,14 @@ pub fn tool_specs() -> Vec<AiToolSpec> {
 
 pub fn risk_of(name: &str) -> Option<Risk> {
     app_tools().into_iter().find(|t| t.name == name).map(|t| t.risk)
+}
+
+/// The risk of one call: a registered tool may raise it for these args (a big download).
+pub fn risk_for(name: &str, args: &Map<String, Value>) -> Option<Risk> {
+    if let Some(d) = registered(name) {
+        return Some(d.risk_for.as_ref().map(|f| f(args)).unwrap_or(d.risk));
+    }
+    risk_of(name)
 }
 
 fn arg<'a>(args: &'a Map<String, Value>, k: &str) -> &'a str {
@@ -198,6 +330,14 @@ pub struct Phrases {
     pub ask: String,
     pub doing: String,
     pub done: String,
+}
+
+impl Phrases {
+    /// `Phrases::new("Generate", "Generating", "Generated", "Ch. 12")`.
+    pub fn new(ask: &str, doing: &str, done: &str, object: &str) -> Self {
+        let join = |v: &str| if object.is_empty() { v.to_string() } else { format!("{v} {object}") };
+        Phrases { ask: join(ask), doing: join(doing), done: join(done) }
+    }
 }
 
 /// Display name for a page id ("media-history" → "Watch history").
@@ -266,7 +406,12 @@ pub fn phrases(name: &str, args: &Map<String, Value>) -> Phrases {
         "youtube_video" => p("Read", "Reading", "Read", "the video's details"),
         "youtube_update_video" => p("Update", "Updating", "Updated", &titled("title", "the video on YouTube")),
         "youtube_schedule" => p("Schedule the video for", "Scheduling the video for", "Scheduled the video for", a("at")),
-        other => p("Run", "Running", "Ran", other),
+        "suggest_replies" => p("Suggest", "Suggesting", "Suggested", "next steps"),
+        "app_suggestions" => p("Check", "Checking", "Checked", "what to do next"),
+        other => match registered(other).and_then(|d| d.phrases) {
+            Some(f) => f(args),
+            None => p("Run", "Running", "Ran", &other.replace('_', " ")),
+        },
     }
 }
 
@@ -277,6 +422,8 @@ pub fn phrases(name: &str, args: &Map<String, Value>) -> Phrases {
 pub enum ToolOutput {
     Value(Value),
     Navigate(Route, Value),
+    /// Buttons to show under the reply (see `suggest_replies`).
+    Suggest(Vec<crate::suggest::Suggestion>, Value),
 }
 
 pub type ToolResult = Result<ToolOutput, String>;
@@ -489,7 +636,22 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
             )
         }
         name if name.starts_with("youtube_") => crate::youtube::execute(name, args).await.map(ToolOutput::Value),
-        other => Err(format!("Unknown tool {other}")),
+        "suggest_replies" => {
+            let list = crate::suggest::parse_replies(args.get("suggestions").unwrap_or(&Value::Null));
+            if list.is_empty() {
+                return Err("Give 1-4 suggestions, each with a label and a prompt".into());
+            }
+            let n = list.len();
+            Ok(ToolOutput::Suggest(list, json!({ "ok": true, "shown": n })))
+        }
+        "app_suggestions" => {
+            let list = blocking(crate::suggest::collect).await?;
+            Ok(ToolOutput::Value(Value::Array(list.iter().map(|s| json!({ "title": s.title, "detail": s.detail, "prompt": s.prompt })).collect())))
+        }
+        other => match registered(other) {
+            Some(d) => (d.run)(args.clone()).await,
+            None => Err(format!("Unknown tool {other}")),
+        },
     }
 }
 
@@ -541,6 +703,52 @@ mod tests {
         }
         assert!(matches!(execute("go_back", &Map::new()).await.unwrap(), ToolOutput::Navigate(Route::Back, _)));
         assert!(execute("bogus", &Map::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn registered_tools_join_the_table_and_run() {
+        register(vec![
+            ToolDef::new("test_reg_echo", "Echo", obj(json!({ "n": { "type": "number" } }), &[]), Risk::Act)
+                .risk_for(|a| if num_arg(a, "n").unwrap_or(0.) > 10. { Risk::Destructive } else { Risk::Act })
+                .phrases(|_| Phrases::new("Echo", "Echoing", "Echoed", "it"))
+                .run(|a| async move { Ok(ToolOutput::Value(Value::Object(a))) }.boxed()),
+            // A built-in name never gets replaced.
+            ToolDef::new("navigate", "Hijack", obj(json!({}), &[]), Risk::Read),
+        ]);
+        assert!(tool_specs().iter().any(|s| s.name == "test_reg_echo"));
+        assert_eq!(tool_specs().iter().filter(|s| s.name == "navigate").count(), 1);
+        let mut a = Map::new();
+        a.insert("n".into(), json!(3));
+        assert_eq!(risk_for("test_reg_echo", &a), Some(Risk::Act));
+        assert_eq!(phrases("test_reg_echo", &a).ask, "Echo it");
+        assert_eq!(execute("test_reg_echo", &a).await.unwrap(), ToolOutput::Value(json!({ "n": 3 })));
+        a.insert("n".into(), json!(30));
+        assert_eq!(risk_for("test_reg_echo", &a), Some(Risk::Destructive));
+        assert_eq!(risk_for("navigate", &a), Some(Risk::Act));
+        assert_eq!(phrases("some_tool", &a).ask, "Run some tool");
+    }
+
+    #[tokio::test]
+    async fn suggest_replies_becomes_buttons() {
+        let mut a = Map::new();
+        a.insert("suggestions".into(), json!([{ "label": "Export", "prompt": "Export the full recap of Solo" }]));
+        match execute("suggest_replies", &a).await.unwrap() {
+            ToolOutput::Suggest(list, _) => assert_eq!(list[0].prompt, "Export the full recap of Solo"),
+            other => panic!("{other:?}"),
+        }
+        assert!(execute("suggest_replies", &Map::new()).await.is_err());
+    }
+
+    #[test]
+    fn list_and_scalar_args() {
+        let mut a = Map::new();
+        a.insert("chapters".into(), json!([12, "13-14", " "]));
+        a.insert("csv".into(), json!("1, 2"));
+        a.insert("flag".into(), json!("yes"));
+        assert_eq!(list_arg(&a, "chapters"), ["12", "13-14"]);
+        assert_eq!(list_arg(&a, "csv"), ["1", "2"]);
+        assert_eq!(bool_arg(&a, "flag"), Some(true));
+        assert_eq!(bool_arg(&a, "none"), None);
     }
 
     #[test]

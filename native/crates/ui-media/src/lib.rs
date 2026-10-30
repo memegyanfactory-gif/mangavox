@@ -4,6 +4,7 @@ use gpui_kit::*;
 use mv_ui::Route;
 
 mod addons_panel;
+mod assist;
 mod anime_detail;
 mod anime_home;
 mod common;
@@ -18,6 +19,11 @@ pub mod remote;
 mod streams;
 
 pub use mv_media::addons::AddonRegistry;
+
+/// Gives the assistant the movie / series / anime tools (sources, play, download). Called once at startup.
+pub fn register_assistant_tools() {
+    assist::register();
+}
 
 /// Shared installed-addon registry (`~/.mangavox/addons`), for other crates that need streams.
 pub fn addon_registry() -> &'static std::sync::Arc<AddonRegistry> {

@@ -124,6 +124,11 @@ impl Downloads {
         self.errors.get(chapter_id).map(String::as_str)
     }
 
+    /// Chapters of the last batch that failed (Retry failed queues them again).
+    pub fn failed_jobs(&self) -> &[Job] {
+        &self.failed
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused
     }

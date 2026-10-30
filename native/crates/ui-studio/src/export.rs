@@ -84,11 +84,11 @@ pub(crate) struct Job {
 }
 
 impl Job {
-    fn new(manga_id: &str, label: &str) -> Job {
+    pub(crate) fn new(manga_id: &str, label: &str) -> Job {
         Job { manga_id: manga_id.to_string(), state: Arc::new(Mutex::new((0., label.to_string()))), cancel: Arc::new(AtomicBool::new(false)) }
     }
 
-    fn reporter(&self) -> Reporter {
+    pub(crate) fn reporter(&self) -> Reporter {
         Reporter { state: self.state.clone(), cancel: self.cancel.clone() }
     }
 
@@ -1047,6 +1047,71 @@ pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &Backg
 // ------------------------------------------------------------------ UI
 
 /// "1:02:05" / "12:05".
+/// After the join: the hook intro (when asked for), then the export with the watermark. Returns
+/// the files and a note about the hook (" · without the hook (…)") for the result message. Used
+/// by the Export button and the assistant's `studio_export`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: ExportPrefs, dir: PathBuf, name: String, font: Option<PathBuf>, r: Reporter, ex: BackgroundExecutor) -> (Result<Vec<PathBuf>>, String) {
+    let hook_dir = hook.as_ref().map(HookJob::work_dir);
+    // A hook that could not be made leaves the video without it (said in the result).
+    let mut hook_note = String::new();
+    let mut hook_path = None;
+    let res = match hook {
+        Some(job) => match make_hook(job, &j, &r, &ex).await {
+            Ok((path, why)) => {
+                if let Some(why) = why {
+                    hook_note = format!(" · the AI hook script failed ({why}), so the hook uses the narration's own lines");
+                }
+                hook_path = Some(path);
+                Ok(())
+            }
+            Err(e) if e.to_string() == CANCELLED => Err(e),
+            Err(e) => {
+                hook_note = format!(" · without the hook ({e:#})");
+                Ok(())
+            }
+        },
+        None => Ok(()),
+    };
+    let res = match res {
+        Ok(()) => mv_ui::bg::blocking(move || {
+            let extras = Extras { hook: hook_path, watermark: load_watermark(&video_look_path()), font };
+            let out = export(&j, prefs.mode(), prefs.music, &dir, &name, &extras, &r);
+            if let Some(d) = hook_dir {
+                let _ = std::fs::remove_dir_all(d);
+            }
+            out
+        })
+        .await
+        .and_then(|r| r),
+        Err(e) => {
+            if let Some(d) = hook_dir {
+                let _ = mv_ui::bg::blocking(move || std::fs::remove_dir_all(d)).await;
+            }
+            Err(e)
+        }
+    };
+    (res, hook_note)
+}
+
+/// "Solo Leveling - Ch. 1 to Ch. 12": the export's file name for these made chapters (in order).
+pub(crate) fn export_name(title: &str, chapters: &[crate::data::ChapterItem]) -> String {
+    let (Some(first), Some(last)) = (chapters.first(), chapters.last()) else { return safe_file_name(title) };
+    let a = crate::pipeline::short_label(first.number, first.title.as_deref());
+    let b = crate::pipeline::short_label(last.number, last.title.as_deref());
+    if chapters.len() == 1 {
+        format!("{} - {a}", safe_file_name(title))
+    } else {
+        format!("{} - {a} to {b}", safe_file_name(title))
+    }
+}
+
+/// The watermark font that ships with the Python scripts.
+pub(crate) fn mark_font(env: Option<&crate::setup::Env>) -> Option<PathBuf> {
+    let scripts = env.and_then(|e| e.scripts.as_ref().ok()).map(|l| l.dir.clone());
+    scripts.or_else(|| mv_studio::PythonLayout::resolve(None).ok().map(|l| l.dir)).map(|d| d.join("fonts").join(MARK_FONT))
+}
+
 pub(crate) fn fmt_duration(secs: f64) -> String {
     let s = secs.max(0.).round() as u64;
     if s >= 3600 {
@@ -1128,15 +1193,14 @@ impl StudioPage {
     /// Asks for a folder, then exports with the section's choices.
     fn start_export(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
         let videos = self.made_videos(g);
-        let (Some(first), Some(last)) = (videos.first(), videos.last()) else { return };
-        let a = crate::pipeline::short_label(first.0.number, first.0.title.as_deref());
-        let b = crate::pipeline::short_label(last.0.number, last.0.title.as_deref());
-        let name = if videos.len() == 1 { format!("{} - {a}", safe_file_name(&g.title)) } else { format!("{} - {a} to {b}", safe_file_name(&g.title)) };
+        if videos.is_empty() {
+            return;
+        }
+        let name = export_name(&g.title, &videos.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>());
         let prefs = self.export_prefs;
         let group = g.clone();
         let env = self.setup.read(cx).env.clone();
-        let scripts = env.as_ref().and_then(|e| e.scripts.as_ref().ok()).map(|l| l.dir.clone());
-        let font = scripts.or_else(|| mv_studio::PythonLayout::resolve(None).ok().map(|l| l.dir)).map(|d| d.join("fonts").join(MARK_FONT));
+        let font = mark_font(env.as_ref());
         let hook = if prefs.mode() == Mode::Whole && prefs.hook {
             let Some((python, layout)) = env.and_then(|e| Some((e.python.ok()?, e.scripts.ok()?))) else {
                 toast::show(cx, Toast::error("The hook is voiced by Studio's Python, which is not set up yet. Finish Setup, or turn the hook off."));
@@ -1170,47 +1234,7 @@ impl StudioPage {
                         let kept = if prefs.music { 0 } else { j.music_kept };
                         let ex = cx.background_executor().clone();
                         cx.spawn_in(window, async move |this, cx| {
-                            let hook_dir = hook.as_ref().map(HookJob::work_dir);
-                            // A hook that could not be made leaves the video without it (said in the result).
-                            let mut hook_note = String::new();
-                            let mut hook_path = None;
-                            let res = match hook {
-                                Some(job) => match make_hook(job, &j, &r, &ex).await {
-                                    Ok((path, why)) => {
-                                        if let Some(why) = why {
-                                            hook_note = format!(" · the AI hook script failed ({why}), so the hook uses the narration's own lines");
-                                        }
-                                        hook_path = Some(path);
-                                        Ok(())
-                                    }
-                                    Err(e) if e.to_string() == CANCELLED => Err(e),
-                                    Err(e) => {
-                                        hook_note = format!(" · without the hook ({e:#})");
-                                        Ok(())
-                                    }
-                                },
-                                None => Ok(()),
-                            };
-                            let res = match res {
-                                Ok(()) => {
-                                    mv_ui::bg::blocking(move || {
-                                        let extras = Extras { hook: hook_path, watermark: load_watermark(&video_look_path()), font };
-                                        let out = export(&j, prefs.mode(), prefs.music, &dir, &name, &extras, &r);
-                                        if let Some(d) = hook_dir {
-                                            let _ = std::fs::remove_dir_all(d);
-                                        }
-                                        out
-                                    })
-                                    .await
-                                    .and_then(|r| r)
-                                }
-                                Err(e) => {
-                                    if let Some(d) = hook_dir {
-                                        let _ = mv_ui::bg::blocking(move || std::fs::remove_dir_all(d)).await;
-                                    }
-                                    Err(e)
-                                }
-                            };
+                            let (res, hook_note) = export_joined(j, hook, prefs, dir, name, font, r, ex).await;
                             let _ = this.update(cx, |this, cx| {
                                 this.export_job = None;
                                 match res {

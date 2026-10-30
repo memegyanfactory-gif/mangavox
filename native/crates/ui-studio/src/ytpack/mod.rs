@@ -3,8 +3,11 @@
 //! on YouTube (found under every title it goes by, compared with a reference channel), a rough
 //! views prediction, and a title / description / thumbnail concept from the picked AI model.
 //! Saved per manga in `studio/<manga>/youtube_package.json`.
+mod assist;
 mod logic;
 mod scrape;
+
+pub(crate) use assist::{has_title, register_tools};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

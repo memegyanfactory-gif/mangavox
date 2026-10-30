@@ -336,9 +336,14 @@ impl Look {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        self.save_to(&look_file())
+        let out = self.save_to(&look_file());
+        SAVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        out
     }
 }
+
+/// Bumped on every save, so an open Look panel picks up a change made elsewhere (the assistant).
+static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `<data>/studio/video_look.json`.
 pub fn look_file() -> PathBuf {
@@ -429,6 +434,7 @@ pub(crate) struct LookPanel {
     text: Entity<InputState>,
     logo: Option<LogoImage>,
     _subs: Vec<Subscription>,
+    _watch: Task<()>,
 }
 
 impl LookPanel {
@@ -449,7 +455,35 @@ impl LookPanel {
             }
         })];
         let logo = look.logo.path.as_deref().and_then(load_logo_image);
-        Self { look, text, logo, _subs: subs }
+        let watch = cx.spawn_in(window, async move |this, cx| {
+            let mut seen = SAVES.load(std::sync::atomic::Ordering::SeqCst);
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                let now = SAVES.load(std::sync::atomic::Ordering::SeqCst);
+                if now == seen {
+                    continue;
+                }
+                seen = now;
+                let fresh = Look::load();
+                let alive = this.update_in(cx, |this, window, cx| {
+                    if fresh != this.look {
+                        if fresh.text.text != this.look.text.text {
+                            let t = fresh.text.text.clone();
+                            this.text.update(cx, |s, cx| s.set_value(t, window, cx));
+                        }
+                        if fresh.logo.path != this.look.logo.path {
+                            this.logo = fresh.logo.path.as_deref().and_then(load_logo_image);
+                        }
+                        this.look = fresh;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
+        Self { look, text, logo, _subs: subs, _watch: watch }
     }
 
     fn edit(&mut self, f: impl FnOnce(&mut Look), cx: &mut Context<Self>) {

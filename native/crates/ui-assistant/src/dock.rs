@@ -23,12 +23,15 @@ use crate::agent::{self, AgentEvent, AgentParams, Outcome};
 use crate::picker::{pretty_id, ModelPicker};
 use crate::shared::{shared, Shared};
 use crate::store::{now_ms, title_from, ChatItem, ItemRole, ItemStatus, StepState, ToolStep};
+use crate::suggest::{self, Suggestion};
 use crate::tools::{self, AppTools};
 use crate::ui::{ago_ms, date_group, field, fmt_secs, not_ready_title, provider_logo, search_prefix, set_value, text_state, value_of};
 
 const PLACEHOLDER: &str = "Ask about your library, find anime, or attach a panel…";
 const DRAWER_W: f32 = 288.;
 const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+/// How often the app's own suggestions are looked at again.
+const SUGGEST_EVERY: Duration = Duration::from_secs(20);
 
 struct Run {
     thread: String,
@@ -69,7 +72,12 @@ pub struct Dock {
     /// "Always allow in this chat": access per thread for this session.
     thread_access: HashMap<String, AiAccessMode>,
     run: Option<Run>,
+    /// The app's proactive suggestions (failed chapters, new downloads...), refreshed in the background.
+    app_suggestions: Vec<Suggestion>,
+    /// Cards closed this session, by id.
+    dismissed: Vec<String>,
     _subs: Vec<Subscription>,
+    _poll: Task<()>,
 }
 
 pub fn create(window: &mut Window, cx: &mut App) -> AnyView {
@@ -105,6 +113,19 @@ impl Dock {
             }
             s.refresh_providers(false, cx);
         });
+        let poll = cx.spawn(async move |this, cx| loop {
+            let list = mv_ui::bg::blocking(suggest::collect).await.unwrap_or_default();
+            let alive = this.update(cx, |this, cx| {
+                if this.app_suggestions != list {
+                    this.app_suggestions = list;
+                    cx.notify();
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+            cx.background_executor().timer(SUGGEST_EVERY).await;
+        });
         Self {
             shared,
             focus: cx.focus_handle(),
@@ -121,7 +142,10 @@ impl Dock {
             wheel_down: false,
             thread_access: HashMap::new(),
             run: None,
+            app_suggestions: vec![],
+            dismissed: vec![],
             _subs: subs,
+            _poll: poll,
         }
     }
 
@@ -270,7 +294,7 @@ impl Dock {
         let cancel = CancellationToken::new();
         let (tx, mut rx) = mpsc::unbounded::<AgentEvent>();
         let registry = self.shared.read(cx).registry.clone();
-        let params = AgentParams { provider: prefs.provider, model: prefs.model.clone(), effort: prefs.effort, access: access.clone(), system: String::new(), history, tools_enabled: def.supports_tools, images };
+        let params = AgentParams { provider: prefs.provider, model: prefs.model.clone(), effort: prefs.effort, access: access.clone(), system: String::new(), history, tools_enabled: true, native_tools: def.supports_tools, images };
         let token = cancel.clone();
         mv_ui::bg::runtime().spawn(async move {
             let mut params = params;
@@ -365,6 +389,7 @@ impl Dock {
                     }
                     AgentEvent::Approval { step_id, reply } => approvals.push((step_id, reply)),
                     AgentEvent::Navigate(route) => navigations.push(route),
+                    AgentEvent::Suggest(list) => item.suggestions = list,
                     AgentEvent::Finished { outcome, history } => {
                         if let (Some(t0), None, true) = (since, item.reasoning_ms, item.reasoning.is_some()) {
                             item.reasoning_ms = Some(now_ms().saturating_sub(t0));
@@ -1018,14 +1043,16 @@ impl Dock {
             }
         }
 
-        if !item.text.trim().is_empty() {
-            col = col.child(div().text_size(px(size::MD)).text_color(Tokens::text_1()).child(TextView::markdown(SharedString::from(format!("md-{}", item.id)), item.text.clone()).selectable(true)));
+        // A CLI agent's ```mangavox action blocks are shown as the step rows above, not as text.
+        let shown = agent::visible_text(&item.text).into_owned();
+        if !shown.trim().is_empty() {
+            col = col.child(div().text_size(px(size::MD)).text_color(Tokens::text_1()).child(TextView::markdown(SharedString::from(format!("md-{}", item.id)), shown.clone()).selectable(true)));
         } else if streaming && item.reasoning.is_none() && item.steps.is_empty() && item.activity.is_empty() {
             col = col.child(div().flex().items_center().gap(px(8.)).h(px(24.)).child(ph_icon(glyphs::ASSISTANT, Weight::Fill, Tokens::accent(), icon_px::SM)).child(shimmer_text("Thinking…").text_size(px(size::MD))));
         }
 
         match item.status {
-            ItemStatus::Done if !item.text.trim().is_empty() => {
+            ItemStatus::Done if !shown.trim().is_empty() => {
                 let model = item.model.as_deref().filter(|m| !m.is_empty()).map(|m| pretty_id(AiProviderId::Custom, m));
                 let wait = self.wait_reason(cx);
                 col = col.child(
@@ -1036,7 +1063,7 @@ impl Dock {
                         .ml(px(-6.))
                         // Always there on the latest answer; on hover for older ones.
                         .when(!last, |d| d.invisible().group_hover("asst-msg", |s| s.visible()))
-                        .child(copy_button(("copy-reply", ix), item.text.clone()).small())
+                        .child(copy_button(("copy-reply", ix), shown.clone()).small())
                         .when(last, |d| {
                             d.child(icon_button(("regen", ix), glyphs::RETRY, "Regenerate").small().when(!idle, |b| b.disabled(wait)).on_click(cx.listener(|this, _, w, cx| this.retry(w, cx))))
                         })
@@ -1059,7 +1086,73 @@ impl Dock {
             }
             _ => {}
         }
+        // Next steps the model offered: on the latest reply only (older ones may be stale).
+        if last && !streaming && !item.suggestions.is_empty() {
+            col = col.child(div().flex().flex_wrap().gap(px(6.)).children(item.suggestions.iter().enumerate().map(|(i, s)| {
+                let prompt = s.prompt.clone();
+                btn(("reply-suggest", i), s.title.clone(), ButtonKind::Secondary)
+                    .small()
+                    .icon(ph::ARROW_RIGHT)
+                    .tooltip(s.prompt.clone())
+                    .on_click(cx.listener(move |this, _, w, cx| this.send(prompt.clone(), w, cx)))
+            })));
+        }
         col.into_any_element()
+    }
+
+    fn dismiss_suggestion(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.dismissed.contains(&id) {
+            self.dismissed.push(id);
+        }
+        cx.notify();
+    }
+
+    /// One proactive card ("Ch. 12 failed at Audio: retry?"): a click sends its prompt.
+    fn suggestion_card(&self, i: usize, s: &Suggestion, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (prompt, id) = (s.prompt.clone(), s.id.clone());
+        div()
+            .id(("app-suggest", i))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .w_full()
+            .px(px(12.))
+            .py(px(8.))
+            .rounded(px(radius::LG))
+            .border_1()
+            .border_color(Tokens::border())
+            .bg(Tokens::surface())
+            .role(Role::Button)
+            .tooltip(tip(s.prompt.clone()))
+            .hover(|st| st.bg(Tokens::hover()).border_color(Tokens::border_strong()))
+            .pressable()
+            .child(ph_icon(ph::LIGHTBULB, Weight::Duotone, Tokens::accent(), icon_px::MD))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().truncate().text_size(px(size::SM)).text_color(Tokens::text_1()).child(s.title.clone()))
+                    .when(!s.detail.is_empty(), |d| d.child(div().truncate().text_size(px(size::XS)).text_color(Tokens::text_3()).child(s.detail.clone()))),
+            )
+            .child(icon_button(("app-suggest-x", i), ph::X, "Not now").small().on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.dismiss_suggestion(id.clone(), cx);
+            })))
+            .on_click(cx.listener(move |this, _, w, cx| this.send(prompt.clone(), w, cx)))
+    }
+
+    /// Up to two app suggestions above the composer while a chat is open and nothing runs.
+    fn suggestion_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.run.is_some() {
+            return None;
+        }
+        let cards = suggest::visible(&self.app_suggestions, &self.dismissed, 2);
+        if cards.is_empty() {
+            return None;
+        }
+        Some(div().flex().flex_col().gap(px(6.)).px(px(14.)).pb(px(8.)).children(cards.iter().enumerate().map(|(i, s)| self.suggestion_card(i, s, cx))).into_any_element())
     }
 
     /// Plain-language error with a way forward; the provider's raw message sits behind Details.
@@ -1205,10 +1298,15 @@ impl Dock {
         }
         let page = tools::page_context();
         let items = suggestions(page.as_ref().map(tools::page_name));
+        let cards = suggest::visible(&self.app_suggestions, &self.dismissed, 4);
+        let for_you = (!cards.is_empty()).then(|| {
+            div().flex().flex_col().gap(px(6.)).w_full().child(section_label("For you")).children(cards.iter().enumerate().map(|(i, s)| self.suggestion_card(i, s, cx)))
+        });
         shell(
             body.child(div().flex().items_center().justify_center().size(px(52.)).rounded_full().bg(Tokens::accent_soft()).child(ph_icon(glyphs::ASSISTANT, Weight::Duotone, Tokens::accent(), icon_px::XL)))
             .child(div().ramp(ramp::SUBTITLE).text_color(Tokens::text_1()).child("How can I help?"))
-            .child(div().max_w(px(320.)).text_center().text_size(px(size::MD)).line_height(px(20.)).text_color(Tokens::text_3()).child("Ask about your library, find something to watch, or let me open pages and change settings for you."))
+            .child(div().max_w(px(320.)).text_center().text_size(px(size::MD)).line_height(px(20.)).text_color(Tokens::text_3()).child("Ask me to download chapters, make and export recap videos, find something to watch, or open any page for you."))
+            .children(for_you)
             .child(div().flex().flex_col().gap(px(6.)).w_full().pt(px(6.)).children(items.into_iter().enumerate().map(|(i, (glyph, text))| {
                 div()
                     .id(("suggest", i))
@@ -1651,6 +1749,7 @@ pub fn suggestions(page: Option<&str>) -> Vec<(Ph, &'static str)> {
         Some("movies") | Some("movie-detail") => vec![(glyphs::SEARCH, "Find a good sci-fi movie"), (glyphs::HISTORY, "What did I watch recently?"), (glyphs::FAVORITES, "Open my favourites")],
         Some("discover") | Some("favorites") | Some("media-history") => vec![(glyphs::HISTORY, "What did I watch recently?"), (glyphs::SEARCH, "Find something like Death Note"), (glyphs::MOVIES, "Switch to movies")],
         Some("settings") => vec![(glyphs::SETTINGS, "Open the AI providers settings"), (glyphs::DOWNLOAD, "Where can I download local models?"), (glyphs::BACK, "Take me back")],
+        Some("studio") => vec![(glyphs::VIDEO, "Which chapters still need a recap?"), (glyphs::ASSISTANT, "How is the recap queue doing?"), (glyphs::DOWNLOADS, "Export the full recap of my latest manga")],
         _ => vec![(glyphs::ASSISTANT, "What can you do in this app?"), (glyphs::LIBRARY, "Show me my library"), (glyphs::HISTORY, "What did I watch recently?")],
     }
 }
@@ -1740,6 +1839,7 @@ impl Render for Dock {
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
             .child(self.header(title, cx))
             .child(list)
+            .when(n > 0, |d| d.children(self.suggestion_strip(cx)))
             .child(self.composer(window, cx))
             .children(drawer)
     }
