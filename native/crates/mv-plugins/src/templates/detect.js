@@ -8,6 +8,8 @@ function detectEngine(html) {
   if (/FoOlSlide|\/foolslide\/|fs-reader|\/content\/themes\/default\/style\.css/.test(h)) return 'foolslide';
   if (/href=["'](?:https?:\/\/[^"']+)?\/series\/\?genre=/i.test(h) && /\/assets\/images\/|realUrl\s*=|id=["']chapters["']/i.test(h)) return 'keyoapp';
   if (/heancms|hean-cms|api\.[a-z0-9-]+\.[a-z]+\/(query|series|chapter)|"series_slug"|series_slug\\?"/i.test(h)) return 'heancms';
+  // Gallery sites: thumbnail grids linking to /gallery/<number>/, or a gallery page's page data.
+  if (/id=["']load_dir["']|g_th\s*=\s*\$\.parseJSON/i.test(h) || (/class=["'][^"']*\binner_thumb\b/i.test(h) && /href=["'](?:https?:\/\/[^"']+)?\/gallery\/\d+\/?["']/i.test(h))) return 'galleryadults';
   return 'generic';
 }
 function detectCanonicalBase(html) {

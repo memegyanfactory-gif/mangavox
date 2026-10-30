@@ -21,6 +21,6 @@ mod types;
 pub mod util;
 pub mod webtoon;
 
-pub use registry::SourceRegistry;
-pub use source::{Result, Source, SourceCtx, SourceError, WallSolver};
+pub use registry::{builtin_for_host, SourceRegistry};
+pub use source::{set_smart_bypass, smart_bypass, Result, Source, SourceCtx, SourceError, WallSolver};
 pub use types::{ChapterInfo, MangaDetails, MangaSearchResult, SourceInfo, Tag};

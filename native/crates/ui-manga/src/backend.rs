@@ -20,11 +20,29 @@ static CTX: OnceLock<SourceCtx> = OnceLock::new();
 /// Optional: let the shell install a `SourceCtx` (shared HTTP client + wall solver) before the first
 /// page opens. Returns false when one was already set / created.
 pub fn set_source_ctx(ctx: SourceCtx) -> bool {
+    mv_sources::set_smart_bypass(smart_bypass());
     CTX.set(ctx).is_ok()
 }
 
 pub fn ctx() -> SourceCtx {
-    CTX.get_or_init(|| SourceCtx::new(Http::with_defaults().expect("http client"))).clone()
+    CTX.get_or_init(|| {
+        mv_sources::set_smart_bypass(smart_bypass());
+        SourceCtx::new(Http::with_defaults().expect("http client"))
+    })
+    .clone()
+}
+
+const SMART_BYPASS_KEY: &str = "sources.smartBypass";
+
+/// Settings › Sources › Smart bypass (on unless switched off): anti-bot walls are cleared in the
+/// hidden browser and the request is retried.
+pub fn smart_bypass() -> bool {
+    mv_core::config::Config::open_default().get(SMART_BYPASS_KEY).and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
+pub fn set_smart_bypass(on: bool) -> Result<()> {
+    mv_sources::set_smart_bypass(on);
+    mv_core::config::Config::open_default().set(SMART_BYPASS_KEY, serde_json::json!(on))
 }
 
 pub fn plugins_dir() -> PathBuf {
@@ -181,6 +199,16 @@ pub async fn registry() -> Arc<SourceRegistry> {
 pub async fn reload_registry() -> Arc<SourceRegistry> {
     let mut reg = SourceRegistry::builtin(ctx());
     let dir = plugins_dir();
+    // A repo extension for a site a built-in source reads (MangaDex, WEBTOON...) was installed as a
+    // generated scraper by older builds; the built-in source replaces it.
+    for p in mv_plugins::repo::installed_repo_plugins(&dir) {
+        if let Some(builtin) = mv_sources::builtin_for_host(&p.manifest.base_url) {
+            match set_source_enabled(builtin, true).and_then(|_| mv_plugins::repo::uninstall_plugin(&dir, &p.manifest.id)) {
+                Ok(_) => eprintln!("[ui-manga] {} now uses the built-in {builtin} source", p.manifest.id),
+                Err(e) => eprintln!("[ui-manga] could not switch {} to the built-in source: {e:#}", p.manifest.id),
+            }
+        }
+    }
     // Repo plugins made by an older template are regenerated offline before they load.
     let upgraded = mv_plugins::repo::upgrade_repo_plugins(&dir);
     if upgraded > 0 {
@@ -194,6 +222,7 @@ pub async fn reload_registry() -> Arc<SourceRegistry> {
     }
     let reg = Arc::new(reg);
     *REGISTRY.lock().unwrap_or_else(|e| e.into_inner()) = Some(reg.clone());
+    bump_sources();
     reg
 }
 
@@ -204,6 +233,39 @@ pub async fn source(id: &str) -> Result<Arc<dyn Source>> {
 /// Ids of builtin sources (everything else in the registry is an installed plugin).
 pub fn is_installed_plugin(id: &str) -> bool {
     mv_plugins::repo::list_installed(&plugins_dir()).iter().any(|m| m.id == id)
+}
+
+static SOURCES_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped whenever the installed sources change (install, removal, registry reload), so Browse
+/// and Settings reload their source lists when they are shown again.
+pub fn sources_version() -> u64 {
+    SOURCES_VERSION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn bump_sources() {
+    SOURCES_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The sources Browse lists, in registry order: every installed plugin and the built-in sources
+/// the user added. Built-in sources are not installed until added.
+pub fn installed_sources(all: Vec<SourceInfo>) -> Vec<SourceInfo> {
+    let builtin: HashSet<String> = builtin_sources().into_iter().map(|s| s.id).collect();
+    let off = disabled_sources();
+    all.into_iter().filter(|s| !builtin.contains(&s.id) || !off.contains(&s.id)).collect()
+}
+
+/// Removes a source so Browse stops listing it: an installed plugin's folder is deleted and the
+/// registry reloaded; a built-in source is taken off the installed list (it can be added again).
+pub async fn remove_source(id: &str) -> Result<()> {
+    if builtin_sources().iter().any(|s| s.id == id) {
+        return set_source_enabled(id, false);
+    }
+    mv_plugins::repo::uninstall_plugin(&plugins_dir(), id)?;
+    // Drop any switch saved for it, so a reinstall starts clean.
+    set_source_enabled(id, true)?;
+    reload_registry().await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- plugin network access
@@ -272,7 +334,7 @@ impl mv_plugins::FetchBackend for WallBackend {
     fn solve(&self, _plugin_id: &str, url: String) -> BoxFut<bool> {
         let ctx = self.ctx.clone();
         Box::pin(async move {
-            let Some(solver) = ctx.solver.clone() else { return Ok(false) };
+            let Some(solver) = ctx.solver.clone().filter(|_| mv_sources::smart_bypass()) else { return Ok(false) };
             let cookies = solver.cookies(&url).await.map_err(|e| format!("{e:#}"))?;
             for (n, v) in &cookies {
                 let _ = ctx.http.add_cookie(&url, &format!("{n}={v}"));
@@ -324,7 +386,9 @@ pub fn with_builtins(disabled: &HashSet<String>, builtin: &[String], enabled: &H
 pub fn set_builtins_enabled(enabled: &HashSet<String>) -> Result<()> {
     let builtin: Vec<String> = builtin_sources().into_iter().map(|s| s.id).collect();
     let v = with_builtins(&disabled_sources(), &builtin, enabled);
-    mv_core::config::Config::open_default().set(DISABLED_KEY, serde_json::json!(v))
+    mv_core::config::Config::open_default().set(DISABLED_KEY, serde_json::json!(v))?;
+    bump_sources();
+    Ok(())
 }
 
 /// A clean start: no built-in source is switched on, so Browse shows nothing until the user adds
@@ -333,13 +397,13 @@ pub fn seed_clean_start() -> Result<()> {
     set_builtins_enabled(&HashSet::new())
 }
 
+/// Sources taken out of Browse. Before anything is saved every built-in source is in it: a new
+/// install starts with no source at all.
 pub fn disabled_sources() -> HashSet<String> {
-    mv_core::config::Config::open_default()
-        .get(DISABLED_KEY)
-        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
+    match mv_core::config::Config::open_default().get(DISABLED_KEY).and_then(|v| serde_json::from_value::<Vec<String>>(v).ok()) {
+        Some(v) => v.into_iter().collect(),
+        None => builtin_sources().into_iter().map(|s| s.id).collect(),
+    }
 }
 
 pub fn set_source_enabled(id: &str, enabled: bool) -> Result<()> {
@@ -351,7 +415,9 @@ pub fn set_source_enabled(id: &str, enabled: bool) -> Result<()> {
     }
     let mut v: Vec<String> = set.into_iter().collect();
     v.sort();
-    mv_core::config::Config::open_default().set(DISABLED_KEY, serde_json::json!(v))
+    mv_core::config::Config::open_default().set(DISABLED_KEY, serde_json::json!(v))?;
+    bump_sources();
+    Ok(())
 }
 
 // ---------------------------------------------------------------- downloads

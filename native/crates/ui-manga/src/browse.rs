@@ -82,6 +82,8 @@ pub struct BrowsePage {
     /// Titles already in the database, for the "In library" marker and instant opening.
     known: Known,
     seen_version: u64,
+    /// [`backend::sources_version`] the source list was loaded at.
+    seen_sources: u64,
     width: f32,
     /// Tag list of `tags_for` (the selected source once the panel has been opened).
     tags: Load<SourceTags>,
@@ -118,6 +120,7 @@ impl BrowsePage {
             busy: None,
             known: HashMap::new(),
             seen_version: u64::MAX,
+            seen_sources: 0,
             width: 0.,
             tags: Load::Loading,
             tags_for: None,
@@ -129,19 +132,28 @@ impl BrowsePage {
         p
     }
 
+    /// (Re)loads the installed sources. Called on open and whenever they change (an install or a
+    /// removal in Settings); the shown results stay when the selected source is still there.
     fn load_sources(&mut self, cx: &mut Context<Self>) {
-        self.sources = Load::Loading;
+        self.seen_sources = backend::sources_version();
+        if !matches!(self.sources, Load::Ready(_)) {
+            self.sources = Load::Loading;
+        }
         cx.spawn(async move |this, cx| {
-            let list = mv_ui::bg::run(async { backend::registry().await.list() }).await;
+            let list = mv_ui::bg::run(async { backend::installed_sources(backend::registry().await.list()) }).await;
             let _ = this.update(cx, |this, cx| {
                 match list {
                     Ok(list) => {
-                        let off = backend::disabled_sources();
-                        let list: Vec<SourceInfo> = list.into_iter().filter(|s| !off.contains(&s.id)).collect();
-                        let last = backend::config_str(SOURCE_KEY).filter(|id| list.iter().any(|s| &s.id == id));
-                        this.selected = last.or_else(|| list.first().map(|s| s.id.clone()));
+                        let had = matches!(this.results, Load::Ready(_)) && this.selected.as_ref().is_some_and(|id| list.iter().any(|s| &s.id == id));
+                        if !had {
+                            let last = backend::config_str(SOURCE_KEY).filter(|id| list.iter().any(|s| &s.id == id));
+                            this.selected = last.or_else(|| list.first().map(|s| s.id.clone()));
+                            this.mode = Mode::Popular;
+                        }
                         this.sources = Load::Ready(list);
-                        this.fetch(cx);
+                        if !had {
+                            this.fetch(cx);
+                        }
                     }
                     Err(e) => this.sources = Load::Failed(format!("{e:#}")),
                 }
@@ -688,6 +700,9 @@ impl Render for BrowsePage {
             self.seen_version = v;
             self.reload_known(cx);
         }
+        if backend::sources_version() != self.seen_sources {
+            self.load_sources(cx);
+        }
         if matches!(self.sources, Load::Ready(_)) {
             if let Some(req) = discover::take_request() {
                 let page = cx.entity();
@@ -720,7 +735,7 @@ impl Render for BrowsePage {
             Load::Ready(list) if list.is_empty() => {
                 // Empty Browse: say why and give the one next step (NN/g empty states).
                 return root.child(
-                    empty_view(glyphs::SOURCES, "Add a source", "Browse finds manga through sources. Add or turn one on in Settings to start exploring.")
+                    empty_view(glyphs::SOURCES, "Add a source", "Browse finds manga through sources. Add one in Settings to start exploring.")
                         .action(btn("open-sources", "Add a source", ButtonKind::Primary).icon(ph::PLUS).on_click(|_, w, cx| mv_ui::navigate(Route::Settings { tab: Some("sources".into()) }, w, cx))),
                 );
             }

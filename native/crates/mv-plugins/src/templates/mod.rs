@@ -28,12 +28,13 @@ const MANGABOX_JS: &str = include_str!("mangabox.js");
 const FOOLSLIDE_JS: &str = include_str!("foolslide.js");
 const HEANCMS_JS: &str = include_str!("heancms.js");
 const KEYOAPP_JS: &str = include_str!("keyoapp.js");
+const GALLERYADULTS_JS: &str = include_str!("galleryadults.js");
 const GENERIC_JS: &str = include_str!("generic.js");
 const DISPATCHER_JS: &str = include_str!("dispatcher.js");
 
 /// Bump when generated code changes in a way installed plugins should pick up (see
 /// [`needs_regeneration`] and `repo::upgrade_repo_plugins`).
-pub const TEMPLATE_VERSION: u32 = 2;
+pub const TEMPLATE_VERSION: u32 = 4;
 pub const TEMPLATE_HEADER: &str = "// MangaVox template plugin";
 /// Header written by the old (pre-template) Electron generator.
 pub const LEGACY_HEADER: &str = "// Auto-generated MangaVox plugin";
@@ -48,6 +49,7 @@ pub enum Engine {
     FoolSlide,
     HeanCms,
     KeyoApp,
+    GalleryAdults,
     Generic,
     #[default]
     Auto,
@@ -62,6 +64,7 @@ impl Engine {
             Engine::FoolSlide => "foolslide",
             Engine::HeanCms => "heancms",
             Engine::KeyoApp => "keyoapp",
+            Engine::GalleryAdults => "galleryadults",
             Engine::Generic => "generic",
             Engine::Auto => "auto",
         }
@@ -75,6 +78,7 @@ impl Engine {
             "foolslide" => Engine::FoolSlide,
             "heancms" => Engine::HeanCms,
             "keyoapp" => Engine::KeyoApp,
+            "galleryadults" => Engine::GalleryAdults,
             "generic" => Engine::Generic,
             "auto" => Engine::Auto,
             _ => return None,
@@ -180,6 +184,7 @@ pub fn generate_template_plugin(opts: &TemplateOptions) -> String {
         FOOLSLIDE_JS.to_string(),
         HEANCMS_JS.to_string(),
         KEYOAPP_JS.to_string(),
+        GALLERYADULTS_JS.to_string(),
         GENERIC_JS.to_string(),
         DISPATCHER_JS.to_string(),
     ]

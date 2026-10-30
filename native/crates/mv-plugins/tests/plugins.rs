@@ -385,6 +385,9 @@ fn engine_detection_matches_the_embedded_signatures() {
     assert_eq!(d("Powered by FoOlSlide"), Engine::FoolSlide);
     assert_eq!(d(r#"<a href="/series/?genre=action"></a><img src="/assets/images/x.png">"#), Engine::KeyoApp);
     assert_eq!(d(r#"{"series_slug":"a"}"#), Engine::HeanCms);
+    assert_eq!(d(r#"<div class="inner_thumb"><a href="/gallery/176338/"><img></a></div>"#), Engine::GalleryAdults);
+    assert_eq!(d(r#"<input type="hidden" id="load_dir" value="005" />"#), Engine::GalleryAdults);
+    assert_eq!(d(r#"<a href="/gallery/12/">a gallery link alone</a>"#), Engine::Generic);
     assert_eq!(d("<html>nothing</html>"), Engine::Generic);
     assert_eq!(d(""), Engine::Generic);
     // Search pages echo our own ?post_type=wp-manga query: that alone is not Madara.
@@ -439,7 +442,7 @@ async fn install_madara_extension_and_browse() {
     assert_eq!(m.extra["repo_pkg"], "eu.kanade.tachiyomi.extension.en.onepiece");
     assert_eq!(m.extra["id_style"], "path");
     let code = std::fs::read_to_string(dir.join(&r.id).join("index.js")).unwrap();
-    assert!(code.starts_with("// MangaVox template plugin v2 (engine: madara)"));
+    assert!(code.starts_with(&format!("// MangaVox template plugin v{} (engine: madara)", mv_plugins::templates::TEMPLATE_VERSION)));
     assert_eq!(repo::read_repo_source(&dir, &r.id), Some(e.clone()));
     assert_eq!(repo::read_repo_source(&dir, "nope"), None);
     assert!(!dir.join(&r.id).join("index.js.tmp").exists());
@@ -783,14 +786,14 @@ async fn old_repo_plugins_are_regenerated_offline() {
     assert_eq!(repo::upgrade_repo_plugins(&dir), 0, "idempotent");
 
     let code = std::fs::read_to_string(legacy.join("index.js")).unwrap();
-    assert!(code.starts_with("// MangaVox template plugin v2 (engine: auto)"));
+    assert!(code.starts_with(&format!("// MangaVox template plugin v{} (engine: auto)", mv_plugins::templates::TEMPLATE_VERSION)));
     assert!(std::fs::read_to_string(legacy.join("index.js.bak")).unwrap().contains("Auto-generated"));
     let m = read_manifest(&legacy).unwrap();
     assert_eq!((m.extra["engine"].as_str(), m.extra["id_style"].as_str()), (Some("auto"), Some("legacy")));
     assert!(code.contains("\"legacyIds\":true"));
 
     let code = std::fs::read_to_string(v1.join("index.js")).unwrap();
-    assert!(code.starts_with("// MangaVox template plugin v2 (engine: madara)"));
+    assert!(code.starts_with(&format!("// MangaVox template plugin v{} (engine: madara)", mv_plugins::templates::TEMPLATE_VERSION)));
     let m = read_manifest(&v1).unwrap();
     assert_eq!((m.extra["id_style"].as_str(), m.extra["repo_pkg"].as_str(), m.extra["generator"].as_str()), (Some("path"), Some("x.extension.en.b"), Some("mangavox-template")));
 

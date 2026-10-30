@@ -136,7 +136,7 @@ impl AddonRegistry {
     pub fn uninstall(&self, id: &str) -> Result<()> {
         let dir = self.folder(id)?;
         if dir.exists() {
-            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::remove_dir_all(&dir).map_err(|e| MediaError::InvalidManifest(format!("could not delete {}: {e}", dir.display())))?;
         }
         self.items().retain(|a| a.manifest.id != id);
         self.clear_cache();

@@ -713,7 +713,8 @@ fn upgrade_one(dir: &Path) -> Result<bool> {
             .map(|e| e.pkg)
     });
     // The old generator never detected anything: let the runtime detect.
-    let engine = if legacy { Engine::Auto } else { str_extra("engine").and_then(|e| Engine::from_id(&e)).unwrap_or(Engine::Auto) };
+    // A `generic` guess is detected again: newer templates may know the site's theme.
+    let engine = if legacy { Engine::Auto } else { str_extra("engine").and_then(|e| Engine::from_id(&e)).filter(|e| *e != Engine::Generic).unwrap_or(Engine::Auto) };
     let legacy_ids = legacy || str_extra("id_style").as_deref() == Some("legacy");
     let next = generate_template_plugin(&TemplateOptions {
         name: m.name.clone(),

@@ -1,5 +1,5 @@
-//! Settings -> Sources: chapter language, installed sources (enable, test, remove), extension
-//! repositories ([`RepoBrowser`]) and installing a plugin from a link ([`PluginLinkBox`]). The
+//! Settings -> Sources: installed sources first (test, remove), then adding one (built-in sources,
+//! extension repositories ([`RepoBrowser`]), a plugin link ([`PluginLinkBox`])), Smart bypass and the chapter language. The
 //! repository browser and the link box are also used by the welcome setup (ui-welcome).
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -13,8 +13,8 @@ use mv_sources::SourceInfo;
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    btn, confirm_dialog, confirm_inline, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, muted, page_title, ph, section_header, size, skeleton, skeleton_line,
-    status_tag, switch, tag, ButtonKind, MenuItem, StatusKind, Tokens, Tone,
+    btn, confirm_dialog, confirm_inline, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, muted, ph, section_header, section_label, size, skeleton, skeleton_line,
+    status_tag, switch, tag, ButtonKind, MenuItem, Ph, StatusKind, Tokens, Tone,
 };
 
 use crate::backend;
@@ -33,14 +33,23 @@ struct Row {
     health: Health,
 }
 
+/// The source lists: what Browse shows, and the built-in sources not added yet.
+struct Lists {
+    installed: Vec<Row>,
+    available: Vec<SourceInfo>,
+}
+
 pub struct SourcesPanel {
-    rows: Option<Result<Vec<Row>, String>>,
-    disabled: HashSet<String>,
+    lists: Option<Result<Lists, String>>,
+    /// Sources being removed.
+    removing: HashSet<String>,
     repos: Entity<RepoBrowser>,
     plugin_box: Entity<PluginLinkBox>,
     /// Preferred chapter language (manga pages show only chapters in it, when there are any).
     lang: String,
-    _subs: Vec<Subscription>,
+    smart_bypass: bool,
+    /// [`backend::sources_version`] the lists were loaded at.
+    seen_sources: u64,
 }
 
 const LANGUAGES: [(&str, &str); 8] = [
@@ -93,31 +102,46 @@ impl SourcesPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let repos = cx.new(|cx| RepoBrowser::new(window, cx));
         let plugin_box = cx.new(|cx| PluginLinkBox::new(window, cx));
-        // An install or removal in either box reloads the list of sources below.
-        let subs = vec![
-            cx.subscribe(&repos, |this, _, _: &SourcesEvent, cx| this.reload(false, cx)),
-            cx.subscribe(&plugin_box, |this, _, _: &SourcesEvent, cx| this.reload(false, cx)),
-        ];
-        let mut p = Self { rows: None, disabled: backend::disabled_sources(), repos, plugin_box, lang: backend::preferred_language(), _subs: subs };
+        let mut p = Self {
+            lists: None,
+            removing: HashSet::new(),
+            repos,
+            plugin_box,
+            lang: backend::preferred_language(),
+            smart_bypass: backend::smart_bypass(),
+            seen_sources: 0,
+        };
         p.reload(false, cx);
         p
     }
 
+    /// Reloads both lists. Runs on open and whenever the installed sources change (an install
+    /// from a repository or a link, a removal, a built-in source added).
     fn reload(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.seen_sources = backend::sources_version();
         cx.spawn(async move |this, cx| {
             let res = mv_ui::bg::run(async move {
                 let reg = if force { backend::reload_registry().await } else { backend::registry().await };
-                let rows: Vec<Row> = reg
-                    .list()
+                let installed: Vec<Row> = backend::installed_sources(reg.list())
                     .into_iter()
                     .map(|info| Row { plugin: backend::is_installed_plugin(&info.id), info, health: Health::Unknown })
                     .collect();
-                rows
+                let off = backend::disabled_sources();
+                let available = backend::builtin_sources().into_iter().filter(|s| off.contains(&s.id)).collect();
+                Lists { installed, available }
             })
             .await;
             let _ = this.update(cx, |this, cx| {
-                this.disabled = backend::disabled_sources();
-                this.rows = Some(res.map_err(|e| format!("{e:#}")));
+                let mut res = res.map_err(|e| format!("{e:#}"));
+                // Test results survive a reload.
+                if let (Ok(new), Some(Ok(old))) = (&mut res, &this.lists) {
+                    for r in &mut new.installed {
+                        if let Some(o) = old.installed.iter().find(|o| o.info.id == r.info.id) {
+                            r.health = o.health.clone();
+                        }
+                    }
+                }
+                this.lists = Some(res);
                 cx.notify();
             });
         })
@@ -125,8 +149,8 @@ impl SourcesPanel {
     }
 
     fn set_health(&mut self, id: &str, h: Health, cx: &mut Context<Self>) {
-        if let Some(Ok(rows)) = &mut self.rows {
-            if let Some(r) = rows.iter_mut().find(|r| r.info.id == id) {
+        if let Some(Ok(lists)) = &mut self.lists {
+            if let Some(r) = lists.installed.iter_mut().find(|r| r.info.id == id) {
                 r.health = h;
             }
         }
@@ -163,56 +187,64 @@ impl SourcesPanel {
         .detach();
     }
 
-    fn set_enabled(&mut self, id: String, enable: bool, cx: &mut Context<Self>) {
-        match backend::set_source_enabled(&id, enable) {
-            Ok(()) => {
-                if enable {
-                    self.disabled.remove(&id);
-                } else {
-                    self.disabled.insert(id);
+    fn add_builtin(&mut self, info: SourceInfo, cx: &mut Context<Self>) {
+        match backend::set_source_enabled(&info.id, true) {
+            Ok(()) => toast::show(cx, Toast::success(format!("Added {}. It is in Browse now.", info.name))),
+            Err(e) => toast::show(cx, Toast::error(format!("Could not add {}: {e:#}", info.name))),
+        }
+        self.reload(false, cx);
+    }
+
+    /// Removing is not undoable from here, so it asks first.
+    /// NN/g confirmation dialogs: https://www.nngroup.com/articles/confirmation-dialog/
+    fn confirm_remove(&mut self, id: String, name: String, plugin: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        let body = if plugin {
+            "Its files are deleted from this computer and Browse stops listing it. Titles from it stay in your library, but they cannot be refreshed until you install it again."
+        } else {
+            "Browse stops listing it. You can add it again any time under Add a source. Titles from it stay in your library."
+        };
+        confirm_dialog(format!("Remove {name}?"), body, "Remove", true)
+            .icon(glyphs::DELETE)
+            .cancel_label("Keep it")
+            .on_confirm(move |_, cx| {
+                let (id, name) = (id.clone(), name.clone());
+                let _ = weak.update(cx, |this, cx| this.remove(id, name, cx));
+            })
+            .open(window, cx);
+    }
+
+    fn remove(&mut self, id: String, name: String, cx: &mut Context<Self>) {
+        if !self.removing.insert(id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let sid = id.clone();
+            let res = mv_ui::bg::run(async move { backend::remove_source(&sid).await }).await.and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.removing.remove(&id);
+                match res {
+                    Ok(()) => toast::show(cx, Toast::success(format!("Removed {name}"))),
+                    Err(e) => toast::show(cx, Toast::error(format!("Could not remove {name}: {e:#}"))),
                 }
-            }
+                this.reload(false, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn set_smart_bypass(&mut self, on: bool, cx: &mut Context<Self>) {
+        match backend::set_smart_bypass(on) {
+            Ok(()) => self.smart_bypass = on,
             Err(e) => toast::show(cx, Toast::error(format!("Could not save: {e:#}"))),
         }
         cx.notify();
     }
 
-    /// Removing a plugin is not undoable from here, so it asks first.
-    /// NN/g confirmation dialogs: https://www.nngroup.com/articles/confirmation-dialog/
-    fn confirm_uninstall(&mut self, id: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        let weak = cx.entity().downgrade();
-        confirm_dialog(
-            format!("Remove {name}?"),
-            "The plugin is uninstalled and Browse stops listing it. Titles from it stay in your library, but they cannot be refreshed until you install it again.",
-            "Remove plugin",
-            true,
-        )
-        .icon(glyphs::DELETE)
-        .cancel_label("Keep plugin")
-        .on_confirm(move |_, cx| {
-            let id = id.clone();
-            let _ = weak.update(cx, |this, cx| this.uninstall(id, cx));
-        })
-        .open(window, cx);
-    }
-
-    fn uninstall(&mut self, id: String, cx: &mut Context<Self>) {
-        match mv_plugins::repo::uninstall_plugin(&backend::plugins_dir(), &id) {
-            Ok(_) => {
-                toast::show(cx, Toast::success(format!("Removed {id}")));
-                self.reload(true, cx);
-                // Its repository row goes back to "Install".
-                self.repos.update(cx, |r, cx| r.refresh_installed(cx));
-            }
-            Err(e) => toast::show(cx, Toast::error(format!("Could not remove {id}: {e:#}"))),
-        }
-        cx.notify();
-    }
-
     fn source_row(&self, i: usize, r: &Row, cx: &mut Context<Self>) -> Stateful<Div> {
-        let id = r.info.id.clone();
-        let enabled = !self.disabled.contains(&id);
-        let (tid, eid, rid, name) = (id.clone(), id.clone(), id.clone(), r.info.name.clone());
+        let (tid, rid, name, plugin) = (r.info.id.clone(), r.info.id.clone(), r.info.name.clone(), r.plugin);
+        let removing = self.removing.contains(&r.info.id);
         let health: Option<AnyElement> = match &r.health {
             Health::Unknown => None,
             Health::Testing => Some(status_tag(StatusKind::Running).label("Testing").into_any_element()),
@@ -230,7 +262,7 @@ impl SourcesPanel {
             .gap(px(12.))
             .py(px(12.))
             .when(i > 0, |d| d.border_t_1().border_color(Tokens::border()))
-            .child(source_avatar(&r.info, 32., false).when(!enabled, |d| d.opacity(0.5)))
+            .child(source_avatar(&r.info, 32., false))
             .child(
                 div()
                     .flex_1()
@@ -243,7 +275,7 @@ impl SourcesPanel {
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(if enabled { Tokens::text_1() } else { Tokens::text_3() }).child(r.info.name.clone()))
+                            .child(div().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(r.info.name.clone()))
                             .children(health),
                     )
                     .child(
@@ -254,8 +286,8 @@ impl SourcesPanel {
                             .gap(px(6.))
                             .when(!r.info.lang.is_empty(), |d| d.child(tag(r.info.lang.to_uppercase(), Tone::Neutral)))
                             .when(r.info.nsfw, |d| d.child(tag("18+", Tone::Danger)))
-                            .child(tag(if r.plugin { "Plugin" } else { "Built in" }, if r.plugin { Tone::Accent } else { Tone::Neutral }))
-                            .child(muted(format!("v{} · {}", r.info.version, r.info.id))),
+                            .child(tag(if r.plugin { "Extension" } else { "Built in" }, if r.plugin { Tone::Accent } else { Tone::Neutral }))
+                            .child(muted(format!("v{}", r.info.version))),
                     )
                     .when_some(fail, |d, e| d.child(div().text_size(px(size::SM)).text_color(Tokens::danger()).child(e))),
             )
@@ -267,14 +299,37 @@ impl SourcesPanel {
                     .tooltip("Load one page of titles to check that the source answers")
                     .on_click(cx.listener(move |this, _, _, cx| this.test(tid.clone(), cx))),
             )
-            .when(r.plugin, |d| {
-                d.child(icon_button(("rm", i), glyphs::DELETE, "Remove plugin").danger().on_click(cx.listener(move |this, _, w, cx| this.confirm_uninstall(rid.clone(), name.clone(), w, cx))))
-            })
             .child(
-                switch(("en", i), enabled)
-                    .tooltip(if enabled { "Shown in Browse" } else { "Hidden from Browse" })
-                    .on_click(cx.listener(move |this, on: &bool, _, cx| this.set_enabled(eid.clone(), *on, cx))),
+                btn(("rm", i), if removing { "Removing" } else { "Remove" }, ButtonKind::DangerGhost)
+                    .small()
+                    .icon(glyphs::DELETE)
+                    .loading(removing)
+                    .tooltip(if plugin { "Uninstall: delete it from this computer and Browse" } else { "Take it out of Browse" })
+                    .on_click(cx.listener(move |this, _, w, cx| this.confirm_remove(rid.clone(), name.clone(), plugin, w, cx))),
             )
+    }
+
+    fn available_row(&self, i: usize, info: &SourceInfo, cx: &mut Context<Self>) -> Stateful<Div> {
+        let add = info.clone();
+        div()
+            .id(("avail-row", i))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .py(px(10.))
+            .when(i > 0, |d| d.border_t_1().border_color(Tokens::border()))
+            .child(source_avatar(info, 32., false))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(info.name.clone()))
+                    .when(info.nsfw, |d| d.child(tag("18+", Tone::Danger))),
+            )
+            .child(btn(("avail-add", i), "Add", ButtonKind::Secondary).small().icon(ph::PLUS).on_click(cx.listener(move |this, _, _, cx| this.add_builtin(add.clone(), cx))))
     }
 }
 
@@ -288,25 +343,43 @@ fn row_skeleton() -> Div {
         .child(div().flex().flex_col().gap(px(8.)).flex_1().child(skeleton_line(px(160.))).child(skeleton_line(px(240.)).h(px(10.))))
 }
 
+fn section(title: &'static str, icon: Ph, hint: Option<&'static str>) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(section_header(title, Some(icon)).mt(px(0.)).mb(px(0.)))
+        .when_some(hint, |d, h| d.child(muted(h)))
+}
+
 impl Render for SourcesPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let list: AnyElement = match &self.rows {
+        if backend::sources_version() != self.seen_sources {
+            self.reload(false, cx);
+        }
+        let installed: AnyElement = match &self.lists {
             None => div().flex().flex_col().children((0..3).map(|_| row_skeleton())).into_any_element(),
             Some(Err(e)) => error_view(e.clone())
                 .title("Could not list sources")
                 .compact()
                 .retry(cx.listener(|this, _, _, cx| {
-                    this.rows = None;
+                    this.lists = None;
                     this.reload(true, cx);
                     cx.notify();
                 }))
                 .into_any_element(),
-            Some(Ok(rows)) if rows.is_empty() => empty_view(glyphs::SOURCES, "No sources installed", "Paste a plugin link above to add one.").compact().into_any_element(),
-            Some(Ok(rows)) => div().flex().flex_col().children(rows.iter().enumerate().map(|(i, r)| self.source_row(i, r, cx))).into_any_element(),
+            Some(Ok(l)) if l.installed.is_empty() => {
+                empty_view(glyphs::SOURCES, "Nothing installed", "Add a built-in source, or install an extension from a repository below. It shows up in Browse straight away.").compact().into_any_element()
+            }
+            Some(Ok(l)) => div().flex().flex_col().children(l.installed.iter().enumerate().map(|(i, r)| self.source_row(i, r, cx))).into_any_element(),
         };
-        let count = match &self.rows {
-            Some(Ok(rows)) => Some(rows.len()),
+        let count = match &self.lists {
+            Some(Ok(l)) => Some(l.installed.len()),
             _ => None,
+        };
+        let available: Vec<SourceInfo> = match &self.lists {
+            Some(Ok(l)) => l.available.clone(),
+            _ => vec![],
         };
         div()
             .id("sources-panel")
@@ -314,16 +387,56 @@ impl Render for SourcesPanel {
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap(px(20.))
-            .child(page_title("Sources").icon(glyphs::SOURCES).subtitle("Where Browse finds manga, and which chapter language to show").mb(px(0.)))
+            .gap(px(24.))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
-                    .child(section_header("Chapter language", Some(glyphs::LANGUAGE)).mt(px(0.)).mb(px(0.)))
-                    .child(muted("Manga pages list chapters in this language. Titles without any fall back to every language."))
-                    .child(div().flex().flex_wrap().gap(px(6.)).pt(px(4.)).children(LANGUAGES.map(|(code, name)| {
+                    .child(section_header("Installed", Some(glyphs::SOURCES)).when_some(count, |h, n| h.count(n)).mt(px(0.)).mb(px(4.)))
+                    .child(muted("Everything here is listed in Browse. Remove takes it out; an extension's files are deleted."))
+                    .child(installed),
+            )
+            .child(
+                section("Add a source", ph::PLUS, None)
+                    .when(!available.is_empty(), |d| {
+                        d.child(section_label("Built-in sources").pt(px(4.)))
+                            .child(div().flex().flex_col().children(available.iter().enumerate().map(|(i, s)| self.available_row(i, s, cx))))
+                    })
+                    .child(section_label("From an extension repository").pt(px(8.)))
+                    .child(muted("Add a Mihon or Tachiyomi repository, then press Install on a site."))
+                    .child(self.repos.clone())
+                    .child(section_label("From a plugin link").pt(px(8.)))
+                    .child(self.plugin_box.clone())
+                    .child(trust_note()),
+            )
+            .child(
+                section("Connection", ph::SHIELD_CHECK, None).child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child("Smart bypass"))
+                                .child(muted(
+                                    "When a site shows an anti-bot check (Cloudflare and similar), MangaVox passes it in a hidden built-in browser and loads the page again. Turn off to see the block as an error instead.",
+                                )),
+                        )
+                        .child(
+                            switch("smart-bypass", self.smart_bypass)
+                                .tooltip(if self.smart_bypass { "On: anti-bot checks are passed automatically" } else { "Off" })
+                                .on_click(cx.listener(|this, on: &bool, _, cx| this.set_smart_bypass(*on, cx))),
+                        ),
+                ),
+            )
+            .child(
+                section("Chapter language", glyphs::LANGUAGE, Some("Manga pages list chapters in this language. Titles without any fall back to every language.")).child(
+                    div().flex().flex_wrap().gap(px(6.)).pt(px(4.)).children(LANGUAGES.map(|(code, name)| {
                         let active = crate::logic::lang_matches(&self.lang, code) && (code == "all") == (self.lang == "all");
                         filter_chip(SharedString::from(format!("lang-{code}")), name, active).on_click(cx.listener(move |this, _, _, cx| {
                             this.lang = code.to_string();
@@ -331,32 +444,8 @@ impl Render for SourcesPanel {
                             backend::bump_data();
                             cx.notify();
                         }))
-                    }))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .child(section_header("Repositories", Some(ph::GIT_BRANCH)).mt(px(0.)).mb(px(0.)))
-                    .child(muted("Add a Mihon or Tachiyomi extension repository, then install the sites you want from its list."))
-                    .child(self.repos.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .child(section_header("Install a plugin", Some(ph::PUZZLE_PIECE)).mt(px(0.)).mb(px(0.)))
-                    .child(self.plugin_box.clone())
-                    .child(trust_note()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(section_header("Installed", Some(glyphs::SOURCES)).when_some(count, |h, n| h.count(n)).mt(px(0.)).mb(px(4.)))
-                    .child(list),
+                    })),
+                ),
             )
     }
 }
@@ -382,7 +471,7 @@ pub fn trust_note() -> Div {
         .line_height(px(18.))
         .text_color(Tokens::text_3())
         .child(div().pt(px(2.)).flex_none().child(icon_ph(ph::SHIELD_CHECK, Tokens::text_3(), icon_px::SM)))
-        .child("Plugins and extensions are third-party code. They run in a sandbox (128 MB of memory, 2 minutes per request), but only add ones you trust.")
+        .child(div().flex_1().min_w_0().child("Plugins and extensions are third-party code. They run in a sandbox (128 MB of memory, 2 minutes per request), but only add ones you trust."))
 }
 
 fn result_line(res: &Result<String, String>) -> Div {
@@ -461,6 +550,7 @@ impl PluginLinkBox {
         cx.spawn(async move |this, cx| {
             let res = mv_ui::bg::run(async move {
                 let m = mv_plugins::repo::install_plugin_from_url(&url, &backend::plugins_dir(), backend::plugin_backend()).await?;
+                backend::set_source_enabled(&m.id, true)?;
                 backend::reload_registry().await;
                 anyhow::Ok(m)
             })
@@ -555,6 +645,12 @@ fn plugin_ids(ext: &RepoExtension) -> Vec<String> {
     (0..ext.sources.len().max(1)).map(|i| mv_plugins::repo::repo_plugin_id(ext, i)).collect()
 }
 
+/// The built-in source that reads `ext`'s site (MangaDex, WEBTOON, ...): installing the extension
+/// adds that source instead of generating a scraper.
+fn builtin_of(ext: &RepoExtension) -> Option<&'static str> {
+    ext.sources.iter().find_map(|s| mv_sources::builtin_for_host(&s.base_url))
+}
+
 /// Extensions matching the search text, language and 18+ choice, in index order.
 pub fn filter_extensions<'a>(exts: &'a [RepoExtension], query: &str, lang: Option<&str>, nsfw: bool) -> Vec<&'a RepoExtension> {
     let q = query.trim().to_lowercase();
@@ -596,6 +692,10 @@ pub struct RepoBrowser {
     show_nsfw: bool,
     /// Installed repository plugin id -> version.
     installed: HashMap<String, String>,
+    /// Built-in sources that are added (an extension for their site shows as installed).
+    builtins_on: HashSet<String>,
+    /// [`backend::sources_version`] `installed` was read at.
+    seen_sources: u64,
     updates: Vec<RepoUpdate>,
     /// Extension packages being installed or updated.
     busy: HashSet<String>,
@@ -641,6 +741,8 @@ impl RepoBrowser {
             lang: None,
             show_nsfw: false,
             installed: HashMap::new(),
+            builtins_on: HashSet::new(),
+            seen_sources: 0,
             updates: vec![],
             busy: HashSet::new(),
             limit: PAGE,
@@ -670,8 +772,41 @@ impl RepoBrowser {
     }
 
     pub fn refresh_installed(&mut self, cx: &mut Context<Self>) {
+        self.seen_sources = backend::sources_version();
         self.installed = mv_plugins::repo::installed_repo_plugins(&backend::plugins_dir()).into_iter().map(|p| (p.manifest.id, p.manifest.version)).collect();
+        self.builtins_on = backend::installed_sources(backend::builtin_sources()).into_iter().map(|s| s.id).collect();
         cx.notify();
+    }
+
+    /// Uninstalls every source of `ext` (or takes its built-in source out of Browse).
+    fn remove_ext(&mut self, ext: RepoExtension, cx: &mut Context<Self>) {
+        let mut ids: Vec<String> = plugin_ids(&ext).into_iter().filter(|id| self.installed.contains_key(id)).collect();
+        ids.extend(builtin_of(&ext).filter(|b| self.builtins_on.contains(*b)).map(String::from));
+        if ids.is_empty() || !self.busy.insert(ext.pkg.clone()) {
+            return;
+        }
+        cx.notify();
+        let name = display_name(&ext);
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::run(async move {
+                for id in &ids {
+                    backend::remove_source(id).await?;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.busy.remove(&ext.pkg);
+                this.refresh_installed(cx);
+                match res {
+                    Ok(()) => toast::show(cx, Toast::success(format!("Removed {name}"))),
+                    Err(e) => toast::show(cx, Toast::error(format!("Could not remove {name}: {e:#}"))),
+                }
+                cx.emit(SourcesEvent::Changed);
+            });
+        })
+        .detach();
     }
 
     fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -799,15 +934,27 @@ impl RepoBrowser {
     }
 
     fn install(&mut self, ext: RepoExtension, index: usize, update: bool, cx: &mut Context<Self>) {
+        let name = display_name(&ext);
+        if let Some(builtin) = builtin_of(&ext) {
+            // MangaVox reads this site itself, far better than a generated scraper could.
+            match backend::set_source_enabled(builtin, true) {
+                Ok(()) => toast::show(cx, Toast::success(format!("Installed {name}. It uses MangaVox's built-in {name} reader."))),
+                Err(e) => toast::show(cx, Toast::error(format!("Could not install {name}: {e:#}"))),
+            }
+            self.refresh_installed(cx);
+            cx.emit(SourcesEvent::Changed);
+            return;
+        }
         if !self.busy.insert(ext.pkg.clone()) {
             return;
         }
         cx.notify();
-        let name = display_name(&ext);
         cx.spawn(async move |this, cx| {
             let e = ext.clone();
             let res = mv_ui::bg::run(async move {
                 let r = mv_plugins::repo::install_repo_extension(&e, index, &backend::plugins_dir(), backend::plugin_backend()).await?;
+                // A switch saved for an earlier install of it must not hide it from Browse.
+                backend::set_source_enabled(&r.id, true)?;
                 backend::reload_registry().await;
                 anyhow::Ok(r)
             })
@@ -849,7 +996,7 @@ impl RepoBrowser {
     }
 
     fn ext_row(&self, i: usize, ext: &RepoExtension, repo: &str, pref_lang: &str, cx: &mut Context<Self>) -> Stateful<Div> {
-        let installed = plugin_ids(ext).iter().any(|id| self.installed.contains_key(id));
+        let installed = plugin_ids(ext).iter().any(|id| self.installed.contains_key(id)) || builtin_of(ext).is_some_and(|b| self.builtins_on.contains(b));
         let update = self.updates.iter().find(|u| u.extension.pkg == ext.pkg).cloned();
         let busy = self.busy.contains(&ext.pkg);
         let name = display_name(ext);
@@ -867,7 +1014,23 @@ impl RepoBrowser {
                     .on_click(cx.listener(move |this, _, _, cx| this.install(e.clone(), ix, true, cx)))
                     .into_any_element()
             }
-            (None, true) => status_tag(StatusKind::Done).label("Installed").into_any_element(),
+            (None, true) => {
+                let e = ext.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(status_tag(StatusKind::Done).label("Installed"))
+                    .child(
+                        btn(("ext-remove", i), if busy { "Removing" } else { "Remove" }, ButtonKind::DangerGhost)
+                            .small()
+                            .icon(glyphs::DELETE)
+                            .loading(busy)
+                            .tooltip("Uninstall: delete it from this computer and Browse")
+                            .on_click(cx.listener(move |this, _, _, cx| this.remove_ext(e.clone(), cx))),
+                    )
+                    .into_any_element()
+            }
             (None, false) => {
                 let e = ext.clone();
                 let ix = preferred_source_index(ext, pref_lang);
@@ -1001,6 +1164,9 @@ impl Render for RepoBrowser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if std::mem::take(&mut self.clear_url) {
             self.url.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        if backend::sources_version() != self.seen_sources {
+            self.refresh_installed(cx);
         }
         let url = self.url.read(cx).value().to_string();
         let empty = url.trim().is_empty();

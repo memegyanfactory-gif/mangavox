@@ -192,9 +192,8 @@ fn pick(m: &Manga, list: &[Chapter], raw: &[String]) -> Result<Vec<Chapter>, Str
 // ---------------------------------------------------------------- tools
 
 async fn sources() -> ToolResult {
-    let disabled = backend::disabled_sources();
-    let list = mv_ui::bg::run(async { backend::registry().await.list() }).await.map_err(|e| e.to_string())?;
-    Ok(ToolOutput::Value(Value::Array(list.into_iter().filter(|s| !disabled.contains(&s.id)).map(|s| json!({ "id": s.id, "name": s.name, "lang": s.lang, "adult": s.nsfw })).collect())))
+    let list = mv_ui::bg::run(async { backend::installed_sources(backend::registry().await.list()) }).await.map_err(|e| e.to_string())?;
+    Ok(ToolOutput::Value(Value::Array(list.into_iter().map(|s| json!({ "id": s.id, "name": s.name, "lang": s.lang, "adult": s.nsfw })).collect())))
 }
 
 fn result_json(source: &str, r: &MangaSearchResult) -> Value {
@@ -207,15 +206,14 @@ async fn search(a: Map<String, Value>) -> ToolResult {
         return Err("query is required".into());
     }
     let wanted = str_arg(&a, "source").to_string();
-    let disabled = backend::disabled_sources();
     let reg = backend::registry().await;
     let ids: Vec<String> = if wanted.is_empty() {
-        reg.list().into_iter().filter(|s| !disabled.contains(&s.id) && !s.nsfw).map(|s| s.id).take(SEARCH_SOURCES).collect()
+        backend::installed_sources(reg.list()).into_iter().filter(|s| !s.nsfw).map(|s| s.id).take(SEARCH_SOURCES).collect()
     } else {
         vec![wanted]
     };
     if ids.is_empty() {
-        return Err("No manga source is enabled. Turn one on in Settings → Sources.".into());
+        return Err("No manga source is installed. Add one in Settings → Sources.".into());
     }
     let searches = ids.iter().map(|id| {
         let (id, q) = (id.clone(), q.clone());

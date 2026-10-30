@@ -2,6 +2,7 @@
 //! the error type, the shared fetch context and the Cloudflare `WallSolver` hook.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,6 +10,18 @@ use mv_net::{Http, NetError, Opts, Resp};
 use serde::de::DeserializeOwned;
 
 use crate::types::{ChapterInfo, MangaDetails, MangaSearchResult, SourceInfo, Tag};
+
+static SMART_BYPASS: AtomicBool = AtomicBool::new(true);
+
+/// "Smart bypass" (Settings › Sources, on by default): when a site answers with an anti-bot wall,
+/// clear it in the hidden browser ([`WallSolver`]) and retry. Off, a wall is reported as an error.
+pub fn set_smart_bypass(on: bool) {
+    SMART_BYPASS.store(on, Ordering::Relaxed);
+}
+
+pub fn smart_bypass() -> bool {
+    SMART_BYPASS.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -81,11 +94,13 @@ impl SourceCtx {
     /// GET through reqwest; when the answer is an anti-bot wall / 403 / 503 and a solver is
     /// attached, borrow its cookies and retry, then fall back to an in-browser fetch.
     /// The response is returned for any other status (callers decide what a 404 means).
+    /// With [`smart_bypass`] off the solver is not used here and a wall is an error.
     pub async fn fetch(&self, source_id: &str, url: &str, opts: &Opts) -> Result<Resp> {
+        let bypass = self.solver.is_some() && smart_bypass();
         let first = match self.http.get(url, opts).await {
             Ok(r) => r,
             Err(e) => {
-                if let (Some(_), NetError::Request { .. }) = (&self.solver, &e) {
+                if bypass && matches!(e, NetError::Request { .. }) {
                     return self.via_solver(source_id, url, opts).await;
                 }
                 return Err(e.into());
@@ -95,7 +110,7 @@ impl SourceCtx {
         if wall.is_none() && first.status != 403 && first.status != 503 {
             return Ok(first);
         }
-        if self.solver.is_none() {
+        if !bypass {
             return match wall {
                 Some(k) => Err(SourceError::Wall { source_id: source_id.into(), kind: k.as_str().into(), url: url.into() }),
                 None => Ok(first),
