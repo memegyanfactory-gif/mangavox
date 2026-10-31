@@ -81,6 +81,16 @@ fn json_extraction() {
 }
 
 #[test]
+fn every_call_asks_for_low_effort() {
+    let ask = |provider, model: &str| crate::llm::request(&ModelChoice { provider, model: model.into() }, vec![], vec![], None);
+    let r = ask(AiProviderId::ClaudeCode, "claude-opus-5-5");
+    assert_eq!((r.effort, r.model.as_str()), (Some(mv_ai::AiEffort::Low), "claude-opus-5-5"));
+    assert_eq!(ask(AiProviderId::Antigravity, "gemini-3.8-flash-high").model, "gemini-3.8-flash-low");
+    assert_eq!(ask(AiProviderId::Antigravity, "gemini-3.8-flash-medium").model, "gemini-3.8-flash-low");
+    assert_eq!(ask(AiProviderId::Antigravity, "gpt-oss-120b-medium").model, "gpt-oss-120b-medium");
+}
+
+#[test]
 fn page_parsing_is_lenient() {
     let v = extract_json("{\"summary\":\"s\",\"panels\":[{\"lines\":[{\"text\":\"hi\"},{\"text\":\"\"}],\"characters\":[{\"name\":\"\"},{\"name\":\"A\",\"face\":[10,10,20,30]}]}]}").unwrap();
     let p = parse_page(&v, 3, "p.png");

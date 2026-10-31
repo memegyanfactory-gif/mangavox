@@ -94,6 +94,9 @@ pub struct Ident {
     pub imdb_id: Option<String>,
     pub mal_id: Option<i64>,
     pub episode: Option<i64>,
+    /// A catalog title (IMDb or MAL id). A local file such as a Studio recap video has neither,
+    /// so it is kept out of watch history and Continue Watching.
+    pub tracked: bool,
 }
 
 pub fn ident(req: &PlayRequest) -> Ident {
@@ -106,6 +109,7 @@ pub fn ident(req: &PlayRequest) -> Ident {
     } else {
         ("movie", format!("movie:imdb:{}", imdb.clone().unwrap_or_else(|| req.title.clone())))
     };
+    let tracked = imdb.is_some() || req.mal_id.as_deref().is_some_and(|m| !m.is_empty());
     Ident {
         id,
         kind,
@@ -113,11 +117,15 @@ pub fn ident(req: &PlayRequest) -> Ident {
         imdb_id: if kind == "anime" { None } else { imdb },
         mal_id: if kind == "anime" { mal } else { None },
         episode: req.episode.map(|e| e as i64),
+        tracked,
     }
 }
 
 /// Saved resume position for this title/episode, if worth resuming.
 pub fn load_resume(ident: &Ident) -> Option<f64> {
+    if !ident.tracked {
+        return None;
+    }
     let conn = mv_core::db::open_default().ok()?;
     let rows = media::list_history(&conn, Some(ident.kind), None, 1000).ok()?;
     let row = rows.into_iter().find(|r| r.media_id == ident.id)?;
@@ -129,6 +137,9 @@ pub fn load_resume(ident: &Ident) -> Option<f64> {
 
 /// `kind` is `play`, `progress` or `complete`.
 pub fn save_event(ident: &Ident, kind: &str, pos: f64, duration: f64) -> Result<()> {
+    if !ident.tracked {
+        return Ok(());
+    }
     let conn = mv_core::db::open_default()?;
     // Never overwrite catalog metadata (genres, cover) with our sparse title.
     let title = match media::get_title(&conn, &ident.id)? {
@@ -254,4 +265,19 @@ pub async fn next_episode(req: PlayRequest) -> Result<PlayRequest> {
         season: req.season,
         episode: Some(ep + 1),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ident;
+    use mv_ui::nav::PlayRequest;
+
+    #[test]
+    fn only_catalog_titles_go_into_watch_history() {
+        let req = |imdb: Option<&str>, mal: Option<&str>| PlayRequest { title: "Ch. 1".into(), source: "E:/video_final.mp4".into(), file_idx: None, imdb_id: imdb.map(Into::into), mal_id: mal.map(Into::into), season: None, episode: None };
+        assert!(!ident(&req(None, None)).tracked, "a Studio recap video is not a movie");
+        assert!(!ident(&req(Some(""), Some(""))).tracked);
+        assert!(ident(&req(Some("tt0111161"), None)).tracked);
+        assert!(ident(&req(None, Some("21"))).tracked);
+    }
 }

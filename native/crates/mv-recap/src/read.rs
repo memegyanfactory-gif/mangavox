@@ -66,12 +66,13 @@ Rules
 7. Never wrap the JSON in code fences. Never output anything but the JSON object."##;
 
 /// Pages read at the same time. Cloud models answer many requests at once; a CLI agent is a whole
-/// process per read; a local model shares one GPU, so a second read only hides the image prep.
+/// process per read that spends most of its ~7 s start-up idle, so more of them overlap well; a
+/// local model shares one GPU, so a second read only hides the image prep.
 fn parallel_reads(provider: AiProviderId) -> usize {
     match provider {
         AiProviderId::Ollama | AiProviderId::Lmstudio | AiProviderId::Llamacpp => 2,
-        AiProviderId::ClaudeCode | AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::Opencode | AiProviderId::GrokCli | AiProviderId::Antigravity => 4,
-        _ => 6,
+        AiProviderId::ClaudeCode | AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::Opencode | AiProviderId::GrokCli | AiProviderId::Antigravity => 8,
+        _ => 10,
     }
 }
 

@@ -2,7 +2,8 @@
 //! chapter, as one app-wide queue that keeps going when the Studio page is left and survives a
 //! restart (`studio/pipeline_queue.json`).
 //!
-//! Every chapter runs its steps in order and skips the ones already done. A failed step marks
+//! Every chapter runs its steps in order and skips the ones already done. The AI steps and the
+//! audio / video steps run in two lanes, so the next chapter is read while one is rendered. A failed step marks
 //! that chapter failed and the queue moves on to the next chapter. Chapters (and the whole queue)
 //! can be paused, resumed, retried and cancelled; adding a chapter that is already waiting does
 //! nothing (or widens what it will make). The page polls [`version`] and re-reads a
@@ -293,12 +294,15 @@ impl Queue {
         was
     }
 
-    /// Holds the whole queue; the running chapter goes back to waiting (returned, to stop it).
-    pub fn pause_all(&mut self) -> Option<u64> {
+    /// Holds the whole queue; the running chapters (one per lane) go back to waiting (returned, to stop them).
+    pub fn pause_all(&mut self) -> Vec<u64> {
         self.paused = true;
-        let it = self.items.iter_mut().find(|i| i.state == ItemState::Running)?;
-        it.state = ItemState::Queued;
-        Some(it.id)
+        let mut ids = vec![];
+        for it in self.items.iter_mut().filter(|i| i.state == ItemState::Running) {
+            it.state = ItemState::Queued;
+            ids.push(it.id);
+        }
+        ids
     }
 
     pub fn resume_all(&mut self) {
@@ -310,9 +314,9 @@ impl Queue {
         }
     }
 
-    /// Drops every chapter still to run; returns the running one (to stop it).
-    pub fn cancel_all(&mut self) -> Option<u64> {
-        let running = self.items.iter().find(|i| i.state == ItemState::Running).map(|i| i.id);
+    /// Drops every chapter still to run; returns the running ones (to stop them).
+    pub fn cancel_all(&mut self) -> Vec<u64> {
+        let running = self.items.iter().filter(|i| i.state == ItemState::Running).map(|i| i.id).collect();
         self.items.retain(|i| !i.state.active());
         self.paused = false;
         self.interrupted = false;
@@ -598,12 +602,6 @@ fn stop_step(item: &QueueItem) {
     }
 }
 
-fn stop_if_running(id: Option<u64>) {
-    if let Some(it) = id.and_then(|id| read(|q| q.get(id).cloned())) {
-        stop_step(&it);
-    }
-}
-
 pub fn pause(id: u64) {
     let item = read(|q| q.get(id).cloned());
     if edit(|q| q.pause(id)) {
@@ -635,10 +633,10 @@ pub fn cancel(id: u64) {
 }
 
 pub fn pause_all() {
-    let running = read(|q| q.items.iter().find(|i| i.state == ItemState::Running).cloned());
+    let running: Vec<QueueItem> = read(|q| q.items.iter().filter(|i| i.state == ItemState::Running).cloned().collect());
     edit(|q| q.pause_all());
-    if let Some(it) = running {
-        stop_step(&it);
+    for it in &running {
+        stop_step(it);
     }
 }
 
@@ -648,8 +646,10 @@ pub fn resume_all() {
 }
 
 pub fn cancel_all() {
-    let running = read(|q| q.items.iter().find(|i| i.state == ItemState::Running).map(|i| i.id));
-    stop_if_running(running);
+    let running: Vec<QueueItem> = read(|q| q.items.iter().filter(|i| i.state == ItemState::Running).cloned().collect());
+    for it in &running {
+        stop_step(it);
+    }
     edit(|q| q.cancel_all());
 }
 
@@ -666,13 +666,40 @@ pub fn dismiss(id: u64) {
 
 // ---------------------------------------------------------------- runner
 
+/// Read, Transcript and Story (the AI steps) run in one lane; Audio, Music and Video in another,
+/// so the AI reads and writes the next chapter while this one is voiced and rendered.
+const AI_STEPS: usize = 3;
+
 async fn runner() {
-    loop {
-        match edit(Queue::claim_next) {
-            Some(id) => run_item(id).await,
-            None => wake().notified().await,
+    // One chapter can wait for the media lane; the AI lane holds the next one until there is room.
+    let (to_media, mut media) = tokio::sync::mpsc::channel::<(u64, bool)>(1);
+    let ai = async move {
+        loop {
+            let Some(id) = edit(Queue::claim_next) else {
+                wake().notified().await;
+                continue;
+            };
+            let Some(dirty) = run_steps(id, 0..AI_STEPS, false).await else { continue };
+            if read(|q| q.get(id).is_some_and(|i| i.until >= AI_STEPS)) {
+                touch(|q| {
+                    if let Some(it) = q.get_mut(id) {
+                        it.current = None;
+                    }
+                });
+                let _ = to_media.send((id, dirty)).await;
+            } else {
+                finish(id);
+            }
         }
-    }
+    };
+    let media = async move {
+        while let Some((id, dirty)) = media.recv().await {
+            if run_steps(id, AI_STEPS..STEPS, dirty).await.is_some() {
+                finish(id);
+            }
+        }
+    };
+    tokio::join!(ai, media);
 }
 
 /// The item is still meant to run (not paused, removed, or held with the queue).
@@ -700,12 +727,14 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.ok()
 }
 
-async fn run_item(id: u64) {
-    let Some(item) = read(|q| q.get(id).cloned()) else { return };
-    let mut dirty = false;
-    for &step in &Step::ALL[..=item.until.min(STEPS - 1)] {
+/// Runs the steps of `id` in `steps` (up to the last one it makes). `dirty`: an earlier step made
+/// something new. Returns the new `dirty` when they all finished, `None` when the chapter stopped,
+/// failed or is no longer meant to run.
+async fn run_steps(id: u64, steps: std::ops::Range<usize>, mut dirty: bool) -> Option<bool> {
+    let item = read(|q| q.get(id).cloned())?;
+    for &step in Step::ALL[steps].iter().filter(|s| s.index() <= item.until) {
         if !still_running(id) {
-            return;
+            return None;
         }
         // Done in an earlier attempt of this item (a resume after a pause or a failure).
         if read(|q| q.get(id).map(|i| i.steps[step.index()])) == Some(StepState::Done) {
@@ -734,7 +763,7 @@ async fn run_item(id: u64) {
             }
             Outcome::Stopped => {
                 edit(|q| q.stopped(id, step));
-                return;
+                return None;
             }
             Outcome::Failed(e) => {
                 edit(|q| {
@@ -745,10 +774,15 @@ async fn run_item(id: u64) {
                     }
                 });
                 // Later chapters still run; the library shows what this one made.
-                return;
+                return None;
             }
         }
     }
+    Some(dirty)
+}
+
+/// Every step of `id` is made.
+fn finish(id: u64) {
     edit(|q| {
         if let Some(it) = q.get_mut(id).filter(|i| i.state == ItemState::Running) {
             it.state = ItemState::Done;
@@ -965,14 +999,16 @@ mod tests {
         let mut q = Queue::default();
         q.add(ch("a"), Step::Video, None, "landscape", None);
         q.add(ch("b"), Step::Video, None, "landscape", None);
+        // The AI lane runs b while the media lane still works on a: both stop.
         let a = q.claim_next().unwrap();
-        assert_eq!(q.pause_all(), Some(a));
-        assert_eq!(q.items[0].state, ItemState::Queued, "the running chapter waits again");
+        let b = q.claim_next().unwrap();
+        assert_eq!(q.pause_all(), vec![a, b]);
+        assert!(q.items.iter().all(|i| i.state == ItemState::Queued), "the running chapters wait again");
         assert_eq!(q.claim_next(), None, "nothing starts while paused");
         q.resume_all();
-        assert_eq!(q.claim_next(), Some(a));
+        assert_eq!(q.claim_next(), Some(a), "order is kept");
         q.items[1].state = ItemState::Done;
-        assert_eq!(q.cancel_all(), Some(a));
+        assert_eq!(q.cancel_all(), vec![a]);
         assert_eq!(q.items.len(), 1, "finished chapters stay listed");
         q.clear_finished();
         assert!(q.items.is_empty());
