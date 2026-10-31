@@ -368,10 +368,16 @@ fn data(v: &Value) -> &Value {
     v.get("data").unwrap_or(v)
 }
 
-/// Checks `key` without spending credits: lists the key's Nano Banana 2.1 tasks.
+/// Checks `key` without spending credits: asks for a task that does not exist. Magnific checks
+/// the key first, so 401/403 means a bad key and anything else ("Task not found") a good one.
 pub async fn verify(key: &str) -> Result<()> {
     let http = client()?;
-    check(http.get(format!("{API}{}", CATALOG[0].path)).header("x-magnific-api-key", key).send().await.context("could not reach Magnific")?).await.map(|_| ())
+    let r = http.get(format!("{API}{}/00000000-0000-0000-0000-000000000000", CATALOG[0].path)).header("x-magnific-api-key", key).send().await.context("could not reach Magnific")?;
+    match r.status().as_u16() {
+        401 | 402 | 403 | 429 => check(r).await.map(|_| ()),
+        s if s >= 500 => bail!("Magnific is having trouble right now ({s}); try again in a minute"),
+        _ => Ok(()),
+    }
 }
 
 /// Makes one image with `m` and saves it as PNG at `out`. `on_status` hears the progress.
