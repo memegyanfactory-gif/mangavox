@@ -8,7 +8,7 @@ use gpui_kit::component::slider::{Slider, SliderState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius, Palette, Preset};
-use mv_ui::{btn, glyphs, icon, icon_button, ph, ph_icon, segmented, setting_row, setting_section, size, switch, ButtonKind, Interactive as _, Tokens, Tone, Weight};
+use mv_ui::{btn, glyphs, icon_button, ph, ph_icon, segmented, setting_row, setting_section, size, switch, ButtonKind, Interactive as _, Tokens, Tone, Weight};
 
 use crate::ui::{divided, icon_row, path_row};
 use crate::{data, SettingsView};
@@ -306,11 +306,8 @@ impl SettingsView {
                             .justify_center()
                             .size(px(52.))
                             .rounded(px(radius::XL))
-                            .bg(Tokens::accent_soft())
-                            .border_1()
-                            .border_color(Tokens::accent_border())
                             .shadow(vec![BoxShadow { color: Tokens::accent_a(0.25).into(), offset: point(px(0.), px(4.)), blur_radius: px(18.), spread_radius: px(0.), inset: false }])
-                            .child(icon("brand/mangavox.svg", Tokens::accent(), icon_px::HERO)),
+                            .child(mv_ui::app_logo(52.)),
                     )
                     .child(
                         div()

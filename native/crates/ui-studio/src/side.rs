@@ -7,7 +7,7 @@ use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    btn, disclosure, empty_view, glyphs, icon_button, icon_ph, icon_tag, icon_toggle, kbd, muted, ph, size, status_tag, ButtonKind, StatusKind, Tokens, Tone,
+    btn, disclosure, empty_view, glyphs, icon_button, icon_ph, icon_tag, icon_toggle, inline_alert, kbd, muted, ph, size, status_tag, AlertKind, ButtonKind, StatusKind, Tokens, Tone,
 };
 
 use crate::page::{plural, vbar, Side, StudioPage, MONO, SIDE_W};
@@ -92,8 +92,8 @@ impl StudioPage {
             .overflow_y_scroll()
             .p(px(space::MD))
             .gap(px(space::MD))
-            .children(self.issues_inline(cx))
-            .children(self.queue_card(cx))
+            // What is happening now comes first; issues and the waiting queue follow.
+            .when_some(run.clone(), |d, r| d.child(self.run_card(&r, cx)))
             .when(run.is_none() && jobs.is_empty() && self.queue.items.is_empty(), |d| {
                 d.child(
                     div().pt(px(space::XL)).child(
@@ -105,7 +105,6 @@ impl StudioPage {
                     ),
                 )
             })
-            .when_some(run, |d, r| d.child(self.run_card(&r, cx)))
             .when(!jobs.is_empty(), |d| {
                 d.child(
                     div()
@@ -170,6 +169,8 @@ impl StudioPage {
                         })
                 }))
             })
+            .children(self.issues_inline(cx))
+            .children(self.queue_card(cx))
     }
 
     fn run_card(&self, r: &run::RunInfo, cx: &mut Context<Self>) -> Div {
@@ -205,6 +206,10 @@ impl StudioPage {
             )
             .child(div().flex().items_center().gap(px(6.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(icon_ph(glyphs::MODEL, Tokens::text_3(), icon_px::XS)).child(r.model.clone()))
             .when(r.running(), |d| d.child(progress_line("act-run", r.progress(), r.status_line())))
+            // The provider hit its limit: the run waits for the reset and then redoes the same page.
+            .when_some(r.waiting.clone().filter(|_| r.running()), |d, (why, until)| {
+                d.child(inline_alert(AlertKind::Warning, format!("Paused: the AI limit is reached. Carrying on {}.", run::resume_in(until)), format!("Nothing is skipped: the same page is sent again once the limit resets. {why}")))
+            })
             .when_some(if let RunState::Failed(e) = &r.state { Some(e.clone()) } else { None }, |d, e| {
                 let step = if r.kind == RunKind::Read { mv_recap::Step::Read } else { mv_recap::Step::Story };
                 d.child(self.failure_block("act-run", step, &e, r.chapter_id.as_deref(), cx))

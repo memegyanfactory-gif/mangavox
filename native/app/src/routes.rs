@@ -93,8 +93,8 @@ pub fn nav_label(section: Section, route: &Route) -> Option<&'static str> {
     nav_for(section).into_iter().find(|e| &e.route == route).map(|e| e.label)
 }
 
-/// Studio and YouTube: wide pages of their own (no section, the 60px rail, their own assistant
-/// panel), shown only in Studio mode.
+/// Studio and YouTube: wide pages of their own (no section, their own assistant panel), shown
+/// only in Studio mode.
 pub fn is_workspace(route: &Route) -> bool {
     matches!(route, Route::Studio | Route::YouTube | Route::Suggestions)
 }

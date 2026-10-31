@@ -22,7 +22,7 @@ use mv_studio::StudioError;
 use mv_ui::theme::{icon as icon_px, radius, ramp};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    appear, btn, checkbox, dot_trail, fmt_bytes, glyphs, icon, icon_button, icon_ph, inline_alert, meter, muted, path_chip, ph, progress_bar, size, status_tag, switch, tag, AlertKind,
+    appear, btn, checkbox, dot_trail, fmt_bytes, glyphs, icon_button, icon_ph, inline_alert, meter, muted, path_chip, ph, progress_bar, size, status_tag, switch, tag, AlertKind,
     ButtonKind, Hue, RampExt as _, Route, StatusKind, Tokens, Tone,
 };
 use ui_manga::backend::{self, PluginLinkBox, RepoBrowser, SourcesEvent};
@@ -467,11 +467,8 @@ impl WelcomeView {
                     .justify_center()
                     .size(px(84.))
                     .rounded(px(radius::XL + 6.))
-                    .bg(Tokens::accent_soft())
-                    .border_1()
-                    .border_color(Tokens::accent_border())
                     .shadow(vec![BoxShadow { color: Tokens::accent_a(0.28).into(), offset: point(px(0.), px(8.)), blur_radius: px(32.), spread_radius: px(0.), inset: false }])
-                    .child(icon("brand/mangavox.svg", Tokens::accent(), 48.)),
+                    .child(mv_ui::app_logo(84.)),
             )
             .child(
                 div()
@@ -982,7 +979,7 @@ impl WelcomeView {
             .mx_auto()
             .px(px(24.))
             .pt(px(16.))
-            .child(icon("brand/mangavox.svg", Tokens::accent(), icon_px::LG))
+            .child(mv_ui::app_logo(24.))
             .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Setup"))
             .child(div().flex_1())
             .children(dots)

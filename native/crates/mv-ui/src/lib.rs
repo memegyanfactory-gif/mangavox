@@ -16,7 +16,7 @@ pub mod theme;
 pub mod toast;
 pub mod update;
 
-pub use assets::Assets;
+pub use assets::{app_logo, Assets, APP_LOGO};
 pub use components::*;
 pub use controls::*;
 pub use feedback::*;

@@ -87,6 +87,32 @@ impl StudioPage {
         cx.notify();
     }
 
+    /// The fixes "Fix all" runs: each open issue's first fix that does the work itself (making or
+    /// retrying chapters, resuming the queue), chapters needing the same fix batched together.
+    /// Issues that need a person (Setup, a voice, a model) keep their own buttons.
+    pub(crate) fn auto_fixes(&self) -> Vec<Fix> {
+        let mut out: Vec<Fix> = vec![];
+        for is in self.issues.iter().filter(|i| i.fixing.is_none()) {
+            let Some(fix) = is.actions.iter().map(|a| &a.fix).find(|f| matches!(f, Fix::Make { .. } | Fix::Retry(_) | Fix::ResumeQueue)) else { continue };
+            match fix {
+                Fix::Make { chapters, until, force } => match out.iter_mut().find(|f| matches!(f, Fix::Make { until: u, force: g, .. } if u == until && g == force)) {
+                    Some(Fix::Make { chapters: all, .. }) => all.extend(chapters.iter().filter(|c| !all.contains(c)).cloned().collect::<Vec<_>>()),
+                    _ => out.push(fix.clone()),
+                },
+                f if !out.contains(f) => out.push(f.clone()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Runs every fix of [`Self::auto_fixes`].
+    pub(crate) fn fix_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for fix in self.auto_fixes() {
+            self.apply_fix(fix, window, cx);
+        }
+    }
+
     /// Every issue right now (see `issues::collect`), minus the dismissed ones.
     pub(crate) fn collect_issues(&self, cx: &mut Context<Self>) -> Vec<Issue> {
         let mut names: HashMap<String, Named> = HashMap::new();
@@ -260,7 +286,8 @@ impl StudioPage {
                         }),
                     ))
                 })
-                .children(q.items.iter().map(|it| self.queue_row(it, cx)))
+                // The chapter being made now on top, then the rest in queue order.
+                .children(q.items.iter().filter(|it| it.state == ItemState::Running).chain(q.items.iter().filter(|it| it.state != ItemState::Running)).map(|it| self.queue_row(it, cx)))
                 .into_any_element(),
         )
     }
@@ -476,6 +503,11 @@ impl StudioPage {
                                 (n, 0) => format!("{n} issue{}", plural(n)),
                                 (n, f) => format!("{n} issue{} · {f} being fixed", plural(n)),
                             }))
+                            .when(!self.auto_fixes().is_empty(), |d| {
+                                d.child(btn("issues-fix-all", "Fix all", ButtonKind::Primary).small().icon(ph::WRENCH).tooltip("Make again or retry every chapter with an issue. Issues that need you (Setup, a voice, a model) keep their own button.").on_click(
+                                    cx.listener(|this, _: &ClickEvent, window, cx| this.fix_all(window, cx)),
+                                ))
+                            })
                             .child(btn("issues-clear", "Dismiss all", ButtonKind::Ghost).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 for i in this.issues.clone() {
                                     this.dismissed.insert(i.key);
@@ -554,6 +586,9 @@ impl StudioPage {
                 .flex()
                 .flex_col()
                 .gap(px(space::SM))
+                .when(n > 1 && !self.auto_fixes().is_empty(), |d| {
+                    d.child(btn("issues-inline-fix-all", format!("Fix all {n} issues"), ButtonKind::Primary).small().icon(ph::WRENCH).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.fix_all(window, cx))))
+                })
                 .children(self.issues.iter().take(2).enumerate().map(|(i, is)| self.issue_card(100 + i, is, cx)))
                 .when(n > 2, |d| {
                     d.child(btn("issues-more", format!("See all {n} issues"), ButtonKind::Ghost).small().trailing_icon(ph::ARROW_RIGHT).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {

@@ -7,6 +7,7 @@
 pub mod config;
 pub mod gguf;
 pub mod hub;
+pub mod limit;
 pub mod providers;
 pub mod registry;
 pub mod stream;
@@ -15,6 +16,7 @@ pub mod types;
 pub mod usage;
 
 pub use gguf::{group_gguf_files, parse_quant, QuantInfo};
+pub use limit::AiLimit;
 pub use hub::{HubConfigPatch, HubConfigPublic, HubSort, ImportResult, ModelHub, ProgressFn, SearchOpts};
 pub use registry::{friendly_error, provider_def, ProviderDef, Registry, TestResult, PROVIDERS};
 pub use stream::{AiError, Result};

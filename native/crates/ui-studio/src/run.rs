@@ -41,6 +41,8 @@ pub struct RunInfo {
     pub since: Option<std::time::Instant>,
     pub logs: VecDeque<String>,
     pub new_characters: Vec<String>,
+    /// The AI provider hit a usage / rate limit: why, and when the run tries again (unix seconds).
+    pub waiting: Option<(String, i64)>,
 }
 
 impl RunInfo {
@@ -53,6 +55,10 @@ impl RunInfo {
         let mut parts: Vec<String> = vec![];
         if let Some(c) = &self.chapter {
             parts.push(c.clone());
+        }
+        if let Some((_, until)) = &self.waiting {
+            parts.push(format!("paused: the AI limit is reached, carrying on {}", resume_in(*until)));
+            return parts.join(" · ");
         }
         match (self.reading.first(), self.reading.last()) {
             (Some(a), Some(b)) if a != b => parts.push(format!("reading pages {}–{}", a + 1, b + 1)),
@@ -88,6 +94,17 @@ impl RunInfo {
             self.logs.pop_front();
         }
         self.logs.push_back(line.into());
+    }
+}
+
+/// "in 7h 52m" / "in 3m" / "in a moment" until the unix time `until`.
+pub fn resume_in(until: i64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let m = ((until - now).max(0) + 59) / 60;
+    match m {
+        0 => "in a moment".into(),
+        m if m < 60 => format!("in {m}m"),
+        m => format!("in {}h {:02}m", m / 60, m % 60),
     }
 }
 
@@ -180,6 +197,7 @@ fn begin(kind: RunKind, model: String, chapters: usize) -> Option<CancellationTo
         since: None,
         logs: VecDeque::new(),
         new_characters: vec![],
+        waiting: None,
     });
     let token = CancellationToken::new();
     *CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
@@ -231,7 +249,15 @@ fn progress_fn() -> mv_recap::ProgressFn {
                     r.new_characters.push(name);
                 }
             }
-            Progress::Done | Progress::Failed(_) => {}
+            Progress::Waiting { message, until } => {
+                r.log(format!("Paused: {message}. Carrying on {} with the same page; nothing is skipped.", resume_in(until)));
+                r.waiting = Some((message, until));
+            }
+            Progress::Resumed => {
+                r.waiting = None;
+                r.log("The AI answers again; carrying on.");
+            }
+            Progress::Done | Progress::Failed(_) => r.waiting = None,
         })
     })
 }

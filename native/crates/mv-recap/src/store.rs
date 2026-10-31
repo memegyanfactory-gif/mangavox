@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 
+use crate::reset::Step;
 use crate::types::*;
 
 /// `<data>/studio` (see `mv_core::paths`).
@@ -143,8 +144,10 @@ pub fn chapter_status(ch: &ChapterRef) -> PhaseStatus {
         .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4"))).collect())
         .unwrap_or_default();
     reels.sort();
+    let read = load_read(ch);
     PhaseStatus {
-        read_pages: load_read(ch).map(|r| r.pages.len()).unwrap_or(0),
+        ai_error: provider_message_in(read.as_ref(), load_story(ch).as_ref()),
+        read_pages: read.map(|r| r.pages.len()).unwrap_or(0),
         total_pages: list_pages(&ch.pages_dir).len(),
         transcript: dir.join("transcript.json").is_file(),
         story: dir.join("story.json").is_file(),
@@ -153,6 +156,17 @@ pub fn chapter_status(ch: &ChapterRef) -> PhaseStatus {
         reels,
         music: ch.output_dir.join("score.wav").is_file(),
     }
+}
+
+/// The step whose saved text is an AI provider's own message rather than content (see
+/// [`PhaseStatus::ai_error`]).
+pub(crate) fn provider_message_in(read: Option<&ChapterRead>, story: Option<&Story>) -> Option<Step> {
+    let bad = |t: &str| mv_ai::limit::provider_error_in(t).is_some();
+    let read_bad = read.is_some_and(|r| r.pages.iter().any(|p| bad(&p.summary) || p.panels.iter().any(|pn| bad(&pn.description) || pn.lines.iter().any(|l| bad(&l.text)))));
+    if read_bad {
+        return Some(Step::Read);
+    }
+    story.is_some_and(|s| bad(&s.title) || s.segments.iter().any(|g| bad(&g.text))).then_some(Step::Story)
 }
 
 /// Delete generated narration audio (call when the script changed and the UI confirmed).

@@ -5676,6 +5676,7 @@ name = "mv-ai"
 version = "8.0.5023"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "dirs 6.0.0",
  "futures-util",
  "regex",

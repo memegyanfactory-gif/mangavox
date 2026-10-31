@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mv_ai::AiProviderId;
+
+use crate::reset::Step;
 use serde::{Deserialize, Serialize};
 
 /// Which LLM does the work.
@@ -181,6 +183,11 @@ pub enum Progress {
     Page { done: usize, total: usize, page: usize },
     Log(String),
     Character { name: String, new: bool },
+    /// The AI provider hit a usage / rate limit: the run waits until `until` (unix seconds), then
+    /// sends the same request again.
+    Waiting { message: String, until: i64 },
+    /// The provider answered again after a [`Progress::Waiting`].
+    Resumed,
     Done,
     Failed(String),
 }
@@ -207,6 +214,9 @@ pub struct PhaseStatus {
     pub reels: Vec<PathBuf>,
     /// `pipeline/score.wav` exists (the Music step's score, see mv-score).
     pub music: bool,
+    /// The earliest step whose saved output holds an AI provider's own message ("You've hit your
+    /// limit") instead of a reading or a story: that step has to be made again.
+    pub ai_error: Option<Step>,
 }
 
 /// Video export formats: one 16:9 video, or 9:16 cut into ~1 minute reels.

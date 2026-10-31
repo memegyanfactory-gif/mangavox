@@ -788,7 +788,9 @@ impl CliAcc {
             let joined = self.plain.join("\n");
             self.emit_text(emit, &joined);
         }
-        if let (Some(e), true) = (&self.error, self.text.is_empty()) {
+        // A failed run is an error even when it printed text first (Claude Code writes its limit
+        // notice as an assistant message, then a failed result): that text is not an answer.
+        if let Some(e) = &self.error {
             return Err(AiError::msg(e.clone()));
         }
         if code != Some(0) && self.text.is_empty() {
@@ -988,6 +990,22 @@ mod tests {
         let (emit, _) = recorder();
         let r = acc.finish("claude", Some(0), false, "", &emit).unwrap();
         assert_eq!(r.usage.unwrap().output_tokens, Some(4));
+    }
+
+    #[test]
+    fn a_failed_run_is_an_error_even_after_printing_text() {
+        // Claude Code writes its limit notice as an assistant message, then a failed result.
+        let note = "You've hit your session limit · resets 8am (Asia/Kolkata)";
+        let (acc, _) = feed_all(
+            AiProviderId::ClaudeCode,
+            &format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{note}"}}]}}}}
+{{"type":"result","is_error":true,"result":"{note}"}}
+"#
+            ),
+        );
+        let (emit, _) = recorder();
+        assert_eq!(acc.finish("claude", Some(1), false, "", &emit).unwrap_err().to_string(), note);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::brain::Brain;
 use crate::json::{num_of, str_of};
-use crate::llm::{ask_json, is_cancelled, request, truncate, Llm};
+use crate::llm::{Patient, ask_json, is_cancelled, request, truncate, Llm};
 use crate::read::roster_text;
 use crate::store::*;
 use crate::transcript::format_line;
@@ -189,7 +189,8 @@ pub async fn write_story(
     progress: ProgressFn,
     cancel: CancellationToken,
 ) -> Result<Vec<(String, Story)>> {
-    write_story_with(&reg, &model, &chapters, &styles, &brain, &progress, &cancel).await
+    let llm = Patient::new(reg, progress.clone());
+    write_story_with(&llm, &model, &chapters, &styles, &brain, &progress, &cancel).await
 }
 
 pub(crate) async fn write_story_with(
@@ -287,7 +288,12 @@ pub(crate) async fn write_story_with(
                         so_far = truncate(&s, 2500);
                     }
                 }
-                Err(_) => progress(Progress::Log(format!("{}: part {} was not valid JSON, skipped.", ch.label, ci + 1))),
+                Err(raw) => {
+                    // Never leave a hole in the story: the chapter fails and shows as an issue to retry.
+                    let msg = format!("{}: the AI's answer for part {} was not a story ({})", ch.label, ci + 1, truncate(&raw, 160));
+                    progress(Progress::Failed(msg.clone()));
+                    return Err(anyhow!(msg));
+                }
             }
             done += chunk.len();
             progress(Progress::Page { done, total: content.len(), page: chunk[chunk.len() - 1] });

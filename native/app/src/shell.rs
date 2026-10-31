@@ -99,7 +99,7 @@ impl Render for DragGhost {
 }
 
 pub struct Shell {
-    /// The user's sidebar choice (Studio forces the rail and restores this afterwards).
+    /// The user's sidebar choice: only the user collapses or expands it, on every page.
     collapsed: bool,
     /// Narrow window: the full sidebar shown over the page from the rail.
     nav_overlay: bool,
@@ -115,8 +115,6 @@ pub struct Shell {
     dock_w: f32,
     /// The assistant edge is being dragged.
     resizing: bool,
-    /// Sidebar state to restore after leaving the (wide) Studio page.
-    saved_collapsed: Option<bool>,
     /// The layout last written to config.json.
     saved: ShellPrefs,
     palette: Option<Palette>,
@@ -182,7 +180,6 @@ impl Shell {
             dock_open: false,
             dock_w: saved.dock_w,
             resizing: false,
-            saved_collapsed: None,
             saved,
             palette: None,
             manga_names: Default::default(),
@@ -445,19 +442,11 @@ impl Shell {
         });
     }
 
-    /// Keeps the back target current (pages label their own back control with it) and gives
-    /// the wide Studio page the 60px rail, restoring the user's own sidebar state afterwards.
+    /// Keeps the back target current (pages label their own back control with it). The sidebar
+    /// stays as the user left it: no page collapses it on its own.
     fn sync_back(&mut self, cx: &mut App) {
         set_back_target(cx, self.back_route());
         set_current_route(cx, self.route.clone());
-        if is_workspace(&self.route) {
-            if self.saved_collapsed.is_none() {
-                self.saved_collapsed = Some(self.collapsed);
-                self.collapsed = true;
-            }
-        } else if let Some(prev) = self.saved_collapsed.take() {
-            self.collapsed = prev;
-        }
     }
 
     /// The window title names the page (taskbar, Alt+Tab and screen readers).
@@ -715,9 +704,7 @@ impl Shell {
             self.nav_overlay = !self.nav_overlay;
         } else {
             self.collapsed = !self.collapsed;
-            if self.saved_collapsed.is_none() {
-                self.save_prefs();
-            }
+            self.save_prefs();
         }
         cx.notify();
     }
@@ -738,7 +725,7 @@ impl Shell {
     }
 
     fn save_prefs(&mut self) {
-        let p = ShellPrefs { collapsed: self.saved_collapsed.unwrap_or(self.collapsed), dock_w: self.dock_w.clamp(DOCK_MIN, DOCK_MAX).round() };
+        let p = ShellPrefs { collapsed: self.collapsed, dock_w: self.dock_w.clamp(DOCK_MIN, DOCK_MAX).round() };
         if p != self.saved {
             self.saved = p;
             prefs::save(p);
@@ -1132,7 +1119,7 @@ impl Shell {
                 let home = this.section.home();
                 this.go_up(home, w, cx);
             }))
-            .child(svg().path("brand/mangavox.svg").size(px(icon_px::XL)).flex_none().text_color(Tokens::accent()))
+            .child(mv_ui::app_logo(28.).rounded(px(radius::SM)))
             .when(!rail, |d| d.child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("MangaVox")));
 
         let switcher = if rail {

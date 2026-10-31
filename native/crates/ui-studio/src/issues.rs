@@ -103,8 +103,8 @@ pub(crate) fn explain(step: Step, raw: &str, chapter: &str, item: Option<u64>) -
     if has(&["cuda", "out of memory", "oom"]) {
         return ("the voice engine ran out of graphics memory".into(), vec![retry(), act("Open Audio settings", Fix::AudioSettings)]);
     }
-    if has(&["rate limit", "429", "quota", "too many requests"]) {
-        return ("the AI provider is limiting requests right now".into(), vec![retry()]);
+    if mv_ai::limit::is_limit(raw) {
+        return ("the AI provider's usage limit was reached (Studio waits for the reset on its own; retry once it has reset)".into(), vec![retry()]);
     }
     if has(&["connection", "connect", "timed out", "timeout", "network", "unreachable", "dns"]) {
         return ("Studio couldn't reach the AI model or a service it needs".into(), vec![retry()]);
@@ -290,6 +290,28 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
                 fixing: None,
             });
         }
+    }
+
+    // Chapters whose saved reading or story is an AI provider's own message ("You've hit your
+    // limit") instead of content: made again from that step, up to what the chapter already had.
+    let mut poisoned: Vec<(&String, &PhaseStatus)> = i.statuses.iter().filter(|(c, st)| st.ai_error.is_some() && !covered.contains(&c.as_str())).collect();
+    poisoned.sort_by_key(|(c, _)| label(c));
+    for (c, st) in poisoned {
+        let bad = st.ai_error.unwrap_or(Step::Story);
+        let until = if st.video.is_some() || !st.reels.is_empty() { Step::Video } else if st.audio_files > 0 { Step::Audio } else { Step::Story };
+        let (what, fix) = if bad == Step::Read { ("its reading", "Read again") } else { ("its story", "Write the story again") };
+        out.push(Issue {
+            key: format!("ai-error-{}-{c}", bad.index()),
+            kind: AlertKind::Error,
+            chapter: Some(c.clone()),
+            step: Some(bad),
+            title: format!("{}: {what} holds an AI provider message (like a usage limit notice) instead of the manga, so it has to be made again.", label(c)),
+            detail: None,
+            actions: vec![act(fix, Fix::Make { chapters: vec![c.clone()], until, force: Some(bad) }), act(format!("Open {}", bad.label()), Fix::Open { chapter: c.clone(), step: bad })],
+            queue_item: None,
+            fixing: None,
+        });
+        covered.push(c);
     }
 
     // Missing prerequisites of the open step, for the chapters it works on.
@@ -499,6 +521,19 @@ mod tests {
         q.items[0].state = ItemState::Done;
         let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &fixing });
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn a_chapter_holding_an_ai_message_is_made_again() {
+        let mut statuses = HashMap::new();
+        statuses.insert("c4".to_string(), PhaseStatus { read_pages: 5, total_pages: 5, story: true, audio_files: 5, ai_error: Some(Step::Read), ..Default::default() });
+        let (names, q) = (names(), Queue::default());
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[] });
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].title.starts_with("Chapter 4: its reading holds an AI provider message"), "{}", issues[0].title);
+        assert_eq!(issues[0].actions[0].fix, Fix::Make { chapters: vec!["c4".into()], until: Step::Audio, force: Some(Step::Read) });
+        let (why, _) = explain(Step::Story, "You've hit your session limit · resets 8am", "c4", None);
+        assert!(why.contains("usage limit"), "{why}");
     }
 
     #[test]

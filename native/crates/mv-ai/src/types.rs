@@ -279,6 +279,10 @@ pub struct AiStepResult {
     pub stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set with `error` when the provider is refusing work for now (usage, rate or quota limit):
+    /// the same request can be sent again once it resets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<crate::limit::AiLimit>,
 }
 
 /// One streamed delta, delivered through an [`Emit`] callback.

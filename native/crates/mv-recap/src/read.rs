@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::brain::Brain;
 use crate::json::{bbox_of, num_of, opt_str, str_list, str_of};
-use crate::llm::{ask_json, is_cancelled, request, truncate, Llm};
+use crate::llm::{Patient, ask_json, is_cancelled, request, truncate, Llm};
 use crate::store::*;
 use crate::strip::{self, Unit};
 use crate::types::*;
@@ -387,7 +387,8 @@ pub async fn read_chapter(
     progress: ProgressFn,
     cancel: CancellationToken,
 ) -> Result<ChapterRead> {
-    read_chapter_with(&reg, &model, &ch, &brain, &opts, &progress, &cancel).await
+    let llm = Patient::new(reg, progress.clone());
+    read_chapter_with(&llm, &model, &ch, &brain, &opts, &progress, &cancel).await
 }
 
 pub(crate) async fn read_chapter_with(

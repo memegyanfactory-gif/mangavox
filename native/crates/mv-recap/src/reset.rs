@@ -722,6 +722,7 @@ mod tests {
             video: None,
             reels: vec![],
             music: from > Step::Music,
+            ai_error: None,
         }
     }
 

@@ -16,6 +16,17 @@ macro_rules! brand {
 }
 brand!("claude", "claudecode", "codex", "openai", "gemini", "geminicli", "opencode", "ollama", "lmstudio", "openrouter", "groq", "deepseek", "mistral", "xai", "grok", "antigravity", "generic", "star", "mangavox");
 
+/// The app's own icon, the purple "M VOX manga app" tile (made from `app/assets/icon.ico`): the logo
+/// in the title bar, Settings and Setup.
+pub const APP_LOGO: &str = "brand/mangavox-app.png";
+const APP_LOGO_PNG: &[u8] = include_bytes!("../assets/brand/mangavox-app.png");
+
+/// The app logo, `size` pixels square.
+pub fn app_logo(size: f32) -> gpui_kit::Img {
+    use gpui_kit::Styled as _;
+    gpui_kit::img(APP_LOGO).size(gpui_kit::px(size)).flex_none()
+}
+
 /// Lucide paths that gpui-component widgets load by name (Select, Input, Dialog, Notification, Rating...),
 /// and the Phosphor glyph served instead so every widget matches the app. The window caption glyphs
 /// (`icons/window-*.svg`) are not listed: they stay on the bundled set.
@@ -81,6 +92,9 @@ impl AssetSource for Assets {
                 Some(b) => Ok(Some(Cow::Borrowed(*b))),
                 None => Err(anyhow::anyhow!("missing Phosphor icon: {path}")),
             };
+        }
+        if path == APP_LOGO {
+            return Ok(Some(Cow::Borrowed(APP_LOGO_PNG)));
         }
         if path.starts_with("brand/") {
             return Ok(BRAND.iter().find(|(p, _)| *p == path).map(|(_, b)| Cow::Borrowed(*b)));

@@ -516,15 +516,23 @@ impl Registry {
         }
         .await;
         self.active.lock().unwrap().remove(&request_id);
+        // A provider that answers "You've hit your limit" as if it were the reply is an error too,
+        // so it never ends up in a transcript or a story.
+        let failed = |raw: &str| AiStepResult { error: Some(friendly_error(def, raw)), limit: crate::limit::limit_of(raw), ..Default::default() };
         match out {
+            Ok(r) if r.stopped => r,
+            Ok(r) if r.error.is_some() => AiStepResult { limit: crate::limit::limit_of(r.error.as_deref().unwrap_or_default()), ..r },
             Ok(r) => {
                 if let Some(u) = &r.usage {
                     crate::usage::record(def.id, &usage_model, u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0));
                 }
-                r
+                match crate::limit::provider_error_in(&r.text).filter(|_| r.tool_calls.is_empty()) {
+                    Some(raw) => failed(&raw),
+                    None => r,
+                }
             }
             Err(_) if cancel.is_cancelled() => AiStepResult { stopped: true, ..Default::default() },
-            Err(e) => AiStepResult { error: Some(friendly_error(def, &e.to_string())), ..Default::default() },
+            Err(e) => failed(&e.to_string()),
         }
     }
 

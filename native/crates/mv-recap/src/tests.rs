@@ -341,6 +341,17 @@ async fn hook_is_written_from_candidates_with_a_json_retry() {
 }
 
 #[test]
+fn saved_provider_messages_are_found() {
+    use crate::store::provider_message_in;
+    let note = "You've hit your session limit · resets 8am (Asia/Kolkata)";
+    let read = |s: &str| ChapterRead { pages: vec![PageRead { index: 0, summary: s.into(), ..Default::default() }], ..Default::default() };
+    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None }], ..Default::default() };
+    assert_eq!(provider_message_in(Some(&read(note)), Some(&story(note))), Some(Step::Read));
+    assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story(note))), Some(Step::Story));
+    assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story("He has no limit to his rage."))), None);
+}
+
+#[test]
 fn story_parts_fit_the_budget_and_keep_order() {
     use crate::story::plan_parts;
     let pages: Vec<(usize, usize)> = (0..10).map(|i| (i, 100)).collect();
