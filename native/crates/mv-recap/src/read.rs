@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use image::{imageops::FilterType, DynamicImage};
-use mv_ai::{AiMessage, AiStepRequest, CancellationToken, Registry};
+use futures::StreamExt;
+use mv_ai::{AiMessage, AiProviderId, AiStepRequest, CancellationToken, Registry};
 use serde_json::Value;
 
 use crate::brain::Brain;
@@ -64,8 +65,15 @@ Rules
 6. SUMMARY continues the story: use the previous page's summary for continuity and write what is new here. If the page is only a title, credits or an ad, say so in the summary and return an empty "panels" list.
 7. Never wrap the JSON in code fences. Never output anything but the JSON object."##;
 
-/// Pages read at the same time.
-const PARALLEL: usize = 3;
+/// Pages read at the same time. Cloud models answer many requests at once; a CLI agent is a whole
+/// process per read; a local model shares one GPU, so a second read only hides the image prep.
+fn parallel_reads(provider: AiProviderId) -> usize {
+    match provider {
+        AiProviderId::Ollama | AiProviderId::Lmstudio | AiProviderId::Llamacpp => 2,
+        AiProviderId::ClaudeCode | AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::Opencode | AiProviderId::GrokCli | AiProviderId::Antigravity => 4,
+        _ => 6,
+    }
+}
 
 // ── parsing ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -434,20 +442,34 @@ pub(crate) async fn read_chapter_with(
     let total: usize = targets.iter().map(|u| u.spans.len()).sum();
     let mut finished = 0;
 
-    // Parts are read a few at a time: each model call is slow (tens of seconds), and a batch
-    // still sees the brain and the summaries of everything read before it.
+    // Parts are read several at a time: each model call is slow (tens of seconds), so a new part
+    // starts as soon as any one finishes instead of waiting for a whole batch. Answers are still
+    // folded in page order, so each part sees the brain and summaries of everything before it.
     // The first part goes alone so the brain has faces before parts are read side by side.
-    let (first, rest) = targets.split_at(1);
-    for batch in std::iter::once(first).chain(rest.chunks(PARALLEL)) {
+    let width = parallel_reads(model.provider);
+    let ask = move |unit: Unit, image: PathBuf, req: Option<AiStepRequest>| async move {
+        let answer = match req {
+            Some(r) => Some(ask_json(llm, r, cancel).await),
+            None => None,
+        };
+        (unit, image, answer)
+    };
+    let mut queue = targets.iter();
+    let mut flight = futures::stream::FuturesOrdered::new();
+    let mut reading: Vec<usize> = vec![];
+    let mut first_done = false;
+    loop {
         if cancel.is_cancelled() {
             progress(Progress::Failed("Cancelled".into()));
             return Err(anyhow!("cancelled"));
         }
-        progress(Progress::Reading { pages: batch.iter().flat_map(Unit::pages).collect(), done: finished, total });
 
-        // 1. Prepare images and prompts.
-        let mut jobs: Vec<(&Unit, PathBuf, Option<AiStepRequest>)> = vec![];
-        for unit in batch {
+        // 1. Start parts until the window is full: prepare the image and prompt, then ask.
+        let mut started = false;
+        while flight.len() < if first_done { width } else { 1 } {
+            let Some(unit) = queue.next() else { break };
+            started = true;
+            reading.extend(unit.pages());
             let i = unit.first();
             let file = pages[i].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
             // Each read gets its own workspace: CLI agents clear their attachments when done.
@@ -475,7 +497,7 @@ pub(crate) async fn read_chapter_with(
                         let file = pages[s.page].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
                         upsert(&mut read, PageRead { index: s.page, file, summary: format!("(unreadable image: {e})"), ..Default::default() });
                     }
-                    jobs.push((unit, PathBuf::new(), None));
+                    flight.push_back(ask(unit.clone(), PathBuf::new(), None));
                     continue;
                 }
             };
@@ -493,21 +515,18 @@ pub(crate) async fn read_chapter_with(
             let mut images = vec![send_path];
             images.extend(faces.iter().map(|(_, p)| p.clone()));
             let req = request(model, vec![AiMessage::system(READ_SYSTEM), AiMessage::user(prompt)], images, Some(ws));
-            jobs.push((unit, image, Some(req)));
+            flight.push_back(ask(unit.clone(), image, Some(req)));
+        }
+        if started {
+            progress(Progress::Reading { pages: reading.clone(), done: finished, total });
         }
 
-        // 2. Ask the model about every part of the batch at once.
-        let answers = futures::future::join_all(jobs.iter().map(|(_, _, req)| async move {
-            match req {
-                Some(r) => Some(ask_json(llm, r.clone(), cancel).await),
-                None => None,
-            }
-        }))
-        .await;
-
-        // 3. Fold the answers in, in page order.
-        for ((unit, image, _), answer) in jobs.into_iter().zip(answers) {
+        // 2. Fold in the next answer, in page order.
+        let Some((unit, image, answer)) = flight.next().await else { break };
+        first_done = true;
+        {
             let i = unit.first();
+            reading.retain(|p| !unit.spans.iter().any(|s| s.page == *p));
             let file_of = |p: usize| pages[p].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
             let Some(answer) = answer else {
                 save_read(ch, &read)?;

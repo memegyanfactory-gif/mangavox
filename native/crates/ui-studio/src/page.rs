@@ -400,7 +400,8 @@ impl StudioPage {
             focus: None,
             focus_id: None,
             phase: Phase::ALL.into_iter().find(|p| prefs.last_phase.as_deref() == Some(p.label())).unwrap_or(Phase::Read),
-            list: ListState::new(0, ListAlignment::Top, px(800.)),
+            // Measured up front so the scrollbar spans every page, not only the ones drawn so far.
+            list: ListState::new(0, ListAlignment::Top, px(800.)).measure_all(),
             lib_scroll: ScrollHandle::new(),
             side_scroll: ScrollHandle::new(),
             list_key: (None, Phase::Read, 0),

@@ -347,6 +347,7 @@ impl StudioPage {
     fn read_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let f = self.focus.as_ref().expect("focus");
         let Some((path, ratio)) = f.pages.get(ix).cloned() else { return div().into_any_element() };
+        let total = f.pages.len();
         let read = f.read.as_ref().and_then(|r| r.pages.iter().find(|p| p.index == ix)).cloned();
         let reading_now = self.run.as_ref().is_some_and(|r| r.running() && r.kind == RunKind::Read && r.chapter_id.as_deref() == Some(f.item.id.as_str()) && r.reading.contains(&ix));
         let faces = run::brain_snapshot(&f.item.manga_id, &f.item.manga_title);
@@ -385,18 +386,19 @@ impl StudioPage {
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.reread_page(ix, cx))),
                 )
             });
-        div().flex().when(stacked, |d| d.flex_col()).items_start().gap(px(space::LG)).child(page_image(ix, &path, ratio, PAGE_MAX_W, reading_now)).child(notes).into_any_element()
+        div().flex().when(stacked, |d| d.flex_col()).items_start().gap(px(space::LG)).child(page_image(ix, total, &path, ratio, PAGE_MAX_W, reading_now)).child(notes).into_any_element()
     }
 
     // ------------------------------------------------------------ Transcript
 
     fn transcript_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let (path, ratio, text, edited, scene) = {
+        let (path, ratio, total, text, edited, scene) = {
             let f = self.focus.as_ref().expect("focus");
             let Some((path, ratio)) = f.pages.get(ix).cloned() else { return div().into_any_element() };
+            let total = f.pages.len();
             let tp = f.transcript.as_ref().and_then(|t| t.pages.iter().find(|p| p.index == ix));
             let scene = f.read.as_ref().and_then(|r| r.pages.iter().find(|p| p.index == ix)).map(|p| p.scene.clone());
-            (path, ratio, transcript_text(f, ix), tp.is_some_and(|p| p.edited), scene)
+            (path, ratio, total, transcript_text(f, ix), tp.is_some_and(|p| p.edited), scene)
         };
         let editor = self.editor(Phase::Transcript, ix, &text, window, cx);
         let focused = editor.read(cx).focus_handle(cx).is_focused(window);
@@ -407,7 +409,7 @@ impl StudioPage {
             .flex()
             .items_start()
             .gap(px(space::LG))
-            .child(page_image(ix, &path, ratio, 240., false))
+            .child(page_image(ix, total, &path, ratio, 240., false))
             .child(
                 div()
                     .flex()
@@ -1317,7 +1319,7 @@ fn audio_pages(f: &Focus) -> Vec<(usize, String)> {
     out
 }
 
-fn page_image(ix: usize, path: &Path, ratio: Option<f32>, max_w: f32, glow: bool) -> Div {
+fn page_image(ix: usize, total: usize, path: &Path, ratio: Option<f32>, max_w: f32, glow: bool) -> Div {
     let im = img(path.to_path_buf());
     div()
         .relative()
@@ -1347,7 +1349,7 @@ fn page_image(ix: usize, path: &Path, ratio: Option<f32>, max_w: f32, glow: bool
                 .text_size(px(size::XS))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(Tokens::text_1())
-                .child(format!("{}", ix + 1)),
+                .child(format!("Page {} / {total}", ix + 1)),
         )
 }
 

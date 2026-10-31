@@ -16,6 +16,7 @@ import shutil
 import wave
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FPS = 30
 AUDIO_RATE = 48000
@@ -1244,6 +1245,11 @@ def run_ffmpeg_progress(cmd, seconds, on_fraction=None, timeout=7200):
     return proc.returncode, stderr
 
 
+def render_jobs():
+    """ffmpeg runs at once while rendering clips and chunks: about one per three cores, 2 to 6."""
+    return max(2, min(6, (os.cpu_count() or 4) // 3))
+
+
 def _render_chunk(paths, starts, trans, out_path, seconds=0.0, on_fraction=None):
     """Crossfade a run of clips into one intermediate video."""
     inputs = []
@@ -1767,6 +1773,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     all_frames = max(1, sum(frame_counts))
     rendered = 0
     clip_paths = []
+    todo = []
     for k, c in enumerate(clips):
         frames = frame_counts[k]
         c["fx"], c["assets"] = clip_fx[k], assets
@@ -1783,23 +1790,35 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                      d.get("bg_dir"), d.get("bg_prev_dir")]
         key = clip_key(c["source"], c["focus"], spec, frames, w, h, fill)
         path = os.path.join(video_dir, f"clip_{c['idx']:04d}_{key}.mp4")
-        # Reuse a clip an interrupted run already rendered.
-        if not (os.path.exists(path) and os.path.getsize(path) > 100):
-            try:
-                _render_clip(c, frames, w, h, path)
-            except Exception as e:
-                print(f"[video] {e} (page {c['page']}); retrying as a still", file=sys.stderr)
-                if c["duo"]:
-                    c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift)
-                    c["duo"] = None
-                c["motion"] = "still"
-                c["move"] = None
-                c["impact"] = False
-                c["fx"] = {}
-                _render_clip(c, frames, w, h, path)
         clip_paths.append(path)
-        rendered += frames
-        report("clips", rendered / all_frames)
+        # Reuse a clip an interrupted run already rendered.
+        if os.path.exists(path) and os.path.getsize(path) > 100:
+            rendered += frames
+        else:
+            todo.append((c, frames, path))
+    report("clips", rendered / all_frames)
+
+    def render_one(c, frames, path):
+        try:
+            _render_clip(c, frames, w, h, path)
+        except Exception as e:
+            print(f"[video] {e} (page {c['page']}); retrying as a still", file=sys.stderr)
+            if c["duo"]:
+                c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift)
+                c["duo"] = None
+            c["motion"] = "still"
+            c["move"] = None
+            c["impact"] = False
+            c["fx"] = {}
+            _render_clip(c, frames, w, h, path)
+        return frames
+
+    # Each clip is its own ffmpeg run whose filter graph mostly uses one core, so several run
+    # side by side; the clips are independent files, joined in order below.
+    with ThreadPoolExecutor(max_workers=render_jobs()) as pool:
+        for done in as_completed([pool.submit(render_one, *t) for t in todo]):
+            rendered += done.result()
+            report("clips", rendered / all_frames)
 
     # Narration, sample-accurate against the same timeline (sped-up clips retimed first).
     _retime_clips(clips, caption_segments, video_dir)
@@ -1812,20 +1831,25 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         video_starts, video_trans = starts, trans
     else:
         video_inputs, video_starts, video_trans = [], [], []
+        jobs = []
         for ci, (a, b) in enumerate(chunks):
             names = [os.path.basename(p) for p in clip_paths[a:b]]
             ckey = clip_key("", None, [names, trans[a + 1:b]], 0, w, h, fill)
             chunk_path = os.path.join(video_dir, f"chunk_{ci:03d}_{ckey}.mp4")
             span = (starts[b] if b < len(starts) else timeline) - starts[a]
             if not (os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 100):
-                _render_chunk(
-                    clip_paths[a:b], starts[a:b], [None] + trans[a + 1:b], chunk_path, span,
-                    lambda f, ci=ci: report("chunks", (ci + f) / len(chunks)),
-                )
+                jobs.append((clip_paths[a:b], starts[a:b], [None] + trans[a + 1:b], chunk_path, span))
             video_inputs.append(chunk_path)
             video_starts.append(starts[a])
             video_trans.append(trans[a])
-            report("chunks", (ci + 1) / len(chunks))
+        # Chunks are independent too: join them side by side.
+        joined = len(chunks) - len(jobs)
+        report("chunks", joined / len(chunks))
+        with ThreadPoolExecutor(max_workers=render_jobs()) as pool:
+            for done in as_completed([pool.submit(_render_chunk, *j) for j in jobs]):
+                done.result()
+                joined += 1
+                report("chunks", joined / len(chunks))
 
     # ── Step 4: Burn captions + mix narration and music + move to final location ──
     bg_music = config.get("bg_music")
