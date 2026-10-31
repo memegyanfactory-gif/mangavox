@@ -407,7 +407,7 @@ impl StudioPage {
         if self.view == View::Video {
             let placed = s.placed();
             ui_assistant::set_studio_context(Some(format!(
-                "The user is in Studio's Video editor on \"{}\" {} ({} clips, {}). Use the video_* tools to edit it; chat edits show on their timeline at once.",
+                "The user is in Studio's Video editor on \"{}\" {} ({} clips, {}). Use the video_* tools to edit it (video_timeline to inspect, video_restyle / video_edit_clips for passes over many clips, video_render at the end); chat edits show on their timeline at once.",
                 s.item.manga_title,
                 s.item.label(),
                 placed.len(),
@@ -978,7 +978,7 @@ impl StudioPage {
                 .filter(|p| p.end_ms() > from)
                 .filter_map(|p| {
                     let b = seq.beats.get(p.clip.src)?;
-                    Some(vedit_play::Slice { file: b.audio.clone(), offset_ms: b.offset_ms + p.clip.trim_in_ms, dur_ms: p.dur_ms })
+                    Some(vedit_play::Slice { file: b.audio.clone(), offset_ms: b.offset_ms + p.clip.trim_in_ms, dur_ms: p.dur_ms, speed: p.clip.speed() })
                 })
                 .collect()
         };
@@ -1930,10 +1930,13 @@ impl StudioPage {
                 let placed = seq.placed();
                 let p = placed.iter().find(|p| p.index == i);
                 let locked = seq.edit.flags(Track::Clips).locked;
-                let motion = segmented("vedit-motion", Motion::ALL.iter().map(|m| (None, m.label())), Motion::ALL.iter().position(|m| *m == c.motion).unwrap_or(0)).small().on_change(cx.listener(move |this, ix: &usize, _, cx| {
-                    let m = Motion::ALL[(*ix).min(3)];
+                let basic = segmented("vedit-motion", Motion::BASIC.iter().map(|m| (None, m.label())), Motion::BASIC.iter().position(|m| *m == c.motion).unwrap_or(0)).small().on_change(cx.listener(move |this, ix: &usize, _, cx| {
+                    let m = Motion::BASIC[(*ix).min(Motion::BASIC.len() - 1)];
                     this.video_clips("Clip motion", |_, cl| cl[i].motion = m, cx);
                 }));
+                // Moves the assistant set (pans, Ken Burns, speed, transitions) are listed under it.
+                let extra = c.amount.is_some() || c.focus_from.is_some() || c.focus_to.is_some() || c.speed() != 1. || c.trans.is_some() || !Motion::BASIC.contains(&c.motion);
+                let motion = div().flex().flex_col().gap(px(4.)).child(basic).when(extra, |d| d.child(muted(c.summary())));
                 let trims = |head: bool| {
                     let label = if head { "In" } else { "Out" };
                     let v = if head { c.trim_in_ms } else { c.trim_out_ms };
@@ -1958,7 +1961,19 @@ impl StudioPage {
                         "motion",
                         ph::ARROWS_OUT,
                         "Motion",
-                        (c.motion != Motion::Auto).then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> { Box::new(move |this: &mut Self, cx: &mut Context<Self>| this.video_clips("Reset motion", |_, cl| cl[i].motion = Motion::Auto, cx)) }),
+                        (c.motion != Motion::Auto || extra).then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> {
+                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
+                                this.video_clips(
+                                    "Reset motion",
+                                    |_, cl| {
+                                        cl[i].reset_motion();
+                                        cl[i].speed = 1.;
+                                        cl[i].trans = None;
+                                    },
+                                    cx,
+                                )
+                            })
+                        }),
                         motion,
                         cx,
                     ))
@@ -1998,7 +2013,18 @@ impl StudioPage {
                         "effects",
                         ph::MAGIC_WAND,
                         "Effects",
-                        c.cut.then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> { Box::new(move |this: &mut Self, cx: &mut Context<Self>| this.video_clips("Reset transition", |_, cl| cl[i].cut = false, cx)) }),
+                        (c.cut || c.trans.is_some()).then(|| -> Box<dyn Fn(&mut Self, &mut Context<Self>)> {
+                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
+                                this.video_clips(
+                                    "Reset transition",
+                                    |_, cl| {
+                                        cl[i].cut = false;
+                                        cl[i].trans = None;
+                                    },
+                                    cx,
+                                )
+                            })
+                        }),
                         div()
                             .flex()
                             .flex_col()

@@ -1,0 +1,19 @@
+{
+ "about": "Panel camera (frame, zoom, x, y) per case: python/video_generator.clip_camera and ui-studio vedit_frame::camera must both give these.",
+ "cases": [
+  {"name": "auto push", "clip": {"motion": "push", "push": 0.05}, "frames": 90, "expect": [[0, 1.0, 0.5, 0.5], [3, 1.00014, 0.5, 0.5], [45, 1.025441, 0.5, 0.5], [89, 1.05, 0.5, 0.5]]},
+  {"name": "auto pan right, short, motion 150%", "clip": {"motion": "pan_right", "push": 0.05, "motion_k": 1.5}, "frames": 60, "expect": [[0, 1.04, 0.0, 0.5], [3, 1.04, 0.006366, 0.5], [30, 1.04, 0.51331, 0.5], [59, 1.04, 1.0, 0.5]]},
+  {"name": "auto pull, ramp, short", "clip": {"motion": "pull", "push": 0.08, "ramp": true}, "frames": 45, "expect": [[0, 1.056, 0.5, 0.5], [3, 1.036073, 0.5, 0.5], [22, 1.0, 0.5, 0.5], [44, 1.0, 0.5, 0.5]]},
+  {"name": "auto pan down, ramp, long", "clip": {"motion": "pan_down", "push": 0.08, "ramp": true}, "frames": 150, "expect": [[0, 1.04, 0.5, 0.0], [3, 1.04, 0.5, 0.013437], [75, 1.04, 0.5, 0.504026], [149, 1.04, 0.5, 1.0]]},
+  {"name": "still", "clip": {"motion": "still", "push": 0.05}, "frames": 40, "expect": [[0, 1, 0.5, 0.5], [3, 1, 0.5, 0.5], [20, 1, 0.5, 0.5], [39, 1, 0.5, 0.5]]},
+  {"name": "zoom 12% into 30,40", "clip": {"motion": "edit", "push": 0.05, "move": {"kind": "zoom", "amount": 0.12, "from": null, "to": [0.3, 0.4]}}, "frames": 90, "expect": [[0, 1.0, 0.3, 0.4], [3, 1.000336, 0.3, 0.4], [45, 1.061059, 0.3, 0.4], [89, 1.12, 0.3, 0.4]]},
+  {"name": "zoom out, look's amount", "clip": {"motion": "edit", "push": 0.06, "move": {"kind": "zoom_out", "amount": null, "from": null, "to": null}}, "frames": 120, "expect": [[0, 1.06, 0.5, 0.5], [3, 1.059906, 0.5, 0.5], [60, 1.029604, 0.5, 0.5], [119, 1.0, 0.5, 0.5]]},
+  {"name": "pan up 20%", "clip": {"motion": "edit", "push": 0.05, "move": {"kind": "pan_up", "amount": 0.2, "from": null, "to": null}}, "frames": 75, "expect": [[0, 1.2, 0.5, 1.0], [3, 1.2, 0.5, 0.99595], [37, 1.2, 0.5, 0.5], [74, 1.2, 0.5, 0.0]]},
+  {"name": "pan left, default", "clip": {"motion": "edit", "push": 0.05, "move": {"kind": "pan_left", "amount": null, "from": null, "to": null}}, "frames": 75, "expect": [[0, 1.04, 1.0, 0.5], [3, 1.04, 0.99595, 0.5], [37, 1.04, 0.5, 0.5], [74, 1.04, 0.0, 0.5]]},
+  {"name": "ken burns, ramp", "clip": {"motion": "edit", "push": 0.08, "ramp": true, "move": {"kind": "ken_burns", "amount": 0.11, "from": [0.3, 0.35], "to": [0.7, 0.62]}}, "frames": 100, "expect": [[0, 1.055, 0.3, 0.35], [3, 1.056127, 0.308196, 0.355532], [50, 1.082833, 0.502424, 0.486636], [99, 1.11, 0.7, 0.62]]},
+  {"name": "ken burns, default path", "clip": {"motion": "edit", "push": 0.05, "move": {"kind": "ken_burns", "amount": null, "from": null, "to": null}}, "frames": 80, "expect": [[0, 1.04, 0.35, 0.4], [3, 1.040142, 0.351066, 0.400711], [40, 1.060398, 0.502982, 0.501988], [79, 1.08, 0.65, 0.6]]},
+  {"name": "punch 15%", "clip": {"motion": "edit", "push": 0.05, "move": {"kind": "punch", "amount": 0.15, "from": null, "to": [0.5, 0.42]}}, "frames": 60, "expect": [[0, 1.0, 0.5, 0.42], [3, 1.113506, 0.5, 0.42], [30, 1.160266, 0.5, 0.42], [59, 1.17, 0.5, 0.42]]},
+  {"name": "shake 20% over a pan", "clip": {"motion": "pan_left", "push": 0.08, "impact": true, "punch": 0.2}, "frames": 50, "expect": [[0, 1.2, 0.5, 0.5], [3, 1.037727, 0.5, 0.5], [25, 1.022912, 0.5, 0.5], [49, 1.0444, 0.5, 0.5]]},
+  {"name": "auto action punch", "clip": {"motion": "push", "push": 0.05, "impact": true}, "frames": 70, "expect": [[0, 1.12, 0.5, 0.5], [3, 1.022572, 0.5, 0.5], [35, 1.019893, 0.5, 0.5], [69, 1.0389, 0.5, 0.5]]}
+ ]
+}

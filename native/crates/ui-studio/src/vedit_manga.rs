@@ -148,7 +148,7 @@ pub fn sound_from(chapters: &[ChapterSound], spans: &[Span], from: u64) -> (Vec<
         let local = from.saturating_sub(s.start_ms);
         if c.edit.flags(Track::Narration).off {
             // Silence as long as the chapter (the player fills a slice it cannot open).
-            narration.push(Slice { file: PathBuf::new(), offset_ms: 0, dur_ms: s.dur_ms });
+            narration.push(Slice { file: PathBuf::new(), offset_ms: 0, dur_ms: s.dur_ms, speed: 1. });
             skip.get_or_insert(local);
         } else {
             for p in c.placed.iter().filter(|p| p.end_ms() > local) {
@@ -156,7 +156,7 @@ pub fn sound_from(chapters: &[ChapterSound], spans: &[Span], from: u64) -> (Vec<
                 if skip.is_none() {
                     skip = Some(local.saturating_sub(p.start_ms));
                 }
-                narration.push(Slice { file: b.audio.clone(), offset_ms: b.offset_ms + p.clip.trim_in_ms, dur_ms: p.dur_ms });
+                narration.push(Slice { file: b.audio.clone(), offset_ms: b.offset_ms + p.clip.trim_in_ms, dur_ms: p.dur_ms, speed: p.clip.speed() });
             }
         }
         let vol = c.edit.music.volume;

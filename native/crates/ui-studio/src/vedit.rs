@@ -92,19 +92,46 @@ pub fn signature(beats: &[Beat]) -> u64 {
 
 // ------------------------------------------------------------------------------------ the edit
 
-/// A clip's movement: the look decides (`Auto`), or the editor's pick.
+/// A clip's movement: the look decides (`Auto`), or the editor's pick. The renderer
+/// (`video_generator.edit_move`) draws each one; `Clip::amount` sets how far it goes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Motion {
     #[default]
     Auto,
     Still,
+    /// Push in.
     Zoom,
+    /// Punch in, camera shake and a white flash (an action beat).
     Shake,
+    /// Pull out.
+    ZoomOut,
+    PanLeft,
+    PanRight,
+    PanUp,
+    PanDown,
+    /// Drift from `focus_from` to `focus_to` while pushing in a little.
+    KenBurns,
+    /// A fast snap in at the start, then a slow drift.
+    Punch,
 }
 
 impl Motion {
-    pub const ALL: [Motion; 4] = [Motion::Auto, Motion::Still, Motion::Zoom, Motion::Shake];
+    pub const ALL: [Motion; 11] = [
+        Motion::Auto,
+        Motion::Still,
+        Motion::Zoom,
+        Motion::Shake,
+        Motion::ZoomOut,
+        Motion::PanLeft,
+        Motion::PanRight,
+        Motion::PanUp,
+        Motion::PanDown,
+        Motion::KenBurns,
+        Motion::Punch,
+    ];
+    /// The ones the clip panel's quick switch offers.
+    pub const BASIC: [Motion; 4] = [Motion::Auto, Motion::Still, Motion::Zoom, Motion::Shake];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -112,14 +139,172 @@ impl Motion {
             Motion::Still => "Still",
             Motion::Zoom => "Zoom in",
             Motion::Shake => "Punch + shake",
+            Motion::ZoomOut => "Zoom out",
+            Motion::PanLeft => "Pan left",
+            Motion::PanRight => "Pan right",
+            Motion::PanUp => "Pan up",
+            Motion::PanDown => "Pan down",
+            Motion::KenBurns => "Ken Burns",
+            Motion::Punch => "Punch in",
         }
     }
+
+    /// The name the renderer and the assistant use (`zoom_out`, `ken_burns`, ...).
+    pub fn key(self) -> &'static str {
+        match self {
+            Motion::Auto => "auto",
+            Motion::Still => "still",
+            Motion::Zoom => "zoom",
+            Motion::Shake => "shake",
+            Motion::ZoomOut => "zoom_out",
+            Motion::PanLeft => "pan_left",
+            Motion::PanRight => "pan_right",
+            Motion::PanUp => "pan_up",
+            Motion::PanDown => "pan_down",
+            Motion::KenBurns => "ken_burns",
+            Motion::Punch => "punch",
+        }
+    }
+
+    /// A key or a common name for it ("zoom in", "push", "kenburns", ...).
+    pub fn parse(name: &str) -> Option<Motion> {
+        let n = name.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        Some(match n.as_str() {
+            "auto" | "default" => Motion::Auto,
+            "still" | "none" | "static" => Motion::Still,
+            "zoom" | "zoom_in" | "push" | "push_in" => Motion::Zoom,
+            "shake" | "punch_+_shake" | "punch_shake" | "impact" => Motion::Shake,
+            "zoom_out" | "pull" | "pull_out" => Motion::ZoomOut,
+            "pan_left" | "left" => Motion::PanLeft,
+            "pan_right" | "right" => Motion::PanRight,
+            "pan_up" | "up" | "tilt_up" => Motion::PanUp,
+            "pan_down" | "down" | "tilt_down" => Motion::PanDown,
+            "ken_burns" | "kenburns" | "drift" => Motion::KenBurns,
+            "punch" | "punch_in" | "snap" | "snap_zoom" => Motion::Punch,
+            _ => return None,
+        })
+    }
+
+    /// Moves the camera itself (the renderer shows the panel alone, never side by side).
+    pub fn own_move(self) -> bool {
+        !matches!(self, Motion::Auto | Motion::Shake)
+    }
+}
+
+/// A transition into a clip, drawn by the renderer (`video_generator.EDIT_TRANSITIONS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransKind {
+    Fade,
+    Dissolve,
+    /// Dip to black.
+    Black,
+    /// Dip to white.
+    Flash,
+    /// A fast slide with motion blur.
+    WhipLeft,
+    WhipRight,
+    WhipUp,
+    WhipDown,
+    SlideLeft,
+    SlideRight,
+    SlideUp,
+    SlideDown,
+    Wipe,
+    Circle,
+    /// Zoom blur: the old picture rushes in, the new one lands out of a blur.
+    Zoom,
+    /// Film burn.
+    Burn,
+    /// Pixelate with an RGB split and noise.
+    Glitch,
+}
+
+impl TransKind {
+    pub const ALL: [TransKind; 17] = [
+        TransKind::Fade,
+        TransKind::Dissolve,
+        TransKind::Black,
+        TransKind::Flash,
+        TransKind::WhipLeft,
+        TransKind::WhipRight,
+        TransKind::WhipUp,
+        TransKind::WhipDown,
+        TransKind::SlideLeft,
+        TransKind::SlideRight,
+        TransKind::SlideUp,
+        TransKind::SlideDown,
+        TransKind::Wipe,
+        TransKind::Circle,
+        TransKind::Zoom,
+        TransKind::Burn,
+        TransKind::Glitch,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            TransKind::Fade => "fade",
+            TransKind::Dissolve => "dissolve",
+            TransKind::Black => "black",
+            TransKind::Flash => "flash",
+            TransKind::WhipLeft => "whip_left",
+            TransKind::WhipRight => "whip_right",
+            TransKind::WhipUp => "whip_up",
+            TransKind::WhipDown => "whip_down",
+            TransKind::SlideLeft => "slide_left",
+            TransKind::SlideRight => "slide_right",
+            TransKind::SlideUp => "slide_up",
+            TransKind::SlideDown => "slide_down",
+            TransKind::Wipe => "wipe",
+            TransKind::Circle => "circle",
+            TransKind::Zoom => "zoom",
+            TransKind::Burn => "burn",
+            TransKind::Glitch => "glitch",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<TransKind> {
+        let n = name.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        let n = match n.as_str() {
+            "crossfade" | "cross_fade" => "fade",
+            "dip_to_black" | "fade_black" | "fadeblack" => "black",
+            "white" | "dip_to_white" | "fade_white" | "fadewhite" => "flash",
+            "whip" => "whip_left",
+            "slide" => "slide_left",
+            "zoom_blur" | "zoomblur" => "zoom",
+            "film_burn" => "burn",
+            other => other,
+        };
+        TransKind::ALL.into_iter().find(|k| k.key() == n)
+    }
+
+    /// The renderer's own length when none is given.
+    pub fn default_ms(self) -> u32 {
+        match self {
+            TransKind::Fade | TransKind::Dissolve | TransKind::Circle => 500,
+            TransKind::Black => 700,
+            TransKind::Flash | TransKind::Glitch => 300,
+            TransKind::WhipLeft | TransKind::WhipRight | TransKind::WhipUp | TransKind::WhipDown => 220,
+            TransKind::SlideLeft | TransKind::SlideRight | TransKind::SlideUp | TransKind::SlideDown | TransKind::Wipe => 450,
+            TransKind::Zoom => 350,
+            TransKind::Burn => 900,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transition {
+    pub kind: TransKind,
+    /// Length (the renderer's own when `None`; it never takes more than 45% of either clip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u32>,
 }
 
 /// One clip on the picture track: a beat, trimmed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub src: usize,
+    /// Narration trimmed off the beat's start and end (source time, before `speed`).
     #[serde(default)]
     pub trim_in_ms: u64,
     #[serde(default)]
@@ -129,14 +314,80 @@ pub struct Clip {
     pub text: Option<String>,
     #[serde(default)]
     pub motion: Motion,
-    /// A hard cut into this clip instead of the look's transition.
+    /// A hard cut into this clip instead of a transition.
     #[serde(default)]
     pub cut: bool,
+    /// How far the motion goes, 0..0.5 (zoom: share zoomed in; pan: zoom that sets the travel;
+    /// shake / punch: the punch zoom, and the shake grows with it). `None`: the look's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<f32>,
+    /// Where the camera looks at the start and end of the move, % of the panel (0 = left /
+    /// top edge, 50 = centre). Ken Burns travels between them; zoom and punch aim at the end one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_from: Option<(f32, f32)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_to: Option<(f32, f32)>,
+    /// Playback speed 0.5..2: the narration is retimed (pitch kept) and the clip gets shorter
+    /// or longer with it.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub speed: f32,
+    /// The transition into this clip (`None`: the look's). `cut` wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trans: Option<Transition>,
 }
+
+fn is_one(v: &f32) -> bool {
+    *v == 1.
+}
+
+pub const MIN_SPEED: f32 = 0.5;
+pub const MAX_SPEED: f32 = 2.;
+pub const MAX_AMOUNT: f32 = 0.5;
 
 impl Clip {
     pub fn of(src: usize) -> Clip {
-        Clip { src, trim_in_ms: 0, trim_out_ms: 0, text: None, motion: Motion::Auto, cut: false }
+        Clip { src, trim_in_ms: 0, trim_out_ms: 0, text: None, motion: Motion::Auto, cut: false, amount: None, focus_from: None, focus_to: None, speed: 1., trans: None }
+    }
+
+    /// The speed in range (a bad saved value plays at 1x).
+    pub fn speed(&self) -> f32 {
+        if self.speed.is_finite() {
+            self.speed.clamp(MIN_SPEED, MAX_SPEED)
+        } else {
+            1.
+        }
+    }
+
+    /// The motion's look-independent parts back to the look's.
+    pub fn reset_motion(&mut self) {
+        self.motion = Motion::Auto;
+        self.amount = None;
+        self.focus_from = None;
+        self.focus_to = None;
+    }
+
+    /// "Ken Burns 12% 30,40>70,60 · 1.1x · in: flash 0.3s" (what the edit changed).
+    pub fn summary(&self) -> String {
+        let mut parts = vec![];
+        let mut m = self.motion.label().to_string();
+        if let Some(a) = self.amount {
+            m += &format!(" {}%", (a * 100.).round());
+        }
+        if let (Some(a), Some(b)) = (self.focus_from, self.focus_to) {
+            m += &format!(" {:.0},{:.0}>{:.0},{:.0}", a.0, a.1, b.0, b.1);
+        } else if let Some(b) = self.focus_to.or(self.focus_from) {
+            m += &format!(" @{:.0},{:.0}", b.0, b.1);
+        }
+        parts.push(m);
+        if self.speed() != 1. {
+            parts.push(format!("{:.2}x", self.speed()));
+        }
+        if self.cut {
+            parts.push("in: cut".into());
+        } else if let Some(t) = self.trans {
+            parts.push(format!("in: {} {:.2}s", t.kind.key(), t.ms.unwrap_or(t.kind.default_ms()) as f32 / 1000.));
+        }
+        parts.join(" · ")
     }
 }
 
@@ -294,7 +545,36 @@ pub struct ChapterEdit {
     /// [`render_key`] of the last render started from this edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rendered: Option<u64>,
+    /// Effect strengths over the look's (key → multiplier 0..2, 1 = the look's own): see
+    /// [`INTENSITIES`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub intensity: BTreeMap<String, f32>,
+    /// The energy level (1..5) of the last restyle pass, and how many passes ran (each pass
+    /// varies the motion differently).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub energy: u8,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub passes: u32,
 }
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// Effect strengths the renderer scales (`video_generator.apply_intensity`): the look's auto
+/// motion (push and pan), film grain, vignette, background parallax drift and the RGB split
+/// of action beats and glitches.
+pub const INTENSITIES: [(&str, &str); 5] = [
+    ("motion", "How far the look's own (auto) moves go"),
+    ("grain", "Film grain"),
+    ("vignette", "Vignette darkness"),
+    ("parallax", "Background drift behind the panel"),
+    ("chroma", "RGB split on action beats and glitches"),
+];
 
 impl ChapterEdit {
     pub fn flags(&self, t: Track) -> TrackFlags {
@@ -418,10 +698,15 @@ impl Placed {
     }
 }
 
-/// How long a clip plays.
-pub fn clip_ms(beats: &[Beat], c: &Clip) -> Option<u64> {
+/// How much of its beat's narration a clip plays (source time, before its speed).
+pub fn src_ms(beats: &[Beat], c: &Clip) -> Option<u64> {
     let b = beats.get(c.src)?;
-    let d = b.dur_ms.saturating_sub(c.trim_in_ms + c.trim_out_ms);
+    Some(b.dur_ms.saturating_sub(c.trim_in_ms + c.trim_out_ms))
+}
+
+/// How long a clip plays (its narration at its speed).
+pub fn clip_ms(beats: &[Beat], c: &Clip) -> Option<u64> {
+    let d = (src_ms(beats, c)? as f64 / c.speed() as f64).round() as u64;
     (d >= MIN_MS).then_some(d)
 }
 
@@ -465,30 +750,33 @@ pub fn reorder(clips: &mut Vec<Clip>, from: usize, to: usize) {
     }
 }
 
-/// Trims clip `i`'s head (`head`) or tail by `delta_ms` (negative extends it back towards the
-/// beat's own length). The clip never gets shorter than [`MIN_MS`].
+/// Trims clip `i`'s head (`head`) or tail by `delta_ms` of the timeline (negative extends it
+/// back towards the beat's own length). The clip never gets shorter than [`MIN_MS`].
 pub fn trim(beats: &[Beat], clips: &mut [Clip], i: usize, head: bool, delta_ms: i64) {
     let Some(c) = clips.get_mut(i) else { return };
     let Some(b) = beats.get(c.src) else { return };
+    let speed = c.speed() as f64;
     let other = if head { c.trim_out_ms } else { c.trim_in_ms };
-    let max = b.dur_ms.saturating_sub(other + MIN_MS) as i64;
+    let max = b.dur_ms.saturating_sub(other + (MIN_MS as f64 * speed).ceil() as u64) as i64;
     let side = if head { &mut c.trim_in_ms } else { &mut c.trim_out_ms };
-    *side = (*side as i64 + delta_ms).clamp(0, max.max(0)) as u64;
+    *side = (*side as i64 + (delta_ms as f64 * speed).round() as i64).clamp(0, max.max(0)) as u64;
 }
 
 /// Splits clip `i` at `at_ms` into it (the clip's own time): two clips of the same beat.
 /// Returns false when either half would be too short.
 pub fn split(beats: &[Beat], clips: &mut Vec<Clip>, i: usize, at_ms: u64) -> bool {
     let Some(c) = clips.get(i).cloned() else { return false };
-    let Some(d) = clip_ms(beats, &c) else { return false };
+    let (Some(d), Some(src)) = (clip_ms(beats, &c), src_ms(beats, &c)) else { return false };
     if at_ms < MIN_MS || at_ms + MIN_MS > d {
         return false;
     }
+    let at_src = ((at_ms as f64 * c.speed() as f64).round() as u64).min(src);
     let mut a = c.clone();
-    a.trim_out_ms += d - at_ms;
+    a.trim_out_ms += src - at_src;
     let mut b = c;
-    b.trim_in_ms += at_ms;
+    b.trim_in_ms += at_src;
     b.cut = true;
+    b.trans = None;
     clips[i] = a;
     clips.insert(i + 1, b);
     true
@@ -561,15 +849,33 @@ pub fn render_extra(beats: &[Beat], e: &ChapterEdit, subs: &SubtitleSetting) -> 
                     v["text"] = json!(t);
                 }
                 if c.motion != Motion::Auto {
-                    v["motion"] = serde_json::to_value(c.motion).unwrap_or(Value::Null);
+                    v["motion"] = json!(c.motion.key());
+                }
+                if let Some(a) = c.amount {
+                    v["amount"] = json!(round3(a.clamp(0., MAX_AMOUNT)));
+                }
+                if let Some((x, y)) = c.focus_from {
+                    v["focus_from"] = json!([round3(x), round3(y)]);
+                }
+                if let Some((x, y)) = c.focus_to {
+                    v["focus_to"] = json!([round3(x), round3(y)]);
+                }
+                if c.speed() != 1. {
+                    v["speed"] = json!(round3(c.speed()));
                 }
                 if c.cut {
                     v["cut"] = json!(true);
+                } else if let Some(t) = c.trans {
+                    v["transition"] = json!({"kind": t.kind.key(), "ms": t.ms.unwrap_or(t.kind.default_ms())});
                 }
                 v
             })
             .collect();
         edit.insert("clips".into(), Value::Array(clips));
+    }
+    if !e.intensity.is_empty() {
+        let k: serde_json::Map<String, Value> = e.intensity.iter().map(|(k, v)| (k.clone(), json!(round3(v.clamp(0., 2.))))).collect();
+        edit.insert("intensity".into(), Value::Object(k));
     }
     if !e.flags(Track::Layers).off {
         let layers: Vec<Value> = e
@@ -637,6 +943,10 @@ pub fn render_extra(beats: &[Beat], e: &ChapterEdit, subs: &SubtitleSetting) -> 
         }
     }
     out
+}
+
+fn round3(v: f32) -> f64 {
+    (v as f64 * 1000.).round() / 1000.
 }
 
 /// A key of what a render of this edit would make (to tell an edit not rendered yet).
@@ -841,6 +1151,100 @@ mod tests {
         assert_eq!(x["edit"]["narration_mute"], true);
         assert!(x["bg_music"].is_null() && x["score"].is_null());
         assert_eq!(x["music_volume"], 0.);
+    }
+
+    #[test]
+    fn old_project_files_still_load() {
+        // A video_edit.json written before moves, speed and transitions existed.
+        let old = r#"{"version":1,"chapters":{"ch1":{"sig":7,"clips":[{"src":2,"trim_in_ms":100,"trim_out_ms":0,"motion":"zoom","cut":true},{"src":0,"motion":"shake"},{"src":1}],
+            "look":{"preset":"dynamic","effects":{"grain":true}},"cuts":false,"music":{"source":{"kind":"score"},"volume":0.8},"layers":[],"tracks":[{},{},{},{},{}]}}}"#;
+        let p: Project = serde_json::from_str(old).unwrap();
+        let e = &p.chapters["ch1"];
+        let c = e.clips.as_ref().unwrap();
+        assert_eq!((c[0].motion, c[0].cut, c[0].speed, c[0].trans, c[0].amount), (Motion::Zoom, true, 1., None, None));
+        assert_eq!(c[1].motion, Motion::Shake);
+        assert_eq!(c[2], Clip::of(1));
+        assert!(e.intensity.is_empty() && e.energy == 0 && e.passes == 0);
+        // Saving it again writes none of the new keys it does not use.
+        let text = serde_json::to_string(&p).unwrap();
+        assert!(!text.contains("speed") && !text.contains("trans") && !text.contains("intensity") && !text.contains("energy"));
+        // The new fields round-trip.
+        let mut e = e.clone();
+        let cl = e.clips.as_mut().unwrap();
+        cl[0].motion = Motion::KenBurns;
+        cl[0].focus_from = Some((30., 40.));
+        cl[0].speed = 1.2;
+        cl[1].trans = Some(Transition { kind: TransKind::WhipLeft, ms: Some(200) });
+        e.intensity.insert("grain".into(), 1.5);
+        e.energy = 4;
+        let back: ChapterEdit = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
+        assert!(serde_json::to_string(&e).unwrap().contains("\"ken_burns\""));
+    }
+
+    #[test]
+    fn speed_retimes_the_clip_and_its_edits() {
+        let b = beats();
+        let mut c = vec![Clip::of(0)];
+        c[0].speed = 2.;
+        assert_eq!(clip_ms(&b, &c[0]), Some(2000));
+        assert_eq!(src_ms(&b, &c[0]), Some(4000));
+        // Splitting 500 ms into the clip is 1 s into its narration.
+        assert!(split(&b, &mut c, 0, 500));
+        assert_eq!((clip_ms(&b, &c[0]), clip_ms(&b, &c[1])), (Some(500), Some(1500)));
+        assert_eq!(c[1].trim_in_ms, 1000);
+        // A trim dragged 100 ms on the timeline takes 200 ms of narration.
+        trim(&b, &mut c, 0, true, 100);
+        assert_eq!(c[0].trim_in_ms, 200);
+        // A bad saved speed plays at 1x.
+        c[0].speed = f32::NAN;
+        assert_eq!(c[0].speed(), 1.);
+    }
+
+    #[test]
+    fn render_extra_carries_moves_speed_transitions_and_intensity() {
+        let b = beats();
+        let mut e = ChapterEdit::default();
+        let mut c: Vec<Clip> = (0..3).map(Clip::of).collect();
+        c[0].motion = Motion::PanLeft;
+        c[0].amount = Some(0.2);
+        c[1].motion = Motion::KenBurns;
+        c[1].focus_from = Some((30., 35.));
+        c[1].focus_to = Some((70., 62.));
+        c[1].speed = 1.15;
+        c[1].trans = Some(Transition { kind: TransKind::Glitch, ms: None });
+        c[2].trans = Some(Transition { kind: TransKind::Flash, ms: Some(250) });
+        c[2].cut = true;
+        e.set_clips(&b, c);
+        e.intensity.insert("motion".into(), 1.5);
+        let x = render_extra(&b, &e, &SubtitleSetting::default());
+        let clips = &x["edit"]["clips"];
+        assert_eq!(clips[0], json!({"src": 0, "trim_in_ms": 0, "trim_out_ms": 0, "motion": "pan_left", "amount": 0.2}));
+        assert_eq!(clips[1]["motion"], "ken_burns");
+        assert_eq!(clips[1]["focus_from"], json!([30., 35.]));
+        assert_eq!(clips[1]["speed"], 1.15);
+        assert_eq!(clips[1]["transition"], json!({"kind": "glitch", "ms": 300}), "the renderer's own length when none is set");
+        assert_eq!(clips[2]["cut"], true);
+        assert!(clips[2].get("transition").is_none(), "a hard cut wins");
+        assert_eq!(x["edit"]["intensity"], json!({"motion": 1.5}));
+    }
+
+    #[test]
+    fn motions_and_transitions_parse_by_common_names() {
+        assert_eq!(Motion::parse("Ken Burns"), Some(Motion::KenBurns));
+        assert_eq!(Motion::parse("zoom in"), Some(Motion::Zoom));
+        assert_eq!(Motion::parse("pull"), Some(Motion::ZoomOut));
+        assert_eq!(Motion::parse("spin"), None);
+        for m in Motion::ALL {
+            assert_eq!(Motion::parse(m.key()), Some(m));
+            assert_eq!(serde_json::to_value(m).unwrap(), json!(m.key()));
+        }
+        assert_eq!(TransKind::parse("crossfade"), Some(TransKind::Fade));
+        assert_eq!(TransKind::parse("whip"), Some(TransKind::WhipLeft));
+        for k in TransKind::ALL {
+            assert_eq!(TransKind::parse(k.key()), Some(k));
+            assert_eq!(serde_json::to_value(k).unwrap(), json!(k.key()));
+        }
     }
 
     #[test]

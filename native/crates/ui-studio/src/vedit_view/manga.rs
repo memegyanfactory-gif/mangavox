@@ -19,10 +19,11 @@ use mv_ui::{btn, icon_button, icon_ph, muted, ph, size, tip, ButtonKind, Tokens}
 
 use super::{clip_box, clip_tiles, lane_h, made, soft, track_color, Drag, Sel, Seq, BOTTOM_H, HEAD_W, LEFT_W, RIGHT_W, RULER_H, TICK};
 use crate::data::{ChapterItem, MangaGroup};
-use crate::look::{Look, Preset};
+use crate::look::Look;
 use crate::page::{plural, StudioPage, View};
 use crate::pipeline::{short_label, ItemState};
 use crate::vedit::{self, Beat, ChapterEdit, LayerKind, Motion, Placed, Project, Track};
+use crate::vedit_frame as vf;
 use crate::vedit_manga::{self as vm, LookState, Span};
 use crate::vedit_play;
 use crate::video::{self, SubtitleSetting};
@@ -1058,68 +1059,133 @@ impl StudioPage {
 
     // ------------------------------------------------------------------------------ look preview
 
-    /// The picture under the layers and captions, drawn the way the chapter's look renders it:
-    /// the blurred fill, the panel (or two tall panels side by side for the duo looks), the
-    /// action flash, and the grade and vignette. An approximation of the renderer's finish.
+    /// The picture under the layers and captions at `now`, from the renderer's own plan of the
+    /// chapter (`vedit_frame`): the shot on screen with its camera move, punch flash and jolt,
+    /// the transition into it while it runs (slide, wipe, dip or dissolve), the duo panels
+    /// sliding in, then the look's grade, glow, vignette and letterbox bars.
     pub(super) fn look_backdrop(&self, seq: &Seq, placed: &[Placed], now: u64, fw: f32, fh: f32) -> Vec<AnyElement> {
         let mut out = vec![];
-        let cur_i = placed.partition_point(|p| p.end_ms() <= now).min(placed.len().saturating_sub(1));
-        let Some(cur) = placed.get(cur_i) else { return out };
-        let Some(image) = seq.beats.get(cur.clip.src).and_then(|b| b.image.clone()) else { return out };
-        let (preset, fx) = match &seq.edit.look {
-            Some(l) => {
-                let p = Preset::parse(&l.preset).unwrap_or_default();
-                let base = p.effects();
-                let pick = |e: crate::look::Effect| l.effects.get(e.key()).copied().unwrap_or(base.get(e));
-                (p, [pick(crate::look::Effect::Grade), pick(crate::look::Effect::Vignette), pick(crate::look::Effect::Glow), pick(crate::look::Effect::Impact)])
+        let studio = self.studio_look();
+        let look = vf::LookParams::of(&seq.edit, (studio.preset, studio.effects()));
+        let shots = vf::plan(&seq.beats, placed, &look, seq.edit.cuts, seq.reels, &aspect);
+        let t = now as f64 / 1000.;
+        let Some(at) = vf::at(&shots, t) else { return out };
+        let layer = |els: Vec<AnyElement>, dx: f64, dy: f64, alpha: f64| div().absolute().left(px(dx as f32)).top(px(dy as f32)).w(px(fw)).h(px(fh)).opacity(alpha as f32).children(els).into_any_element();
+        let pic = |k: usize, on: f64| self.shot_picture(seq, placed, &shots, k, on, &look, fw, fh);
+        match (at.from, &at.trans) {
+            (Some((from, from_on)), Some((name, p))) => {
+                let m = vf::mix(name, *p);
+                out.push(layer(pic(from, from_on), m.out_dx * fw as f64, m.out_dy * fh as f64, 1.));
+                let incoming = pic(at.shot, at.on);
+                match m.reveal {
+                    Some((side, share)) => {
+                        let (fwd, fhd) = (fw as f64, fh as f64);
+                        let (x, y, w, h) = match side {
+                            vf::Side::Right => (fwd * (1. - share), 0., fwd * share, fhd),
+                            vf::Side::Left => (0., 0., fwd * share, fhd),
+                            vf::Side::Bottom => (0., fhd * (1. - share), fwd, fhd * share),
+                            vf::Side::Top => (0., 0., fwd, fhd * share),
+                        };
+                        out.push(div().absolute().left(px(x as f32)).top(px(y as f32)).w(px(w as f32)).h(px(h as f32)).overflow_hidden().child(layer(incoming, -x, -y, 1.)).into_any_element());
+                    }
+                    None if m.in_alpha > 0. => out.push(layer(incoming, m.in_dx * fw as f64, m.in_dy * fh as f64, m.in_alpha)),
+                    None => {}
+                }
+                if let Some((white, a)) = m.dip {
+                    out.push(div().absolute().inset_0().bg(video::paint(super::hex(if white { "#ffffff" } else { "#000000" }), a as f32)).into_any_element());
+                }
             }
-            None => {
-                let l = self.studio_look();
-                let f = l.effects();
-                (l.preset, [f.grade, f.vignette, f.glow, f.impact])
-            }
-        };
-        let [grade, vignette, glow, impact] = fx;
-        out.push(img(image.clone()).absolute().inset_0().size_full().object_fit(ObjectFit::Cover).opacity(0.28).into_any_element());
-        out.push(div().absolute().inset_0().bg(video::paint(super::hex("#000000"), 0.35)).into_any_element());
-        // The duo looks pair tall panels: the new one in one half, the one before it in the other.
-        let duo_look = matches!(preset, Preset::Recap | Preset::Dynamic) && !seq.reels;
-        let duo_ok = |p: &Placed| !matches!(p.clip.motion, Motion::Still | Motion::Zoom) && seq.beats.get(p.clip.src).and_then(|b| b.image.as_deref()).and_then(aspect).is_some_and(vm::duo_aspect);
-        if duo_look && duo_ok(cur) {
-            let run = placed[..=cur_i].iter().rev().take_while(|p| duo_ok(p)).count();
-            let slot = (run + 1) % 2;
-            let partner = (run > 1).then(|| placed.get(cur_i - 1)).flatten().and_then(|p| seq.beats.get(p.clip.src)).and_then(|b| b.image.clone());
-            for (path, s) in [(Some(image.clone()), slot), (partner, 1 - slot)] {
-                let Some(path) = path else { continue };
-                let a = aspect(&path).unwrap_or(0.6);
-                let (x, y, w, h, vis) = vm::duo_box(a, fw, fh, s);
-                out.push(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(vis)).overflow_hidden().child(img(path).absolute().left_0().top_0().w(px(w)).h(px(h)).object_fit(ObjectFit::Fill)).into_any_element());
-            }
-        } else {
-            out.push(img(image).absolute().inset_0().size_full().object_fit(ObjectFit::Contain).into_any_element());
+            _ => out.push(layer(pic(at.shot, at.on), 0., 0., 1.)),
         }
-        // The action punch's white flash at the start of an action beat.
-        let into = now.saturating_sub(cur.start_ms);
-        if into < 400 {
-            let text = cur.clip.text.clone().or_else(|| seq.beats.get(cur.clip.src).map(|b| b.text.clone())).unwrap_or_default();
-            let punch = cur.clip.motion == Motion::Shake || (impact && cur.clip.motion == Motion::Auto && vm::is_impact(&text));
-            if punch {
-                out.push(div().absolute().inset_0().bg(video::paint(super::hex("#ffffff"), 0.55 * (1. - into as f32 / 400.))).into_any_element());
+        // The action punch's white flash (the renderer adds this much brightness).
+        if shots[at.shot].impact {
+            let a = vf::flash(at.on / vf::FPS);
+            if a > 0. {
+                out.push(div().absolute().inset_0().bg(video::paint(super::hex("#ffffff"), a as f32)).into_any_element());
             }
         }
-        if grade {
+        let fx = look.fx;
+        if fx.grade {
             out.push(div().absolute().inset_0().bg(video::paint(super::hex("#ff9a3c"), 0.06)).into_any_element());
         }
-        if glow {
+        if fx.glow {
             out.push(div().absolute().inset_0().bg(video::paint(super::hex("#ffffff"), 0.04)).into_any_element());
         }
-        if vignette {
-            let shade = |angle: f32| linear_gradient(angle, linear_color_stop(video::paint(super::hex("#000000"), 0.55), 0.), linear_color_stop(video::paint(super::hex("#000000"), 0.), 1.));
+        let vk = look.k("vignette") as f32;
+        if fx.vignette && vk > 0. {
+            let shade = move |angle: f32| linear_gradient(angle, linear_color_stop(video::paint(super::hex("#000000"), (0.55 * vk).min(0.95)), 0.), linear_color_stop(video::paint(super::hex("#000000"), 0.), 1.));
             out.push(div().absolute().left_0().right_0().top_0().h(relative(0.22)).bg(shade(180.)).into_any_element());
             out.push(div().absolute().left_0().right_0().bottom_0().h(relative(0.22)).bg(shade(0.)).into_any_element());
             out.push(div().absolute().top_0().bottom_0().left_0().w(relative(0.16)).bg(shade(90.)).into_any_element());
             out.push(div().absolute().top_0().bottom_0().right_0().w(relative(0.16)).bg(shade(270.)).into_any_element());
         }
+        if fx.letterbox {
+            let (w, h) = vf::render_size(seq.reels);
+            let bar = (vf::letterbox_bar(w, h) / h) as f32 * fh;
+            if bar > 0. {
+                out.push(div().absolute().left_0().right_0().top_0().h(px(bar)).bg(video::paint(super::hex("#000000"), 1.)).into_any_element());
+                out.push(div().absolute().left_0().right_0().bottom_0().h(px(bar)).bg(video::paint(super::hex("#000000"), 1.)).into_any_element());
+            }
+        }
+        out
+    }
+
+    /// Shot `k` at frame `on`, full frame: the blurred fill, then the panel through its camera
+    /// (or the duo pair, the new panel sliding in like the renderer's `_render_duo_clip`).
+    #[allow(clippy::too_many_arguments)]
+    fn shot_picture(&self, seq: &Seq, placed: &[Placed], shots: &[vf::Shot], k: usize, on: f64, look: &vf::LookParams, fw: f32, fh: f32) -> Vec<AnyElement> {
+        let mut out = vec![];
+        let shot = &shots[k];
+        let Some(image) = placed.get(k).and_then(|p| seq.beats.get(p.clip.src)).and_then(|b| b.image.clone()) else { return out };
+        let t = on / vf::FPS;
+        out.push(img(image.clone()).absolute().inset_0().size_full().object_fit(ObjectFit::Cover).opacity(0.28).into_any_element());
+        out.push(div().absolute().inset_0().bg(video::paint(super::hex("#000000"), 0.35)).into_any_element());
+        let (jx, jy) = if shot.impact { vf::jolt(t, shot.cam.punch, fh as f64) } else { (0., 0.) };
+        if shot.duo {
+            // The new panel in one half, the one before it (when it was a duo panel too) in the other.
+            let run = shots[..=k].iter().rev().take_while(|s| s.duo).count();
+            let slot = (run + 1) % 2;
+            let partner = (run > 1).then(|| placed.get(k - 1)).flatten().and_then(|p| seq.beats.get(p.clip.src)).and_then(|b| b.image.clone());
+            let slide = 0.45 * if shot.impact { 0.55 } else { 1. };
+            let dist = fw as f64 * 0.06 * if shot.impact { 1.6 } else { 1. } * if slot == 0 { -1. } else { 1. };
+            let left = (1. - (t / slide).min(1.)).powi(3);
+            for (path, s, new) in [(partner, 1 - slot, false), (Some(image), slot, true)] {
+                let Some(path) = path else { continue };
+                let a = aspect(&path).unwrap_or(0.6);
+                let (x, y, w, h, vis) = vm::duo_box(a, fw, fh, s);
+                let (dx, alpha) = if new { (dist * left, (t / (slide * 0.7)).min(1.)) } else { (0., 1.) };
+                out.push(
+                    div()
+                        .absolute()
+                        .left(px(x + (dx + jx) as f32))
+                        .top(px(y + jy as f32))
+                        .w(px(w))
+                        .h(px(vis))
+                        .opacity(alpha as f32)
+                        .overflow_hidden()
+                        .child(img(path).absolute().left_0().top_0().w(px(w)).h(px(h)).object_fit(ObjectFit::Fill))
+                        .into_any_element(),
+                );
+            }
+            return out;
+        }
+        let (rw, rh) = vf::render_size(seq.reels);
+        let s = fw as f64 / rw;
+        let (bx, by, bw, bh) = vf::panel_box(aspect(&image).map(f64::from).unwrap_or(1.), rw, rh, look.fx.letterbox);
+        let (bx, by, bw, bh) = (bx * s, by * s, bw * s, bh * s);
+        let v = vf::camera(&shot.cam, shot.frames, on);
+        let (iw, ih) = (bw * v.zoom, bh * v.zoom);
+        out.push(
+            div()
+                .absolute()
+                .left(px((bx + jx) as f32))
+                .top(px((by + jy) as f32))
+                .w(px(bw as f32))
+                .h(px(bh as f32))
+                .overflow_hidden()
+                .child(img(image).absolute().left(px((-(iw - bw) * v.x) as f32)).top(px((-(ih - bh) * v.y) as f32)).w(px(iw as f32)).h(px(ih as f32)).object_fit(ObjectFit::Fill))
+                .into_any_element(),
+        );
         out
     }
 }
