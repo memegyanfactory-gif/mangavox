@@ -18,6 +18,7 @@ use ui_assistant::tools::{AppTool, Phrases, Risk, ToolOutput, ToolResult};
 use crate::data::{ChapterItem, MangaGroup};
 use crate::look::{Effect, Preset};
 use crate::vedit::{self, Beat, ChapterEdit, Clip, Layer, LayerKind, LookEdit, Motion, MusicSource, Track};
+use crate::vedit_plan;
 use crate::video::{self, SubtitleSetting};
 
 // ------------------------------------------------------------------------------------ shared state
@@ -118,7 +119,7 @@ fn s<'a>(args: &'a Map<String, Value>, k: &str) -> &'a str {
 fn num(args: &Map<String, Value>, k: &str) -> Option<f64> {
     match args.get(k)? {
         Value::Number(n) => n.as_f64(),
-        Value::String(t) => t.trim().trim_end_matches(['%', 's']).trim().parse().ok(),
+        Value::String(t) => t.trim().trim_end_matches(['%', 's', 'x']).trim().parse().ok(),
         _ => None,
     }
 }
@@ -335,35 +336,108 @@ fn overview(args: &Map<String, Value>) -> Result<Value, String> {
     Ok(json!({ "manga": g.title, "openInVideoEditor": open, "finishedChapters": chapters, "notFinished": g.chapters.iter().filter(|c| !made(c)).count() }))
 }
 
+/// Characters of clip lines one `video_timeline` call returns (the rest is paged).
+const TIMELINE_BUDGET: usize = 4_200;
+/// Layers listed in full (the rest are counted).
+const TIMELINE_LAYERS: usize = 25;
+
+/// One clip as a compact line: `#3 p2 12.4s +3.1s ken_burns 11% 30,35>70,62 1.06x in:flash/0.25 trim "caption"`.
+pub(crate) fn clip_line(p: &vedit::Placed, b: Option<&Beat>, text: bool) -> String {
+    let c = &p.clip;
+    let mut s = format!("#{} p{} {}s +{}s {}", p.index + 1, b.map(|b| b.page + 1).unwrap_or(0), secs(p.start_ms), secs(p.dur_ms), c.motion.key());
+    if let Some(a) = c.amount {
+        s += &format!(" {}%", (a * 100.).round());
+    }
+    match (c.focus_from, c.focus_to) {
+        (Some(a), Some(b)) => s += &format!(" {:.0},{:.0}>{:.0},{:.0}", a.0, a.1, b.0, b.1),
+        (Some(f), None) | (None, Some(f)) => s += &format!(" @{:.0},{:.0}", f.0, f.1),
+        _ => {}
+    }
+    if c.speed() != 1. {
+        s += &format!(" {:.2}x", c.speed());
+    }
+    if c.cut {
+        s += " in:cut";
+    } else if let Some(t) = c.trans {
+        s += &format!(" in:{}/{:.2}", t.kind.key(), t.ms.unwrap_or(t.kind.default_ms()) as f32 / 1000.);
+    }
+    if c.trim_in_ms + c.trim_out_ms > 0 {
+        s += &format!(" trim{}+{}", secs(c.trim_in_ms), secs(c.trim_out_ms));
+    }
+    if text {
+        let t = c.text.as_deref().or(b.map(|b| b.text.as_str())).unwrap_or("");
+        let short: String = t.chars().take(44).collect();
+        s += &format!(" {}\"{}{}\"", if c.text.is_some() { "caption=" } else { "" }, short, if t.chars().count() > 44 { "…" } else { "" });
+    }
+    s
+}
+
+fn layer_line(l: &Layer) -> String {
+    let at = format!("{}-{}s @{:.0},{:.0} {}%", secs(l.start_ms), secs(l.end_ms), l.x, l.y, (l.opacity * 100.).round());
+    match &l.kind {
+        LayerKind::Image { path } => format!("L{} image {} {at} w{}%", l.id, path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), (l.scale * 100.).round()),
+        LayerKind::Text { text, color, boxed } => {
+            let t: String = text.chars().take(40).collect();
+            format!("L{} text {at} h{}% {color}{} \"{t}\"", l.id, (l.scale * 1000.).round() / 10., if *boxed { " box" } else { "" })
+        }
+    }
+}
+
 fn timeline(args: &Map<String, Value>) -> Result<Value, String> {
     let (g, c) = one(args)?;
     let beats = beats_of(&c);
     let e = vedit::chapter_edit(&c.output_dir, &c.id).unwrap_or_default();
     let placed = vedit::place(&beats, &e.clips(&beats));
-    let from = num(args, "from_clip").map(|n| (n.max(1.) as usize) - 1).unwrap_or(0);
-    let limit = num(args, "limit").map(|n| n.clamp(1., 80.) as usize).unwrap_or(40);
-    let clips: Vec<Value> = placed
+    let from = match (num(args, "offset"), num(args, "from_clip")) {
+        (Some(o), _) => o.max(0.) as usize,
+        (None, Some(n)) => (n.max(1.) as usize) - 1,
+        _ => 0,
+    }
+    .min(placed.len());
+    let limit = num(args, "limit").map(|n| n.clamp(1., 400.) as usize).unwrap_or(400);
+    let text = flag(args, "text").unwrap_or(true);
+    let mut lines = vec![];
+    let mut used = 0;
+    for p in placed.iter().skip(from).take(limit) {
+        let line = clip_line(p, beats.get(p.clip.src), text);
+        if used + line.len() > TIMELINE_BUDGET && !lines.is_empty() {
+            break;
+        }
+        used += line.len() + 4;
+        lines.push(line);
+    }
+    let end = from + lines.len();
+    let tracks: Vec<String> = Track::ALL
         .iter()
-        .skip(from)
-        .take(limit)
-        .map(|p| {
-            let b = beats.get(p.clip.src);
-            let text: String = p.clip.text.clone().or_else(|| b.map(|b| b.text.clone())).unwrap_or_default().chars().take(90).collect();
-            json!({
-                "clip": p.index + 1, "page": b.map(|b| b.page + 1), "start": secs(p.start_ms), "seconds": secs(p.dur_ms),
-                "motion": p.clip.motion.label(), "hardCut": p.clip.cut, "trimmed": p.clip.trim_in_ms + p.clip.trim_out_ms > 0, "caption": text,
-            })
-        })
+        .filter(|t| e.flags(**t).off || e.flags(**t).locked)
+        .map(|t| format!("{} {}", t.label().to_lowercase(), match (e.flags(*t).off, e.flags(*t).locked) {
+            (true, true) => "off+locked",
+            (true, false) => "off",
+            _ => "locked",
+        }))
         .collect();
-    let tracks: Map<String, Value> = Track::ALL.iter().map(|t| (t.label().to_lowercase(), json!({ "off": e.flags(*t).off, "locked": e.flags(*t).locked }))).collect();
-    Ok(json!({
+    let mut out = json!({
         "manga": g.title, "chapter": c.label(), "seconds": secs(vedit::total_ms(&placed)), "clipCount": placed.len(),
-        "clipsShown": format!("{}-{} of {}", from + 1, (from + clips.len()).max(from + 1), placed.len()),
-        "clips": clips, "layers": e.layers.iter().map(layer_json).collect::<Vec<_>>(),
+        "clipsShown": format!("{}-{} of {}", from + 1, end.max(from + 1), placed.len()),
+        "clipFormat": "#clip p<page> <start>s +<length>s <motion> [amount%] [focus x,y or from>to] [speed x] [in:<transition>/<seconds>] [trim<start>+<end>] \"caption\"",
+        "clips": lines,
+        "layers": e.layers.iter().take(TIMELINE_LAYERS).map(layer_line).collect::<Vec<_>>(),
         "captions": captions_of(&vedit::placed_captions(&c.output_dir, &video::subtitle_setting_for(&c)), &e), "music": music_of(&e), "look": look_of(&e),
-        "transitions": if e.cuts { "hard cuts" } else { "the look's transitions" }, "tracks": tracks,
+        "transitions": if e.cuts { "hard cuts (clips with in:<transition> keep theirs)" } else { "the look's (clips with in:<transition> or in:cut override)" },
+        "energyLevel": e.energy, "restylePasses": e.passes,
+        "tracksOffOrLocked": tracks,
         "renderedWithThisEdit": e.rendered.is_some() && e.rendered == vedit::extra_for(&c.output_dir, &c.id, &c.pages_dir, &video::subtitle_setting_for(&c)).map(|x| vedit::render_key(&x)),
-    }))
+    });
+    if e.layers.len() > TIMELINE_LAYERS {
+        out["moreLayers"] = json!(e.layers.len() - TIMELINE_LAYERS);
+    }
+    if !e.intensity.is_empty() {
+        out["intensityPercent"] = json!(e.intensity.iter().map(|(k, v)| (k.clone(), json!((v * 100.).round()))).collect::<Map<String, Value>>());
+    }
+    if end < placed.len() {
+        out["more"] = json!(format!("{} more clips: call video_timeline with offset {end}", placed.len() - end));
+    }
+    Ok(out)
 }
 
 fn caption_styles() -> Value {
@@ -635,9 +709,29 @@ fn set_look(args: &Map<String, Value>) -> Result<Value, String> {
         "look" | "transitions" | "fade" | "default" => Some(false),
         other => return Err(format!("transitions is \"cuts\" or \"look\", not \"{other}\"")),
     };
+    let mut intensity: Vec<(String, f32)> = vec![];
+    if let Some(Value::Object(m)) = args.get("intensity") {
+        for (k, v) in m {
+            let key = k.trim().to_ascii_lowercase();
+            if !vedit::INTENSITIES.iter().any(|(n, _)| *n == key) {
+                return Err(format!("No intensity \"{k}\" ({})", vedit::INTENSITIES.map(|(n, _)| n).join(", ")));
+            }
+            let mut one = Map::new();
+            one.insert("v".into(), v.clone());
+            let pct = num(&one, "v").ok_or(format!("intensity {k} is a percent (100 = the look's own)"))?;
+            intensity.push((key, (pct as f32 / 100.).clamp(0., 2.)));
+        }
+    }
     edit_chapters(&chapters, |_, e| {
         if studio {
             e.look = None;
+        }
+        for (k, v) in &intensity {
+            if (*v - 1.).abs() < 0.005 {
+                e.intensity.remove(k);
+            } else {
+                e.intensity.insert(k.clone(), *v);
+            }
         }
         if let Some(p) = p {
             e.look = Some(LookEdit { preset: p.key().into(), effects: Default::default() });
@@ -660,7 +754,10 @@ fn set_look(args: &Map<String, Value>) -> Result<Value, String> {
         Ok(())
     })?;
     let e = vedit::chapter_edit(&chapters[0].output_dir, &chapters[0].id).unwrap_or_default();
-    Ok(json!({ "ok": true, "chapters": chapters.len(), "look": look_of(&e), "transitions": if e.cuts { "hard cuts" } else { "the look's transitions" } }))
+    Ok(json!({
+        "ok": true, "chapters": chapters.len(), "look": look_of(&e), "transitions": if e.cuts { "hard cuts" } else { "the look's transitions" },
+        "intensityPercent": e.intensity.iter().map(|(k, v)| (k.clone(), json!((v * 100.).round()))).collect::<Map<String, Value>>(),
+    }))
 }
 
 /// Applies `f` to the chapter's clip list.
@@ -689,40 +786,273 @@ fn clip_index(args: &Map<String, Value>, k: &str, len: usize) -> Result<usize, S
     Ok(n - 1)
 }
 
+/// A camera focus: [x, y], "x,y", {"x":..,"y":..} or a place name ("top left", "center", ...),
+/// in % of the panel.
+fn focus_arg(args: &Map<String, Value>, k: &str) -> Result<Option<(f32, f32)>, String> {
+    let bad = || format!("{k} is [x, y] in % of the panel (0,0 top left; 50,50 centre) or a place like \"top left\"");
+    let n = |v: &Value| v.as_f64().or_else(|| v.as_str().and_then(|t| t.trim().trim_end_matches('%').parse().ok()));
+    let pair = match args.get(k) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(a)) if a.len() == 2 => n(&a[0]).zip(n(&a[1])),
+        Some(Value::Object(o)) => o.get("x").and_then(n).zip(o.get("y").and_then(n)),
+        Some(Value::String(t)) => {
+            let t = t.trim().to_ascii_lowercase();
+            match t.split_once(',') {
+                Some((x, y)) => x.trim().trim_end_matches('%').parse().ok().zip(y.trim().trim_end_matches('%').parse().ok()),
+                None if t.is_empty() => return Ok(None),
+                None => {
+                    let x = if t.contains("left") { 25. } else if t.contains("right") { 75. } else { 50. };
+                    let y = if t.contains("top") { 25. } else if t.contains("bottom") { 75. } else { 50. };
+                    let named = ["left", "right", "top", "bottom", "center", "centre", "middle"].iter().any(|w| t.contains(w));
+                    named.then_some((x, y))
+                }
+            }
+        }
+        _ => None,
+    };
+    pair.map(|(x, y)| Some(((x as f32).clamp(0., 100.), (y as f32).clamp(0., 100.)))).ok_or_else(bad)
+}
+
+const MOTION_HELP: &str = "auto, still, zoom (push in), zoom_out, pan_left, pan_right, pan_up, pan_down, ken_burns, punch (snap in), shake (punch + shake + flash) or varied";
+const TRANS_HELP: &str = "look, cut, fade, dissolve, black, flash, whip_left, whip_right, whip_up, whip_down, slide_left, slide_right, slide_up, slide_down, wipe, circle, zoom, burn, glitch or varied";
+
+/// The clip changes in `args` (shared by video_edit_clip and video_edit_clips).
+fn change_of(args: &Map<String, Value>) -> Result<vedit_plan::Change, String> {
+    use vedit_plan::{MotionPick, TransPick};
+    let mut ch = vedit_plan::Change::default();
+    let motion = s(args, "motion").to_lowercase();
+    if !motion.is_empty() {
+        ch.motion = Some(match motion.as_str() {
+            "varied" | "vary" | "mixed" | "mix" | "random" => MotionPick::Varied,
+            m => MotionPick::One(Motion::parse(m).ok_or(format!("Unknown motion \"{m}\" ({MOTION_HELP})"))?),
+        });
+    }
+    if let Some(a) = num(args, "amount") {
+        // A percent; a fraction below 1 is taken as one too ("0.15" = 15%).
+        ch.amount = Some(if a < 1. { a as f32 } else { a as f32 / 100. });
+    }
+    ch.focus_from = focus_arg(args, "focus_from")?;
+    ch.focus_to = focus_arg(args, "focus_to")?;
+    if let Some(v) = num(args, "speed") {
+        if v <= 0. {
+            return Err("speed is a multiplier from 0.5 to 2 (1.2 = 20% faster)".into());
+        }
+        ch.speed = Some(v as f32);
+    }
+    let trans = s(args, "transition").to_lowercase();
+    if !trans.is_empty() {
+        ch.trans = Some(match trans.as_str() {
+            "look" | "default" | "auto" => TransPick::Look,
+            "cut" | "hard cut" | "hard_cut" | "none" => TransPick::Cut,
+            "varied" | "vary" | "mixed" | "mix" => TransPick::Varied,
+            t => TransPick::One(vedit::TransKind::parse(t).ok_or(format!("Unknown transition \"{t}\" ({TRANS_HELP})"))?),
+        });
+    }
+    if let Some(sec) = num(args, "transition_seconds") {
+        ch.trans_ms = Some(ms(sec) as u32);
+    }
+    match (flag(args, "hard_cut"), ch.trans) {
+        (Some(true), None) => ch.trans = Some(TransPick::Cut),
+        (Some(false), None) => ch.trans = Some(TransPick::Look),
+        _ => {}
+    }
+    ch.trim_in_ms = num(args, "trim_start").map(ms);
+    ch.trim_out_ms = num(args, "trim_end").map(ms);
+    ch.caption = args.get("caption").and_then(Value::as_str).map(str::to_string);
+    Ok(ch)
+}
+
 fn edit_clip(args: &Map<String, Value>) -> Result<Value, String> {
     let (_, c) = one(args)?;
+    let ch = change_of(args)?;
     edit_clips(&c, |beats, clips| {
         let i = clip_index(args, "clip", clips.len())?;
-        let cl = &mut clips[i];
-        let motion = s(args, "motion").to_lowercase();
-        if !motion.is_empty() {
-            cl.motion = match motion.as_str() {
-                "auto" => Motion::Auto,
-                "still" | "none" => Motion::Still,
-                "zoom" | "zoom in" | "push" => Motion::Zoom,
-                "shake" | "punch" | "punch + shake" => Motion::Shake,
-                other => return Err(format!("Unknown motion \"{other}\" (auto, still, zoom or shake)")),
-            };
-        }
-        if let Some(t) = args.get("caption").and_then(Value::as_str) {
-            let own = beats.get(cl.src).map(|b| b.text.as_str()) == Some(t);
-            cl.text = (!own && !t.trim().is_empty()).then(|| t.to_string());
-        }
-        if let Some(b) = flag(args, "hard_cut") {
-            cl.cut = b;
-        }
-        let beat_ms = beats.get(cl.src).map(|b| b.dur_ms).unwrap_or(0);
-        if let Some(v) = num(args, "trim_start") {
-            cl.trim_in_ms = ms(v);
-        }
-        if let Some(v) = num(args, "trim_end") {
-            cl.trim_out_ms = ms(v);
-        }
-        if cl.trim_in_ms + cl.trim_out_ms + vedit::MIN_MS > beat_ms {
-            return Err(format!("That trims away the whole clip (it is {:.1} s)", beat_ms as f64 / 1000.));
-        }
-        Ok(json!({ "ok": true, "clip": i + 1, "seconds": secs(vedit::clip_ms(beats, cl).unwrap_or(0)), "motion": cl.motion.label(), "hardCut": cl.cut, "caption": cl.text }))
+        vedit_plan::apply(beats, clips, &[i], &ch)?;
+        let cl = &clips[i];
+        Ok(json!({ "ok": true, "clip": i + 1, "seconds": secs(vedit::clip_ms(beats, cl).unwrap_or(0)), "now": cl.summary(), "caption": cl.text }))
     })
+}
+
+/// The clips `args` select (see the video_edit_clips table entry).
+fn filter_of(args: &Map<String, Value>, len: usize) -> Result<vedit_plan::Filter, String> {
+    let mut f = vedit_plan::Filter::default();
+    let which = s(args, "clips").to_lowercase();
+    let rest = match which.strip_prefix("every") {
+        Some(r) => {
+            // "every 3rd", "every 2 clips", "every other"
+            let digits: String = r.chars().filter(char::is_ascii_digit).collect();
+            f.every = if r.contains("other") { 2 } else { digits.parse().unwrap_or(1) };
+            ""
+        }
+        None => which.as_str(),
+    };
+    if !matches!(rest, "" | "all" | "every clip" | "everything") {
+        let list = parse_clips(rest)?;
+        if let Some(bad) = list.iter().find(|i| **i >= len) {
+            return Err(format!("There is no clip {} (the chapter has {len})", bad + 1));
+        }
+        f.only = Some(list);
+    }
+    if let Some(n) = num(args, "every") {
+        f.every = n.max(1.) as usize;
+    }
+    if let Some(n) = num(args, "first") {
+        f.phase = (n.max(1.) as usize) - 1;
+    }
+    f.longer_ms = num(args, "longer_than").map(ms);
+    f.shorter_ms = num(args, "shorter_than").map(ms);
+    let pages = s(args, "pages");
+    if !pages.is_empty() {
+        f.pages = Some(parse_clips(pages).map_err(|_| format!("pages is page numbers, e.g. \"3\" or \"2,5-7\", not \"{pages}\""))?);
+    }
+    f.page_changes = flag(args, "page_turns").unwrap_or(false);
+    f.action = flag(args, "action_beats").unwrap_or(false);
+    let m = s(args, "where_motion");
+    if !m.is_empty() {
+        f.motion = Some(Motion::parse(m).ok_or(format!("Unknown motion \"{m}\""))?);
+    }
+    Ok(f)
+}
+
+fn edit_many(args: &Map<String, Value>) -> Result<Value, String> {
+    let (_, c) = one(args)?;
+    let ch = change_of(args)?;
+    if ch.is_empty() {
+        return Err("Nothing to change: give motion, amount, focus_from/focus_to, speed, transition, transition_seconds, hard_cut or trims".into());
+    }
+    edit_clips(&c, |beats, clips| {
+        let f = filter_of(args, clips.len())?;
+        let idxs = vedit_plan::select(beats, clips, &f);
+        if idxs.is_empty() {
+            return Err("No clip matches that selection (video_timeline shows the clips)".into());
+        }
+        let changed = vedit_plan::apply(beats, clips, &idxs, &ch)?;
+        let placed = vedit::place(beats, clips);
+        let sample: Vec<String> = idxs.iter().take(8).filter_map(|i| placed.iter().find(|p| p.index == *i)).map(|p| clip_line(p, beats.get(p.clip.src), false)).collect();
+        let numbers: Vec<usize> = idxs.iter().take(60).map(|i| i + 1).collect();
+        Ok(json!({
+            "ok": true, "selected": idxs.len(), "changed": changed, "clips": numbers, "chapterSeconds": secs(vedit::total_ms(&placed)),
+            "sample": sample, "note": if changed == 0 { "The selected clips already had these settings: nothing changed." } else { "Shown on the timeline now; video_render makes the video." },
+        }))
+    })
+}
+
+/// The music's beats on the chapter's timeline (ms): the chapter score's cues, when the score
+/// plays. `Err`: why there is none.
+fn music_beats(c: &ChapterItem, e: &ChapterEdit) -> Result<Vec<u64>, &'static str> {
+    if e.flags(Track::Music).off || e.music.volume <= 0. {
+        return Err("the music is muted");
+    }
+    match e.music.source {
+        MusicSource::Score => {
+            let score = mv_score::load_score(&crate::page::chref(c)).ok_or("the chapter has no score yet (Music step)")?;
+            let cues: Vec<(f64, f64, f32)> = score.cues.iter().map(|q| (q.start, q.end, q.bpm)).collect();
+            let grid = vedit_plan::beat_grid(&cues);
+            if grid.is_empty() {
+                Err("the score has no tempo")
+            } else {
+                Ok(grid)
+            }
+        }
+        MusicSource::File { .. } => Err("a picked music file has no beat map (only the chapter's score does)"),
+        MusicSource::None => Err("there is no music"),
+    }
+}
+
+fn restyle_of(args: &Map<String, Value>) -> Result<vedit_plan::Restyle, String> {
+    use vedit_plan::{Energy, MotionStyle, Pacing, Restyle, TransStyle};
+    let style = s(args, "style");
+    let mut r = if style.is_empty() { Restyle::default() } else { Restyle::style(style).ok_or(format!("Unknown style \"{style}\" (dynamic, cinematic, calm or hype)"))? };
+    let energy = s(args, "energy").to_lowercase();
+    if !energy.is_empty() || num(args, "energy").is_some() {
+        r.energy = match energy.as_str() {
+            "calm" | "low" | "1" => Energy::Level(1),
+            "medium" | "normal" | "mid" | "2" => Energy::Level(2),
+            "high" | "3" => Energy::Level(3),
+            "very high" | "very_high" | "higher" | "4" => Energy::Level(4),
+            "max" | "maximum" | "extreme" | "insane" | "5" => Energy::Level(5),
+            "more" | "up" | "+" | "" => match num(args, "energy") {
+                Some(n) if energy.is_empty() => Energy::Level(n.clamp(1., 5.) as u8),
+                _ => Energy::More,
+            },
+            "less" | "down" | "-" => Energy::Less,
+            other => return Err(format!("energy is calm, medium, high, very high, max, more or less (or 1-5), not \"{other}\"")),
+        };
+    }
+    let pick = |k: &str| s(args, k).to_lowercase();
+    match pick("pacing").as_str() {
+        "" => {}
+        "auto" => r.pacing = Pacing::Auto,
+        "keep" => r.pacing = Pacing::Keep,
+        "calm" | "slow" => r.pacing = Pacing::Calm,
+        "normal" => r.pacing = Pacing::Normal,
+        "fast" => r.pacing = Pacing::Fast,
+        "faster" | "very fast" | "max" => r.pacing = Pacing::Faster,
+        other => return Err(format!("pacing is auto, keep, calm, normal, fast or faster, not \"{other}\"")),
+    }
+    match pick("motion").as_str() {
+        "" => {}
+        "keep" => r.motion = MotionStyle::Keep,
+        "still" => r.motion = MotionStyle::Still,
+        "subtle" | "slow" => r.motion = MotionStyle::Subtle,
+        "cinematic" => r.motion = MotionStyle::Cinematic,
+        "varied" | "mixed" => r.motion = MotionStyle::Varied,
+        "aggressive" | "intense" | "wild" => r.motion = MotionStyle::Aggressive,
+        other => return Err(format!("motion is keep, still, subtle, cinematic, varied or aggressive, not \"{other}\"")),
+    }
+    match pick("transitions").as_str() {
+        "" => {}
+        "keep" => r.transitions = TransStyle::Keep,
+        "look" | "default" => r.transitions = TransStyle::Look,
+        "cuts" | "cut" | "hard cuts" => r.transitions = TransStyle::Cuts,
+        "smooth" | "soft" | "fades" => r.transitions = TransStyle::Smooth,
+        "varied" | "mixed" => r.transitions = TransStyle::Varied,
+        "flashy" | "aggressive" | "wild" => r.transitions = TransStyle::Flashy,
+        other => return Err(format!("transitions is keep, look, cuts, smooth, varied or flashy, not \"{other}\"")),
+    }
+    if let Some(b) = flag(args, "beat_sync") {
+        r.beat_sync = b;
+    }
+    Ok(r)
+}
+
+fn restyle_tool(args: &Map<String, Value>) -> Result<Value, String> {
+    let (_, chapters) = resolve(args)?;
+    let r = restyle_of(args)?;
+    let mut reports = vec![];
+    edit_chapters(&chapters, |c, e| {
+        not_locked(e, Track::Clips)?;
+        let beats = beats_of(c);
+        if beats.is_empty() {
+            return Err(format!("{} has no narrated beats to restyle", c.label()));
+        }
+        let (grid, why) = match r.beat_sync.then(|| music_beats(c, e)) {
+            Some(Ok(g)) => (g, None),
+            Some(Err(why)) => (vec![], Some(why)),
+            None => (vec![], None),
+        };
+        let rep = vedit_plan::restyle(&beats, e, &r, &grid);
+        let mut v = json!({
+            "chapter": c.label(), "energyLevel": rep.level, "pass": rep.pass,
+            "clips": format!("{} -> {}", rep.clips_before, rep.clips_after), "jumpCutsAdded": rep.split, "clipsChanged": rep.changed,
+            "seconds": format!("{} -> {}", rep.seconds_before, rep.seconds_after),
+            "motions": rep.motions, "transitionsIn": rep.transitions,
+        });
+        if let Some(sp) = rep.speed {
+            v["speed"] = json!(sp);
+        }
+        match (rep.beat_synced, why) {
+            (Some(n), _) => v["cutsOnTheBeat"] = json!(n),
+            (None, Some(why)) => v["beatSync"] = json!(format!("skipped: {why}")),
+            _ => {}
+        }
+        reports.push(v);
+        Ok(())
+    })?;
+    Ok(json!({
+        "ok": true, "restyled": reports,
+        "note": "Applied on the timeline (undo in the Video editor). Not in the video file until video_render. Ask again for more energy (each pass goes a level up, max 5).",
+    }))
 }
 
 fn delete_clips(args: &Map<String, Value>) -> Result<Value, String> {
@@ -879,13 +1209,46 @@ fn with_target(extra: Value, all: bool) -> Value {
 pub(crate) fn tools() -> Vec<AppTool> {
     let t = |name, description: &str, parameters, risk| AppTool { name, description: description.into(), parameters, risk };
     let fx: Map<String, Value> = Effect::ALL.iter().map(|e| (e.key().to_string(), bo(e.label()))).collect();
+    let intensity: Map<String, Value> = vedit::INTENSITIES.iter().map(|(k, d)| (k.to_string(), nu(&format!("{d}, % of the look's (0-200)")))).collect();
     let mut look = with_target(
         json!({
             "preset": en("Look (studio = use the Studio-wide look)", &["clean", "cinematic", "recap", "dynamic", "studio"]),
-            "transitions": en("Between clips", &["look", "cuts"]),
+            "transitions": en("Between clips, where a clip has no transition of its own", &["look", "cuts"]),
+            "intensity": { "type": "object", "description": "Effect strengths in % (100 = the look's own, 0 = off, 200 = double): {\"grain\": 150, \"motion\": 140}", "properties": intensity },
         }),
         true,
     );
+    let clip_changes = json!({
+        "motion": st(&format!("Camera move: {MOTION_HELP} (varied = a different move per clip, never the same twice running)")),
+        "amount": nu("How far the move goes, % (zoom: 4 subtle, 10 clear, 20 strong, 50 max; pan: travel; punch/shake: punch size)"),
+        "focus_from": st("Where the camera starts, [x, y] % of the panel (0,0 top left, 50,50 centre) or \"top left\"; ken_burns travels from here"),
+        "focus_to": st("Where it ends / aims ([x, y] or a place); zoom and punch push into it"),
+        "speed": nu("Clip speed 0.5-2 (1.15 = 15% faster): the narration is retimed with its pitch kept, the clip gets shorter"),
+        "transition": st(&format!("Transition INTO the clip: {TRANS_HELP}")),
+        "transition_seconds": nu("Transition length (it never takes more than 45% of either clip)"),
+        "hard_cut": bo("Hard cut into the clip (same as transition cut)"),
+        "trim_start": nu("Seconds of narration trimmed off the start (cuts words)"),
+        "trim_end": nu("Seconds of narration trimmed off the end"),
+    });
+    let mut one_clip = with_target(json!({ "clip": nu("Clip number"), "caption": st("Caption text (empty = the narration's)") }), false);
+    let mut many_clips = with_target(
+        json!({
+            "clips": st("Which clips: \"all\" (default), numbers \"3,5,7-9\", or \"every 3rd\" / \"every other\""),
+            "every": nu("Every Nth of the matching clips"),
+            "first": nu("With every: start at the Nth matching clip (default 1)"),
+            "longer_than": nu("Only clips longer than this many seconds"),
+            "shorter_than": nu("Only clips shorter than this many seconds"),
+            "pages": st("Only clips of these manga pages, e.g. \"4\" or \"2,5-7\""),
+            "page_turns": bo("Only the first clip of each page"),
+            "action_beats": bo("Only action lines (an exclamation or a word like strike, explode, scream)"),
+            "where_motion": st("Only clips that have this motion now"),
+        }),
+        false,
+    );
+    if let (Some(a), Some(b), Value::Object(f)) = (one_clip.as_object_mut(), many_clips.as_object_mut(), clip_changes) {
+        a.extend(f.clone());
+        b.extend(f);
+    }
     if let Some(o) = look.as_object_mut() {
         o.extend(fx);
     }
@@ -905,8 +1268,8 @@ pub(crate) fn tools() -> Vec<AppTool> {
         t("video_overview", "The manga's finished chapter videos for the Video editor: chapter numbers, lengths, which are edited, and which is open. Start here.", obj(json!({ "manga": st("Manga title (default: the one open in the Video editor)") }), &[]), Risk::Read),
         t(
             "video_timeline",
-            "One chapter's timeline: clips (numbered from 1, with page, start, length, motion and caption), image/text layers (with ids), captions, music, look and track switches.",
-            obj(with_target(json!({ "from_clip": nu("First clip to list (default 1)"), "limit": nu("How many clips (default 40)") }), false), &[]),
+            "One chapter's whole edit: every clip as a compact line (number, page, start, length, motion, amount, focus, speed, transition in, trims, caption), the layers, captions, music, look, effect intensities and energy level. Long chapters page: when \"more\" is in the result, call again with that offset.",
+            obj(with_target(json!({ "offset": nu("Clips to skip (0 = from clip 1)"), "limit": nu("At most this many clips"), "text": bo("Include caption text (default true; false fits about twice as many clips per page)") }), false), &[]),
             Risk::Read,
         ),
         t("video_caption_styles", "The caption templates (ids and names) video_set_captions takes.", obj(json!({}), &[]), Risk::Read),
@@ -931,11 +1294,36 @@ pub(crate) fn tools() -> Vec<AppTool> {
         t("video_add_layer", "Add a text, image or logo layer over the picture.", obj(add_layer, &["kind"]), Risk::Act),
         t("video_edit_layer", "Change a layer's text, timing, place, size, colour or opacity.", obj(edit_layer, &["id"]), Risk::Act),
         t("video_remove_layer", "Remove a layer by id, or \"all\" layers.", obj(with_target(json!({ "id": st("Layer id, or \"all\"") }), false), &["id"]), Risk::Destructive),
-        t("video_set_look", "Set the look (clean, cinematic, recap, dynamic) and its effects (grade, glow, vignette, grain, impact) for a chapter or all, and the transitions (the look's or hard cuts).", obj(look, &[]), Risk::Act),
+        t("video_set_look", "Set the look (clean, cinematic, recap, dynamic), its effects on/off (grade, glow, vignette, grain, impact, leaks, chroma, parallax, particles, letterbox), effect intensities, and the default transitions (the look's or hard cuts), for a chapter or all.", obj(look, &[]), Risk::Act),
+        t(
+            "video_restyle",
+            "Plan and apply a full pass over EVERY clip of a chapter in one call: pacing (faster narration, long clips split into jump cuts), a varied camera move per clip, and a transition at every join. style: dynamic, cinematic, calm or hype; or set energy/pacing/motion/transitions yourself. Repeating it (or energy \"more\") goes one energy level up (max 5); every pass visibly changes the clips.",
+            obj(
+                with_target(
+                    json!({
+                        "style": en("Preset pass", &["dynamic", "cinematic", "calm", "hype"]),
+                        "energy": st("calm, medium, high, very high, max (or 1-5), more or less. Asking high again when already high goes higher"),
+                        "pacing": en("auto = the energy's; fast/faster speed the narration a little and split long clips into jump cuts; calm/normal = 1x", &["auto", "keep", "calm", "normal", "fast", "faster"]),
+                        "motion": en("Camera moves", &["varied", "cinematic", "subtle", "aggressive", "still", "keep"]),
+                        "transitions": en("Joins: varied (by energy), smooth (fades, dips to black), flashy (flash, glitch, whip, zoom), cuts, look, keep", &["varied", "smooth", "flashy", "cuts", "look", "keep"]),
+                        "beat_sync": bo("Retime clips (within 8%) so cuts land on the music's beats (the chapter's score only)"),
+                    }),
+                    true,
+                ),
+                &[],
+            ),
+            Risk::Act,
+        ),
+        t(
+            "video_edit_clips",
+            "Change many clips in one call: pick them (all, numbers/ranges, every Nth, longer/shorter than, pages, page turns, action beats, current motion) and set motion, amount, focus, speed, transition and its length, hard cut or trims. Use this instead of many video_edit_clip calls.",
+            obj(many_clips, &[]),
+            Risk::Act,
+        ),
         t(
             "video_edit_clip",
-            "Change one clip: its motion (auto, still, zoom, shake), caption text (the voice is unchanged), a hard cut into it, or trim seconds off its start/end.",
-            obj(with_target(json!({ "clip": nu("Clip number"), "motion": en("Motion", &["auto", "still", "zoom", "shake"]), "caption": st("Caption text (empty = the narration's)"), "hard_cut": bo("Hard cut into the clip"), "trim_start": nu("Seconds trimmed off the start"), "trim_end": nu("Seconds trimmed off the end") }), false), &["clip"]),
+            "Change one clip: motion, amount, focus, speed, transition into it, caption text (the voice is unchanged), hard cut, or trim seconds off its start/end.",
+            obj(one_clip, &["clip"]),
             Risk::Act,
         ),
         t("video_delete_clips", "Delete clips (with their narration) from a chapter.", obj(with_target(json!({ "clips": st("Clip numbers, e.g. \"3\" or \"3,5,7-9\"") }), false), &["clips"]), Risk::Destructive),
@@ -975,6 +1363,8 @@ fn phrase(name: &str, args: &Map<String, Value>) -> Option<Phrases> {
         "video_remove_layer" => three("Remove", "Removing", "Removed", &format!(" layer {}{of}", s(args, "id"))),
         "video_set_look" => three("Change", "Changing", "Changed", &format!(" the look{of}")),
         "video_edit_clip" => three("Change", "Changing", "Changed", &format!(" clip {}{of}", args.get("clip").map(|v| v.to_string()).unwrap_or_default())),
+        "video_edit_clips" => three("Change", "Changing", "Changed", &format!(" {} clips{of}", if s(args, "clips").is_empty() { "the" } else { s(args, "clips") })),
+        "video_restyle" => three("Restyle", "Restyling", "Restyled", &format!(" the video{of}{}", if s(args, "style").is_empty() { String::new() } else { format!(" ({})", s(args, "style")) })),
         "video_delete_clips" => three("Delete", "Deleting", "Deleted", &format!(" clips {}{of}", s(args, "clips"))),
         "video_move_clip" => three("Move", "Moving", "Moved", &format!(" a clip{of}")),
         "video_split_clip" => three("Cut", "Cutting", "Cut", &format!(" a clip in two{of}")),
@@ -985,6 +1375,25 @@ fn phrase(name: &str, args: &Map<String, Value>) -> Option<Phrases> {
         _ => None,
     }
 }
+
+/// How the assistant should edit with these tools.
+const PROMPT: &str = "\
+Studio's Video editor tools (video_*) edit a manga's finished recap videos like a video editor would: every clip (one narrated panel) has a camera move, a speed and a transition into it; over them sit captions, image/text layers, music, and the look with its effects. \
+Chapters are named by number; without one the tools act on the chapter open in the Video editor.\n\
+How to edit:\n\
+1. Inspect: video_timeline (page through it with offset while it says \"more\") so you know the clips, their lengths, moves and transitions before you change them.\n\
+2. Plan the whole pass, not one clip: decide the pacing, the move per kind of clip, the transitions at page turns, and which beats to hit hard.\n\
+3. Apply in batches: video_restyle for a full pass over every clip in one call, then video_edit_clips to refine groups (action beats, page turns, long clips, every Nth), video_edit_clip for single clips, video_set_look for the look, effects and their intensity, layers and captions as needed. Never edit clips one by one when a batch does it.\n\
+4. Render: finish with video_render (edits show on the timeline at once but reach the video file only after it), unless the user wants to review first.\n\
+5. Report what changed in numbers: energy level, clips before/after, jump cuts added, the mix of moves and transitions, speed, length before/after, and that it is rendering.\n\
+What the words mean here:\n\
+- dynamic / energetic / more exciting: video_restyle style dynamic (energy 3: punch-ins, pans and Ken Burns at 11%, whips, flashes and zoom blurs on page turns, jump cuts in clips over 6 s). Asked again (\"more\", \"even more dynamic\"), call it again: each pass goes one energy level up (4: 6% faster narration, clips over 4.5 s cut, shakes on action beats, glitches; 5: 12% faster, clips over 3.2 s cut, 20% moves). Also consider video_set_look preset dynamic and intensity motion/chroma 150. Never answer \"make it more X\" with a pass that changes nothing.\n\
+- cinematic: style cinematic (slow Ken Burns and pans under 8%, fades and dips to black, 1x speed) plus video_set_look preset cinematic (letterbox, grade, grain, glow).\n\
+- calm / slower: style calm (subtle 2-4% pushes, long fades, 1x, energy 1).\n\
+- hype / trailer: style hype (energy 5, aggressive moves, flashy transitions).\n\
+- On the beat: beat_sync true (only with the chapter's own score).\n\
+Moves: zoom (push in), zoom_out, pan_left/right/up/down, ken_burns (focus_from to focus_to), punch (snap in), shake (punch, camera shake, white flash: for action beats), still, auto (the look decides). amount is in % (4 subtle, 10 clear, 20 strong). Transitions into a clip: cut, fade, dissolve, black, flash, whip_*, slide_*, wipe, circle, zoom, burn, glitch. speed retimes the narration (pitch kept): 1.05-1.15 tightens pacing without hurting the voice; trims cut words, so prefer speed and jump cuts over trims. \
+The user can undo any edit in the Video editor.";
 
 struct VideoTools;
 
@@ -1019,6 +1428,8 @@ impl ToolProvider for VideoTools {
                         "video_remove_layer" => value(remove_layer(&args)),
                         "video_set_look" => value(set_look(&args)),
                         "video_edit_clip" => value(edit_clip(&args)),
+                        "video_edit_clips" => value(edit_many(&args)),
+                        "video_restyle" => value(restyle_tool(&args)),
                         "video_delete_clips" => value(delete_clips(&args)),
                         "video_move_clip" => value(move_clip(&args)),
                         "video_split_clip" => value(split_clip(&args)),
@@ -1037,12 +1448,7 @@ impl ToolProvider for VideoTools {
     }
 
     fn prompt(&self) -> Option<String> {
-        Some(
-            "Studio's Video editor tools (video_*) edit a manga's finished recap videos: captions, music, image/text layers, the look and effects, clips (trim, reorder, delete, cut, motion), then render and export. \
-             Chapters are named by number; without one they act on the chapter open in the Video editor. Read video_overview / video_timeline before editing clips or layers by number. \
-             Edits show on the Video editor's timeline at once and the user can undo them there; they reach the video file only after video_render."
-                .into(),
-        )
+        Some(PROMPT.into())
     }
 }
 

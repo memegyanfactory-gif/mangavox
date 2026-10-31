@@ -6,7 +6,9 @@ import unittest
 # overlay_graph imports caption_engine the way the pipeline does (python/ on the path).
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
-from python.video_generator import apply_edit_clips, overlay_graph
+from python.video_generator import (  # noqa: E402
+    apply_edit_clips, apply_intensity, look_filters, overlay_graph, plan_clip_fx, plan_transitions, resolve_look, xfade_chain,
+)
 
 BEATS = [
     {"page": 0, "text": "One.", "audio_file": "page_0000.wav", "start_ms": 0, "end_ms": 4000, "audio_offset_ms": 0, "duration_ms": 4000},
@@ -44,6 +46,50 @@ class ApplyEditClipsTests(unittest.TestCase):
         self.assertEqual(out[0]["motion"], "shake")
         self.assertTrue(out[0]["cut"])
         self.assertNotIn("motion", out[1])
+
+
+class EditParametersTests(unittest.TestCase):
+    def test_moves_speed_and_transitions_reach_the_render_items(self):
+        out = apply_edit_clips(BEATS, [
+            {"src": 0, "motion": "ken_burns", "amount": 0.11, "focus_from": [30, 35], "focus_to": [70, 62], "speed": 1.25},
+            {"src": 1, "motion": "pan_left", "amount": 9, "transition": {"kind": "glitch", "ms": 250}},
+            {"src": 2, "cut": True, "transition": {"kind": "flash"}},
+            {"src": 1, "transition": {"kind": "spin"}, "speed": 50},
+        ])
+        self.assertEqual(out[0]["motion"], "ken_burns")
+        self.assertEqual(out[0]["amount"], 0.11)
+        self.assertEqual(out[0]["focus_from"], (0.3, 0.35))
+        self.assertEqual(out[0]["speed"], 1.25)
+        self.assertEqual(out[0]["duration_ms"], 4000, "the narration slice stays whole; the renderer retimes it")
+        self.assertEqual(out[1]["amount"], 0.5, "amounts clamp")
+        self.assertEqual(out[1]["transition"], ("glitch", 0.25))
+        self.assertTrue(out[2]["cut"])
+        self.assertNotIn("transition", out[2])
+        self.assertNotIn("transition", out[3])
+        self.assertEqual(out[3]["speed"], 2.0)
+
+    def test_the_editors_transition_wins_and_is_drawn(self):
+        starts, trans = plan_transitions([2, 2, 2], [0, 0, 1], forced=[None, ("glitch", 0.3), ("whipleft", 0.2)])
+        self.assertEqual(trans[1], ("glitch", 0.3))
+        self.assertEqual(trans[2], ("whipleft", 0.2))
+        fx = plan_clip_fx(starts, trans, [0, 0, 1], forced=[None, ("glitch", 0.3), ("whipleft", 0.2)])
+        self.assertEqual(fx[0]["glitch_out"], (2.0, 0.3))
+        self.assertEqual(fx[1]["glitch_in"], 0.3)
+        self.assertIn("whipleft_out", fx[1])
+        graph = xfade_chain(["a", "b", "c"], starts, trans, "v")
+        self.assertIn("transition=pixelize", graph)
+        self.assertIn("transition=slideleft", graph)
+        # Same page, not picked by the editor: the usual quick fade.
+        _, trans = plan_transitions([2, 2], [0, 0])
+        self.assertEqual(trans[1], ("fade", 0.35))
+
+    def test_intensity_scales_the_look(self):
+        look = apply_intensity(resolve_look({"preset": "cinematic"}), {"motion": 2, "grain": 0.5, "vignette": 0})
+        self.assertAlmostEqual(look["push"], 0.12)
+        graph = look_filters(look, 1920, 1080, "a", "b")
+        self.assertIn("noise=alls=2", graph)
+        self.assertNotIn("vignette", graph)
+        self.assertEqual(apply_intensity(resolve_look("clean"), None)["push"], 0.05)
 
 
 class OverlayGraphTests(unittest.TestCase):

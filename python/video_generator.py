@@ -99,6 +99,22 @@ COLOR_PRESETS = {
 # that swells over the cut) and a zoom blur (the old page rushes in and blurs, the new one
 # lands out of it).
 CLIP_TRANSITIONS = ("burn", "zoomblur")
+# Transitions the clips help draw, and the xfade under them: the two above, a glitch (pixelate
+# with an RGB tear and noise on both sides) and whips (a fast slide, both sides motion-blurred).
+CLIP_DRAWN = {
+    "burn": "fade", "zoomblur": "fade", "glitch": "pixelize",
+    "whipleft": "slideleft", "whipright": "slideright", "whipup": "slideup", "whipdown": "slidedown",
+}
+# The Video editor's per-clip transitions: name -> (transition as planned, default seconds).
+EDIT_TRANSITIONS = {
+    "fade": ("fade", 0.5), "dissolve": ("dissolve", 0.5), "black": ("fadeblack", 0.7), "flash": ("fadewhite", 0.3),
+    "whip_left": ("whipleft", 0.22), "whip_right": ("whipright", 0.22), "whip_up": ("whipup", 0.22), "whip_down": ("whipdown", 0.22),
+    "slide_left": ("slideleft", 0.45), "slide_right": ("slideright", 0.45), "slide_up": ("slideup", 0.45), "slide_down": ("slidedown", 0.45),
+    "wipe": ("wipeleft", 0.45), "circle": ("circleopen", 0.5), "zoom": ("zoomblur", 0.35), "burn": ("burn", 0.9),
+    "glitch": ("glitch", 0.3),
+}
+# Effect strengths the editor can scale (multipliers 0..2 over the look's own).
+INTENSITIES = ("motion", "grain", "vignette", "parallax", "chroma")
 # Letterbox: the picture area of a landscape frame with bars (width / height).
 LETTERBOX_ASPECT = 2.39
 # Parallax: how far the background drifts (share of the frame width) while the panel moves.
@@ -146,6 +162,21 @@ def resolve_look(value):
             look[k] = value[k]
     if value.get("color") in COLOR_PRESETS:
         look["color"] = value["color"]
+    return look
+
+
+def apply_intensity(look, intensity):
+    """`look` with the editor's effect strengths (INTENSITIES -> multiplier 0..2) applied:
+    "motion" scales the auto moves (push and pan zoom), the rest are kept as "<name>_k" for the
+    grain, vignette, parallax drift and RGB split to scale by."""
+    look = dict(look)
+    for k in INTENSITIES:
+        look[f"{k}_k"] = 1.0
+    if isinstance(intensity, dict):
+        for k in INTENSITIES:
+            if k in intensity:
+                look[f"{k}_k"] = _num(intensity.get(k), 1.0, 0.0, 2.0)
+    look["push"] = round(look.get("push", FG_PUSH) * look["motion_k"], 4)
     return look
 
 
@@ -210,10 +241,11 @@ def look_filters(look, w, h, src, out, particles=None):
         parts.append(f"[{cur}][{particles}]overlay=0:0:shortest=1:format=yuv420[{out}_p]")
         cur = f"{out}_p"
     tail = []
-    if look.get("vignette"):
-        tail.append("vignette=angle=PI/6")
-    if look.get("grain"):
-        tail.append("noise=alls=4:allf=t")
+    vk, gk = look.get("vignette_k", 1.0), look.get("grain_k", 1.0)
+    if look.get("vignette") and vk > 0:
+        tail.append("vignette=angle=PI/6" if vk == 1.0 else f"vignette=angle={min(1.4, math.pi / 6 * vk):.4f}")
+    if look.get("grain") and round(4 * gk) > 0:
+        tail.append(f"noise=alls={round(4 * gk)}:allf=t")
     bar = letterbox_bar(w, h) if look.get("letterbox") else 0
     if bar:
         tail.append(f"drawbox=x=0:y=0:w={w}:h={bar}:color=black:t=fill")
@@ -356,7 +388,7 @@ def combine_audio_files(audio_paths, output_path):
 
 # ── Timeline planning (pure helpers) ──
 
-def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, joins=None):
+def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, joins=None, forced=None):
     """Plan crossfades between clips of `durations` seconds without moving the narration.
 
     Returns (starts, trans): starts[k] is when clip k's narration begins (running sum)
@@ -366,10 +398,12 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
     Same-page beats dissolve quickly, page changes rotate through `names` (default
     PAGE_TRANSITIONS), short clips get shorter fades, and kind "none" gives one-frame (hard)
     cuts. joins[k] "cut" cuts into clip k (it animates its own entrance: a duo slide) and
-    "impact" makes it a quick dissolve (the clip flashes in itself).
+    "impact" makes it a quick dissolve (the clip flashes in itself). forced[k] (name, seconds),
+    the editor's pick for clip k, wins over all of that.
     """
     names = names or PAGE_TRANSITIONS
     joins = joins or [None] * len(durations)
+    forced = forced or [None] * len(durations)
     starts = []
     t = 0.0
     for d in durations:
@@ -379,7 +413,9 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
     trans = [None]
     turn = 0
     for k in range(1, len(durations)):
-        if kind == "none" or joins[k] == "cut":
+        if forced[k]:
+            name, dur = forced[k]
+        elif kind == "none" or joins[k] == "cut":
             name, dur = "fade", frame
         elif joins[k] == "impact":
             name, dur = "fade", 0.12
@@ -393,16 +429,17 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
     return starts, trans
 
 
-def plan_clip_fx(starts, trans, pages, joins=None, leaks=False, impacts=None, gap=None):
-    """The page-turn effects each clip draws itself, in its own seconds. A burn or zoom blur
-    into clip k is drawn by both clips (the same frames at the same moment, under a plain
-    dissolve, so the join cannot show): clip k-1 gets "<name>_out": (when the change starts,
-    seconds) and clip k "<name>_in": seconds. With `leaks`, a clip that turns to a new page
-    some other way (and the opening clip) gets "leak": a flare blooming as it lands, at most
-    one every `gap` seconds (a burn counts) so it stays an accent; an action beat (`impacts`)
-    flashes instead."""
+def plan_clip_fx(starts, trans, pages, joins=None, leaks=False, impacts=None, gap=None, forced=None):
+    """The page-turn effects each clip draws itself, in its own seconds. A burn, zoom blur,
+    glitch or whip into clip k is drawn by both clips (the same frames at the same moment, under
+    the join, so it cannot show): clip k-1 gets "<name>_out": (when the change starts, seconds)
+    and clip k "<name>_in": seconds. With `leaks`, a clip that turns to a new page some other
+    way (and the opening clip) gets "leak": a flare blooming as it lands, at most one every
+    `gap` seconds (a burn counts) so it stays an accent; an action beat (`impacts`) flashes
+    instead. A transition the editor picked (`forced[k]`) is drawn wherever it is."""
     joins = joins or [None] * len(starts)
     impacts = impacts or [False] * len(starts)
+    forced = forced or [None] * len(starts)
     gap = LEAK_GAP if gap is None else gap
     fx = [{} for _ in starts]
     last = -gap
@@ -410,7 +447,19 @@ def plan_clip_fx(starts, trans, pages, joins=None, leaks=False, impacts=None, ga
         fx[0]["leak"] = True
         last = 0.0
     for k in range(1, len(starts)):
-        if not trans[k] or joins[k] == "impact" or impacts[k] or pages[k] == pages[k - 1]:
+        if not trans[k]:
+            continue
+        if forced[k]:
+            name, dur = trans[k]
+            if name in CLIP_DRAWN and dur > 1.5 / FPS:
+                if name == "burn":
+                    last = starts[k]
+                fx[k - 1][f"{name}_out"] = (round(starts[k] - starts[k - 1], 3), dur)
+                fx[k][f"{name}_in"] = dur
+                if name == "burn":
+                    fx[k - 1]["burn_flip"] = fx[k]["burn_flip_in"] = k % 2 == 0
+            continue
+        if joins[k] == "impact" or impacts[k] or pages[k] == pages[k - 1]:
             continue
         name, dur = trans[k]
         if name in CLIP_TRANSITIONS and dur > 1.5 / FPS:
@@ -468,8 +517,8 @@ def xfade_chain(labels, starts, trans, out):
         # pts >= offset) never slips a frame through decimal rounding.
         offset = max(0.0, (round(starts[k] * FPS) - base) / FPS - 0.001)
         nxt = out if k == len(labels) - 1 else f"{out}_{k}"
-        # A burn or zoom blur is drawn by the clips on both sides; the join itself dissolves.
-        name = "fade" if name in CLIP_TRANSITIONS else name
+        # A burn, zoom blur, glitch or whip is drawn by the clips on both sides over a plain join.
+        name = CLIP_DRAWN.get(name, name)
         parts.append(
             f"[{prev}][{labels[k]}]xfade=transition={name}:duration={dur:.3f}:offset={offset:.6f}[{nxt}]"
         )
@@ -506,6 +555,59 @@ def _motion_zoom(motion, amount, pan_zoom):
     if motion in ("pan_down", "pan_up", "pan_right", "pan_left"):
         return f"{pan_zoom}"
     return "1"
+
+
+# A punch-in snaps to its zoom over this long, then drifts on.
+PUNCH_SEC = 0.25
+
+
+def edit_move(move, push):
+    """Zoom (an expression of the eased progress {e} and frame counter `on`) and window (x, y
+    fractions of the slack the zoom leaves, of {e}) for a Video editor move: {"kind", "amount",
+    "from", "to"} with from / to (x, y) in 0..1 of the panel (where the camera looks; 0.5 is the
+    centre) and amount the share zoomed in. `push` (the look's push for the clip) stands in for a
+    missing amount on zooms.
+
+    zoom pushes into "to" (else "from", else the centre); zoom_out pulls back from "from";
+    pan_* travels the whole slack of a 1 + amount zoom; ken_burns drifts from "from" to "to" while
+    pushing from half the amount to all of it; punch snaps to the amount in PUNCH_SEC, then drifts
+    in a little more; still holds."""
+    kind = move.get("kind")
+    a = move.get("amount")
+    f0, f1 = move.get("from"), move.get("to")
+
+    def aim(f):
+        return (f"{f[0]:.4f}", f"{f[1]:.4f}") if f else ("0.5", "0.5")
+
+    if kind == "zoom":
+        a = push if a is None else a
+        return f"1+{a:.4f}*{{e}}", aim(f1 or f0)
+    if kind == "zoom_out":
+        a = push if a is None else a
+        return f"{1 + a:.4f}-{a:.4f}*{{e}}", aim(f0 or f1)
+    if kind in ("pan_left", "pan_right", "pan_up", "pan_down"):
+        a = max(0.02, FG_PAN_ZOOM - 1 if a is None else a)
+        return f"{1 + a:.4f}", FG_WINDOW[kind]
+    if kind == "ken_burns":
+        a = 0.08 if a is None else a
+        p0, p1 = f0 or (0.35, 0.4), f1 or (0.65, 0.6)
+        window = (f"({p0[0]:.4f}+{p1[0] - p0[0]:.4f}*{{e}})", f"({p0[1]:.4f}+{p1[1] - p0[1]:.4f}*{{e}})")
+        return f"{1 + a / 2:.4f}+{a / 2:.4f}*{{e}}", window
+    if kind == "punch":
+        a = 0.15 if a is None else a
+        n = max(2, round(PUNCH_SEC * FPS))
+        return f"1+{a:.4f}*(1-pow(1-min(1,on/{n}),3))+0.02*{{e}}", aim(f1 or f0)
+    return "1", FG_WINDOW["still"]
+
+
+def move_dirs(move):
+    """Which way the blurred background drifts under an editor move (see PARALLAX_DIRS)."""
+    kind = move.get("kind")
+    if kind == "ken_burns":
+        p0, p1 = move.get("from") or (0.35, 0.4), move.get("to") or (0.65, 0.6)
+        sign = lambda v: (v > 0.01) - (v < -0.01)
+        return (sign(p1[0] - p0[0]) * 0.8, sign(p1[1] - p0[1]) * 0.6)
+    return PARALLAX_DIRS.get({"zoom": "push", "zoom_out": "pull", "punch": "push"}.get(kind, kind), (0.6, 0))
 
 
 def _warp(window, zoom, frames, interp, ease=None):
@@ -885,19 +987,34 @@ def _zoom_blur(n, dur, w, out):
     return ",".join(chain)
 
 
-def _chroma(w):
+def _chroma(w, span=IMPACT_SEC, strength=1.0, grow=False):
     """RGB split for an action beat: red and blue torn apart at the hit, settling back as the
-    punch dies out (only its frames go through RGB)."""
-    s = max(2, round(w * 0.006))
+    punch dies out over `span` seconds (only its frames go through RGB). `grow` tears them
+    apart towards the end instead (the clip a glitch leaves)."""
+    s = max(2, round(w * 0.006 * strength))
+    steps = ((0, 0.5, 0.3), (0.5, 0.8, 0.6), (0.8, 99, 1.0)) if grow else ((0, 0.12, 1.0), (0.12, 0.24, 0.6), (0.24, 99, 0.3))
     chain = ["format=gbrp"]
-    for a, b, k in ((0, 0.12, 1.0), (0.12, 0.24, 0.6), (0.24, 99, 0.3)):
+    for a, b, k in steps:
         amt = max(1, round(s * k))
         chain.append(
             f"rgbashift=rh=-{amt}:bh={amt}:rv={-max(0, amt // 3)}:bv={max(0, amt // 3)}:"
-            f"enable='gte(t,{a * IMPACT_SEC:.3f})*lt(t,{b * IMPACT_SEC:.3f})'"
+            f"enable='gte(t,{a * span:.3f})*lt(t,{b * span:.3f})'"
         )
     chain.append("format=yuv420p")
     return ",".join(chain)
+
+
+def _glitch(w, span, strength, out):
+    """A glitch over `span` seconds: a hard RGB tear with noise (growing into the cut on the
+    clip it leaves, dying out on the one it lands on)."""
+    return _chroma(w, span, max(0.5, strength) * 2.2, grow=out) + ",noise=alls=18:allf=t+u"
+
+
+def _whip_blur(name, w, h):
+    """Motion blur along a whip's direction (frames under the slide only)."""
+    if name in ("whipleft", "whipright"):
+        return f"avgblur=sizeX={max(2, round(w * 0.012))}:sizeY=1"
+    return f"avgblur=sizeX=1:sizeY={max(2, round(h * 0.02))}"
 
 
 def _finish_clip(clip, frames, w, h, inputs, graph, cur):
@@ -914,8 +1031,22 @@ def _finish_clip(clip, frames, w, h, inputs, graph, cur):
         dur = fx["zoomblur_in"]
         n = max(2, round(dur * 1.6 * FPS))
         cur = _window(graph, cur, 0, n, frames, _zoom_blur(n, dur * 1.6, w, False), "zi")
-    if clip.get("impact") and clip.get("chroma"):
-        cur = _window(graph, cur, 0, round(IMPACT_SEC * FPS), frames, _chroma(w), "ca")
+    ck = clip.get("chroma_k", 1.0)
+    if "glitch_out" in fx:
+        t0, dur = fx["glitch_out"]
+        cur = _window(graph, cur, round(t0 * FPS), frames, frames, _glitch(w, dur, ck, True), "go")
+    if "glitch_in" in fx:
+        dur = fx["glitch_in"] * 1.5
+        cur = _window(graph, cur, 0, max(2, round(dur * FPS)), frames, _glitch(w, dur, ck, False), "gi")
+    for whip in ("whipleft", "whipright", "whipup", "whipdown"):
+        if f"{whip}_out" in fx:
+            t0, dur = fx[f"{whip}_out"]
+            a = round(t0 * FPS)
+            cur = _window(graph, cur, a, a + max(1, round(dur * FPS)), frames, _whip_blur(whip, w, h), "wo")
+        if f"{whip}_in" in fx:
+            cur = _window(graph, cur, 0, max(1, round(fx[f"{whip}_in"] * FPS)), frames, _whip_blur(whip, w, h), "wi")
+    if clip.get("impact") and clip.get("chroma") and ck > 0:
+        cur = _window(graph, cur, 0, round(IMPACT_SEC * FPS), frames, _chroma(w, strength=ck), "ca")
     flares = []
     if "burn_out" in fx and assets.get("burn"):
         t0, dur = fx["burn_out"]
@@ -940,6 +1071,37 @@ def _finish_clip(clip, frames, w, h, inputs, graph, cur):
     graph.append(f"[{cur}]null[v]")
 
 
+def clip_camera(clip, frames):
+    """The single-panel camera of a clip `frames` frames long: (zoom, window, ease). The zoom is
+    an ffmpeg expression of the eased progress {e} and the frame counter `on`; the window is the
+    (x, y) fractions of the slack where the visible 1/zoom rectangle sits; ease is the progress
+    expression. The Video editor's preview computes the same numbers (ui-studio vedit_frame.rs);
+    tests/fixtures/frame_transforms.json pins both.
+
+    `clip`: motion (an auto move of FG_WINDOW, "still" or "edit"), move (edit_move's), impact,
+    ramp, push (the look's), motion_k and punch."""
+    motion = clip["motion"]
+    move = clip.get("move")
+    ramp = clip.get("ramp", False)
+    # Short clips move proportionally less, so a half-second beat never lurches; with the speed
+    # ramp a short beat snaps through more of the move instead, and quickly.
+    k = min(1.0, frames / (3.0 * FPS))
+    if ramp and frames < 2 * FPS:
+        k = max(k, 0.7)
+    push = round(clip.get("push", FG_PUSH) * k, 4)
+    fg_zoom = _motion_zoom(motion, push, round(1 + (FG_PAN_ZOOM - 1) * k * clip.get("motion_k", 1.0), 4))
+    window = FG_WINDOW.get(motion, FG_WINDOW["still"])
+    if move:
+        # The editor's own move (its amount as given: the editor chose it).
+        fg_zoom, window = edit_move(move, push)
+    # The punch zoom of an action beat (the editor's shake amount, else 12%).
+    if clip.get("impact") and motion != "still":
+        n = max(2, round(IMPACT_SEC * FPS * 0.6))
+        fg_zoom = f"1+{clip.get('punch', 0.12)}*pow(1-min(1,on/{n}),3)+{push}*{{e}}"
+        window = FG_WINDOW["push"]
+    return fg_zoom, window, ramp_ease("on", frames, ramp)
+
+
 def _render_clip(clip, frames, w, h, out_path):
     """Render one clip's video (no audio): the still background with the Ken Burns panel on it.
     An action beat ("punch") snaps in from a zoom, jolts and flashes white. With parallax the
@@ -948,27 +1110,20 @@ def _render_clip(clip, frames, w, h, out_path):
         return _render_duo_clip(clip, frames, w, h, out_path)
     imgs = clip["images"]
     motion = clip["motion"]
+    move = clip.get("move")
     impact = clip.get("impact", False)
     ramp = clip.get("ramp", False)
-    # Short clips move proportionally less, so a half-second beat never lurches; with the speed
-    # ramp a short beat snaps through more of the move instead, and quickly.
+    fg_zoom, window, ease = clip_camera(clip, frames)
     k = min(1.0, frames / (3.0 * FPS))
     if ramp and frames < 2 * FPS:
         k = max(k, 0.7)
-    push = round(clip.get("push", FG_PUSH) * k, 4)
-    fg_zoom = _motion_zoom(motion, push, round(1 + (FG_PAN_ZOOM - 1) * k, 4))
-    window = FG_WINDOW[motion]
-    ease = ramp_ease("on", frames, ramp)
-    if impact and motion != "still":
-        n = max(2, round(IMPACT_SEC * FPS * 0.6))
-        fg_zoom = f"1+0.12*pow(1-min(1,on/{n}),3)+{push}*{{e}}"
-        window = FG_WINDOW["push"]
+    punch = clip.get("punch", 0.12)
     fx, fy = imgs["fg_pos"]
-    jolt = round(h * 0.012) if impact else 0
+    jolt = round(h * 0.1 * punch) if impact else 0
     bg = f"[0:v]{TV}format=yuv420p,setsar=1,{_hold(frames)}"
     drift = imgs.get("drift", 0)
     if drift:
-        dx, dy = PARALLAX_DIRS.get(motion, (0.6, 0))
+        dx, dy = move_dirs(move) if move else PARALLAX_DIRS.get(motion, (0.6, 0))
         e = f"(2*{ramp_ease('n', frames, ramp)}-1)"
         bg += f",crop={w}:{h}:x='{drift}+{round(dx * drift * k, 2)}*{e}':y='{drift}+{round(dy * drift * k, 2)}*{e}'"
     inputs = ["-i", imgs["bg"], "-i", imgs["fg"]]
@@ -1142,6 +1297,31 @@ def _build_narration(clips, work_dir, out_path):
             out.writeframes(data + b"\0\0" * (count - len(data) // 2))
 
 
+def _retime_clips(clips, caption_segments, work_dir):
+    """Clips the editor sped up or slowed down: their narration slice is retimed with atempo
+    (the pitch kept) into a file of its own, which the narration track and the caption timing
+    then read from its start. A slice that cannot be retimed plays as it is, cut to the clip."""
+    for i, c in enumerate(clips):
+        speed = c.get("speed", 1.0)
+        if abs(speed - 1.0) < 1e-3:
+            continue
+        out = os.path.join(work_dir, f"retimed_{c['idx']:04d}.wav")
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{c['offset']:.3f}", "-t", f"{c['src_duration']:.3f}", "-i", c["audio_path"],
+            "-af", f"atempo={speed:.4f}", "-ac", "1", "-ar", str(AUDIO_RATE), "-c:a", "pcm_s16le", out,
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        except Exception as e:
+            print(f"[video] Could not retime clip {c['idx']}: {e}", file=sys.stderr)
+            continue
+        c["audio_path"], c["offset"] = out, 0.0
+        if i < len(caption_segments):
+            caption_segments[i]["audio_path"] = out
+            caption_segments[i]["audio_offset_ms"] = 0
+
+
 # Share of the video step's progress bar each stage takes (they add up to 1).
 PROGRESS_SPLIT = {"prepare": 0.05, "clips": 0.55, "chunks": 0.15, "finalize": 0.25}
 
@@ -1172,8 +1352,9 @@ class _Progress:
             self.cb("video", value, 1000)
 
 
-# Clip motions the Video editor can pick per clip (anything else: the look decides).
-EDIT_MOTIONS = ("still", "zoom", "shake")
+# Clip motions the Video editor can pick per clip (anything else: the look decides). All but
+# shake are drawn by edit_move; shake is the action punch (zoom, jolt, white flash).
+EDIT_MOTIONS = ("still", "zoom", "shake", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down", "ken_burns", "punch")
 # Font a text overlay is drawn in (python/fonts).
 OVERLAY_FONT = "Inter-ExtraBold.ttf"
 
@@ -1189,8 +1370,11 @@ def _num(v, default, lo, hi):
 def apply_edit_clips(items, clips):
     """The render items of a Video editor edit: `clips` lists, in their new order, which item
     (`src`, an index into `items`) plays, trimmed by `trim_in_ms` / `trim_out_ms` off its audio
-    slice, with an optional caption `text`, a `motion` from EDIT_MOTIONS and `cut` (a hard cut
-    into it). Unknown sources and clips trimmed below 0.1 s are dropped."""
+    slice, with an optional caption `text`, a `motion` from EDIT_MOTIONS with its `amount`
+    (0..0.5) and `focus_from` / `focus_to` ([x, y] percent of the panel, kept as 0..1), a
+    `speed` (0.5..2: the narration is retimed), and `cut` (a hard cut into it) or a
+    `transition` {kind (EDIT_TRANSITIONS), ms}. Unknown sources and clips shorter than 0.1 s
+    are dropped; unknown motions and transitions are ignored."""
     out = []
     for c in clips or []:
         if not isinstance(c, dict):
@@ -1206,16 +1390,30 @@ def apply_edit_clips(items, clips):
         tin = int(_num(c.get("trim_in_ms"), 0, 0, 1e9))
         tout = int(_num(c.get("trim_out_ms"), 0, 0, 1e9))
         left = int(dur) - tin - tout
-        if left < 100:
+        speed = _num(c.get("speed"), 1.0, 0.5, 2.0)
+        if left < 100 or left / speed < 100:
             continue
         seg["audio_offset_ms"] = int(seg.get("audio_offset_ms") or 0) + tin
         seg["duration_ms"] = left
+        if speed != 1.0:
+            seg["speed"] = speed
         if isinstance(c.get("text"), str):
             seg["text"] = c["text"]
         if c.get("motion") in EDIT_MOTIONS:
             seg["motion"] = c["motion"]
+            amount = _num(c.get("amount"), None, 0.0, 0.5)
+            if amount is not None:
+                seg["amount"] = amount
+            for key in ("focus_from", "focus_to"):
+                f = c.get(key)
+                if isinstance(f, (list, tuple)) and len(f) == 2:
+                    seg[key] = (_num(f[0], 50.0, 0.0, 100.0) / 100.0, _num(f[1], 50.0, 0.0, 100.0) / 100.0)
+        t = c.get("transition")
         if c.get("cut"):
             seg["cut"] = True
+        elif isinstance(t, dict) and t.get("kind") in EDIT_TRANSITIONS:
+            name, default = EDIT_TRANSITIONS[t["kind"]]
+            seg["transition"] = (name, round(_num(t.get("ms"), default * 1000, 40, 3000) / 1000.0, 3))
         out.append(seg)
     return out
 
@@ -1332,13 +1530,14 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     fmt = "reels" if config.get("format") == "reels" else "landscape"
     w, h = get_resolution(resolution, fmt)
     fill = "black" if config.get("fill") == "black" else "blur"
-    look = resolve_look(config.get("look"))
+    edit = config.get("edit") if isinstance(config.get("edit"), dict) else {}
+    look = apply_intensity(resolve_look(config.get("look")), edit.get("intensity"))
     # Side-by-side panels need the wide frame and the blurred fill.
     duo_on = look["duo"] and fmt == "landscape" and fill == "blur" and effect != "none"
     # Letterbox bars (landscape only): panels are laid out between them. Parallax needs the
     # blurred fill to drift.
     inset = letterbox_bar(w, h) if look.get("letterbox") else 0
-    drift = round(w * PARALLAX / 2) // 2 * 2 if look.get("parallax") and fill == "blur" and effect != "none" else 0
+    drift = round(w * PARALLAX * look["parallax_k"] / 2) // 2 * 2 if look.get("parallax") and fill == "blur" and effect != "none" else 0
     reels_dir = os.path.join(output_dir, "reels")
 
     video_dir = os.path.join(output_dir, "video_parts")
@@ -1351,7 +1550,6 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     segments = sync_map.get("segments", [])
     use_beats = bool(beat_segments)
     render_items = beat_segments if use_beats else segments
-    edit = config.get("edit") if isinstance(config.get("edit"), dict) else {}
     if isinstance(edit.get("clips"), list):
         render_items = apply_edit_clips(render_items, edit["clips"])
         use_beats = True
@@ -1448,6 +1646,10 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             duration = float(seg["duration_ms"]) / 1000.0
         else:
             duration = get_audio_duration_sec(audio_path)
+        # The editor's speed: the slice plays retimed (see _retime_clips), the clip as long as that.
+        speed = _num(seg.get("speed"), 1.0, 0.5, 2.0)
+        src_duration = round(duration, 3)
+        duration = duration / speed
         if duration < 0.1:
             continue
         duration = round(duration, 3)
@@ -1457,7 +1659,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             tall = False
             # A beat may ask to be shown whole ("layout": "single"), like the hook's closing cover,
             # and an editor motion other than a shake moves the panel on its own.
-            if duo_on and seg.get("layout") != "single" and override not in ("still", "zoom"):
+            if duo_on and seg.get("layout") != "single" and override in (None, "shake"):
                 from PIL import Image
                 with Image.open(page_image) as im:
                     tall = im.width < DUO_MAX_ASPECT * im.height
@@ -1483,6 +1685,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             continue
 
         motion = "still"
+        move = None
         if duo:
             motion = "duo"
             duo_prev = {"duo": duo, "source": source_image, "focus": focus_point}
@@ -1490,8 +1693,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             duo_prev = None
             if override == "still":
                 motion = "still"
-            elif override == "zoom":
-                motion = "push"
+            elif override and override != "shake":
+                motion = "edit"
+                move = {"kind": override, "amount": seg.get("amount"), "from": seg.get("focus_from"), "to": seg.get("focus_to")}
             elif effect != "none":
                 motion = pick_motion(images["aspect"], images["box_aspect"], turn, prev_motion)
                 turn += 1
@@ -1506,12 +1710,13 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             last_impact = len(clips)
 
         clips.append({
-            "idx": idx, "page": page_num, "images": images, "motion": motion,
+            "idx": idx, "page": page_num, "images": images, "motion": motion, "move": move,
             "duo": duo, "impact": impact, "push": look["push"], "ramp": look.get("ramp", False),
-            "chroma": look.get("chroma", False),
+            "punch": seg["amount"] if override == "shake" and seg.get("amount") is not None else 0.12,
+            "chroma": look.get("chroma", False), "chroma_k": look["chroma_k"], "motion_k": look["motion_k"],
             "source": source_image, "focus": focus_point,
-            "audio_path": audio_path, "offset": audio_offset,
-            "start": timeline, "duration": duration, "cut": bool(seg.get("cut")),
+            "audio_path": audio_path, "offset": audio_offset, "speed": speed, "src_duration": src_duration,
+            "start": timeline, "duration": duration, "cut": bool(seg.get("cut")), "trans": seg.get("transition"),
         })
         caption_segments.append({
             "text": seg.get("text", ""),
@@ -1541,13 +1746,16 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             joins.append("impact")
         else:
             joins.append(None)
+    # The editor's own transition into a clip (a hard cut wins: it is a join above).
+    forced = [None] + [tuple(c["trans"]) if c.get("trans") and not c["cut"] else None for c in clips[1:]]
     starts, trans = plan_transitions(
-        durations, [c["page"] for c in clips], trans_kind, trans_dur, look["transitions"], joins,
+        durations, [c["page"] for c in clips], trans_kind, trans_dur, look["transitions"], joins, forced,
     )
     frame_counts = [clip_frames(starts, trans, k, durations[-1]) for k in range(len(clips))]
     # Page-turn effects the clips draw themselves, and the light frames they share (made once).
     clip_fx = plan_clip_fx(
         starts, trans, [c["page"] for c in clips], joins, look.get("leaks", False), [c["impact"] for c in clips],
+        forced=forced,
     )
     assets = {}
     for kind, key in (("leak", "leak"), ("burn", "burn_in")):
@@ -1562,8 +1770,10 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     for k, c in enumerate(clips):
         frames = frame_counts[k]
         c["fx"], c["assets"] = clip_fx[k], assets
+        drawn = lambda n: n.split("_")[0] in assets or "zoom" in n or n.split("_")[0] in CLIP_DRAWN and not n.startswith("burn")
         spec = [c["motion"], c["impact"], c["push"], look["glow"], c["ramp"], c["chroma"] and c["impact"],
-                inset, drift, sorted((n, v) for n, v in clip_fx[k].items() if n.split("_")[0] in assets or "zoom" in n)]
+                inset, drift, sorted((n, v) for n, v in clip_fx[k].items() if drawn(n)),
+                c["move"], c["punch"], c["chroma_k"], c["motion_k"]]
         if c["duo"]:
             # The pan ends where the next clip cuts in, so the panel left behind does not jump.
             nxt = round(starts[k + 1] * FPS) if k + 1 < len(starts) else round(starts[k] * FPS) + frames
@@ -1583,6 +1793,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                     c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift)
                     c["duo"] = None
                 c["motion"] = "still"
+                c["move"] = None
                 c["impact"] = False
                 c["fx"] = {}
                 _render_clip(c, frames, w, h, path)
@@ -1590,7 +1801,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         rendered += frames
         report("clips", rendered / all_frames)
 
-    # Narration, sample-accurate against the same timeline.
+    # Narration, sample-accurate against the same timeline (sped-up clips retimed first).
+    _retime_clips(clips, caption_segments, video_dir)
     narration = os.path.join(video_dir, "narration.wav")
     _build_narration(clips, video_dir, narration)
 

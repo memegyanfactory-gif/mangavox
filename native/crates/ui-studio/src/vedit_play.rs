@@ -12,7 +12,10 @@ use rodio::Source as _;
 pub(crate) struct Slice {
     pub file: PathBuf,
     pub offset_ms: u64,
+    /// On the timeline (the file plays `dur_ms * speed` of itself).
     pub dur_ms: u64,
+    /// The clip's speed (the preview speeds the sound up, pitch and all; the render keeps the pitch).
+    pub speed: f32,
 }
 
 pub(crate) struct Play {
@@ -53,7 +56,10 @@ fn sender() -> Sender<Cmd> {
                     if let Ok(s) = rodio::Sink::try_new(&handle) {
                         for (i, sl) in p.narration.iter().enumerate() {
                             let skip = if i == 0 { p.skip_ms.min(sl.dur_ms) } else { 0 };
-                            match open(&sl.file, sl.offset_ms + skip) {
+                            let speed = if sl.speed.is_finite() && sl.speed > 0. { sl.speed } else { 1. };
+                            let src_ms = |ms: u64| (ms as f64 * speed as f64).round() as u64;
+                            match open(&sl.file, sl.offset_ms + src_ms(skip)) {
+                                Some(src) if speed != 1. => s.append(src.take_duration(Duration::from_millis(src_ms(sl.dur_ms - skip))).speed(speed)),
                                 Some(src) => s.append(src.take_duration(Duration::from_millis(sl.dur_ms - skip))),
                                 None => s.append(silence(sl.dur_ms - skip)),
                             }
