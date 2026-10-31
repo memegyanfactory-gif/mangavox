@@ -356,7 +356,7 @@ fn plausible(name: &str, channel: &str) -> bool {
 }
 
 /// Manga names a recap may cover, most likely first: a "Manhwa: X" / "Title: X" line in the
-/// description, then the uploader's tags (the first tag is usually the title), then quoted text.
+/// description, then the uploader's first two tags (the first is usually the title), then quoted text.
 pub fn candidates(v: &TrendVideo) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let push = |s: &str, out: &mut Vec<String>| {
@@ -380,7 +380,9 @@ pub fn candidates(v: &TrendVideo) -> Vec<String> {
             }
         }
     }
-    for k in &v.keywords {
+    // Uploaders put the manga's name first; later tags are often other popular titles added
+    // for search reach, so only the first two count.
+    for k in v.keywords.iter().take(2) {
         push(k, &mut out);
     }
     for q in quoted(&v.title) {
