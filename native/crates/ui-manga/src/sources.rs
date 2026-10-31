@@ -13,7 +13,7 @@ use mv_sources::SourceInfo;
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    btn, confirm_dialog, confirm_inline, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, muted, ph, section_header, section_label, size, skeleton, skeleton_line,
+    btn, checkbox, confirm_dialog, confirm_inline, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, muted, ph, section_header, section_label, size, skeleton, skeleton_line,
     status_tag, switch, tag, ButtonKind, MenuItem, Ph, StatusKind, Tokens, Tone,
 };
 
@@ -48,6 +48,10 @@ pub struct SourcesPanel {
     /// Preferred chapter language (manga pages show only chapters in it, when there are any).
     lang: String,
     smart_bypass: bool,
+    /// The built-in sites list is open (closed by default: nothing is offered until asked).
+    show_builtins: bool,
+    /// The user confirmed they are 18 or older, so the adult built-in sites are listed.
+    adult_ok: bool,
     /// [`backend::sources_version`] the lists were loaded at.
     seen_sources: u64,
 }
@@ -109,6 +113,8 @@ impl SourcesPanel {
             plugin_box,
             lang: backend::preferred_language(),
             smart_bypass: backend::smart_bypass(),
+            show_builtins: false,
+            adult_ok: false,
             seen_sources: 0,
         };
         p.reload(false, cx);
@@ -369,7 +375,7 @@ impl Render for SourcesPanel {
                 }))
                 .into_any_element(),
             Some(Ok(l)) if l.installed.is_empty() => {
-                empty_view(glyphs::SOURCES, "Nothing installed", "Add a built-in source, or install an extension from a repository below. It shows up in Browse straight away.").compact().into_any_element()
+                empty_view(glyphs::SOURCES, "Nothing installed", "Install an extension from a repository or a plugin link below. It shows up in Browse straight away.").compact().into_any_element()
             }
             Some(Ok(l)) => div().flex().flex_col().children(l.installed.iter().enumerate().map(|(i, r)| self.source_row(i, r, cx))).into_any_element(),
         };
@@ -381,6 +387,8 @@ impl Render for SourcesPanel {
             Some(Ok(l)) => l.available.clone(),
             _ => vec![],
         };
+        let (adult, general): (Vec<SourceInfo>, Vec<SourceInfo>) = available.into_iter().partition(|s| s.nsfw);
+        let adult_count = adult.len();
         div()
             .id("sources-panel")
             .size_full()
@@ -398,15 +406,41 @@ impl Render for SourcesPanel {
             )
             .child(
                 section("Add a source", ph::PLUS, None)
-                    .when(!available.is_empty(), |d| {
-                        d.child(section_label("Built-in sources").pt(px(4.)))
-                            .child(div().flex().flex_col().children(available.iter().enumerate().map(|(i, s)| self.available_row(i, s, cx))))
-                    })
-                    .child(section_label("From an extension repository").pt(px(8.)))
+                    .child(section_label("From an extension repository").pt(px(4.)))
                     .child(muted("Add a Mihon or Tachiyomi repository, then press Install on a site."))
                     .child(self.repos.clone())
                     .child(section_label("From a plugin link").pt(px(8.)))
                     .child(self.plugin_box.clone())
+                    // Built-in sites stay folded away until asked for; adult ones need an explicit 18+ tick.
+                    .when(!general.is_empty() || adult_count > 0, |d| {
+                        d.child(section_label("Built-in sites").pt(px(8.))).child(if !self.show_builtins {
+                            btn("show-builtins", format!("Show built-in sites ({})", general.len()), ButtonKind::Ghost)
+                                .small()
+                                .icon(ph::CARET_DOWN)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_builtins = true;
+                                    cx.notify();
+                                }))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .children(general.iter().enumerate().map(|(i, s)| self.available_row(i, s, cx)))
+                                .when(adult_count > 0, |d| {
+                                    d.child(
+                                        div().pt(px(10.)).child(checkbox("sources-adult-ok", self.adult_ok).child(format!("I am 18 or older. Show the {adult_count} adult sites")).on_click(cx.listener(
+                                            |this, _, _, cx| {
+                                                this.adult_ok = !this.adult_ok;
+                                                cx.notify();
+                                            },
+                                        ))),
+                                    )
+                                    .when(self.adult_ok, |d| d.children(adult.iter().enumerate().map(|(i, s)| self.available_row(100 + i, s, cx))))
+                                })
+                                .into_any_element()
+                        })
+                    })
                     .child(trust_note()),
             )
             .child(
