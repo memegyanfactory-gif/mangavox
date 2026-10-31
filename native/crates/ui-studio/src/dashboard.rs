@@ -239,6 +239,25 @@ impl StudioPage {
             (None, _) => format!("{active} chapter{} waiting", plural(active)),
         };
         let p = if total > 0 { q.items.iter().map(|i| i.progress()).sum::<f32>() / total as f32 } else { 0. };
+        // Combined length of the queued chapters' videos made so far (it grows as each one
+        // finishes; cached by file time, so it is cheap per frame).
+        let made_secs: f64 = q.items.iter().filter_map(|i| self.statuses.get(&i.chapter.id).and_then(|s| s.video.clone())).filter_map(|v| crate::export::video_seconds(&v)).sum();
+        let timer = div()
+            .id("strip-length")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .px(px(10.))
+            .py(px(4.))
+            .rounded(px(radius::LG))
+            .bg(Tokens::surface())
+            .border_1()
+            .border_color(Tokens::border())
+            .tooltip(tip("Total length of the chapter videos made so far in this run"))
+            .child(icon_ph(ph::FILM_STRIP, Tokens::text_2(), icon_px::SM))
+            .child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(crate::export::fmt_duration(made_secs)))
+            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("of video"));
         Some(
             div()
                 .flex()
@@ -268,6 +287,7 @@ impl StudioPage {
                         .child(div().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(text))
                         .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!("{done} of {total} chapter{} made · picks you add now join the queue", plural(total)))),
                 )
+                .child(timer)
                 .child(if q.paused {
                     btn("strip-resume", "Resume", ButtonKind::Primary).small().icon(ph::PLAY).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.sync_pipeline(cx);
