@@ -82,6 +82,56 @@ pub fn dot_trail(id: impl Into<ElementId>, lit: Vec<bool>, running: bool, dot: f
     .into_any_element()
 }
 
+/// Where a step of a job is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepMark {
+    Todo,
+    Running,
+    Done,
+}
+
+/// A row of small step cards: grey to do, green done, and the running one in the accent colour
+/// with a breathing glow and a sweep of light so it is plain that work is happening (static
+/// under reduced motion). `steps` are `(name, mark)`; each card's tooltip says its name.
+pub fn step_cards(id: impl Into<SharedString>, steps: Vec<(&'static str, StepMark)>) -> Div {
+    let id: SharedString = id.into();
+    let (w, h) = (16., 10.);
+    div().flex().items_center().gap(px(3.)).children(steps.into_iter().enumerate().map(move |(i, (name, mark))| {
+        let card = div()
+            .id(SharedString::from(format!("{id}-{i}")))
+            .relative()
+            .w(px(w))
+            .h(px(h))
+            .rounded(px(3.))
+            .overflow_hidden()
+            .tooltip(crate::tip(format!(
+                "{name}: {}",
+                match mark {
+                    StepMark::Todo => "not done yet",
+                    StepMark::Running => "working on it now",
+                    StepMark::Done => "done",
+                }
+            )));
+        match mark {
+            StepMark::Done => card.bg(Tokens::success()).into_any_element(),
+            StepMark::Todo => card.bg(Tokens::active()).into_any_element(),
+            StepMark::Running if reduced() => card.bg(Tokens::accent()).into_any_element(),
+            StepMark::Running => card
+                .child(div().absolute().inset_0().with_animation(
+                    SharedString::from(format!("{id}-{i}-glow")),
+                    Animation::new(Duration::from_millis(1100)).repeat().with_easing(ease_in_out),
+                    |d, t| d.bg(alpha(Tokens::accent(), 0.45 + 0.55 * (1. - (t * 2. - 1.).abs()))),
+                ))
+                .child(div().absolute().top_0().h_full().w(px(6.)).with_animation(
+                    SharedString::from(format!("{id}-{i}-sweep")),
+                    Animation::new(Duration::from_millis(900)).repeat(),
+                    move |d, t| d.left(px(-6. + t * (w + 6.))).bg(linear_gradient(90., linear_color_stop(alpha(Tokens::text_1(), 0.), 0.), linear_color_stop(alpha(Tokens::text_1(), 0.6), 1.))),
+                ))
+                .into_any_element(),
+        }
+    }))
+}
+
 /// Thin progress bar. While `active` a comet of light sweeps the filled part (the whole track
 /// before anything is done) so a long step never looks frozen. Under reduced motion there is no
 /// comet; an active bar with nothing done yet shows a soft accent track instead.

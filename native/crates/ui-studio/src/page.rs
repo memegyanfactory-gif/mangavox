@@ -15,8 +15,8 @@ use mv_recap::{ChapterRead, ChapterRef, ModelChoice, PhaseStatus, Prefs, Step, S
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    btn, checkbox, dot_trail, empty_view, error_view, fmt_bytes, glyphs, icon_button, icon_ph, inline_alert, interactive, list_row, ph, ph_icon, size, skeleton, skeleton_line, spinner,
-    stepper, tip, AlertKind, ButtonKind, CheckState, Route, Tokens, Weight,
+    btn, checkbox, empty_view, error_view, fmt_bytes, glyphs, icon_button, icon_ph, inline_alert, interactive, list_row, ph, ph_icon, size, skeleton, skeleton_line, spinner,
+    step_cards, stepper, tip, AlertKind, StepMark, ButtonKind, CheckState, Route, Tokens, Weight,
 };
 
 use crate::data::{self, ChapterItem, MangaGroup};
@@ -1839,7 +1839,25 @@ impl StudioPage {
             || self.jobs.iter().any(|j| j.chapter_id == c.id && !j.state.finished())
             || (self.music.busy.is_some() && self.music.composing.contains(&c.id))
             || self.queue.for_chapter(&c.id).is_some_and(|i| i.state == crate::pipeline::ItemState::Running);
-        let trail_tip = Phase::ALL.iter().map(|p| format!("{} {}", p.label(), if p.done(&st) { "✓" } else { "–" })).collect::<Vec<_>>().join(" · ");
+        // The step being made now: the queue's current step, else the first one not done yet.
+        let working: Option<Phase> = running.then(|| {
+            let queued = self.queue.for_chapter(&c.id).filter(|i| i.state == crate::pipeline::ItemState::Running).and_then(|i| i.current_step()).map(Phase::of);
+            let composing = (self.music.busy.is_some() && self.music.composing.contains(&c.id)).then_some(Phase::Music);
+            queued.or(composing).or_else(|| Phase::ALL.iter().copied().find(|p| !p.done(&st)))
+        }).flatten();
+        let cards: Vec<(&'static str, StepMark)> = Phase::ALL
+            .iter()
+            .map(|p| {
+                let mark = if Some(*p) == working {
+                    StepMark::Running
+                } else if p.done(&st) {
+                    StepMark::Done
+                } else {
+                    StepMark::Todo
+                };
+                (p.label(), mark)
+            })
+            .collect();
         let blocker = self.reset_blocker(&c.id);
         let (id, item, reset_item) = (c.id.clone(), c.clone(), c.clone());
         list_row(SharedString::from(format!("ch-{}", c.id)), focused)
@@ -1863,8 +1881,7 @@ impl StudioPage {
                     })),
             )
             .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).child(c.label()))
-            .when(running, |d| d.child(spinner(SharedString::from(format!("row-spin-{}", c.id)), Tokens::accent(), icon_px::SM)))
-            .child(div().id(SharedString::from(format!("row-trail-{}", c.id))).tooltip(tip(trail_tip)).child(dot_trail(SharedString::from(format!("row-dots-{}", c.id)), Phase::ALL.iter().map(|p| p.done(&st)).collect(), running, 5.)))
+            .child(step_cards(format!("row-steps-{}", c.id), cards))
             .child(
                 icon_button(SharedString::from(format!("ch-reset-{}", c.id)), glyphs::DELETE, "Reset chapter")
                     .small()
