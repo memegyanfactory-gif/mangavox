@@ -16,7 +16,8 @@ macro_rules! brand {
 }
 brand!("claude", "claudecode", "codex", "openai", "gemini", "geminicli", "opencode", "ollama", "lmstudio", "openrouter", "groq", "deepseek", "mistral", "xai", "grok", "antigravity", "generic", "star", "mangavox");
 
-/// The app's own icon, the purple "M VOX manga app" tile (made from `app/assets/icon.ico`): the logo
+/// The app's own icon, the purple tile with the white M and sound waves (`mangavox-app.svg`, the
+/// source of this PNG, `app/assets/icon.ico` and the phone icons): the logo
 /// in the title bar, Settings and Setup.
 pub const APP_LOGO: &str = "brand/mangavox-app.png";
 const APP_LOGO_PNG: &[u8] = include_bytes!("../assets/brand/mangavox-app.png");
