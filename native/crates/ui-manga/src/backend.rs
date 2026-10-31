@@ -74,6 +74,8 @@ pub fn with_db<T>(f: impl FnOnce(&mut rusqlite::Connection) -> Result<T>) -> Res
 /// A JS plugin presented through the native [`Source`] trait.
 pub struct PluginSource {
     plugin: mv_plugins::Plugin,
+    /// Its icon: the manifest's, else the repository index's for an extension.
+    icon: Option<String>,
 }
 
 fn other(e: anyhow::Error) -> SourceError {
@@ -108,7 +110,11 @@ fn fix_chapter(v: &mut Value) {
 
 impl PluginSource {
     pub fn new(plugin: mv_plugins::Plugin) -> Self {
-        Self { plugin }
+        let m = plugin.manifest();
+        let icon = m.extra.get("icon").and_then(|v| v.as_str()).map(String::from).or_else(|| {
+            mv_plugins::repo::read_repo_source(&plugins_dir(), &m.id).and_then(|e| e.icon_url).filter(|u| u.starts_with("http"))
+        });
+        Self { plugin, icon }
     }
 
     fn need(&self, method: &str, what: &'static str) -> Result<(), SourceError> {
@@ -131,7 +137,7 @@ impl Source for PluginSource {
             lang: m.lang.clone(),
             nsfw: m.nsfw,
             requires_wall_solver: false,
-            icon: m.extra.get("icon").and_then(|v| v.as_str()).map(String::from),
+            icon: self.icon.clone(),
         }
     }
 
