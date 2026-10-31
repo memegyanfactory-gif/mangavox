@@ -188,7 +188,16 @@ pub async fn subtitles(imdb: String, season: Option<u32>, episode: Option<u32>) 
 /// Settings → Playback (auto-play, countdown, skip intro, pre-download, subtitle language).
 pub fn load_prefs() -> logic::PlaybackPrefs {
     let all = mv_core::config::Config::open_default().get_all();
-    logic::PlaybackPrefs::from_config(all.get("playback"), all.get("playback.skipIntro"), all.get("playback.subtitleLanguage"))
+    let mut prefs = logic::PlaybackPrefs::from_config(all.get("playback"), all.get("playback.skipIntro"), all.get("playback.subtitleLanguage"));
+    prefs.memory = logic::PlayerMemory::from_json(all.get(MEMORY_KEY));
+    prefs
+}
+
+const MEMORY_KEY: &str = "player.memory";
+
+/// Remembers the viewer's audio / subtitle language, volume and speed for the next video.
+pub fn save_memory(memory: &logic::PlayerMemory) {
+    let _ = mv_core::config::Config::open_default().set(MEMORY_KEY, memory.to_json());
 }
 
 /// Info hash of a torrent source before it is added, so the loader can show peer stats while

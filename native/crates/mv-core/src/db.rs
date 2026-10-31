@@ -303,6 +303,13 @@ const MIGRATIONS: &[Migration] = &[
       );
       CREATE INDEX IF NOT EXISTS idx_manga_category_cat ON manga_category(category_id);
     "#)] },
+    // Studio recap videos played before the player kept local files out of watch history were
+    // saved as movies keyed by their title ("movie:imdb:<title>"); real titles carry a tt id.
+    Migration { id: 16, name: "016_forget_local_video_history", steps: &[Sql(r#"
+      DELETE FROM media_event WHERE (media_id LIKE 'movie:imdb:%' OR media_id LIKE 'series:imdb:%') AND media_id NOT LIKE '%:imdb:tt%';
+      DELETE FROM media_playback WHERE (media_id LIKE 'movie:imdb:%' OR media_id LIKE 'series:imdb:%') AND media_id NOT LIKE '%:imdb:tt%';
+      DELETE FROM media_title WHERE (id LIKE 'movie:imdb:%' OR id LIKE 'series:imdb:%') AND id NOT LIKE '%:imdb:tt%';
+    "#)] },
 ];
 
 /// Tables the TS services create with `registerSchema` (run on every start; all idempotent).
@@ -449,6 +456,19 @@ mod tests {
         assert!(has_column(&conn, "chapter", "source_plugin").unwrap());
         let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
         assert_eq!(fk, 1);
+    }
+
+    #[test]
+    fn studio_videos_leave_watch_history_real_titles_stay() {
+        let (_d, mut conn) = temp_db();
+        for id in ["movie:imdb:Tokyo Fears Rhapsody · Chapter 2", "movie:imdb:tt0111161", "series:imdb:tt0413573"] {
+            conn.execute("INSERT INTO media_title (id, kind, title, updated_at) VALUES (?1, 'movie', 't', 0)", [id]).unwrap();
+            conn.execute("INSERT INTO media_playback (media_id, kind, updated_at) VALUES (?1, 'movie', 0)", [id]).unwrap();
+        }
+        conn.execute("DELETE FROM _migrations WHERE id = 16", []).unwrap();
+        migrate(&mut conn).unwrap();
+        let left: Vec<String> = conn.prepare("SELECT media_id FROM media_playback ORDER BY media_id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(left, ["movie:imdb:tt0111161", "series:imdb:tt0413573"]);
     }
 
     #[test]

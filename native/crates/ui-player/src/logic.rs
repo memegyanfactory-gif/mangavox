@@ -186,12 +186,14 @@ pub struct PlaybackPrefs {
     pub skip_intro: bool,
     /// ISO 639-1 code of the preferred subtitle language.
     pub subtitle_language: String,
+    /// The viewer's last picks in the player (they win over the Settings language).
+    pub memory: PlayerMemory,
 }
 
 impl Default for PlaybackPrefs {
     /// The Settings page defaults (ui-settings `Playback::default`).
     fn default() -> Self {
-        Self { auto_play: true, countdown: 20, pre_download_next: true, skip_intro: false, subtitle_language: "en".into() }
+        Self { auto_play: true, countdown: 20, pre_download_next: true, skip_intro: false, subtitle_language: "en".into(), memory: PlayerMemory::default() }
     }
 }
 
@@ -205,7 +207,37 @@ impl PlaybackPrefs {
             pre_download_next: field("preDownloadNext").and_then(|v| v.as_bool()).unwrap_or(d.pre_download_next),
             skip_intro: skip_intro.and_then(|v| v.as_bool()).unwrap_or(d.skip_intro),
             subtitle_language: subtitle_language.and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(d.subtitle_language),
+            memory: d.memory,
         }
+    }
+}
+
+/// What the viewer last picked in the player (config `player.memory`), so the next movie,
+/// episode or anime starts the same way.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlayerMemory {
+    pub audio_lang: Option<String>,
+    pub sub_lang: Option<String>,
+    pub subs_off: bool,
+    pub volume: Option<f64>,
+    pub speed: Option<f64>,
+}
+
+impl PlayerMemory {
+    pub fn from_json(v: Option<&serde_json::Value>) -> Self {
+        let s = |k: &str| v.and_then(|v| v.get(k)).and_then(|x| x.as_str()).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string);
+        let n = |k: &str| v.and_then(|v| v.get(k)).and_then(|x| x.as_f64());
+        Self {
+            audio_lang: s("audioLang"),
+            sub_lang: s("subLang"),
+            subs_off: v.and_then(|v| v.get("subsOff")).and_then(|x| x.as_bool()).unwrap_or(false),
+            volume: n("volume").filter(|x| (0.0..=150.0).contains(x)),
+            speed: n("speed").filter(|x| (0.25..=4.0).contains(x)),
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "audioLang": self.audio_lang, "subLang": self.sub_lang, "subsOff": self.subs_off, "volume": self.volume, "speed": self.speed })
     }
 }
 
@@ -549,6 +581,15 @@ pub fn classify_source(src: &str) -> SourceKind {
 mod tests {
     use super::*;
     use crate::mpv::TrackKind;
+
+    #[test]
+    fn player_memory_survives_a_restart() {
+        let m = PlayerMemory { audio_lang: Some("jpn".into()), sub_lang: Some("en".into()), subs_off: false, volume: Some(70.0), speed: Some(1.25) };
+        assert_eq!(PlayerMemory::from_json(Some(&m.to_json())), m);
+        assert_eq!(PlayerMemory::from_json(None), PlayerMemory::default(), "nothing saved yet");
+        let odd = serde_json::json!({ "volume": 900, "speed": 0, "audioLang": " ", "subsOff": true });
+        assert_eq!(PlayerMemory::from_json(Some(&odd)), PlayerMemory { subs_off: true, ..Default::default() }, "out-of-range values are ignored");
+    }
 
     #[test]
     fn time_format() {

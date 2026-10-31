@@ -454,8 +454,22 @@ impl PlayerView {
         };
         match created {
             Ok(m) => {
-                // Settings → Playback → Subtitle language picks the embedded track mpv selects.
-                let _ = m.set("slang", &logic::slang(&self.prefs.subtitle_language));
+                // The viewer's last picks in the player win over Settings → Playback → Subtitle language.
+                let mem = self.prefs.memory.clone();
+                let _ = m.set("slang", &logic::slang(mem.sub_lang.as_deref().unwrap_or(&self.prefs.subtitle_language)));
+                if let Some(a) = &mem.audio_lang {
+                    let _ = m.set("alang", &logic::slang(a));
+                }
+                if mem.subs_off {
+                    let _ = m.set("sid", "no");
+                }
+                if let Some(v) = mem.volume {
+                    let _ = m.set("volume", &format!("{v:.0}"));
+                    self.snap.volume = v;
+                }
+                if let Some(s) = mem.speed {
+                    let _ = m.set("speed", &format!("{s}"));
+                }
                 self.resume_note = resume;
                 if let Some(t) = resume {
                     let _ = m.set("start", &format!("{t:.1}"));
@@ -829,6 +843,10 @@ impl PlayerView {
             *n += 1;
             let _ = mpv.sub_add(&s.url, &format!("{} {}", logic::language_name(&s.lang), n), &s.lang);
         }
+        // Subtitles were turned off last time: an added track that matches the language stays off.
+        if self.prefs.memory.subs_off {
+            let _ = mpv.set("sid", "no");
+        }
         self.tracks = mpv.tracks();
     }
 
@@ -1091,8 +1109,28 @@ impl PlayerView {
                 self.last_sid = id;
             }
             self.tracks = m.tracks();
+            // Remember the language picked (or subtitles off) for the next video.
+            let lang = id.and_then(|i| self.tracks.iter().find(|t| t.id == i && t.kind == kind)).map(|t| t.lang.trim().to_string()).filter(|l| !l.is_empty());
+            let mem = &mut self.prefs.memory;
+            match kind {
+                TrackKind::Audio => mem.audio_lang = lang.or(mem.audio_lang.take()),
+                TrackKind::Sub => {
+                    mem.subs_off = id.is_none();
+                    mem.sub_lang = lang.or(mem.sub_lang.take());
+                }
+            }
+            self.remember();
             cx.notify();
         }
+    }
+
+    /// Saves the viewer's picks (languages, volume, speed) off the UI thread.
+    fn remember(&mut self) {
+        let mut mem = self.prefs.memory.clone();
+        mem.volume = Some(self.snap.volume);
+        mem.speed = Some(self.snap.speed).filter(|s| *s > 0.0);
+        self.prefs.memory = mem.clone();
+        std::thread::spawn(move || backend::save_memory(&mem));
     }
 
     /// `c`: subtitles off, or back on with the last (or first) track (YouTube).
@@ -1159,6 +1197,9 @@ impl PlayerView {
     /// Saves progress and hides the video + overlay before the page goes away.
     fn leave(&mut self) {
         self.save("progress");
+        if self.mpv.is_some() {
+            self.remember();
+        }
         if let Some(m) = &self.mpv {
             m.set_pause(true);
         }

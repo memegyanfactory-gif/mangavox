@@ -21,6 +21,7 @@ mod types;
 pub use brain::{safe_id, Brain};
 pub use export::export_for_pipeline;
 pub use json::extract_json;
+pub use llm::retry_now;
 pub use read::read_chapter;
 pub use reset::{chapter_plan, reset_chapter, reset_phase, reset_plan, Footprint, ResetPlan, ResetReport, Step};
 pub use store::{

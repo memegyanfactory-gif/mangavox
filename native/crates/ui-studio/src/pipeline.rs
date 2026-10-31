@@ -375,6 +375,17 @@ impl Queue {
         }
     }
 
+    /// The running step of `id` was stopped to start again (another AI was picked): the chapter
+    /// waits again at its place in the queue, so it is the next one the AI lane takes.
+    pub fn restart(&mut self, id: u64, step: Step) {
+        let Some(it) = self.get_mut(id) else { return };
+        it.steps[step.index()] = StepState::Pending;
+        it.job = None;
+        if it.state == ItemState::Running {
+            it.state = ItemState::Queued;
+        }
+    }
+
     fn set_step(&mut self, id: u64, step: Step, st: StepState) {
         if let Some(it) = self.get_mut(id) {
             it.steps[step.index()] = st;
@@ -471,6 +482,8 @@ static QUEUE: Mutex<Option<Queue>> = Mutex::new(None);
 static CTX: Mutex<Option<Ctx>> = Mutex::new(None);
 static VERSION: AtomicU64 = AtomicU64::new(0);
 static RUNNER: AtomicBool = AtomicBool::new(false);
+/// The AI step was stopped to start again with another AI (see [`set_context`]).
+static RESTART_AI: AtomicBool = AtomicBool::new(false);
 
 fn wake() -> &'static tokio::sync::Notify {
     static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
@@ -538,7 +551,21 @@ pub fn snapshot() -> Queue {
 
 /// Hands the runner the registry, model and setup it uses for the next steps.
 pub fn set_context(ctx: Ctx) {
-    *CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+    let model = |c: &Option<Ctx>| c.as_ref().and_then(|c| c.model.as_ref().map(|(m, _)| (m.provider, m.model.clone())));
+    let switched = {
+        let mut g = CTX.lock().unwrap_or_else(|e| e.into_inner());
+        let new = Some(ctx);
+        let switched = g.is_some() && model(&g) != model(&new);
+        *g = new;
+        switched
+    };
+    // Another AI was picked while a Generate step waits for a usage limit: that step starts
+    // again with the new AI (a read carries on from the pages already read).
+    let waiting = run::snapshot().filter(|r| r.running() && r.waiting.is_some()).and_then(|r| r.chapter_id);
+    if switched && waiting.is_some_and(|ch| read(|q| q.items.iter().any(|i| i.state == ItemState::Running && i.chapter.id == ch))) {
+        RESTART_AI.store(true, Ordering::SeqCst);
+        run::cancel();
+    }
 }
 
 /// The runner was handed a context (the Studio page was opened, or [`context_from_app`] ran).
@@ -619,6 +646,7 @@ pub fn resume(id: u64) {
         q.paused = false;
         q.interrupted = false;
     });
+    mv_recap::retry_now();
     ensure_runner();
 }
 
@@ -640,8 +668,10 @@ pub fn pause_all() {
     }
 }
 
+/// Resumes the queue; an AI step waiting for a usage limit tries again now.
 pub fn resume_all() {
     edit(Queue::resume_all);
+    mv_recap::retry_now();
     ensure_runner();
 }
 
@@ -671,8 +701,9 @@ pub fn dismiss(id: u64) {
 const AI_STEPS: usize = 3;
 
 async fn runner() {
-    // One chapter can wait for the media lane; the AI lane holds the next one until there is room.
-    let (to_media, mut media) = tokio::sync::mpsc::channel::<(u64, bool)>(1);
+    // The AI lane reads every waiting chapter ahead; the media lane voices and renders them in
+    // order. While the AI waits for a usage limit, the media lane carries on with what is read.
+    let (to_media, mut media) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
     let ai = async move {
         loop {
             let Some(id) = edit(Queue::claim_next) else {
@@ -686,7 +717,7 @@ async fn runner() {
                         it.current = None;
                     }
                 });
-                let _ = to_media.send((id, dirty)).await;
+                let _ = to_media.send((id, dirty));
             } else {
                 finish(id);
             }
@@ -760,6 +791,10 @@ async fn run_steps(id: u64, steps: std::ops::Range<usize>, mut dirty: bool) -> O
                 // transcript only fills a gap (the story is written from the read).
                 dirty |= step != Step::Transcript;
                 edit(|q| q.set_step(id, step, StepState::Done));
+            }
+            Outcome::Stopped if step.index() < AI_STEPS && RESTART_AI.swap(false, Ordering::SeqCst) => {
+                edit(|q| q.restart(id, step));
+                return None;
             }
             Outcome::Stopped => {
                 edit(|q| q.stopped(id, step));
@@ -1050,6 +1085,19 @@ mod tests {
         q.remove(c);
         q.stopped(c, Step::Read);
         assert!(q.get(c).is_none());
+    }
+
+    #[test]
+    fn switching_ai_during_a_limit_restarts_the_chapter_in_place() {
+        let mut q = Queue::default();
+        q.add(ch("a"), Step::Video, None, "landscape", None);
+        q.add(ch("b"), Step::Video, None, "landscape", None);
+        let a = q.claim_next().unwrap();
+        q.set_step(a, Step::Read, StepState::Running);
+        q.restart(a, Step::Read);
+        assert_eq!((q.items[0].state, q.items[0].steps[0], q.items[0].note.clone()), (ItemState::Queued, StepState::Pending, None));
+        assert!(!q.paused);
+        assert_eq!(q.claim_next(), Some(a), "it goes again before the chapters after it");
     }
 
     #[test]

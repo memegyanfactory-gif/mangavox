@@ -71,10 +71,21 @@ impl Llm for Patient {
                 tokio::select! {
                     _ = cancel.cancelled() => bail!("cancelled"),
                     _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                    _ = retry_signal().notified() => {}
                 }
             }
         })
     }
+}
+
+fn retry_signal() -> &'static tokio::sync::Notify {
+    static N: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
+}
+
+/// A run waiting for a usage limit to reset sends its request again now (the user asked to carry on).
+pub fn retry_now() {
+    retry_signal().notify_waiters();
 }
 
 pub(crate) fn is_cancelled(e: &anyhow::Error) -> bool {
