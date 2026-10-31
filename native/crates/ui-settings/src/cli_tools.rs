@@ -125,7 +125,48 @@ impl SettingsView {
                     })),
             )));
 
-        div().flex().flex_col().gap(px(20.)).child(list).child(settings)
+        div().flex().flex_col().gap(px(20.)).child(list).when_some(self.render_app_tools(cx), |d, s| d.child(s)).child(settings)
+    }
+
+    /// Opt-ins that let Grok and Antigravity load the app's tools (a `mangavox` entry in their own
+    /// MCP settings). `None` while neither is installed.
+    fn render_app_tools(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let here = std::env::current_exe().ok();
+        let mut section = setting_section("App tools", Some("Claude Code, Codex, Gemini CLI and OpenCode load MangaVox's tools by themselves. These two need a one-time opt-in.".into()));
+        let mut rows = 0;
+        for s in CLIS.iter().filter(|s| mv_ai::providers::cli_mcp::bridged(s.provider)) {
+            let info = self.cli.read(cx).info(s.id).cloned().unwrap_or_default();
+            if info.installed.is_none() {
+                continue;
+            }
+            let on = info.bridge.as_ref().is_some_and(|e| e.enabled);
+            let file = match s.provider {
+                mv_ai::AiProviderId::GrokCli => "~/.grok/config.toml",
+                _ => "~/.gemini/config/mcp_config.json",
+            };
+            let mut hint = format!("Adds a \"mangavox\" MCP server entry to {}'s own settings ({file}); turning this off removes it.", s.name);
+            if let Some(e) = info.bridge.as_ref().filter(|e| here.as_ref().is_some_and(|h| !same_path(h, &e.command))) {
+                hint = format!("Uses another MangaVox copy ({}). Turn off and on again to use this one.", e.command);
+            }
+            if info.bridge_busy {
+                hint = if on { "Removing the entry…".into() } else { "Adding the entry…".into() };
+            }
+            if let Some(err) = &info.bridge_error {
+                hint = err.clone();
+            }
+            let id = s.id;
+            let row = setting_row(
+                format!("Let {} use MangaVox's tools", s.name),
+                hint,
+                switch(SharedString::from(format!("cli-bridge-{id}")), on).on_click(cx.listener(move |this, on: &bool, _, cx| {
+                    let on = *on;
+                    this.cli.update(cx, |c, cx| c.set_bridge(id, on, cx));
+                })),
+            );
+            section = section.child(if rows == 0 { row } else { divided(row) });
+            rows += 1;
+        }
+        (rows > 0).then_some(section)
     }
 
     /// Update banners at the top of the AI pages; empty elsewhere.
@@ -151,6 +192,12 @@ impl SettingsView {
             })
             .collect()
     }
+}
+
+/// The running exe and the one an entry names, ignoring case and separators on Windows.
+fn same_path(exe: &std::path::Path, named: &str) -> bool {
+    let norm = |s: &str| if cfg!(windows) { s.replace('/', "\\").to_lowercase() } else { s.to_string() };
+    norm(&exe.to_string_lossy()) == norm(named)
 }
 
 fn hint_text(text: String) -> AnyElement {

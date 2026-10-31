@@ -222,7 +222,7 @@ impl Tab {
             Tab::Storage => "folder disk space delete reset cache downloads data move factory",
             Tab::Providers => "api key openai claude gemini ollama lm studio openrouter cloud",
             Tab::Models => "gguf ollama whisper comfyui local models engines",
-            Tab::CliTools => "claude code codex gemini cli update terminal",
+            Tab::CliTools => "claude code codex gemini cli update terminal grok antigravity mcp app tools",
             Tab::Studio => "resolution speed default voice video export",
             Tab::About => "version update licence github bug report",
         }

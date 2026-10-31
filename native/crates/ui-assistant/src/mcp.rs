@@ -6,6 +6,7 @@
 //! token, one server per turn. It lists the turn's tools and hands every call to the agent loop
 //! ([`McpCall`]), which runs it exactly like a native tool call: same risk, same approval in Ask
 //! mode, same step row in the chat.
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -95,11 +96,88 @@ impl McpServer {
     pub fn connected(&self) -> bool {
         self.shared.listed.load(Ordering::SeqCst)
     }
+
+    /// Publishes this server as the current turn's for the stdio bridge ([`crate::mcp_bridge`]),
+    /// until the returned guard is dropped.
+    pub fn publish(&self) -> std::io::Result<Published> {
+        Published::new(endpoint_file(), &self.endpoint)
+    }
 }
 
 impl Drop for McpServer {
     fn drop(&mut self) {
         self.stop.cancel();
+    }
+}
+
+// ── Endpoint file (for the stdio bridge) ─────────────────────────────────────────────
+
+/// Where the running turn's endpoint is published for `mangavox --mcp-bridge` (Grok, Antigravity).
+/// Between turns it holds `{}`.
+pub fn endpoint_file() -> PathBuf {
+    mv_core::paths::root().join("mcp-endpoint.json")
+}
+
+/// The endpoint a file names, if a turn is running.
+pub fn read_endpoint(path: &Path) -> Option<McpEndpoint> {
+    let v: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let s = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
+    Some(McpEndpoint { url: s("url")?, token: s("token")? })
+}
+
+/// The endpoint written to the file; marked stale again when dropped.
+pub struct Published {
+    path: PathBuf,
+    token: String,
+}
+
+impl Published {
+    pub(crate) fn new(path: PathBuf, ep: &McpEndpoint) -> std::io::Result<Self> {
+        if !path.exists() {
+            // Made readable by the user only before the token goes in; later writes keep that.
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, "{}")?;
+            restrict_to_user(&path);
+        }
+        std::fs::write(&path, json!({ "url": ep.url, "token": ep.token, "pid": std::process::id() }).to_string())?;
+        Ok(Published { path, token: ep.token.clone() })
+    }
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        // Only while it still names this turn: an overlapping turn may have published since.
+        if read_endpoint(&self.path).is_some_and(|e| e.token == self.token) {
+            let _ = std::fs::write(&self.path, "{}");
+        }
+    }
+}
+
+fn restrict_to_user(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let Ok(user) = std::env::var("USERNAME") else { return };
+        let who = match std::env::var("USERDOMAIN") {
+            Ok(d) if !d.is_empty() => format!("{d}\\{user}"),
+            _ => user,
+        };
+        // No inherited entries, full control for this user only.
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", &format!("{who}:F")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
     }
 }
 
@@ -383,6 +461,30 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let addr = url.trim_start_matches("http://").split('/').next().unwrap().to_string();
         assert!(TcpStream::connect(&addr).await.is_err());
+    }
+
+    #[test]
+    fn the_endpoint_file_names_the_running_turn_only() {
+        let dir = std::env::temp_dir().join(format!("mv-mcp-endpoint-{}", std::process::id()));
+        let path = dir.join("mcp-endpoint.json");
+        assert!(read_endpoint(&path).is_none());
+        let a = McpEndpoint { url: "http://127.0.0.1:1/mcp".into(), token: "aaa".into() };
+        let b = McpEndpoint { url: "http://127.0.0.1:2/mcp".into(), token: "bbb".into() };
+        let first = Published::new(path.clone(), &a).unwrap();
+        assert_eq!(read_endpoint(&path), Some(a.clone()));
+        // An overlapping turn takes over; the first one ending leaves it alone.
+        let second = Published::new(path.clone(), &b).unwrap();
+        drop(first);
+        assert_eq!(read_endpoint(&path), Some(b));
+        drop(second);
+        assert!(read_endpoint(&path).is_none());
+        // Marked stale, not removed, so the restricted file is reused.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let _ = Published::new(path.clone(), &a).unwrap();
+        assert!(read_endpoint(&path).is_none());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_endpoint(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

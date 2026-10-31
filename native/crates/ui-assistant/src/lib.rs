@@ -11,6 +11,7 @@ pub mod ext;
 mod fit;
 mod hub;
 pub mod mcp;
+pub mod mcp_bridge;
 mod picker;
 mod providers;
 mod shared;

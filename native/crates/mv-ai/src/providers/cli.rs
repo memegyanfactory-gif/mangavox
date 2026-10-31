@@ -343,6 +343,10 @@ pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
                 add(&["-m", &req.model]);
             }
             add(&["--permission-mode", if full(req) { "acceptEdits" } else { "default" }]);
+            if mcp {
+                // The `mangavox` server comes from the opt-in entry; its tools run without a prompt.
+                add(&["--allow", &format!("mcp__{MCP_SERVER}")]);
+            }
         }
         AiProviderId::Antigravity => {
             add(&["--input-format", "stream-json", "--output-format", "stream-json"]);
@@ -354,6 +358,9 @@ pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
             }
             if full(req) {
                 add(&["--mode", "accept-edits"]);
+            }
+            if mcp {
+                add(&["--settings", super::cli_mcp::AGY_SETTINGS_FILE]);
             }
         }
         _ => {}
@@ -376,9 +383,10 @@ const MCP_TOOL_TIMEOUT_SECS: u64 = 3600;
 /// CLIs that load the app's MCP server for a run; the others keep the `mangavox` text-block
 /// protocol. Grok (1.0.70) loads a project's MCP servers only in a folder the user trusted (which
 /// would mean writing to `~/.grok`), and Antigravity (1.4.12) only from its global config or a
-/// plugin, so neither has a per-run way in.
+/// plugin, so neither has a per-run way in: they get the app's tools only once the user opted in
+/// (a global `mangavox` entry that runs the app's stdio bridge, see [`super::cli_mcp`]).
 pub fn supports_mcp(id: AiProviderId) -> bool {
-    matches!(id, AiProviderId::ClaudeCode | AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::Opencode)
+    matches!(id, AiProviderId::ClaudeCode | AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::Opencode) || super::cli_mcp::bridge_on(id)
 }
 
 /// This run loads the app's MCP server (an agent turn with an endpoint, on a CLI that can).
@@ -417,6 +425,9 @@ pub fn mcp_setup(req: &AiStepRequest) -> McpSetup {
             let cfg = json!({ "mcp": { MCP_SERVER: { "type": "remote", "url": ep.url, "headers": { "Authorization": bearer }, "enabled": true } } });
             s.env.push(("OPENCODE_CONFIG_CONTENT".into(), cfg.to_string()));
         }
+        // Grok and Antigravity reach the endpoint through the bridge, which reads the file the
+        // turn publishes; Antigravity takes its tool approvals from a run settings file.
+        AiProviderId::Antigravity => s.files.push((super::cli_mcp::AGY_SETTINGS_FILE.into(), super::cli_mcp::agy_settings())),
         _ => {}
     }
     s
@@ -1288,9 +1299,37 @@ mod tests {
         let mut lean = mcp_req(AiProviderId::ClaudeCode);
         lean.lean = true;
         assert!(!uses_mcp(&lean) && mcp_setup(&lean) == McpSetup::default());
+        // Grok and Antigravity only once the user opted in.
+        super::super::cli_mcp::FORCE_ON.with(|f| f.set(Some(false)));
         for id in [AiProviderId::Ollama, AiProviderId::GrokCli, AiProviderId::Antigravity] {
             assert!(!supports_mcp(id) && cli_args(&mcp_req(id)) == cli_args(&AiStepRequest { mcp: None, ..mcp_req(id) }));
+            assert_eq!(mcp_setup(&mcp_req(id)), McpSetup::default());
         }
+    }
+
+    #[test]
+    fn grok_and_antigravity_use_the_bridge_once_opted_in() {
+        use super::super::cli_mcp::{AGY_SETTINGS_FILE, FORCE_ON};
+        FORCE_ON.with(|f| f.set(Some(true)));
+        let has = |a: &[String], w: &[&str]| a.windows(w.len()).any(|x| x == w);
+        assert!(!supports_mcp(AiProviderId::Ollama) && !supports_mcp(AiProviderId::Gemini));
+        let grok = mcp_req(AiProviderId::GrokCli);
+        assert!(supports_mcp(AiProviderId::GrokCli) && uses_mcp(&grok));
+        let a = cli_args(&grok);
+        assert!(has(&a, &["--allow", "mcp__mangavox"]) && a.iter().all(|x| safe_arg(x)) && !a.iter().any(|x| x.contains("s3cret")));
+        // The bridge finds the endpoint itself: nothing per run.
+        assert_eq!(mcp_setup(&grok), McpSetup::default());
+        let agy = mcp_req(AiProviderId::Antigravity);
+        assert!(uses_mcp(&agy));
+        let a = cli_args(&agy);
+        assert!(has(&a, &["--settings", AGY_SETTINGS_FILE]) && a.iter().all(|x| safe_arg(x)));
+        let s = mcp_setup(&agy);
+        assert!(s.env.is_empty() && s.files[0].0 == AGY_SETTINGS_FILE && !s.files[0].1.contains("s3cret"));
+        // A lean step or a turn without a server stays on the text protocol.
+        let lean = AiStepRequest { lean: true, ..mcp_req(AiProviderId::GrokCli) };
+        assert!(!uses_mcp(&lean) && !cli_args(&lean).contains(&"--allow".to_string()));
+        assert!(!cli_args(&AiStepRequest { mcp: None, ..mcp_req(AiProviderId::Antigravity) }).contains(&"--settings".to_string()));
+        FORCE_ON.with(|f| f.set(None));
     }
 
     #[test]

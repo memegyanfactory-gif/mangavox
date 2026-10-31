@@ -64,6 +64,11 @@ fn wait_for_exit(pid: u32) -> bool {
 }
 
 fn main() {
+    // Grok / Antigravity start `mangavox.exe --mcp-bridge` as a stdio MCP server once the user opted
+    // in: forward to the running assistant turn, with no window, GPU or data-folder upkeep.
+    if std::env::args().nth(1).as_deref() == Some(ui_assistant::mcp_bridge::FLAG) {
+        std::process::exit(ui_assistant::mcp_bridge::run());
+    }
     // Settings → Apps → Uninstall runs `mangavox.exe --uninstall` (user data in ~/.mangavox stays).
     if std::env::args().any(|a| a == "--uninstall") {
         if let Err(e) = mv_update::uninstall() {

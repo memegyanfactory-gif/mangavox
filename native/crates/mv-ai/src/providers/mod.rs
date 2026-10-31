@@ -3,6 +3,7 @@
 
 pub mod anthropic;
 pub mod cli;
+pub mod cli_mcp;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;

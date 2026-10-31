@@ -432,6 +432,16 @@ async fn run_mcp<R: StepRunner, T: ToolRunner>(runner: &R, turn: &Turn<'_, T>, h
             return None;
         }
     };
+    // Grok and Antigravity reach the server through the app's stdio bridge, which finds it in a
+    // file for as long as this turn runs. If that fails the CLI lists no tools and the check
+    // below falls back to the text protocol.
+    let _published = match mv_ai::providers::cli_mcp::bridged(p.provider).then(|| server.publish()) {
+        Some(Err(e)) => {
+            let _ = tx.unbounded_send(AgentEvent::Delta(StreamEvent::Status { text: format!("Could not publish the app's tools for this agent ({e})") }));
+            None
+        }
+        other => other.and_then(Result::ok),
+    };
     let _ = tx.unbounded_send(AgentEvent::Round(0));
     let delta_tx = tx.clone();
     let emit = emit_fn(move |ev| {

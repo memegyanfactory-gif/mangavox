@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui_kit::*;
+use mv_ai::providers::cli_mcp::{self, BridgeEntry};
 use mv_ai::AiProviderId;
 use mv_core::config::Config;
 use serde_json::{json, Value};
@@ -111,6 +112,10 @@ pub struct CliInfo {
     pub busy: bool,
     /// (ok, text) of the last update run.
     pub result: Option<(bool, String)>,
+    /// Grok / Antigravity: the `mangavox` entry in the CLI's own MCP settings (the opt-in to the app's tools).
+    pub bridge: Option<BridgeEntry>,
+    pub bridge_busy: bool,
+    pub bridge_error: Option<String>,
 }
 
 impl CliInfo {
@@ -173,7 +178,8 @@ pub async fn check_one(s: &'static CliSpec) -> CliInfo {
             Latest::Unknown => None,
         }
     };
-    CliInfo { id: s.id, installed, latest, ..Default::default() }
+    let bridge = if cli_mcp::bridged(s.provider) { cli_mcp::entry(s.provider) } else { None };
+    CliInfo { id: s.id, installed, latest, bridge, ..Default::default() }
 }
 
 async fn check_all() -> Vec<CliInfo> {
@@ -297,7 +303,7 @@ impl CliUpdates {
     fn apply_check(&mut self, infos: Vec<CliInfo>, cx: &mut Context<Self>) {
         for new in infos {
             if let Some(old) = self.info_mut(new.id) {
-                *old = CliInfo { busy: old.busy, result: old.result.take(), ..new };
+                *old = CliInfo { busy: old.busy, result: old.result.take(), bridge_busy: old.bridge_busy, bridge_error: old.bridge_error.take(), ..new };
             }
         }
         self.checking = false;
@@ -359,6 +365,39 @@ impl CliUpdates {
             }
         }
         cx.notify();
+    }
+
+    /// Adds (`on`) or removes the `mangavox` entry in Grok's / Antigravity's own MCP settings,
+    /// pointing at this exe in bridge mode. Only ever run from the user's click.
+    pub fn set_bridge(&mut self, id: &'static str, on: bool, cx: &mut Context<Self>) {
+        let Some(s) = spec(id).filter(|s| cli_mcp::bridged(s.provider)) else { return };
+        let Some(item) = self.info_mut(id) else { return };
+        if item.bridge_busy {
+            return;
+        }
+        item.bridge_busy = true;
+        item.bridge_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let r = mv_ui::bg::run(async move {
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                cli_mcp::set_bridge(s.provider, on, &exe).await.map_err(|e| e.to_string())?;
+                Ok::<_, String>(())
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            let entry = mv_ui::bg::blocking(move || cli_mcp::entry(s.provider)).await.ok().flatten();
+            this.update(cx, |t, cx| {
+                if let Some(item) = t.info_mut(s.id) {
+                    item.bridge_busy = false;
+                    item.bridge = entry;
+                    item.bridge_error = r.err();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn set_auto_update(&mut self, on: bool, cx: &mut Context<Self>) {
