@@ -54,6 +54,12 @@ pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView>
     vedit_tools::register();
     match route {
         Route::Studio => Some(cx.new(|cx| page::StudioPage::new(window, cx)).into()),
+        Route::Thumbnails => Some(cx.new(ytpack::ThumbnailsPage::new).into()),
         _ => None,
     }
+}
+
+/// Settings › Magnific: the API key, the thumbnail defaults and the credits spent.
+pub fn magnific_settings(window: &mut Window, cx: &mut App) -> AnyView {
+    ytpack::magnific_settings(window, cx)
 }

@@ -5,9 +5,16 @@
 //! Saved per manga in `studio/<manga>/youtube_package.json`.
 mod assist;
 mod logic;
+mod magnific;
+mod magnific_settings;
 mod scrape;
+mod thumb_page;
+mod thumb_view;
+mod thumbs;
 
 pub(crate) use assist::{has_title, register_tools};
+pub(crate) use magnific_settings::create as magnific_settings;
+pub(crate) use thumb_page::ThumbnailsPage;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -432,6 +439,15 @@ impl Render for YtPackage {
                     .tooltip("Title, description and thumbnail idea from the model picked at the top, based on what performs best")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.suggest(cx))),
             )
+            .child({
+                let id = self.manga_id.clone();
+                btn("ytp-thumbs", "Make thumbnails", ButtonKind::Secondary).small().icon(ph::IMAGES).tooltip("Open Studio › Thumbnails on this manga (Magnific)").on_click(move |_, window, cx| {
+                    let mut p = magnific::Prefs::load();
+                    p.manga = id.clone();
+                    p.save();
+                    mv_ui::navigate(mv_ui::Route::Thumbnails, window, cx);
+                })
+            })
             .child(
                 icon_button("ytp-toggle", if self.open { ph::CARET_UP } else { ph::CARET_DOWN }, if self.open { "Hide" } else { "Show" }).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.open = !this.open;

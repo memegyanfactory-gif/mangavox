@@ -69,6 +69,7 @@ pub enum Tab {
     Storage,
     System,
     Studio,
+    Magnific,
     About,
 }
 
@@ -82,7 +83,7 @@ const GROUPS: &[(&str, &[Tab])] = &[
 ];
 
 /// Shown only while Studio mode is on.
-const STUDIO_GROUP: (&str, &[Tab]) = ("Studio", &[Tab::Studio]);
+const STUDIO_GROUP: (&str, &[Tab]) = ("Studio", &[Tab::Studio, Tab::Magnific]);
 
 const HELP_URL: &str = "https://github.com/memegyanfactory-gif/mangavox/issues";
 
@@ -105,6 +106,7 @@ impl Tab {
             "models" | "model-library" => Tab::Models,
             "cli-tools" | "cli" => Tab::CliTools,
             "studio" => Tab::Studio,
+            "magnific" | "thumbnails" => Tab::Magnific,
             "about" => Tab::About,
             _ => return None,
         })
@@ -125,6 +127,7 @@ impl Tab {
             Tab::Models => "models",
             Tab::CliTools => "cli-tools",
             Tab::Studio => "studio",
+            Tab::Magnific => "magnific",
             Tab::About => "about",
         }
     }
@@ -144,6 +147,7 @@ impl Tab {
             Tab::Models => "Model Library",
             Tab::CliTools => "CLI tools",
             Tab::Studio => "Studio",
+            Tab::Magnific => "Magnific",
             Tab::About => "About",
         }
     }
@@ -163,6 +167,7 @@ impl Tab {
             Tab::Models => "Models on this PC and what MangaVox uses them for.",
             Tab::CliTools => "Installed coding-agent CLIs, their versions and updates.",
             Tab::Studio => "Defaults for narration and video output in Studio projects.",
+            Tab::Magnific => "The Magnific API key for Studio's thumbnail generator, the default model and size, and the credits Studio has spent.",
             Tab::About => "Version, data folder and links.",
         }
     }
@@ -184,6 +189,7 @@ impl Tab {
             Tab::Models => glyphs::MODEL,
             Tab::CliTools => ph::TERMINAL_WINDOW,
             Tab::Studio => glyphs::STUDIO,
+            Tab::Magnific => ph::IMAGES,
             Tab::About => ph::INFO,
         }
     }
@@ -204,6 +210,7 @@ impl Tab {
             Tab::Storage => Hue::Blue,
             Tab::System => Hue::Green,
             Tab::Studio => Hue::Violet,
+            Tab::Magnific => Hue::Rose,
             Tab::About => Hue::Slate,
         }
     }
@@ -224,6 +231,7 @@ impl Tab {
             Tab::Models => "gguf ollama whisper comfyui local models engines",
             Tab::CliTools => "claude code codex gemini cli update terminal grok antigravity mcp app tools",
             Tab::Studio => "resolution speed default voice video export",
+            Tab::Magnific => "api key thumbnail thumbnails image generator magnific freepik nano banana credits",
             Tab::About => "version update licence github bug report",
         }
     }
@@ -236,7 +244,7 @@ impl Tab {
 
     /// Tabs whose body is an embedded panel from another crate.
     fn is_panel(self) -> bool {
-        matches!(self, Tab::Sources | Tab::Addons | Tab::Providers)
+        matches!(self, Tab::Sources | Tab::Addons | Tab::Providers | Tab::Magnific)
     }
 }
 
@@ -416,7 +424,7 @@ impl SettingsView {
         // The rail's Studio group follows the live mode flag.
         let obs = cx.observe_global::<mv_ui::mode::StudioMode>(|this, cx| {
             this.mode = if mv_ui::mode::studio_enabled(cx) { "studio" } else { "entertainment" }.into();
-            if this.mode != "studio" && this.tab == Tab::Studio {
+            if this.mode != "studio" && matches!(this.tab, Tab::Studio | Tab::Magnific) {
                 this.tab = Tab::Mode;
             }
             cx.notify();
@@ -543,6 +551,7 @@ impl SettingsView {
         let view = match tab {
             Tab::Sources => ui_manga::sources_panel(window, cx),
             Tab::Addons => ui_media::addons_panel(window, cx),
+            Tab::Magnific => ui_studio::magnific_settings(window, cx),
             _ => ui_assistant::providers_panel(window, cx),
         };
         self.panels.insert(tab, view);

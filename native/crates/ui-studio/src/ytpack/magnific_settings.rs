@@ -1,0 +1,300 @@
+//! Settings › Magnific: the API key (paste, test, remove), the thumbnail generator's default
+//! model and size, and the credits Studio has spent.
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use mv_ui::{icon_ph, segmented, setting_row, setting_section, Route};
+
+use super::magnific::{self, Usage, CATALOG};
+use super::thumb_page::notify_changed;
+use super::*;
+
+const ASPECTS: [&str; 4] = ["16:9", "9:16", "1:1", "4:3"];
+
+#[derive(Clone, PartialEq)]
+enum Check {
+    Idle,
+    Checking,
+    Ok,
+    Failed(String),
+}
+
+pub(crate) struct MagnificSettings {
+    key_input: Entity<InputState>,
+    budget: Entity<InputState>,
+    check: Check,
+    prefs: magnific::Prefs,
+    usage: Usage,
+    _subs: Vec<Subscription>,
+}
+
+pub(crate) fn create(window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|cx| MagnificSettings::new(window, cx)).into()
+}
+
+/// "MSa1…24d" for a saved key.
+fn masked(k: &str) -> String {
+    let n = k.chars().count();
+    if n <= 8 {
+        return "••••".into();
+    }
+    format!("{}…{}", k.chars().take(4).collect::<String>(), k.chars().skip(n - 4).collect::<String>())
+}
+
+impl MagnificSettings {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let key_input = cx.new(|cx| InputState::new(window, cx).placeholder(if magnific::key().is_some() { "Paste a new key to replace it" } else { "Paste your Magnific API key" }).masked(true));
+        let usage = Usage::load();
+        let budget = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 10000"));
+        if let Some(b) = usage.budget {
+            budget.update(cx, |s, cx| s.set_value(b.to_string(), window, cx));
+        }
+        let subs = vec![
+            cx.subscribe_in(&key_input, window, |this, _, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    this.save_key(window, cx);
+                }
+            }),
+            cx.subscribe_in(&budget, window, |this, input, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    let v: String = input.read(cx).value().chars().filter(|c| c.is_ascii_digit()).collect();
+                    this.usage = Usage::load();
+                    this.usage.budget = v.parse().ok();
+                    this.usage.save();
+                    notify_changed(cx);
+                    cx.notify();
+                }
+            }),
+        ];
+        MagnificSettings { key_input, budget, check: Check::Idle, prefs: magnific::Prefs::load(), usage, _subs: subs }
+    }
+
+    fn save_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let k = self.key_input.read(cx).value().trim().to_string();
+        if k.is_empty() {
+            return;
+        }
+        if let Err(e) = magnific::set_key(Some(&k)) {
+            self.check = Check::Failed(format!("Could not save the key: {e:#}"));
+            cx.notify();
+            return;
+        }
+        self.key_input.update(cx, |s, cx| s.set_value("", window, cx));
+        notify_changed(cx);
+        self.test(cx);
+    }
+
+    fn test(&mut self, cx: &mut Context<Self>) {
+        let Some(k) = magnific::key() else { return };
+        self.check = Check::Checking;
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::run(async move { magnific::verify(&k).await }).await.and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.check = match res {
+                    Ok(()) => Check::Ok,
+                    Err(e) => Check::Failed(format!("{e:#}")),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn remove_key(&mut self, cx: &mut Context<Self>) {
+        let _ = magnific::set_key(None);
+        self.check = Check::Idle;
+        notify_changed(cx);
+        toast::show(cx, Toast::info("Magnific key removed"));
+        cx.notify();
+    }
+
+    fn set_prefs(&mut self, f: impl FnOnce(&mut magnific::Prefs), cx: &mut Context<Self>) {
+        self.prefs = magnific::Prefs::load();
+        f(&mut self.prefs);
+        self.prefs.save();
+        notify_changed(cx);
+        cx.notify();
+    }
+
+    fn key_section(&self, cx: &mut Context<Self>) -> Div {
+        let key = magnific::key();
+        let from_env = key.is_some() && std::fs::metadata(mv_core::paths::studio().join("magnific.json")).is_err();
+        let (tone, text) = match (&key, &self.check) {
+            (None, _) => (Tone::Neutral, "Not connected".to_string()),
+            (Some(_), Check::Checking) => (Tone::Info, "Checking…".to_string()),
+            (Some(_), Check::Ok) => (Tone::Success, "Connected".to_string()),
+            (Some(_), Check::Failed(_)) => (Tone::Danger, "Not working".to_string()),
+            (Some(_), Check::Idle) => (Tone::Accent, "Saved".to_string()),
+        };
+        let status = div()
+            .flex()
+            .items_center()
+            .gap(px(space::SM))
+            .child(badge(text, tone))
+            .when_some(key.as_deref().map(masked), |d, m| d.child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(m)))
+            .when(key.is_some(), |d| {
+                d.child(btn("mg-test", "Test", ButtonKind::Secondary).small().icon(ph::PLUGS_CONNECTED).loading(self.check == Check::Checking).tooltip("Checks the key with Magnific; costs no credits").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.test(cx))))
+                    .when(!from_env, |d| d.child(btn("mg-remove", "Remove", ButtonKind::DangerGhost).small().icon(ph::TRASH).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.remove_key(cx)))))
+            });
+        let error = match &self.check {
+            Check::Failed(e) => Some(div().text_size(px(size::SM)).text_color(Tokens::danger()).whitespace_normal().child(e.clone())),
+            _ => None,
+        };
+        setting_section("API key", Some("From magnific.com → Developers → API key. Kept on this computer in Studio's data folder, never in the project or sent anywhere but Magnific.".into()))
+            .child(setting_row("Status", if from_env { "From the MAGNIFIC_API_KEY environment variable" } else { "" }, status))
+            .children(error)
+            .child(divided(setting_row(
+                if key.is_some() { "Replace key" } else { "API key" },
+                "Press Enter or Save; Studio checks it right away.",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(space::SM))
+                    .child(div().w(px(300.)).child(Input::new(&self.key_input).mask_toggle()))
+                    .child(btn("mg-save", "Save", ButtonKind::Primary).icon(ph::CHECK).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_key(window, cx)))),
+            )))
+            .child(divided(setting_row(
+                "Get a key",
+                "Magnific bills API images in credits from its API balance.",
+                btn("mg-get", "Open Magnific", ButtonKind::Ghost).icon(ph::ARROW_SQUARE_OUT).on_click(|_, _, cx| cx.open_url("https://www.magnific.com/developers/dashboard/api-key")),
+            )))
+    }
+
+    fn defaults_section(&self, cx: &mut Context<Self>) -> Div {
+        let model = CATALOG.iter().position(|m| m.id == self.prefs.model).unwrap_or(0);
+        let m = &CATALOG[model];
+        let aspect = ASPECTS.iter().position(|a| *a == self.prefs.aspect).unwrap_or(0);
+        let this = cx.entity().downgrade();
+        let this2 = this.clone();
+        let mut list = div().flex().flex_col().gap(px(2.)).w_full();
+        for (i, mm) in CATALOG.iter().enumerate() {
+            let on = i == model;
+            list = list.child(
+                div()
+                    .id(("mg-model", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(space::SM))
+                    .h(px(34.))
+                    .px(px(space::MD))
+                    .rounded(px(radius::MD))
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(Tokens::active()))
+                    .hover(|s| s.bg(Tokens::hover()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_prefs(
+                            |p| {
+                                p.model = mm.id.to_string();
+                                if !mm.resolutions.contains(&p.resolution.as_str()) {
+                                    p.resolution = mm.resolutions.first().unwrap_or(&"1K").to_string();
+                                }
+                            },
+                            cx,
+                        )
+                    }))
+                    .child(ph_icon(if on { ph::RADIO_BUTTON } else { ph::RADIO_BUTTON }, if on { Weight::Fill } else { Weight::Regular }, if on { Tokens::accent() } else { Tokens::text_3() }, icon_px::SM))
+                    .child(div().w(px(220.)).truncate().text_size(px(size::SM)).text_color(Tokens::text_1()).child(mm.name))
+                    .child(div().w(px(110.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(if mm.refs > 0 { format!("{} refs", mm.refs) } else { "no refs".into() }))
+                    .child(div().w(px(90.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(mm.res_label()))
+                    .child(div().flex_1().text_size(px(size::XS)).text_color(Tokens::text_2()).child(match mm.credits {
+                        Some((lo, hi)) if lo == hi => format!("{lo} credits"),
+                        Some((lo, hi)) => format!("{lo} - {hi} credits"),
+                        None => "credits (no listed price)".into(),
+                    }))
+                    .when_some(mm.web_unlimited, |d, r| d.child(div().id(("mg-unl", i)).flex().items_center().gap(px(3.)).tooltip(tip("Unlimited in the Magnific web app on your plan; the API still bills credits")).child(icon_ph(ph::INFINITY, Tokens::info(), icon_px::XS)).child(div().text_size(px(size::XS)).text_color(Tokens::info()).child(format!("Web · {r}"))))),
+            );
+        }
+        let res_items: Vec<&'static str> = m.resolutions.to_vec();
+        let res_ix = res_items.iter().position(|r| *r == self.prefs.resolution).unwrap_or(0);
+        setting_section("Defaults", Some("What the Thumbnails page starts with. Every model here is offered by the Magnific API; the ones shown only in the web app are left out.".into()))
+            .child(setting_row(
+                "Aspect",
+                "16:9 for YouTube; 9:16 for Shorts.",
+                segmented("mg-aspect", ASPECTS, aspect).small().on_change(move |ix, _, cx| {
+                    let _ = this.update(cx, |this, cx| this.set_prefs(|p| p.aspect = ASPECTS[*ix].to_string(), cx));
+                }),
+            ))
+            .when(!res_items.is_empty(), |d| {
+                d.child(divided(setting_row(
+                    "Resolution",
+                    format!("{}: {}", m.name, res_items.iter().map(|r| format!("{r}{}", m.cost_label(r))).collect::<Vec<_>>().join(", ")),
+                    segmented("mg-res", res_items.clone(), res_ix).small().on_change(move |ix, _, cx| {
+                        let r = res_items[*ix];
+                        let _ = this2.update(cx, |this, cx| this.set_prefs(|p| p.resolution = r.to_string(), cx));
+                    }),
+                )))
+            })
+            .child(div().pt(px(space::SM)).pb(px(4.)).text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child("Model"))
+            .child(list)
+    }
+
+    fn credits_section(&self, cx: &mut Context<Self>) -> Div {
+        let u = &self.usage;
+        let left = u.budget.map(|b| (b as f64 - u.spent).max(0.));
+        let p = u.budget.map(|b| (u.spent / b.max(1) as f64) as f32).unwrap_or(0.);
+        let summary = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .w(px(320.))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(space::SM))
+                    .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(format!("{} used", u.spent.round())))
+                    .child(div().pb(px(3.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(match left {
+                        Some(l) => format!("{} left", l.round()),
+                        None => "set your plan's credits below".into(),
+                    })),
+            )
+            .child(mv_ui::progress_bar("mg-credits", p, false))
+            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{} images · {} this month · {} without a listed price", u.images, u.month_spent().round(), u.unpriced)));
+        setting_section("Credits", Some("Magnific's API has no balance endpoint, so Studio counts what it spends at Magnific's listed prices. Your exact balance is on magnific.com.".into()))
+            .child(setting_row("Spent by Studio", "", summary))
+            .child(divided(setting_row("Credits on your plan", "For \"left\" on the Thumbnails page.", div().w(px(160.)).child(Input::new(&self.budget)))))
+            .child(divided(setting_row(
+                "Balance and usage",
+                "",
+                div()
+                    .flex()
+                    .gap(px(space::SM))
+                    .child(btn("mg-dash", "Open dashboard", ButtonKind::Secondary).icon(ph::ARROW_SQUARE_OUT).on_click(|_, _, cx| cx.open_url("https://www.magnific.com/developers/dashboard")))
+                    .child(btn("mg-reset", "Reset count", ButtonKind::Ghost).icon(ph::ARROW_COUNTER_CLOCKWISE).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.usage = Usage { budget: this.usage.budget, ..Default::default() };
+                        this.usage.save();
+                        notify_changed(cx);
+                        cx.notify();
+                    }))),
+            )))
+    }
+}
+
+/// A row with the hairline above it.
+fn divided(row: Div) -> Div {
+    row.border_t_1().border_color(Tokens::border())
+}
+
+impl Render for MagnificSettings {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.usage = Usage::load();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(20.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(space::SM))
+                    .p(px(space::MD))
+                    .rounded(px(radius::LG))
+                    .bg(Tokens::info_soft())
+                    .child(icon_ph(ph::INFINITY, Tokens::info(), icon_px::SM))
+                    .child(div().flex_1().text_size(px(size::SM)).text_color(Tokens::text_1()).whitespace_normal().child("\"Unlimited\" on a Magnific plan only covers the web app. Every image Studio makes through the API costs credits from your API balance."))
+                    .child(btn("mg-open-page", "Open Thumbnails", ButtonKind::Secondary).small().icon(ph::IMAGES).on_click(|_, window, cx| mv_ui::navigate(Route::Thumbnails, window, cx))),
+            )
+            .child(self.key_section(cx))
+            .child(self.defaults_section(cx))
+            .child(self.credits_section(cx))
+    }
+}

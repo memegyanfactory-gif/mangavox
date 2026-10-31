@@ -163,7 +163,7 @@ phosphor! {
     MASK_HAPPY = "mask-happy", MASK_SAD = "mask-sad", GHOST = "ghost", SKULL = "skull", DETECTIVE = "detective",
     EAR = "ear", EYE = "eye", EYE_SLASH = "eye-slash", EYE_CLOSED = "eye-closed", HEART = "heart",
     HEART_STRAIGHT = "heart-straight", HEART_BREAK = "heart-break", HEARTBEAT = "heartbeat", STAR = "star",
-    STAR_FOUR = "star-four", STAR_HALF = "star-half", FIRE = "fire", LIGHTNING = "lightning", SPARKLE = "sparkle",
+    STAR_FOUR = "star-four", STAR_HALF = "star-half", FIRE = "fire", LIGHTNING = "lightning", SPARKLE = "sparkle", INFINITY = "infinity", COINS = "coins",
     MAGIC_WAND = "magic-wand", CROWN_SIMPLE = "crown-simple", TROPHY = "trophy", MEDAL = "medal", FLAG = "flag",
     SWORD = "sword", SHIELD = "shield", MOUNTAINS = "mountains", ROCKET_LAUNCH = "rocket-launch",
     THUMBS_UP = "thumbs-up", THUMBS_DOWN = "thumbs-down",

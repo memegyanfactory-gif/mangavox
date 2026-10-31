@@ -32,6 +32,8 @@ pub enum Route {
     YouTube,
     /// Studio suggestions: trending manga recaps on YouTube, what to recap next, the channel meter.
     Suggestions,
+    /// Studio thumbnails: Magnific image generation for a manga's YouTube thumbnails.
+    Thumbnails,
     // App
     Settings { tab: Option<String> },
     /// First-run setup (full window; also "Run welcome setup again" in Settings › About).

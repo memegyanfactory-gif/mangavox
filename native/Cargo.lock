@@ -9946,6 +9946,7 @@ name = "ui-studio"
 version = "8.0.5024"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "futures",
  "gpui-kit",
  "hound",

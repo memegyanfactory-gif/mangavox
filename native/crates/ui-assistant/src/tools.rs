@@ -191,6 +191,7 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::Studio => "studio",
         Route::YouTube => "youtube",
         Route::Suggestions => "suggestions",
+        Route::Thumbnails => "thumbnails",
         Route::Settings { .. } => "settings",
         Route::Welcome => "welcome",
         Route::Back => "back",
@@ -390,6 +391,7 @@ pub fn page_groups(route: Option<&Route>) -> &'static [Group] {
         Some(Route::Studio) => &[Group::Studio, Group::Video],
         Some(Route::YouTube) => &[Group::Youtube, Group::Studio],
         Some(Route::Suggestions) => &[Group::Studio, Group::Manga],
+        Some(Route::Thumbnails) => &[Group::Studio],
         Some(Route::Settings { .. } | Route::Welcome | Route::Mobile) => &[],
         Some(r) if section_name(r) != "manga" => &[Group::Media],
         _ => &[Group::Manga],
@@ -703,6 +705,7 @@ pub fn route_for_page(page: &str) -> Option<Route> {
         "mobile" => Route::Mobile,
         "youtube" => Route::YouTube,
         "suggestions" => Route::Suggestions,
+        "thumbnails" => Route::Thumbnails,
         "settings" => Route::Settings { tab: None },
         _ => return None,
     })
