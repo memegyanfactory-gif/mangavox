@@ -2,7 +2,11 @@
 
 use crate::types::{AiMessage, AiRole};
 
+/// Characters of earlier turns kept (newest first).
 const BUDGET: usize = 24_000;
+/// The latest message is the task itself (a whole chapter's reading is ~90k characters): it is
+/// sent whole up to this size (~100k tokens), never cut to the history budget.
+const LATEST_MAX: usize = 400_000;
 
 pub fn build_transcript(messages: &[AiMessage]) -> String {
     let system = messages.iter().filter(|m| m.role == AiRole::System).map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n\n");
@@ -25,18 +29,22 @@ pub fn build_transcript(messages: &[AiMessage]) -> String {
         };
         let is_latest = i == turns.len() - 1;
         let len = m.content.chars().count();
-        // Older turns that no longer fit are dropped whole; only the latest is ever shortened.
+        // Older turns that no longer fit are dropped whole; only the latest is ever shortened,
+        // and only past LATEST_MAX.
         if !is_latest && len > budget {
             break;
         }
-        let body = if len > budget {
-            let mut s: String = m.content.chars().take(budget).collect();
+        let cap = if is_latest { LATEST_MAX } else { budget };
+        let body = if len > cap {
+            let mut s: String = m.content.chars().take(cap).collect();
             s.push('…');
             s
         } else {
             m.content.clone()
         };
-        budget = budget.saturating_sub(body.chars().count().min(len));
+        if !is_latest {
+            budget = budget.saturating_sub(len);
+        }
         lines.push(format!("{who}: {body}"));
     }
     lines.reverse();
@@ -92,9 +100,18 @@ mod tests {
     }
 
     #[test]
-    fn latest_message_is_shortened_not_dropped() {
-        let out = build_transcript(&[AiMessage::user("y".repeat(30_000))]);
+    fn a_long_latest_message_is_sent_whole() {
+        // A whole chapter's reading: cutting it hid every page after ~33 from the story writer.
+        let chapter = "y".repeat(90_000);
+        let out = build_transcript(&[AiMessage::user("old"), AiMessage::assistant("x".repeat(30_000)), AiMessage::user(chapter.clone())]);
+        assert!(out.ends_with(&chapter));
+        assert!(!out.contains("xxxx"), "history still has its own budget");
+    }
+
+    #[test]
+    fn only_a_huge_latest_message_is_shortened() {
+        let out = build_transcript(&[AiMessage::user("y".repeat(LATEST_MAX + 10))]);
         assert!(out.ends_with('…'));
-        assert!(out.chars().count() < 24_100);
+        assert!(out.chars().count() < LATEST_MAX + 100);
     }
 }

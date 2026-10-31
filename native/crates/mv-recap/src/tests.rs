@@ -201,8 +201,8 @@ fn export_formats() {
     std::fs::write(panel_path(&ch, 1, 0), b"x").unwrap();
     let story = Story {
         segments: vec![
-            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None },
-            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }) },
+            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None, hook: false },
+            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }), hook: false },
         ],
         ..Default::default()
     };
@@ -310,8 +310,8 @@ async fn story_chunks_and_saves() {
     let s = &out[0].1;
     assert_eq!(s.title, "Duel");
     assert_eq!(s.segments, vec![
-        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None },
-        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None },
+        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None, hook: false },
+        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None, hook: false },
     ]);
     let req = story.seen.lock().unwrap();
     let sys = &req[0].messages[0].content;
@@ -345,7 +345,7 @@ fn saved_provider_messages_are_found() {
     use crate::store::provider_message_in;
     let note = "You've hit your session limit · resets 8am (Asia/Kolkata)";
     let read = |s: &str| ChapterRead { pages: vec![PageRead { index: 0, summary: s.into(), ..Default::default() }], ..Default::default() };
-    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None }], ..Default::default() };
+    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None, hook: false }], ..Default::default() };
     assert_eq!(provider_message_in(Some(&read(note)), Some(&story(note))), Some(Step::Read));
     assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story(note))), Some(Step::Story));
     assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story("He has no limit to his rage."))), None);
@@ -386,7 +386,7 @@ fn export_skips_silent_pages_and_blank_panels() {
     let panel = |chars: bool| Panel { bbox: None, description: String::new(), characters: if chars { vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }] } else { vec![] }, lines: vec![] };
     let read = ChapterRead { pages: vec![PageRead { index: 1, panels: vec![panel(false), panel(true)], ..Default::default() }], ..Default::default() };
     save_read(&ch, &read).unwrap();
-    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None }], ..Default::default() };
+    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None, hook: false }], ..Default::default() };
     export_for_pipeline(&ch, &story).unwrap();
     let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
     let b = beats["beats"].as_array().unwrap();
@@ -407,8 +407,57 @@ async fn story_sees_the_whole_chapter_and_remembers_it() {
     let seen = llm.seen.lock().unwrap();
     assert_eq!(seen.len(), 1, "one call for the whole chapter");
     assert!(seen[0].messages[1].content.contains("the whole chapter"));
-    assert!(seen[0].messages[1].content.contains("cold open"));
+    assert!(seen[0].messages[1].content.contains("IN MEDIAS RES"));
     let b = brain.lock().unwrap();
     assert_eq!(b.recaps[0].summary, "Ruko meets Kaito.");
     assert_eq!(b.recap_before("Chapter 2"), Some("Ruko meets Kaito."));
+}
+
+#[tokio::test]
+async fn story_opens_in_medias_res_and_finishes_what_it_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 2);
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
+    // The first answer opens on page 2's twist, then stops after page 1: the rest is asked for.
+    let llm = Fake::new(&[
+        r#"{"title":"T","summary_so_far":"s","segments":[{"page":2,"panel":1,"hook":true,"text":"Kaito names himself."},{"page":1,"panel":1,"text":"Ruko meets a stranger."}]}"#,
+        r#"{"summary_so_far":"s2","segments":[{"page":2,"panel":1,"hook":true,"text":"Only the opening is a hook."},{"page":2,"panel":1,"text":"The stranger is Kaito."}]}"#,
+    ]);
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    let segs: Vec<(usize, bool, &str)> = out[0].1.segments.iter().map(|s| (s.page, s.hook, s.text.as_str())).collect();
+    assert_eq!(segs, vec![(1, true, "Kaito names himself."), (0, false, "Ruko meets a stranger."), (1, false, "Only the opening is a hook."), (1, false, "The stranger is Kaito.")]);
+    {
+        let seen = llm.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].messages[1].content.contains("LENGTH TARGET: about 200 words (2 lines"), "{}", seen[0].messages[1].content);
+        let again = &seen[1].messages[1].content;
+        assert!(again.contains("pages 2-2") && again.contains("LAST LINES ALREADY SPOKEN") && again.contains("Ruko meets a stranger."), "{again}");
+    }
+
+    // The hook is voiced first, on the first narrated page, showing page 2.
+    export_for_pipeline(&ch, &out[0].1).unwrap();
+    let script: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("script_edited.json")).unwrap()).unwrap();
+    assert_eq!(script[0]["text"], "Kaito names himself. Ruko meets a stranger.");
+    assert_eq!(script[1]["text"], "Only the opening is a hook. The stranger is Kaito.");
+    let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
+    let first = &beats["beats"][0];
+    assert_eq!(first["page"], 0);
+    let img = first["panel_image"].as_str().unwrap();
+    assert!(img.contains("p0001_") || img.ends_with("page2.png"), "{img}");
+}
+
+#[test]
+fn length_follows_what_the_chapter_says_and_the_cast_flags_looks() {
+    use crate::story::{cast_text, length_target};
+    assert_eq!((length_target(10), length_target(208), length_target(2000)), (200, 600, 1400));
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = Brain::load_in(dir.path().to_path_buf(), "m1", "T");
+    for (name, n, aliases) in [("Mujin", 50, vec!["Brown-haired young man", "Muj"]), ("Bald elder with glasses", 9, vec![]), ("Crying bald boy", 1, vec![])] {
+        b.characters.push(Character { id: name.into(), name: name.into(), aliases: aliases.into_iter().map(String::from).collect(), appearances: n, ..Default::default() });
+    }
+    let cast = cast_text(&b);
+    assert!(cast.starts_with("- Mujin (also called: Muj)"), "{cast}");
+    assert!(cast.contains("Not named yet:\n- \"Bald elder with glasses\" (known only by looks)"), "{cast}");
+    assert!(!cast.contains("Crying bald boy"), "one-off extras are left out");
 }

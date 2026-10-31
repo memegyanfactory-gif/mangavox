@@ -63,9 +63,14 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
     let mut script: Vec<Value> = vec![];
     let mut beats: Vec<Value> = vec![];
 
+    // The in-medias-res opening is voiced first, on the first narrated page, over its own panels.
+    let said = |s: &&StorySegment| !s.text.trim().is_empty();
+    let opening = story.segments.iter().filter(said).filter(|s| !s.hook).map(|s| s.page).min().or_else(|| story.segments.iter().filter(said).map(|s| s.page).min());
+
     for page in 0..page_count {
         let page_img = pages.get(page).map(|p| abs(p));
-        let segs: Vec<&StorySegment> = story.segments.iter().filter(|s| s.page == page && !s.text.trim().is_empty()).collect();
+        let hook = story.segments.iter().filter(said).filter(|s| s.hook && Some(page) == opening);
+        let segs: Vec<&StorySegment> = hook.chain(story.segments.iter().filter(said).filter(|s| !s.hook && s.page == page)).collect();
         let text = segs.iter().map(|s| s.text.trim()).collect::<Vec<_>>().join(" ");
         script.push(json!({ "page": page, "text": text }));
 
@@ -74,9 +79,10 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
             continue;
         }
         for s in segs {
-            let (panel, image) = match pick_panel(ch, read.as_ref(), page, s.panel, &mut blank) {
+            // A hook line shows its own page's panel while it is voiced on this page.
+            let (panel, image) = match pick_panel(ch, read.as_ref(), s.page, s.panel, &mut blank) {
                 Some((n, p)) => (json!(p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| n.to_string())), Some(abs(&p))),
-                None => (Value::Null, page_img.clone()),
+                None => (Value::Null, pages.get(s.page).map(|p| abs(p))),
             };
             let mut beat = json!({ "page": page, "panel": panel, "panel_image": image, "text": s.text.trim() });
             // The user's direction for this passage (narration_tts.build_plan: a beat's own

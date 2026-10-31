@@ -142,6 +142,10 @@ pub struct StorySegment {
     /// page's scene (read.json). Exported on the passage's beat, where the narration reads it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<Delivery>,
+    /// Part of the in-medias-res opening of the recap's first chapter: spoken first (on the
+    /// chapter's first narrated page) while showing its own page and panel.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hook: bool,
 }
 
 /// Narrator direction for one passage: a scene kind the emotion mapping knows
