@@ -49,6 +49,7 @@ pub(crate) fn request(m: &ModelChoice, messages: Vec<AiMessage>, images: Vec<Pat
         images,
         workspace,
         lean: true,
+        mcp: None,
     }
 }
 

@@ -293,6 +293,7 @@ async fn ask(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiProviderId
             images: Vec::new(),
             workspace: None,
             lean: true,
+            mcp: None,
         };
         let r = reg.run_step_cancellable(req, mv_ai::emit_noop(), mv_ai::CancellationToken::new()).await;
         if let Some(e) = r.error {

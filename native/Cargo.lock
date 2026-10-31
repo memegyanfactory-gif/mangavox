@@ -9805,6 +9805,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures",
+ "getrandom 0.3.4",
  "gpui-kit",
  "mv-ai",
  "mv-core",

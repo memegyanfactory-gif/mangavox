@@ -15,9 +15,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 futures = "0.3"
 sysinfo = "0.31"
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util", "sync"] }
+# The MCP server token (already in the lockfile).
+getrandom = "0.3"
 # Local dates for the chat-history groups (Today, Yesterday...); already in the lockfile via mv-core and ui-manga.
 chrono = "0.4"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"] }

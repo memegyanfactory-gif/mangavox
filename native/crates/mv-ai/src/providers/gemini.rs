@@ -249,6 +249,7 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":"it up."},{"fun
             images: vec![],
             workspace: None,
             lean: false,
+            mcp: None,
         };
         let b = build_body(&req);
         assert_eq!(b["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096);
@@ -279,6 +280,7 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":"it up."},{"fun
             images: vec![],
             workspace: None,
             lean: false,
+            mcp: None,
         };
         let b = build_body_with(&req, &[ImageData { mime: "image/jpeg", b64: "QUJD".into() }]);
         assert_eq!(b["contents"][0]["parts"][0], json!({"inline_data":{"mime_type":"image/jpeg","data":"QUJD"}}));

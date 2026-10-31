@@ -90,8 +90,14 @@ pub fn build_body_with(req: &AiStepRequest, images: &[ImageData]) -> Value {
         "stream": true,
         "messages": messages,
     });
+    // Prompt caching: the tool list, the system prompt and the conversation so far are cache
+    // breakpoints, so the rounds of one turn (and the next turn within minutes) re-read them at a
+    // tenth of the price instead of paying for them again.
     if !system.is_empty() {
-        body["system"] = json!(system);
+        body["system"] = json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }]);
+    }
+    if let Some(last) = messages_last_block(&mut body) {
+        last["cache_control"] = json!({ "type": "ephemeral" });
     }
     if is_adaptive_model(&req.model) {
         body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
@@ -104,8 +110,21 @@ pub fn build_body_with(req: &AiStepRequest, images: &[ImageData]) -> Value {
             .iter()
             .map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.parameters, "eager_input_streaming": true }))
             .collect();
+        if let Some(last) = body["tools"].as_array_mut().and_then(|t| t.last_mut()) {
+            last["cache_control"] = json!({ "type": "ephemeral" });
+        }
     }
     body
+}
+
+/// The last content block of the last message when that message is the user's (a text or a
+/// tool result; assistant thinking blocks cannot carry a breakpoint).
+fn messages_last_block(body: &mut Value) -> Option<&mut Value> {
+    let last = body["messages"].as_array_mut()?.last_mut()?;
+    if last["role"] != "user" {
+        return None;
+    }
+    last["content"].as_array_mut()?.last_mut()
 }
 
 #[derive(Default)]
@@ -129,7 +148,14 @@ impl AnthropicAcc {
     pub fn feed(&mut self, ev: &Value, emit: &Emit) -> Result<()> {
         let idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0);
         match ev.get("type").and_then(Value::as_str).unwrap_or("") {
-            "message_start" => self.input_tokens = ev.pointer("/message/usage/input_tokens").and_then(Value::as_u64),
+            // With prompt caching `input_tokens` is only the uncached part: cache writes and reads
+            // are input too (counted once each, as Claude Code's own totals are).
+            "message_start" => {
+                self.input_tokens = ev.pointer("/message/usage/input_tokens").and_then(Value::as_u64).map(|n| {
+                    let u = |k: &str| ev.pointer(&format!("/message/usage/{k}")).and_then(Value::as_u64).unwrap_or(0);
+                    n + u("cache_creation_input_tokens") + u("cache_read_input_tokens")
+                })
+            }
             "content_block_start" => {
                 let block = ev.get("content_block").and_then(Value::as_object).cloned().unwrap_or_default();
                 self.blocks.insert(idx, (block, String::new()));
@@ -367,6 +393,7 @@ data: {"type":"message_stop"}
             images: vec![],
             workspace: None,
             lean: false,
+            mcp: None,
         }
     }
 
@@ -375,7 +402,7 @@ data: {"type":"message_stop"}
         let b = build_body(&req("claude-sonnet-5-5"));
         assert_eq!(b["thinking"], json!({"type":"adaptive","display":"summarized"}));
         assert_eq!(b["output_config"], json!({"effort":"high"}));
-        assert_eq!(b["system"], "sys");
+        assert_eq!(b["system"][0]["text"], "sys");
         assert_eq!(b["tools"][0]["eager_input_streaming"], true);
         assert!(!b.to_string().contains("budget_tokens"));
         for m in ["claude-opus-4-7", "claude-fable-5-1", "claude-haiku-5-5", "claude-sonnet-4-6"] {
@@ -404,6 +431,31 @@ data: {"type":"message_stop"}
         assert_eq!(out.messages[2]["role"], "user");
         assert_eq!(out.messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(out.messages[2]["content"][1]["text"], "more");
+    }
+
+    #[test]
+    fn tools_system_and_conversation_are_cache_breakpoints() {
+        let mut r = req("claude-sonnet-5-5");
+        r.tools.as_mut().unwrap().push(AiToolSpec { name: "u".into(), description: "d".into(), parameters: json!({"type":"object"}) });
+        let b = build_body(&r);
+        let eph = json!({ "type": "ephemeral" });
+        assert!(b["tools"][0].get("cache_control").is_none());
+        assert_eq!(b["tools"][1]["cache_control"], eph);
+        assert_eq!(b["system"][0]["cache_control"], eph);
+        assert_eq!(b["messages"][0]["content"][0]["cache_control"], eph);
+        // Never more than the API's four breakpoints.
+        assert!(b.to_string().matches("ephemeral").count() <= 4);
+        // A trailing assistant turn (prefill) gets none.
+        r.messages.push(AiMessage::assistant("pre"));
+        assert!(build_body(&r)["messages"][1]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cached_input_counts_once() {
+        let (emit, _) = recorder();
+        let mut acc = AnthropicAcc::default();
+        acc.feed_line(r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":300,"cache_read_input_tokens":2000,"output_tokens":1}}}"#, &emit).unwrap();
+        assert_eq!(acc.finish().usage.unwrap().input_tokens, Some(2310));
     }
 
     #[test]

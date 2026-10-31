@@ -141,6 +141,7 @@ fn request(provider: AiProviderId, model: &str, messages: Vec<AiMessage>) -> AiS
         images: Vec::new(),
         workspace: None,
         lean: true,
+        mcp: None,
     }
 }
 

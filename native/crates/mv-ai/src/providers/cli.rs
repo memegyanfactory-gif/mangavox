@@ -7,7 +7,7 @@ use crate::stream::{js_str, AiError, LineBuffer, Result};
 use crate::transcript::build_transcript;
 use crate::types::{AiAccessMode, AiProviderId, AiRole, AiStepRequest, AiStepResult, AiUsage, Emit, StreamEvent};
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -251,7 +251,21 @@ fn stage_attachments(ctx: &StepContext) -> Vec<String> {
 pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut add = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+    let mcp = uses_mcp(req);
     match req.provider_id {
+        AiProviderId::ClaudeCode if mcp => {
+            // Our system prompt, the app's tools from its MCP server and no built-in tools, skills or
+            // session file: one process runs the whole turn's tool loop. Images go inline.
+            add(&["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]);
+            add(&["--system-prompt-file", MCP_SYSTEM_FILE, "--mcp-config", MCP_CONFIG_FILE, "--strict-mcp-config", "--tools", EMPTY_ARG]);
+            add(&["--allowedTools", "mcp__mangavox", "--disable-slash-commands", "--no-session-persistence"]);
+            if has_model(req) {
+                add(&["--model", &req.model]);
+            }
+            if let Some(e) = req.effort {
+                add(&["--effort", e.as_str()]);
+            }
+        }
         AiProviderId::ClaudeCode if req.lean => {
             // Our own short system prompt, no tools / MCP servers / skills / session file, and the
             // prompt + images as one stream-json message: one short turn instead of an agent loop.
@@ -289,6 +303,13 @@ pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
             if let Some(e) = req.effort {
                 add(&["-c", &format!("model_reasoning_effort={}", e.as_str())]);
             }
+            if let Some(ep) = req.mcp.as_ref().filter(|_| mcp) {
+                // `-c` values that are not TOML are taken as plain strings. The token comes from the env.
+                let timeout = MCP_TOOL_TIMEOUT_SECS.to_string();
+                for (k, v) in [("url", ep.url.as_str()), ("bearer_token_env_var", MCP_TOKEN_ENV), ("default_tools_approval_mode", "approve"), ("tool_timeout_sec", &timeout)] {
+                    add(&["-c", &format!("mcp_servers.{MCP_SERVER}.{k}={v}")]);
+                }
+            }
             add(&["-"]);
         }
         AiProviderId::GeminiCli => {
@@ -297,6 +318,9 @@ pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
                 add(&["-m", &req.model]);
             }
             add(&["--approval-mode", if full(req) { "auto_edit" } else { "default" }]);
+            if mcp {
+                add(&["--allowed-mcp-server-names", MCP_SERVER]);
+            }
         }
         AiProviderId::Opencode => {
             add(&["run", "--format", "json"]);
@@ -337,6 +361,72 @@ pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
     a
 }
 
+// ── App tools over MCP ───────────────────────────────────────────────────────
+
+/// The name of the app's MCP server in every CLI (its tools show as `mcp__mangavox__x`, `mangavox__x`, ...).
+pub const MCP_SERVER: &str = "mangavox";
+/// Carries the bearer token to CLIs that read it from the environment, so it is never on argv.
+pub const MCP_TOKEN_ENV: &str = "MANGAVOX_MCP_TOKEN";
+/// Workspace files of a Claude Code MCP run: the server config and our system prompt.
+pub const MCP_CONFIG_FILE: &str = ".mangavox-mcp.json";
+pub const MCP_SYSTEM_FILE: &str = ".mangavox-system.md";
+/// A call can wait on the user's OK in Ask mode; give it an hour before the CLI gives up.
+const MCP_TOOL_TIMEOUT_SECS: u64 = 3600;
+
+/// CLIs that load the app's MCP server for a run; the others keep the `mangavox` text-block
+/// protocol. Grok (1.0.70) loads a project's MCP servers only in a folder the user trusted (which
+/// would mean writing to `~/.grok`), and Antigravity (1.4.12) only from its global config or a
+/// plugin, so neither has a per-run way in.
+pub fn supports_mcp(id: AiProviderId) -> bool {
+    matches!(id, AiProviderId::ClaudeCode | AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::Opencode)
+}
+
+/// This run loads the app's MCP server (an agent turn with an endpoint, on a CLI that can).
+pub fn uses_mcp(req: &AiStepRequest) -> bool {
+    req.mcp.is_some() && !req.lean && supports_mcp(req.provider_id)
+}
+
+/// What a CLI needs besides its arguments to load the app's MCP server for one run: environment
+/// for the child process and workspace files (written before the run, removed after). Each CLI's
+/// per-project or per-run mechanism is used, so the user's own config is never touched.
+#[derive(Debug, Default, PartialEq)]
+pub struct McpSetup {
+    pub env: Vec<(String, String)>,
+    /// Workspace-relative path and contents.
+    pub files: Vec<(String, String)>,
+}
+
+pub fn mcp_setup(req: &AiStepRequest) -> McpSetup {
+    let mut s = McpSetup::default();
+    let Some(ep) = req.mcp.as_ref().filter(|_| uses_mcp(req)) else { return s };
+    let bearer = format!("Bearer {}", ep.token);
+    match req.provider_id {
+        AiProviderId::ClaudeCode => {
+            let cfg = json!({ "mcpServers": { MCP_SERVER: { "type": "http", "url": ep.url, "headers": { "Authorization": bearer } } } });
+            s.files.push((MCP_CONFIG_FILE.into(), cfg.to_string()));
+            s.files.push((MCP_SYSTEM_FILE.into(), lean_system(req)));
+        }
+        AiProviderId::Codex => s.env.push((MCP_TOKEN_ENV.to_string(), ep.token.clone())),
+        AiProviderId::GeminiCli => {
+            // Project settings in the app's own workspace, which this run trusts.
+            let cfg = json!({ "mcpServers": { MCP_SERVER: { "httpUrl": ep.url, "headers": { "Authorization": bearer }, "trust": true, "timeout": MCP_TOOL_TIMEOUT_SECS * 1000 } } });
+            s.files.push((".gemini/settings.json".into(), cfg.to_string()));
+            s.env.push(("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into()));
+        }
+        AiProviderId::Opencode => {
+            let cfg = json!({ "mcp": { MCP_SERVER: { "type": "remote", "url": ep.url, "headers": { "Authorization": bearer }, "enabled": true } } });
+            s.env.push(("OPENCODE_CONFIG_CONTENT".into(), cfg.to_string()));
+        }
+        _ => {}
+    }
+    s
+}
+
+/// A CLI reporting a call to one of the app's own tools (the app shows those as step rows already).
+fn own_tool(name: &str) -> bool {
+    name.contains(MCP_SERVER)
+}
+
 // ── Event parsing ────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -359,6 +449,13 @@ impl CliAcc {
         }
         self.text.push_str(delta);
         emit_text(emit, delta);
+    }
+
+    /// A blank line before the next message's text, unless the reply is empty or already ends a line.
+    fn separate(&mut self, emit: &Emit) {
+        if !self.text.is_empty() && !self.text.ends_with('\n') {
+            self.emit_text(emit, "\n\n");
+        }
     }
 
     /// Feed one stdout line from the given CLI.
@@ -394,6 +491,10 @@ impl CliAcc {
         let ty = ev.get("type").and_then(Value::as_str).unwrap_or("");
         match ty {
             "stream_event" => {
+                // A turn with tool calls streams several messages: keep their texts apart.
+                if ev.pointer("/event/type").and_then(Value::as_str) == Some("message_start") {
+                    self.separate(emit);
+                }
                 let d = ev.pointer("/event/delta");
                 match d.and_then(|d| d.get("type")).and_then(Value::as_str) {
                     Some("text_delta") => {
@@ -414,10 +515,11 @@ impl CliAcc {
                 for b in ev.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
                     match b.get("type").and_then(Value::as_str) {
                         Some("text") if !self.saw_delta => {
+                            self.separate(emit);
                             let t = js_str(b.get("text"));
                             self.emit_text(emit, &t);
                         }
-                        Some("tool_use") => emit(StreamEvent::Activity { label: format!("Claude Code: {}", js_str(b.get("name"))), detail: None }),
+                        Some("tool_use") if !own_tool(&js_str(b.get("name"))) => emit(StreamEvent::Activity { label: format!("Claude Code: {}", js_str(b.get("name"))), detail: None }),
                         _ => {}
                     }
                 }
@@ -474,6 +576,7 @@ impl CliAcc {
                 match item.get("type").and_then(Value::as_str) {
                     Some("command_execution") => emit(StreamEvent::Activity { label: "Codex ran a command".into(), detail: s(item.get("command")) }),
                     Some("web_search") => emit(StreamEvent::Activity { label: "Codex searched the web".into(), detail: s(item.get("query")) }),
+                    Some("mcp_tool_call") if item.get("server").and_then(Value::as_str) == Some(MCP_SERVER) => {}
                     Some("mcp_tool_call") => emit(StreamEvent::Activity {
                         label: format!("Codex: {}", s(item.get("tool")).unwrap_or_else(|| "tool".into())),
                         detail: None,
@@ -512,7 +615,9 @@ impl CliAcc {
             }
             Some("tool_use") => {
                 let name = ev.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
-                emit(StreamEvent::Activity { label: format!("Gemini: {name}"), detail: None });
+                if !own_tool(name) {
+                    emit(StreamEvent::Activity { label: format!("Gemini: {name}"), detail: None });
+                }
                 true
             }
             Some("error") => {
@@ -555,12 +660,22 @@ impl CliAcc {
             }
             Some("tool_use") => {
                 let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
-                emit(StreamEvent::Activity { label: format!("OpenCode: {tool}"), detail: None });
+                if !own_tool(tool) {
+                    emit(StreamEvent::Activity { label: format!("OpenCode: {tool}"), detail: None });
+                }
                 true
             }
             Some("step_finish") => {
-                self.input_tokens = part.pointer("/tokens/input").and_then(Value::as_u64);
-                self.output_tokens = part.pointer("/tokens/output").and_then(Value::as_u64);
+                // One per model call: a run with tool calls has several, so they add up. Cache
+                // reads and writes are reported apart from `input`.
+                let n = |k: &str| part.pointer(&format!("/tokens/{k}")).and_then(Value::as_u64);
+                if let Some(i) = n("input") {
+                    let cache = n("cache/read").unwrap_or(0) + n("cache/write").unwrap_or(0);
+                    self.input_tokens = Some(self.input_tokens.unwrap_or(0) + i + cache);
+                }
+                if let Some(o) = n("output") {
+                    self.output_tokens = Some(self.output_tokens.unwrap_or(0) + o);
+                }
                 true
             }
             Some("error") => {
@@ -726,23 +841,41 @@ pub async fn cli_step(ctx: &StepContext) -> Result<AiStepResult> {
         let sys = ctx.workspace.join(LEAN_SYSTEM_FILE);
         std::fs::create_dir_all(&ctx.workspace).and_then(|_| std::fs::write(&sys, lean_system(&ctx.req))).map_err(|e| AiError::msg(format!("Could not write the system prompt: {e}")))?;
         let payload = lean_claude_payload(&ctx.req, &ctx.emit);
-        let res = run_cli(ctx, id, bin, &cli_args(&ctx.req), payload).await;
+        let res = run_cli(ctx, id, bin, &cli_args(&ctx.req), payload, &[]).await;
         let _ = std::fs::remove_file(sys);
         return res;
     }
-    let rels = stage_attachments(ctx);
+    let setup = mcp_setup(&ctx.req);
+    for (rel, text) in &setup.files {
+        let path = ctx.workspace.join(rel);
+        let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, text));
+        written.map_err(|e| AiError::msg(format!("Could not set up the app's tools for {bin}: {e}")))?;
+    }
+    // Claude Code on MCP takes the conversation and images as one stream-json message.
+    let inline = id == AiProviderId::ClaudeCode && uses_mcp(&ctx.req);
+    let rels = if inline { Vec::new() } else { stage_attachments(ctx) };
     let args = cli_args_with(&ctx.req, &rels);
-    let mut prompt = build_transcript(&ctx.req.messages);
-    prompt.push_str(&attachment_prompt(id, &rels));
-    let res = run_cli(ctx, id, bin, &args, stdin_payload(id, &prompt)).await;
-    if !ctx.req.images.is_empty() {
+    let payload = if inline {
+        lean_claude_payload(&ctx.req, &ctx.emit)
+    } else {
+        let mut prompt = build_transcript(&ctx.req.messages);
+        prompt.push_str(&attachment_prompt(id, &rels));
+        stdin_payload(id, &prompt)
+    };
+    let res = run_cli(ctx, id, bin, &args, payload, &setup.env).await;
+    if !inline && !ctx.req.images.is_empty() {
         let _ = std::fs::remove_dir_all(ctx.workspace.join(ATTACH_DIR));
+    }
+    // The files hold a token that dies with this run anyway.
+    for (rel, _) in &setup.files {
+        let _ = std::fs::remove_file(ctx.workspace.join(rel));
     }
     res
 }
 
-async fn run_cli(ctx: &StepContext, id: AiProviderId, bin: &'static str, args: &[String], prompt: String) -> Result<AiStepResult> {
+async fn run_cli(ctx: &StepContext, id: AiProviderId, bin: &'static str, args: &[String], prompt: String, env: &[(String, String)]) -> Result<AiStepResult> {
     let mut cmd = start_cli(bin, args, &ctx.workspace)?;
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| AiError::msg(format!("{bin} could not start: {e}")))?;
     let pid = child.id();
@@ -1003,6 +1136,7 @@ mod tests {
             images: vec![],
             workspace: None,
             lean: false,
+            mcp: None,
         };
         let a = cli_args(&req);
         assert_eq!(&a[..4], ["--output-format", "streaming-json", "-p", "-"]);
@@ -1061,6 +1195,7 @@ mod tests {
             images: vec![],
             workspace: None,
             lean: false,
+            mcp: None,
         };
         let a = cli_args(&req);
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
@@ -1093,6 +1228,7 @@ mod tests {
             images: vec![],
             workspace: None,
             lean: false,
+            mcp: None,
         };
         let none = cli_args_with(&req, &[]);
         assert!(!none.contains(&"--allowedTools".to_string()));
@@ -1117,6 +1253,96 @@ mod tests {
         assert!(a.iter().all(|x| safe_arg(x)));
         assert_eq!(attachment_prompt(AiProviderId::Opencode, &rels), "");
         assert_eq!(attachment_prompt(AiProviderId::Codex, &[]), "");
+    }
+
+    fn mcp_req(id: AiProviderId) -> AiStepRequest {
+        AiStepRequest {
+            request_id: "r".into(),
+            provider_id: id,
+            model: "default".into(),
+            messages: vec![AiMessage::system("Be the app."), AiMessage::user("open the library")],
+            tools: None,
+            effort: None,
+            access: Some(AiAccessMode::Ask),
+            images: vec![],
+            workspace: None,
+            lean: false,
+            mcp: Some(crate::types::McpEndpoint { url: "http://127.0.0.1:50123/mcp".into(), token: "s3cret".into() }),
+        }
+    }
+
+    #[test]
+    fn every_cli_loads_the_app_mcp_server_without_the_token_on_argv() {
+        for id in [AiProviderId::ClaudeCode, AiProviderId::Codex, AiProviderId::GeminiCli, AiProviderId::Opencode] {
+            let req = mcp_req(id);
+            assert!(supports_mcp(id) && uses_mcp(&req));
+            let args = cli_args(&req);
+            assert!(args.iter().all(|a| safe_arg(a)), "{id:?}: {args:?}");
+            assert!(!args.iter().any(|a| a.contains("s3cret")), "{id:?}");
+            let s = mcp_setup(&req);
+            let all = format!("{args:?}{:?}{:?}", s.env, s.files);
+            assert!(all.contains("127.0.0.1:50123"), "{id:?} names the server");
+            assert!(all.contains("s3cret") || all.contains(MCP_TOKEN_ENV), "{id:?} passes the token");
+        }
+        // Not for a lean step or another kind of provider.
+        let mut lean = mcp_req(AiProviderId::ClaudeCode);
+        lean.lean = true;
+        assert!(!uses_mcp(&lean) && mcp_setup(&lean) == McpSetup::default());
+        for id in [AiProviderId::Ollama, AiProviderId::GrokCli, AiProviderId::Antigravity] {
+            assert!(!supports_mcp(id) && cli_args(&mcp_req(id)) == cli_args(&AiStepRequest { mcp: None, ..mcp_req(id) }));
+        }
+    }
+
+    #[test]
+    fn mcp_command_lines_per_cli() {
+        let has = |a: &[String], w: &[&str]| a.windows(w.len()).any(|x| x == w);
+        let a = cli_args(&mcp_req(AiProviderId::ClaudeCode));
+        assert!(has(&a, &["--mcp-config", MCP_CONFIG_FILE, "--strict-mcp-config"]) && has(&a, &["--allowedTools", "mcp__mangavox"]));
+        assert!(has(&a, &["--system-prompt-file", MCP_SYSTEM_FILE]) && has(&a, &["--tools", EMPTY_ARG]) && has(&a, &["--input-format", "stream-json"]));
+        let s = mcp_setup(&mcp_req(AiProviderId::ClaudeCode));
+        let cfg: Value = serde_json::from_str(&s.files[0].1).unwrap();
+        assert_eq!(cfg["mcpServers"]["mangavox"], json!({ "type": "http", "url": "http://127.0.0.1:50123/mcp", "headers": { "Authorization": "Bearer s3cret" } }));
+        assert_eq!(s.files[1], (MCP_SYSTEM_FILE.to_string(), "Be the app.".to_string()));
+
+        let a = cli_args(&mcp_req(AiProviderId::Codex));
+        assert_eq!(a.last().unwrap(), "-");
+        assert!(has(&a, &["-c", "mcp_servers.mangavox.url=http://127.0.0.1:50123/mcp"]) && has(&a, &["-c", "mcp_servers.mangavox.bearer_token_env_var=MANGAVOX_MCP_TOKEN"]));
+        assert!(has(&a, &["-c", "mcp_servers.mangavox.default_tools_approval_mode=approve"]));
+        assert_eq!(mcp_setup(&mcp_req(AiProviderId::Codex)).env, [(MCP_TOKEN_ENV.to_string(), "s3cret".to_string())]);
+
+        let a = cli_args(&mcp_req(AiProviderId::GeminiCli));
+        assert!(has(&a, &["--allowed-mcp-server-names", "mangavox"]));
+        let s = mcp_setup(&mcp_req(AiProviderId::GeminiCli));
+        assert_eq!(s.files[0].0, ".gemini/settings.json");
+        assert_eq!(serde_json::from_str::<Value>(&s.files[0].1).unwrap()["mcpServers"]["mangavox"]["trust"], true);
+        assert!(s.env.contains(&("GEMINI_CLI_TRUST_WORKSPACE".to_string(), "true".to_string())));
+
+        let s = mcp_setup(&mcp_req(AiProviderId::Opencode));
+        let cfg: Value = serde_json::from_str(&s.env[0].1).unwrap();
+        assert_eq!((s.env[0].0.as_str(), cfg["mcp"]["mangavox"]["type"].as_str()), ("OPENCODE_CONFIG_CONTENT", Some("remote")));
+    }
+
+    #[test]
+    fn own_tool_calls_are_not_activity_and_turn_texts_stay_apart() {
+        let fixture = r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Opening it."}}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Opening it."},{"type":"tool_use","id":"t","name":"mcp__mangavox__navigate","input":{}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}}
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"m2"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}}
+{"type":"result","is_error":false,"result":"Done.","usage":{"input_tokens":5,"cache_creation_input_tokens":100,"cache_read_input_tokens":900,"output_tokens":20}}
+"#;
+        let (acc, ev) = feed_all(AiProviderId::ClaudeCode, fixture);
+        assert_eq!(acc.text, "Opening it.\n\nDone.");
+        assert!(!ev.iter().any(|e| matches!(e, StreamEvent::Activity { .. })));
+        let (emit, _) = recorder();
+        assert_eq!(acc.finish("claude", Some(0), false, "", &emit).unwrap().usage.unwrap().input_tokens, Some(1005));
+        // OpenCode reports each model call: they add up, cache included.
+        let oc = "{\"type\":\"step_finish\",\"part\":{\"tokens\":{\"input\":10,\"output\":3,\"cache\":{\"read\":100,\"write\":0}}}}\n{\"type\":\"tool_use\",\"part\":{\"tool\":\"mangavox_navigate\"}}\n{\"type\":\"step_finish\",\"part\":{\"tokens\":{\"input\":4,\"output\":2,\"cache\":{\"read\":120,\"write\":5}}}}\n";
+        let (acc, ev) = feed_all(AiProviderId::Opencode, oc);
+        assert!(ev.is_empty());
+        let u = acc.finish("opencode", Some(0), false, "", &emit).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (Some(239), Some(5)));
     }
 
     #[test]
@@ -1144,6 +1370,7 @@ mod tests {
                 images: vec![],
                 workspace: None,
                 lean: false,
+                mcp: None,
             },
             cancel: CancellationToken::new(),
             api_key: None,
@@ -1177,6 +1404,7 @@ mod tests {
                 images: vec![img],
                 workspace: None,
                 lean: true,
+                mcp: None,
             },
             cancel: CancellationToken::new(),
             api_key: None,
@@ -1211,6 +1439,7 @@ mod tests {
                 images: vec![],
                 workspace: None,
                 lean: false,
+                mcp: None,
             },
             cancel: cancel.clone(),
             api_key: None,

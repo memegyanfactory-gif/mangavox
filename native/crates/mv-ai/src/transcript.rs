@@ -14,6 +14,10 @@ pub fn build_transcript(messages: &[AiMessage]) -> String {
             break;
         }
         let m = turns[i];
+        // A round that only called tools (its results follow) has nothing to say here.
+        if m.content.trim().is_empty() && i + 1 < turns.len() {
+            continue;
+        }
         let who = match m.role {
             AiRole::User => "User".to_string(),
             AiRole::Assistant => "Assistant".to_string(),
@@ -65,6 +69,14 @@ mod tests {
         assert!(out.contains("<instructions>\nBe brief.\n</instructions>"));
         assert!(out.contains("User: Hi\n\nAssistant: Hello!"));
         assert!(out.ends_with("Reply to this latest message:\nRecommend an anime"));
+    }
+
+    #[test]
+    fn a_round_that_only_called_tools_shows_just_its_results() {
+        let mut result = AiMessage::new(AiRole::Tool, "{\"ok\":true}");
+        result.tool_name = Some("navigate".into());
+        let out = build_transcript(&[AiMessage::user("Open it"), AiMessage::assistant(""), result, AiMessage::assistant("Opened."), AiMessage::user("Thanks")]);
+        assert!(out.contains("User: Open it\n\nTool result (navigate): {\"ok\":true}\n\nAssistant: Opened."), "{out}");
     }
 
     #[test]

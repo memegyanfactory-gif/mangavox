@@ -294,7 +294,19 @@ impl Dock {
         let cancel = CancellationToken::new();
         let (tx, mut rx) = mpsc::unbounded::<AgentEvent>();
         let registry = self.shared.read(cx).registry.clone();
-        let params = AgentParams { provider: prefs.provider, model: prefs.model.clone(), effort: prefs.effort, access: access.clone(), system: String::new(), history, tools_enabled: true, native_tools: def.supports_tools, images };
+        let params = AgentParams {
+            provider: prefs.provider,
+            model: prefs.model.clone(),
+            effort: prefs.effort,
+            access: access.clone(),
+            system: String::new(),
+            history,
+            tools_enabled: true,
+            native_tools: def.supports_tools,
+            mcp: mv_ai::providers::cli::supports_mcp(prefs.provider),
+            page: tools::page_context(),
+            images,
+        };
         let token = cancel.clone();
         mv_ui::bg::runtime().spawn(async move {
             let mut params = params;

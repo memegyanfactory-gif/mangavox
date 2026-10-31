@@ -563,6 +563,7 @@ impl Registry {
                     images: vec![],
                     workspace: None,
                     lean: false,
+                    mcp: None,
                 },
                 emit_noop(),
             )
@@ -701,6 +702,7 @@ mod tests {
                     images: vec![],
                     workspace: None,
                     lean: false,
+                    mcp: None,
                 },
                 emit_noop(),
             )

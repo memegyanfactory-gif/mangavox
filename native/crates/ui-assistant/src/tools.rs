@@ -141,6 +141,23 @@ pub fn num_arg(args: &Map<String, Value>, k: &str) -> Option<f64> {
     }
 }
 
+/// `offset` (default 0) and `limit` (default `default`, at most 200) of a paged reader.
+pub fn page_args(args: &Map<String, Value>, default: usize) -> (usize, usize) {
+    let offset = num_arg(args, "offset").map_or(0, |n| n.max(0.) as usize);
+    let limit = num_arg(args, "limit").map_or(default, |n| (n.max(1.) as usize).min(200));
+    (offset, limit)
+}
+
+/// One page of a list: the items, the total, and the offset of the next page when there is one.
+pub fn paged(items: Vec<Value>, offset: usize, total: usize) -> Value {
+    let end = offset + items.len();
+    let mut v = json!({ "total": total, "shown": if items.is_empty() { "none".to_string() } else { format!("{}-{end}", offset + 1) }, "items": items });
+    if end < total {
+        v["next"] = json!(format!("{} more: call again with offset {end}", total - end));
+    }
+    v
+}
+
 // ── Page context (the shell may call `set_page_context` on every navigation) ────
 
 static PAGE: Mutex<Option<Route>> = Mutex::new(None);
@@ -236,7 +253,12 @@ fn builtin_tools() -> Vec<AppTool> {
         ),
         t("list_themes", "List the available colour themes.".into(), obj(json!({}), &[]), Risk::Read),
         t("set_theme", "Change the app colour theme. Use list_themes for ids.".into(), obj(json!({ "id": s("Theme id") }), &["id"]), Risk::Act),
-        t("list_library", "List manga in the user's library, optionally filtered by a text query.".into(), obj(json!({ "query": s("Optional filter") }), &[]), Risk::Read),
+        t(
+            "list_library",
+            "List manga in the user's library, optionally filtered by a text query. Pages through big libraries with offset/limit.".into(),
+            obj(json!({ "query": s("Optional filter"), "offset": { "type": "number", "description": "Skip this many (default 0)" }, "limit": { "type": "number", "description": "Max items (default 40)" } }), &[]),
+            Risk::Read,
+        ),
         t(
             "get_watch_history",
             "Recently watched anime, movies and series.".into(),
@@ -303,6 +325,171 @@ fn builtin_tools() -> Vec<AppTool> {
 
 pub fn tool_specs() -> Vec<AiToolSpec> {
     app_tools().into_iter().map(|t| AiToolSpec { name: t.name.into(), description: t.description, parameters: t.parameters }).collect()
+}
+
+// ── Tool groups (a step carries only the tools for where the user is) ─────────────────
+
+/// The tools fall into groups; a step gets the core ones plus the groups of the page the user is
+/// on, and the model loads others with [`LOAD_TOOLS`] when the request needs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Group {
+    Core,
+    Manga,
+    Media,
+    Studio,
+    Video,
+    Youtube,
+}
+
+impl Group {
+    pub const ALL: [Group; 6] = [Group::Core, Group::Manga, Group::Media, Group::Studio, Group::Video, Group::Youtube];
+
+    pub fn key(&self) -> &'static str {
+        match self {
+            Group::Core => "core",
+            Group::Manga => "manga",
+            Group::Media => "media",
+            Group::Studio => "studio",
+            Group::Video => "video",
+            Group::Youtube => "youtube",
+        }
+    }
+
+    /// What the group's tools do, for the catalog in [`LOAD_TOOLS`].
+    fn about(&self) -> &'static str {
+        match self {
+            Group::Core => "pages, settings, suggestions",
+            Group::Manga => "the library, manga sources, chapters, downloads, the reader",
+            Group::Media => "anime, movies and series: search, open, play, stream sources, downloads, watch history",
+            Group::Studio => "recap videos: the Studio library, the generate queue, voices, look, captions, export, YouTube package",
+            Group::Video => "the Video editor: a chapter video's timeline, clips, layers, captions, music, look, render",
+            Group::Youtube => "the YouTube channel: stats, videos, SEO, upload schedule",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Group> {
+        Group::ALL.into_iter().find(|g| g.key().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// The group a tool belongs to (by name, so tools other crates add sort themselves).
+pub fn group_of(name: &str) -> Group {
+    match name {
+        n if n.starts_with("video_") => Group::Video,
+        n if n.starts_with("studio_") => Group::Studio,
+        n if n.starts_with("youtube_") => Group::Youtube,
+        n if n.starts_with("manga_") || matches!(n, "list_library" | "open_manga" | "open_reader") => Group::Manga,
+        n if n.starts_with("media_") || matches!(n, "get_watch_history" | "search_anime" | "open_anime" | "search_movies" | "open_movie" | "play_title") => Group::Media,
+        _ => Group::Core,
+    }
+}
+
+/// The groups that come with a page (besides core).
+pub fn page_groups(route: Option<&Route>) -> &'static [Group] {
+    match route {
+        Some(Route::Studio) => &[Group::Studio, Group::Video],
+        Some(Route::YouTube) => &[Group::Youtube, Group::Studio],
+        Some(Route::Suggestions) => &[Group::Studio, Group::Manga],
+        Some(Route::Settings { .. } | Route::Welcome | Route::Mobile) => &[],
+        Some(r) if section_name(r) != "manga" => &[Group::Media],
+        _ => &[Group::Manga],
+    }
+}
+
+/// Loads more tool groups (handled by the agent loop, not [`execute`]).
+pub const LOAD_TOOLS: &str = "load_tools";
+/// Runs any app tool by name: how an MCP client calls a tool loaded after it listed the tools.
+pub const RUN_TOOL: &str = "run_tool";
+
+/// The tool groups one chat turn can use. Starts from the page's groups and the ones the recent
+/// conversation used; grows when the model calls [`LOAD_TOOLS`] or a tool of another group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolScope {
+    groups: std::collections::BTreeSet<Group>,
+    /// Tools reach the model over MCP: it lists them once, so later groups go through [`RUN_TOOL`].
+    mcp: bool,
+}
+
+/// How many recent messages decide which groups the conversation is using.
+const RECENT: usize = 20;
+
+impl ToolScope {
+    pub fn new(page: Option<&Route>, history: &[mv_ai::AiMessage], mcp: bool) -> Self {
+        let mut groups: std::collections::BTreeSet<Group> = std::iter::once(Group::Core).chain(page_groups(page).iter().copied()).collect();
+        for m in history.iter().rev().take(RECENT) {
+            groups.extend(m.tool_calls.iter().flatten().map(|c| group_of(&c.name)));
+            groups.extend(m.tool_name.as_deref().map(group_of));
+        }
+        ToolScope { groups, mcp }
+    }
+
+    pub fn groups(&self) -> Vec<Group> {
+        self.groups.iter().copied().collect()
+    }
+
+    /// Adds the group of a tool the model called directly.
+    pub fn add_for(&mut self, name: &str) {
+        self.groups.insert(group_of(name));
+    }
+
+    /// The specs to send: the scope's tools plus [`LOAD_TOOLS`] (and [`RUN_TOOL`] over MCP).
+    pub fn specs(&self) -> Vec<AiToolSpec> {
+        let mut out: Vec<AiToolSpec> = tool_specs().into_iter().filter(|t| self.groups.contains(&group_of(&t.name))).collect();
+        let others: Vec<String> = Group::ALL.iter().filter(|g| !self.groups.contains(g)).map(|g| format!("{} ({})", g.key(), g.about())).collect();
+        if !others.is_empty() {
+            out.push(AiToolSpec {
+                name: LOAD_TOOLS.into(),
+                description: format!("Loads more of the app's tools when the request needs them. Not loaded yet: {}.", others.join("; ")),
+                parameters: obj(json!({ "groups": { "type": "array", "items": s_enum("Group", &Group::ALL.map(|g| g.key())), "description": "Groups to load" } }), &["groups"]),
+            });
+        }
+        if self.mcp {
+            out.push(AiToolSpec {
+                name: RUN_TOOL.into(),
+                description: "Runs an app tool by name with its arguments: for tools load_tools returned that your tool list does not show.".into(),
+                parameters: obj(json!({ "name": s("Tool name"), "args": { "type": "object", "description": "The tool's arguments" } }), &["name"]),
+            });
+        }
+        out
+    }
+
+    /// Runs [`LOAD_TOOLS`]: adds the groups and says what they hold. Over MCP the result carries
+    /// the tools' signatures, since the client's list stays as it was.
+    pub fn load(&mut self, args: &Map<String, Value>) -> Result<Value, String> {
+        let wanted = list_arg(args, "groups");
+        let groups: Vec<Group> = wanted.iter().filter_map(|g| Group::parse(g)).collect();
+        if groups.is_empty() {
+            return Err(format!("Name one or more groups: {}", Group::ALL.map(|g| g.key()).join(", ")));
+        }
+        self.groups.extend(groups.iter().copied());
+        let specs: Vec<AiToolSpec> = tool_specs().into_iter().filter(|t| groups.contains(&group_of(&t.name))).collect();
+        Ok(if self.mcp {
+            json!({ "loaded": groups.iter().map(Group::key).collect::<Vec<_>>(), "tools": specs.iter().map(signature).collect::<Vec<_>>(), "howToCall": format!("Call these with {RUN_TOOL} {{\"name\": ..., \"args\": {{...}}}}.") })
+        } else {
+            json!({ "loaded": groups.iter().map(Group::key).collect::<Vec<_>>(), "tools": specs.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), "note": "These tools are available now." })
+        })
+    }
+}
+
+/// One line per tool: `name(arg: type, optional?: type): what it does`.
+pub fn signature(t: &AiToolSpec) -> String {
+    let props = t.parameters.get("properties").and_then(Value::as_object);
+    let required: Vec<&str> = t.parameters.get("required").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let args: Vec<String> = props
+        .map(|p| {
+            p.iter()
+                .map(|(k, v)| {
+                    let ty = v.get("enum").and_then(Value::as_array).map(|e| e.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("|")).unwrap_or_else(|| match v.get("items").and_then(|i| i.get("properties")).and_then(Value::as_object) {
+                        // Lists of objects show their keys: suggestions: [{label, prompt}].
+                        Some(item) => format!("[{{{}}}]", item.keys().cloned().collect::<Vec<_>>().join(", ")),
+                        None => v.get("type").and_then(Value::as_str).unwrap_or("any").to_string(),
+                    });
+                    format!("{k}{}: {ty}", if required.contains(&k.as_str()) { "" } else { "?" })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    format!("{}({}): {}", t.name, args.join(", "), t.description)
 }
 
 pub fn risk_of(name: &str) -> Option<Risk> {
@@ -444,19 +631,57 @@ impl ToolRunner for AppTools {
     }
 }
 
-/// Keep tool results small enough for small local context windows.
+/// Keep tool results small enough for small local context windows. A list keeps as many items as
+/// fit; an object keeps its fields and cuts its biggest list; anything else is cut as text. Every
+/// cut says so, and how to get the rest, so nothing is lost silently.
 pub fn trim_result(value: Value, max: usize) -> Value {
-    let text = value.to_string();
-    if text.len() <= max {
+    if value.to_string().len() <= max {
         return value;
     }
+    const NOTE: &str = "Narrow the request, or pass offset/limit where the tool takes them, to see the rest.";
     match value {
         Value::Array(items) => {
             let n = items.len();
-            json!({ "items": items.into_iter().take(15).collect::<Vec<_>>(), "note": format!("{n} items, first 15 shown") })
+            let kept = fit_items(items, max.saturating_sub(200));
+            let k = kept.len();
+            json!({ "items": kept, "note": format!("Result too long: items 1-{k} of {n} shown. {NOTE}") })
         }
-        _ => json!({ "truncated": text.chars().take(max).collect::<String>() }),
+        Value::Object(mut map) => {
+            let biggest = map.iter().filter(|(_, v)| v.is_array()).max_by_key(|(_, v)| v.to_string().len()).map(|(k, v)| (k.clone(), v.to_string().len()));
+            // Cut the biggest list when the other fields leave room for part of it.
+            if let Some((key, size)) = biggest {
+                let rest = Value::Object(map.clone()).to_string().len() - size;
+                if rest + 300 < max {
+                    if let Some(Value::Array(items)) = map.remove(&key) {
+                        let n = items.len();
+                        let kept = fit_items(items, max - rest - 300);
+                        map.insert("truncated".into(), json!(format!("Result too long: {key} 1-{} of {n} shown. {NOTE}", kept.len())));
+                        map.insert(key, Value::Array(kept));
+                        return Value::Object(map);
+                    }
+                }
+            }
+            cut_text(&Value::Object(map).to_string(), max)
+        }
+        other => cut_text(&other.to_string(), max),
     }
+}
+
+/// The leading items whose JSON fits in `budget` characters.
+fn fit_items(items: Vec<Value>, budget: usize) -> Vec<Value> {
+    let mut used = 2;
+    items
+        .into_iter()
+        .take_while(|v| {
+            used += v.to_string().len() + 1;
+            used <= budget
+        })
+        .collect()
+}
+
+fn cut_text(text: &str, max: usize) -> Value {
+    let keep: String = text.chars().take(max.saturating_sub(120)).collect();
+    json!({ "truncated": keep, "note": format!("Cut at {} of {} characters. Ask for less (a narrower query, or offset/limit where the tool takes them).", keep.len(), text.len()) })
 }
 
 fn nav(route: Route, v: Value) -> ToolResult {
@@ -533,13 +758,15 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
                 mv_core::library::open_readonly().and_then(|c| mv_core::library::list_manga(&c)).map_err(|e| e.to_string())
             })
             .await??;
-            let items: Vec<Value> = rows
-                .into_iter()
-                .filter(|m| q.is_empty() || m.title.to_lowercase().contains(&q))
-                .take(40)
+            let hits: Vec<_> = rows.into_iter().filter(|m| q.is_empty() || m.title.to_lowercase().contains(&q)).collect();
+            let (offset, limit) = page_args(args, 40);
+            let items: Vec<Value> = hits
+                .iter()
+                .skip(offset)
+                .take(limit)
                 .map(|m| json!({ "id": m.id, "title": m.title, "status": m.status, "author": m.author, "unread": m.unread }))
                 .collect();
-            Ok(ToolOutput::Value(Value::Array(items)))
+            Ok(ToolOutput::Value(paged(items, offset, hits.len())))
         }
         "get_watch_history" => {
             let kind = Some(a("kind").to_string()).filter(|k| !k.is_empty());
@@ -760,12 +987,88 @@ mod tests {
     }
 
     #[test]
-    fn trims_big_results() {
+    fn trims_big_results_and_says_so() {
         let big = Value::Array((0..500).map(|i| json!({ "n": i, "pad": "x".repeat(50) })).collect());
         let t = trim_result(big, 6000);
-        assert_eq!(t["items"].as_array().unwrap().len(), 15);
+        let kept = t["items"].as_array().unwrap().len();
+        assert!(kept > 50 && kept < 100, "as many items as fit: {kept}");
+        assert!(t.to_string().len() <= 6000);
+        assert!(t["note"].as_str().unwrap().contains(&format!("1-{kept} of 500")));
         let small = json!([1, 2]);
         assert_eq!(trim_result(small.clone(), 6000), small);
+        // An object keeps its fields and cuts its biggest list.
+        let obj = json!({ "manga": "Solo", "clipCount": 300, "clips": (0..300).map(|i| format!("{i} | p1 | 0+3 | Auto | {}", "w".repeat(60))).collect::<Vec<_>>(), "layers": [] });
+        let t = trim_result(obj, 6000);
+        assert_eq!((t["manga"].as_str(), t["clipCount"].as_u64(), t["layers"].as_array().map(Vec::len)), (Some("Solo"), Some(300), Some(0)));
+        let n = t["clips"].as_array().unwrap().len();
+        assert!(n > 20 && t.to_string().len() <= 6000, "{n}");
+        assert!(t["truncated"].as_str().unwrap().contains(&format!("clips 1-{n} of 300")));
+        // Anything else is cut as text, with its full length.
+        let t = trim_result(json!({ "text": "z".repeat(9000) }), 6000);
+        assert!(t["truncated"].as_str().unwrap().len() < 6000 && t["note"].as_str().unwrap().contains("of 9011 characters"));
+    }
+
+    #[test]
+    fn pages_say_where_the_next_one_starts() {
+        let mut a = Map::new();
+        assert_eq!(page_args(&a, 40), (0, 40));
+        a.insert("offset".into(), json!(40));
+        a.insert("limit".into(), json!("10"));
+        assert_eq!(page_args(&a, 40), (40, 10));
+        let p = paged((0..10).map(|i| json!(i)).collect(), 40, 55);
+        assert_eq!((p["total"].as_u64(), p["shown"].as_str()), (Some(55), Some("41-50")));
+        assert_eq!(p["next"], "5 more: call again with offset 50");
+        assert!(paged(vec![json!(1)], 54, 55).get("next").is_none());
+    }
+
+    #[test]
+    fn tools_come_in_groups_by_page() {
+        assert_eq!(group_of("video_timeline"), Group::Video);
+        assert_eq!(group_of("studio_youtube_package"), Group::Studio);
+        assert_eq!(group_of("manga_download"), Group::Manga);
+        assert_eq!(group_of("open_reader"), Group::Manga);
+        assert_eq!(group_of("play_title"), Group::Media);
+        assert_eq!(group_of("youtube_channel"), Group::Youtube);
+        assert_eq!(group_of("navigate"), Group::Core);
+        assert_eq!(page_groups(Some(&Route::Studio)), &[Group::Studio, Group::Video]);
+        assert_eq!(page_groups(Some(&Route::AnimeHome)), &[Group::Media]);
+        assert_eq!(page_groups(Some(&Route::MoviesHome)), &[Group::Media]);
+        assert_eq!(page_groups(Some(&Route::Library)), &[Group::Manga]);
+        assert_eq!(page_groups(None), &[Group::Manga]);
+        assert!(page_groups(Some(&Route::Settings { tab: None })).is_empty());
+    }
+
+    #[test]
+    fn a_scope_sends_its_groups_and_can_load_more() {
+        let names = |s: &ToolScope| s.specs().into_iter().map(|t| t.name).collect::<Vec<_>>();
+        let mut scope = ToolScope::new(Some(&Route::AnimeHome), &[], false);
+        let n = names(&scope);
+        assert!(n.contains(&"search_anime".into()) && n.contains(&"navigate".into()) && n.contains(&LOAD_TOOLS.into()));
+        assert!(!n.contains(&"list_library".into()) && !n.contains(&RUN_TOOL.into()));
+        let load = scope.specs().into_iter().find(|t| t.name == LOAD_TOOLS).unwrap();
+        assert!(load.description.contains("manga (") && !load.description.contains("media ("));
+        let mut a = Map::new();
+        a.insert("groups".into(), json!(["manga", "bogus"]));
+        let r = scope.load(&a).unwrap();
+        assert_eq!(r["loaded"], json!(["manga"]));
+        assert!(names(&scope).contains(&"list_library".into()));
+        assert!(scope.load(&Map::new()).is_err());
+        // The conversation's recent tools keep their groups.
+        let mut m = mv_ai::AiMessage::new(mv_ai::AiRole::Tool, "{}");
+        m.tool_name = Some("youtube_channel".into());
+        assert!(ToolScope::new(Some(&Route::Library), &[m], false).groups().contains(&Group::Youtube));
+        // Over MCP the list has run_tool, and loading returns signatures to call through it.
+        let mut mcp = ToolScope::new(Some(&Route::Library), &[], true);
+        assert!(names(&mcp).contains(&RUN_TOOL.into()));
+        a.insert("groups".into(), json!("media"));
+        let r = mcp.load(&a).unwrap();
+        assert!(r["tools"].as_array().unwrap().iter().any(|t| t.as_str().unwrap().starts_with("search_anime(query: string)")));
+        assert!(r["howToCall"].as_str().unwrap().contains(RUN_TOOL));
+        // Everything loaded: no load_tools left to offer.
+        let mut all = Map::new();
+        all.insert("groups".into(), json!(Group::ALL.map(|g| g.key())));
+        mcp.load(&all).unwrap();
+        assert!(!names(&mcp).contains(&LOAD_TOOLS.into()));
     }
 
     #[test]

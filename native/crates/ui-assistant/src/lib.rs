@@ -10,6 +10,7 @@ mod dock;
 pub mod ext;
 mod fit;
 mod hub;
+pub mod mcp;
 mod picker;
 mod providers;
 mod shared;

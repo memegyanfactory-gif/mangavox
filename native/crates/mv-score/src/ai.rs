@@ -65,6 +65,7 @@ pub async fn spot(reg: Arc<Registry>, model: ModelChoice, ch: ChapterRef, cancel
         images: vec![],
         workspace: None,
         lean: true,
+        mcp: None,
     };
     let r = reg.run_step_cancellable(req, emit_noop(), cancel).await;
     if r.stopped {

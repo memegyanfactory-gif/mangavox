@@ -52,8 +52,11 @@ fn tools() -> Vec<ToolDef> {
             .run(|_| async move { sources().await }.boxed()),
         ToolDef::new(
             "manga_chapters",
-            "A manga's chapters with their download state. Pass `manga` (a Library title or id), or `source` + `id` from manga_search (this loads the title into the app without adding it to the Library). `refresh` re-reads the chapter list from the source.",
-            obj(json!({ "manga": s("Library title or manga id"), "source": s("Source id from manga_search"), "id": s("The title's id on that source"), "title": s("Title (with source + id)"), "refresh": { "type": "boolean" } }), &[]),
+            "A manga's chapters with their download state, 50 at a time (offset/limit for more). Pass `manga` (a Library title or id), or `source` + `id` from manga_search (this loads the title into the app without adding it to the Library). `refresh` re-reads the chapter list from the source.",
+            obj(
+                json!({ "manga": s("Library title or manga id"), "source": s("Source id from manga_search"), "id": s("The title's id on that source"), "title": s("Title (with source + id)"), "refresh": { "type": "boolean" }, "offset": { "type": "number", "description": "Chapters to skip (default 0)" }, "limit": { "type": "number", "description": "How many (default 50)" } }),
+                &[],
+            ),
             Risk::Read,
         )
         .phrases(|a| Phrases::new("Read the chapters of", "Reading the chapters of", "Read the chapters of", &name_of(a)))
@@ -262,20 +265,36 @@ async fn chapters_tool(a: Map<String, Value>) -> ToolResult {
     let mm = m.clone();
     let list = blocking(move || backend::with_db(|c| chapter_list(c, &mm))).await?;
     let in_library = !backend::browse_only().contains(&m.id);
-    let rows: Vec<Value> = list
-        .iter()
-        .map(|c| json!({ "chapter": logic::chapter_short(c), "number": c.number, "id": c.id, "title": c.title, "downloaded": c.download_status == "complete", "read": c.is_read }))
-        .collect();
+    let (offset, limit) = at::page_args(&a, 50);
+    let rows: Vec<Value> = list.iter().skip(offset).take(limit).map(|c| json!(chapter_line(c))).collect();
     let downloaded: Vec<f64> = list.iter().filter(|c| c.download_status == "complete").filter_map(|c| c.number).collect();
-    Ok(ToolOutput::Value(json!({
+    let mut out = json!({
         "mangaId": m.id,
         "title": m.title,
         "source": m.source_plugin,
         "inLibrary": in_library,
-        "count": list.len(),
         "downloaded": compress(&downloaded),
-        "chapters": at::trim_result(Value::Array(rows), 5000),
-    })))
+        "chapterFormat": "chapter | id | title | downloaded | read",
+    });
+    if let (Value::Object(o), Value::Object(page)) = (&mut out, at::paged(rows, offset, list.len())) {
+        o.extend(page.into_iter().map(|(k, v)| (if k == "items" { "chapters".to_string() } else { k }, v)));
+    }
+    Ok(ToolOutput::Value(out))
+}
+
+/// One chapter as a short line, so a long series pages in big steps.
+fn chapter_line(c: &Chapter) -> String {
+    let mut line = format!("{} | {}", logic::chapter_short(c), c.id);
+    if let Some(t) = c.title.as_deref().filter(|t| !t.is_empty()) {
+        line.push_str(&format!(" | {t}"));
+    }
+    if c.download_status == "complete" {
+        line.push_str(" | downloaded");
+    }
+    if c.is_read {
+        line.push_str(" | read");
+    }
+    line
 }
 
 async fn add_to_library(a: Map<String, Value>) -> ToolResult {

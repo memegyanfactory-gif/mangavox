@@ -109,6 +109,17 @@ pub fn attach_images(messages: &mut [Value], images: &[ImageData]) {
     }
 }
 
+/// Context window for a request of `body_chars`. Ollama's default (2-4k tokens) silently cuts the
+/// system prompt and tools off; a change of size reloads the model, so it moves in two big steps.
+pub fn num_ctx(body_chars: usize) -> u32 {
+    // ~3.5 chars a token, plus room for the reply.
+    if body_chars / 3 + 4096 <= 16_384 {
+        16_384
+    } else {
+        32_768
+    }
+}
+
 async fn run(ctx: &StepContext, with_tools: bool) -> Result<AiStepResult> {
     let req = &ctx.req;
     let mut messages = to_ollama_messages(&req.messages);
@@ -121,6 +132,7 @@ async fn run(ctx: &StepContext, with_tools: bool) -> Result<AiStepResult> {
     if let Some(tools) = req.tools.as_ref().filter(|t| with_tools && !t.is_empty()) {
         body["tools"] = tools.iter().map(|t| json!({ "type": "function", "function": t })).collect();
     }
+    body["options"] = json!({ "num_ctx": num_ctx(body.to_string().len()) });
     let res = post_json(&ctx.client, &format!("{}/api/chat", ctx.base_url), &body, &[], &ctx.cancel).await?;
     let mut acc = OllamaAcc::default();
     for_each_line(res, &ctx.cancel, |line| acc.feed_line(line, &ctx.emit)).await?;
@@ -235,5 +247,12 @@ mod tests {
         attach_images(&mut m, &[ImageData { mime: "image/png", b64: "QUJD".into() }]);
         assert!(m[0].get("images").is_none());
         assert_eq!(m[1]["images"], json!(["QUJD"]));
+    }
+
+    #[test]
+    fn context_window_fits_the_request_in_two_steps() {
+        assert_eq!(num_ctx(2_000), 16_384);
+        assert_eq!(num_ctx(36_000), 16_384);
+        assert_eq!(num_ctx(40_000), 32_768);
     }
 }

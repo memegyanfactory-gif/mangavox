@@ -242,6 +242,17 @@ pub struct AiStepRequest {
     /// MCP servers and skills, and get images inline when they can (far fewer tokens).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lean: bool,
+    /// The app's tools as an MCP server for this step: a CLI agent loads it (instead of the
+    /// `mangavox` text-block protocol) and runs its own tool loop in one process.
+    #[serde(skip)]
+    pub mcp: Option<McpEndpoint>,
+}
+
+/// A streamable-HTTP MCP server on 127.0.0.1 that wants `Authorization: Bearer <token>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpEndpoint {
+    pub url: String,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -436,6 +447,7 @@ mod image_tests {
             images: vec![],
             workspace: None,
             lean: false,
+            mcp: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         assert!(!j.contains("images") && !j.contains("workspace"));
