@@ -32,7 +32,7 @@ downloads/
 *.gif
 *.avif
 !native/crates/mv-ui/assets/**
-!logo manga vox.png
+!docs/images/*.png
 *.mp4
 *.mkv
 *.mov
@@ -60,3 +60,15 @@ downloads/
 
 # Agent worktrees (whole checkouts, never committed)
 .claude/worktrees/
+
+# Per-machine AI tool configs and internal notes (generated locally, not part of the project)
+.claude/
+.codex/
+.cursorrules
+.windsurfrules
+.mcp.json
+.opencode.json
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+docs/internal/

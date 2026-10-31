@@ -23,10 +23,10 @@ fi
 bad=0
 say() { echo "  BLOCKED: $1" >&2; bad=1; }
 
-# Files that may be media: the app's own icons and logo.
+# Files that may be media: the app's own icons, logo and README screenshots.
 allowed() {
   case "$1" in
-    native/crates/mv-ui/assets/*|"logo manga vox.png") return 0 ;;
+    native/crates/mv-ui/assets/*|docs/images/*.png) return 0 ;;
   esac
   return 1
 }
