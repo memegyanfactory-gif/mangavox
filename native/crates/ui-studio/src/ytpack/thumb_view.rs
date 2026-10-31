@@ -388,6 +388,10 @@ impl ThumbGen {
             // References need a model that takes them; Nano Banana 2.1 does.
             model = &CATALOG[0];
         }
+        if !model.takes_aspect() && t.aspect != "1:1" {
+            // A square-only model cannot make a 16:9 thumbnail; Nano Banana 2.1 takes the size.
+            model = &CATALOG[0];
+        }
         let first = usize::from(base.is_some());
         let just_cast: Vec<Cast> = t.cast.iter().map(|(c, _)| c.clone()).collect();
         let (resolved, mut order) = thumbs::resolve(&prompt, &just_cast, first);
@@ -681,7 +685,10 @@ impl ThumbGen {
             icon_button("thg-key", ph::GEAR_SIX, "Magnific settings: key, default model, credits").on_click(|_, window, cx| open_settings(window, cx)),
         );
         let row = if open { row.child(self.model_menu(cx)) } else { row };
-        div().flex().flex_col().gap(px(space::SM)).child(label_caps("Model")).child(row)
+        let square_only = !m.takes_aspect() && self.th.aspect != "1:1";
+        div().flex().flex_col().gap(px(space::SM)).child(label_caps("Model")).child(row).when(square_only, |d| {
+            d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).whitespace_normal().child(format!("{} only makes square images, so {} thumbnails are made with {} ({}).", m.name, self.th.aspect, CATALOG[0].name, CATALOG[0].cost_label(self.th.res).trim_start_matches(" · "))))
+        })
     }
 
     fn model_row(&self, i: usize, m: &'static ImageModel, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -707,7 +714,7 @@ impl ThumbGen {
                 cx.notify();
             }))
             .child(div().w(px(240.)).flex().items_center().gap(px(6.)).child(icon_ph(m.icon(), Tokens::text_2(), icon_px::XS)).child(div().truncate().text_size(px(size::SM)).text_color(Tokens::text_1()).child(m.name)).when(m.new, |d| d.child(badge("New", Tone::Accent))))
-            .child(div().flex().flex_1().gap(px(4.)).when(m.refs > 0, |d| d.child(spec("Refs"))).child(spec(m.speed)).child(spec(m.res_label())))
+            .child(div().flex().flex_1().gap(px(4.)).when(m.refs > 0, |d| d.child(spec("Refs"))).child(spec(m.speed)).child(spec(if m.takes_aspect() { m.res_label() } else { "1:1 only".into() })))
             .child(price(m))
     }
 

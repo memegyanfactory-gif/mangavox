@@ -101,6 +101,11 @@ impl ImageModel {
         }
     }
 
+    /// It takes an aspect ratio. Gemini 2.5 Flash Image has no size field and makes squares.
+    pub fn takes_aspect(&self) -> bool {
+        self.shape != Shape::Gemini
+    }
+
     /// "2K-4K", "1K-2K", or "" for one size.
     pub fn res_label(&self) -> String {
         match (self.resolutions.first(), self.resolutions.last()) {
@@ -380,6 +385,19 @@ pub async fn verify(key: &str) -> Result<()> {
     }
 }
 
+/// `img` cut to `aspect` ("16:9") around its centre when its shape is more than 3% off, so a
+/// model that ignores the size still gives a thumbnail of the asked shape. "auto" keeps it.
+pub fn fit_aspect(img: image::DynamicImage, aspect: &str) -> image::DynamicImage {
+    let Some((a, b)) = aspect.split_once(':').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?))).filter(|(a, b)| *a > 0. && *b > 0.) else { return img };
+    let (w, h) = (img.width() as f64, img.height() as f64);
+    let want = a / b;
+    if h == 0. || ((w / h) / want - 1.).abs() <= 0.03 {
+        return img;
+    }
+    let (cw, ch) = if w / h > want { ((h * want).round(), h) } else { (w, (w / want).round()) };
+    img.crop_imm(((w - cw) / 2.) as u32, ((h - ch) / 2.) as u32, cw as u32, ch as u32)
+}
+
 /// Makes one image with `m` and saves it as PNG at `out`. `on_status` hears the progress.
 pub async fn generate(m: &'static ImageModel, key: &str, prompt: &str, refs: &[Reference], aspect: &str, res: &str, out: &Path, on_status: impl Fn(&str)) -> Result<()> {
     let mut images = vec![];
@@ -409,8 +427,9 @@ pub async fn generate(m: &'static ImageModel, key: &str, prompt: &str, refs: &[R
                 on_status("Downloading");
                 let bytes = http.get(src).send().await?.error_for_status()?.bytes().await?;
                 let out = out.to_path_buf();
+                let aspect = aspect.to_string();
                 return tokio::task::spawn_blocking(move || -> Result<()> {
-                    let img = image::load_from_memory(&bytes).context("Magnific sent an unreadable image")?;
+                    let img = fit_aspect(image::load_from_memory(&bytes).context("Magnific sent an unreadable image")?, &aspect);
                     if let Some(d) = out.parent() {
                         std::fs::create_dir_all(d)?;
                     }
@@ -469,5 +488,21 @@ mod tests {
         assert_eq!(m.cost_at("1K"), 50.);
         assert_eq!(m.cost_at("4K"), 145.);
         assert!(m.cost_at("2K") > 50. && m.cost_at("2K") < 145.);
+    }
+
+    #[test]
+    fn square_only_models_and_aspect_fit() {
+        use image::GenericImageView as _;
+        let gemini = CATALOG.iter().find(|m| m.shape == Shape::Gemini).unwrap();
+        assert!(!gemini.takes_aspect() && CATALOG[0].takes_aspect());
+        // A square from a model that ignores the size comes out 16:9, cut around the centre.
+        let sq = image::DynamicImage::new_rgb8(1024, 1024);
+        let f = fit_aspect(sq.clone(), "16:9");
+        assert_eq!((f.width(), f.height()), (1024, 576));
+        assert_eq!(fit_aspect(sq.clone(), "9:16").dimensions(), (576, 1024));
+        // Close enough, "auto" and "1:1" stay as they are.
+        assert_eq!(fit_aspect(image::DynamicImage::new_rgb8(1376, 768), "16:9").dimensions(), (1376, 768));
+        assert_eq!(fit_aspect(sq.clone(), "auto").dimensions(), (1024, 1024));
+        assert_eq!(fit_aspect(sq, "1:1").dimensions(), (1024, 1024));
     }
 }
