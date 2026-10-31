@@ -82,7 +82,8 @@ pub enum SetupState {
 pub enum Target {
     /// A voice pack: its engine and its model files.
     Pack(&'static VoicePack),
-    /// An engine on its own (`kokoro`, `piper` or `chatterbox`).
+    /// An engine on its own (`kokoro`, `piper` or `chatterbox`), or `kokoro-gpu`: the graphics
+    /// card runtime that makes Kokoro speak about 10x faster on an NVIDIA card.
     Engine(&'static str),
 }
 
@@ -94,6 +95,7 @@ impl Target {
     pub fn engine(name: &str) -> Self {
         Target::Engine(match name {
             "kokoro" => "kokoro",
+            "kokoro-gpu" => "kokoro-gpu",
             "chatterbox" => "chatterbox",
             _ => "piper",
         })
@@ -104,6 +106,7 @@ impl Target {
         match self {
             Target::Pack(p) => p.id,
             Target::Engine("kokoro") => "engine:kokoro",
+            Target::Engine("kokoro-gpu") => "engine:kokoro-gpu",
             Target::Engine("chatterbox") => "engine:chatterbox",
             Target::Engine(_) => "engine:piper",
         }
@@ -196,6 +199,8 @@ pub fn suggested_pack() -> &'static VoicePack {
 pub fn engine_size_hint(engine: &str) -> &'static str {
     match engine {
         "kokoro" => "about 60 MB",
+        // NVIDIA's CUDA and cuDNN libraries for ONNX Runtime.
+        "kokoro-gpu" => "about 2 GB",
         // Its own Python 3.11 and PyTorch with CUDA (about 2.5 GB to download).
         "chatterbox" => "about 5 GB",
         _ => "about 40 MB",
@@ -206,6 +211,7 @@ pub fn engine_size_hint(engine: &str) -> &'static str {
 fn deps_flag(engine: &str) -> &'static str {
     match engine {
         "kokoro" => "kokoroDepsReady",
+        "kokoro-gpu" => "kokoroGpu",
         "chatterbox" => "chatterboxDepsReady",
         _ => "piperDepsReady",
     }

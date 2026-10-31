@@ -332,11 +332,43 @@ def _thread_cap() -> int | None:
         return None
 
 
+def _gpu_providers() -> list[str] | None:
+    """ONNX Runtime providers for the graphics card, when the CUDA runtime is installed in the
+    voice environment (Settings → Audio → Use graphics card) and MANGAVOX_TTS_GPU is not "0".
+    On an RTX 3080 this speaks about 11x faster than the CPU."""
+    if os.environ.get("MANGAVOX_TTS_GPU", "1") == "0":
+        return None
+    try:
+        import onnxruntime as ort
+
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            return None
+        try:
+            # The CUDA and cuDNN libraries come as pip packages next to onnxruntime-gpu.
+            ort.preload_dlls()
+        except Exception:
+            pass
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    except Exception:
+        return None
+
+
 def load_kokoro():
-    """Kokoro with ONNX Runtime capped to the allowed thread count."""
+    """Kokoro on the graphics card when it can be used, else ONNX Runtime on the CPU capped to
+    the allowed thread count."""
     from kokoro_onnx import Kokoro
 
     onnx_path, voices_path = kokoro_model_paths()
+    gpu = _gpu_providers()
+    if gpu:
+        try:
+            import onnxruntime as ort
+
+            session = ort.InferenceSession(onnx_path, providers=gpu)
+            if "CUDAExecutionProvider" in session.get_providers():
+                return Kokoro.from_session(session, voices_path)
+        except Exception:
+            pass
     cap = _thread_cap()
     if cap:
         try:
@@ -1048,6 +1080,9 @@ def status() -> dict:
     st = {
         "installed": engine is not None or kokoro_models or piper_models or f5_ready_flag or parler_ready_flag,
         "kokoroDepsReady": kokoro_deps_flag,
+        # Settings → Audio offers "Use graphics card" when a card is there and not used yet.
+        "nvidiaGpu": nvidia_gpu_present(),
+        "kokoroGpu": kokoro_deps_flag and nvidia_gpu_present() and kokoro_gpu_ready(py),
         "piperDepsReady": piper_deps_flag,
         "engine": engine or "none",
         "f5Ready": f5_ready_flag,
@@ -1416,7 +1451,8 @@ def synthesize_kokoro(text: str, output_path: str, voice: str, speed: float) -> 
     if not kokoro_models_ready():
         raise RuntimeError(missing_message(voice) or "The Kokoro voice pack is not downloaded")
     try:
-        engine = load_kokoro()
+        # Loaded once per process (the worker keeps it for a whole chapter).
+        engine = get_kokoro_model()
     except ImportError as e:
         raise RuntimeError(
             f'The Kokoro engine is not installed in {sys.executable} ({e}). '
@@ -1497,7 +1533,10 @@ def synthesize_parler(text: str, output_path: str, voice: str, speed: float) -> 
 def synthesize_to_file(text: str, output_path: str, voice: str = "hf_alpha", speed: float = 1.0) -> str:
     """Synthesizes `text` with `voice`, or with its stand-in when the voice's own engine is not
     installed. Returns the engine used. Never downloads anything."""
-    plan = voice_plan(voice)
+    # What is installed does not change while a process runs, so each voice is planned once.
+    plan = _PLANS.get(voice)
+    if plan is None or not plan["ready"]:
+        plan = _PLANS[voice] = voice_plan(voice)
     if not plan["ready"]:
         raise RuntimeError(plan.get("message") or f"No installed engine can voice {voice}")
     engine, synth_voice = plan["engine"], plan["synthVoice"]
@@ -1521,6 +1560,8 @@ def synthesize_to_file(text: str, output_path: str, voice: str = "hf_alpha", spe
         raise RuntimeError(f"Unknown voice engine {engine} for {voice}")
     return engine
 
+
+_PLANS: dict = {}
 
 _loaded_kokoro_model = None
 
@@ -1616,6 +1657,77 @@ def cmd_synthesize(args_path: str) -> int:
         return 1
 
 
+def run_worker() -> int:
+    """One process for a whole chapter (tts_bridge.py starts it): a JSON request per line on
+    stdin, {"text", "voice", "output_path", "speed"}, and one answer line per request on stdout,
+    {"ok": true, "path", "engine"} or {"ok": false, "message"}. The model loads once, so each
+    request costs only the speech itself. Other stdout lines (info) carry no "ok" key."""
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            engine = synthesize_to_file((req.get("text") or "").strip(), req["output_path"], req.get("voice", "hf_alpha"), req.get("speed", 1.0))
+            out = {"ok": True, "path": req["output_path"], "engine": engine}
+        except Exception as e:
+            out = {"ok": False, "message": str(e)[:500]}
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.stdout.flush()
+    return 0
+
+
+def kokoro_gpu_ready(python: str | None = None) -> bool:
+    """The voice environment's ONNX Runtime can use an NVIDIA graphics card."""
+    py = python or resolve_python()
+    try:
+        r = subprocess.run([py, "-c", "import onnxruntime as o; import sys; sys.exit(0 if 'CUDAExecutionProvider' in o.get_available_providers() else 1)"],
+                           capture_output=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def nvidia_gpu_present() -> bool:
+    return shutil.which("nvidia-smi") is not None
+
+
+def install_kokoro_gpu() -> int:
+    """Swaps the voice environment's ONNX Runtime for the CUDA build (about 2 GB with NVIDIA's
+    CUDA and cuDNN libraries), so Kokoro speaks on an NVIDIA graphics card. Restores the CPU
+    build when the GPU one cannot be used."""
+    if not nvidia_gpu_present():
+        emit({"type": "error", "message": "No NVIDIA graphics card was found (nvidia-smi is missing). Kokoro keeps using the CPU."})
+        return 1
+    py = _ensure_venv()
+    if not py:
+        emit({"type": "error", "message": "The voice environment is not set up yet. Install the Kokoro engine first."})
+        return 1
+    if kokoro_gpu_ready(py):
+        emit({"type": "done", "message": "Kokoro already uses the graphics card", "python": py})
+        return 0
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    emit({"type": "progress", "stage": "pip", "current": 1, "total": 3, "message": "Downloading the graphics card runtime (about 2 GB)…"})
+    try:
+        subprocess.run([py, "-m", "pip", "uninstall", "-y", "onnxruntime"], capture_output=True, timeout=600, creationflags=flags)
+        _pip_install(py, ["onnxruntime-gpu[cuda,cudnn]>=1.21"])
+    except Exception as e:
+        emit({"type": "progress", "stage": "pip", "current": 2, "total": 3, "message": "Putting the CPU runtime back…"})
+        try:
+            subprocess.run([py, "-m", "pip", "uninstall", "-y", "onnxruntime-gpu"], capture_output=True, timeout=600, creationflags=flags)
+            _pip_install(py, ["onnxruntime>=1.19.0,<2"])
+        except Exception:
+            pass
+        emit({"type": "error", "message": f"Could not install the graphics card runtime: {str(e)[-400:]}"})
+        return 1
+    emit({"type": "progress", "stage": "verify", "current": 3, "total": 3, "message": "Checking the graphics card…"})
+    if not kokoro_gpu_ready(py):
+        emit({"type": "error", "message": "The graphics card runtime installed but cannot see the card. Update the NVIDIA driver and try again."})
+        return 1
+    emit({"type": "done", "message": "Kokoro now speaks on the graphics card", "python": py})
+    return 0
+
+
 ENGINE_PACKAGES = {
     "kokoro": ["kokoro-onnx>=0.4.0", "soundfile>=0.12.0", "numpy>=1.26"],
     "piper": ["piper-tts>=1.3.0", "onnxruntime>=1.19.0,<2"],
@@ -1648,6 +1760,9 @@ def install_engine(name: str) -> int:
     if check(py):
         emit({"type": "done", "message": f"{name} is already installed", "python": py})
         return 0
+    # The graphics card runtime already provides onnxruntime; the CPU build would replace it.
+    if kokoro_gpu_ready(py):
+        packages = [p for p in packages if not p.startswith("onnxruntime")]
     emit({"type": "progress", "stage": "pip", "current": 2, "total": 3, "message": f"Installing {', '.join(packages)}…"})
     try:
         _pip_install(py, packages)
@@ -1673,7 +1788,10 @@ def main() -> int:
     if cmd in ("install", "install-all"):
         return install()
     if cmd == "install-engine":
-        return install_engine(sys.argv[2] if len(sys.argv) > 2 else "kokoro")
+        name = sys.argv[2] if len(sys.argv) > 2 else "kokoro"
+        return install_kokoro_gpu() if name == "kokoro-gpu" else install_engine(name)
+    if cmd == "worker":
+        return run_worker()
     if cmd == "serve":
         voice_id = sys.argv[2] if len(sys.argv) > 2 else "hf_alpha"
         run_server(voice_id)

@@ -79,6 +79,10 @@ pub struct Engines {
     pub kokoro: bool,
     pub kokoro_models: bool,
     pub kokoro_deps: bool,
+    /// An NVIDIA graphics card is present (`nvidia-smi`).
+    pub nvidia_gpu: bool,
+    /// Kokoro speaks on that card (the CUDA runtime is installed in the voice environment).
+    pub kokoro_gpu: bool,
     pub piper_deps: bool,
     /// At least one Hindi / English Piper voice can speak (packages and that voice's files).
     pub piper_hi: bool,
@@ -135,6 +139,8 @@ impl Engines {
             kokoro: b("/engines/kokoro/ready"),
             kokoro_models: b("/kokoroReady"),
             kokoro_deps: b("/kokoroDepsReady"),
+            nvidia_gpu: b("/nvidiaGpu"),
+            kokoro_gpu: b("/kokoroGpu"),
             piper_deps,
             piper_hi: false,
             piper_en: false,

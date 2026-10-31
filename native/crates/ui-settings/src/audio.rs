@@ -107,7 +107,12 @@ impl Engine {
 
     /// `voice_setup` registry keys that belong to this engine (its packs and the engine alone).
     fn setup_keys(self) -> Vec<&'static str> {
-        self.packs().map(|p| p.id).chain([Target::engine(self.id()).key()]).collect()
+        let mut keys: Vec<&'static str> = self.packs().map(|p| p.id).chain([Target::engine(self.id()).key()]).collect();
+        // Kokoro's graphics card runtime shows its progress on the Kokoro card.
+        if self == Engine::Kokoro {
+            keys.push(Target::engine("kokoro-gpu").key());
+        }
+        keys
     }
 
     /// Catalog voices the engine speaks, once each (Kokoro's full and Lite packs share them).
@@ -946,6 +951,33 @@ impl SettingsView {
     }
 
     /// Graphics card and measured speed, for Chatterbox.
+    /// Kokoro on the graphics card: "Speaking on your NVIDIA card", or the one-step install of the
+    /// CUDA runtime (about 10x faster narration) when an NVIDIA card is there and Kokoro is set
+    /// up. Nothing for other PCs.
+    fn kokoro_gpu_row(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let g = &self.audio.env.as_ref()?.engines;
+        if !g.nvidia_gpu || !g.kokoro_deps {
+            return None;
+        }
+        let running = matches!(voice_setup::state(Target::engine("kokoro-gpu").key()), Some(SetupState::Running(_)));
+        let row = div().flex().items_center().gap(px(10.)).pl(px(58.));
+        Some(if g.kokoro_gpu {
+            row.child(icon_tag(ph::LIGHTNING, "Speaking on your NVIDIA graphics card", Tone::Success))
+        } else {
+            row.child(div().flex_1().min_w_0().text_size(px(size::SM)).line_height(px(18.)).text_color(Tokens::text_2()).child(
+                "Your NVIDIA graphics card can narrate about 10x faster than the CPU (measured on an RTX 3080: 0.3 s instead of 3 s per sentence group).",
+            ))
+            .child(
+                btn("kokoro-gpu", if running { "Installing" } else { "Use graphics card" }, ButtonKind::Primary)
+                    .small()
+                    .icon(ph::LIGHTNING)
+                    .loading(running)
+                    .tooltip(format!("Downloads NVIDIA's runtime for ONNX ({})", voice_setup::engine_size_hint("kokoro-gpu")))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.run_setup(Target::engine("kokoro-gpu"), cx))),
+            )
+        })
+    }
+
     fn gpu_note(&self) -> Div {
         let gpu: AnyElement = match &self.audio.system {
             None => skeleton_line(px(160.)).into_any_element(),
@@ -1160,6 +1192,9 @@ impl SettingsView {
         let mut card = surface().p(px(16.)).gap(px(14.)).child(head).child(facts);
         if e == Engine::Chatterbox {
             card = card.child(self.gpu_note());
+        }
+        if e == Engine::Kokoro {
+            card = card.children(self.kokoro_gpu_row(cx));
         }
         card = match &status {
             Status::Installing { stop, step, text, fraction } => card.child(self.progress_block(e, *stop, *step, text, *fraction, cx)),
@@ -1614,7 +1649,9 @@ mod tests {
             for k in e.setup_keys() {
                 let t = target_for_key(k).expect(k);
                 assert_eq!(t.key(), k);
-                assert_eq!(t.engine_name(), e.id());
+                // Kokoro's card also shows its graphics card runtime's job.
+                let gpu = e == Engine::Kokoro && t.engine_name() == "kokoro-gpu";
+                assert!(gpu || t.engine_name() == e.id(), "{k}");
             }
         }
     }

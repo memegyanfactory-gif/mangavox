@@ -448,6 +448,7 @@ pub fn engine_hint(voice: &str) -> &'static str {
 pub fn engine_label(engine: &str) -> &'static str {
     match engine {
         "kokoro" => "Kokoro",
+        "kokoro-gpu" => "Kokoro graphics card runtime",
         "piper" => "Piper",
         "f5-tts" => "F5-TTS",
         "parler-tts" => "Parler-TTS",

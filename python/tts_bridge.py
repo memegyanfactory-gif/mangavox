@@ -826,8 +826,51 @@ def _generate_audio_say(text, output_path, voice, speed):
         raise RuntimeError("`say` produced no output file")
 
 
+_WORKER = None
+
+
+def _kokoro_worker():
+    """The `kokoro_tts.py worker` process for this run, started on first use. It keeps the voice
+    model loaded, so a chapter loads it once instead of once per chunk (about 11 s each)."""
+    global _WORKER
+    if _WORKER is None or _WORKER.poll() is not None:
+        _WORKER = subprocess.Popen(
+            [_tts_subprocess_python(), KOKORO_SCRIPT, "worker"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    return _WORKER
+
+
+def _worker_synthesize(text, output_path, voice, speed):
+    """Speaks one chunk through the worker. True when it is written; raises the voice's own
+    error; None when the worker itself is unusable (the caller then runs the old way)."""
+    try:
+        w = _kokoro_worker()
+        w.stdin.write(json.dumps({"text": text, "voice": voice, "output_path": output_path, "speed": speed}) + "\n")
+        w.stdin.flush()
+        while True:
+            line = w.stdout.readline()
+            if not line:
+                return None
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(msg, dict) and "ok" in msg:
+                break
+    except Exception:
+        return None
+    if msg.get("ok") and os.path.exists(output_path):
+        return True
+    raise RuntimeError((msg.get("message") or "Kokoro synthesis failed")[:500])
+
+
 def _generate_audio_kokoro(text, output_path, voice, speed):
     """Bundled Kokoro-82M — local ONNX, no API, Hindi + English."""
+    if os.path.isfile(KOKORO_SCRIPT) and _worker_synthesize(text, output_path, voice, speed):
+        return
     # Attempt to hit the memory caching HTTP daemon on port 5566 first
     import urllib.request
     import urllib.error
