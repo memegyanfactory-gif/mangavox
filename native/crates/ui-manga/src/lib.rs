@@ -11,6 +11,7 @@ mod detail;
 mod discover;
 mod downloads;
 mod downloads_page;
+mod foryou;
 mod history;
 mod library;
 pub mod logic;
@@ -20,7 +21,9 @@ mod reader;
 pub mod recap;
 mod sources;
 pub mod store;
+mod suggest;
 pub mod tags;
+mod taste;
 mod ui;
 
 pub use backend::set_source_ctx;

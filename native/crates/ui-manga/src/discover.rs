@@ -144,7 +144,6 @@ pub async fn resolve_tag(req: TagRequest) -> TagTarget {
 pub struct Recs {
     /// Source the recommended titles come from (open them with this source).
     pub source_id: String,
-    pub source_name: String,
     /// Names of the tags the query used.
     pub basis: Vec<String>,
     pub items: Vec<MangaSearchResult>,
@@ -206,7 +205,6 @@ pub async fn recommendations(own_source: String, own_id: String, title: String, 
         }
     }
     Ok(Recs {
-        source_name: src.info().name,
         source_id: sid,
         basis: picked.into_iter().map(|t| t.name).collect(),
         items: {
@@ -257,7 +255,7 @@ mod live {
 
             // A WEBTOON title (no tags there) falls back to MangaDex.
             let r = recommendations("webtoon".into(), "95".into(), "Tower of God".into(), vec!["Fantasy".into()]).await.unwrap();
-            println!("Tower of God recs (from {}, by {}): {}", r.source_name, r.basis.join(" + "), r.items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>().join(" | "));
+            println!("Tower of God recs (from {}, by {}): {}", r.source_id, r.basis.join(" + "), r.items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>().join(" | "));
             assert_eq!(r.source_id, FALLBACK_SOURCE);
             assert!(!r.items.is_empty());
         });

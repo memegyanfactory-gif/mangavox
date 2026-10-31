@@ -207,6 +207,12 @@ pub trait Source: Send + Sync {
             _ => Err(SourceError::Unsupported("combining tags")),
         }
     }
+    /// Titles by an author or artist. The default searches by the name and keeps the results
+    /// whose author is that person (sources that do not report authors find none).
+    async fn get_manga_by_creator(&self, name: &str, page: u32) -> Result<Vec<MangaSearchResult>> {
+        let list = self.search_manga(name, page).await?;
+        Ok(list.into_iter().filter(|r| r.author.as_deref().is_some_and(|a| crate::util::creator_matches(a, name))).collect())
+    }
     /// Whether [`get_manga_by_tags`](Self::get_manga_by_tags) accepts more than one tag.
     fn supports_multi_tag(&self) -> bool {
         false

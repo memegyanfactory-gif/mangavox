@@ -162,6 +162,15 @@ mod tests {
     }
 
     #[test]
+    fn people_and_creator_match() {
+        assert_eq!(split_people("ONE, Murata Yusuke & one / Unknown"), ["ONE", "Murata Yusuke"]);
+        assert!(creator_matches("Murata Yusuke, ONE", "one"));
+        assert!(creator_matches("Yusuke Murata", "Murata Yusuke"));
+        assert!(!creator_matches("Murata Yusuke", "Murata"));
+        assert!(!creator_matches("", "x"));
+    }
+
+    #[test]
     fn entities() {
         assert_eq!(decode_entities("Tom &amp; Jerry &#039;s &#x41; &lt;b&gt; &bogus; &"), "Tom & Jerry 's A <b> &bogus; &");
     }
@@ -172,6 +181,31 @@ mod tests {
         assert_eq!(abs_url("https://a.test/", "/x").as_deref(), Some("https://a.test/x"));
         assert_eq!(abs_url("https://a.test", "x.jpg"), None);
     }
+}
+
+/// The people in an author / artist field ("A, B & C" -> three names), placeholders dropped.
+pub fn split_people(field: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in field.split([',', '&', '/', ';', '\u{3001}']) {
+        let p = p.trim();
+        let key = title_key(p);
+        if key.is_empty() || ["unknown", "n a", "na", "none", "various"].contains(&key.as_str()) || out.iter().any(|o| title_key(o) == key) {
+            continue;
+        }
+        out.push(p.to_string());
+    }
+    out
+}
+
+/// Whether an author / artist field names `name` (any of its people, same words in any order).
+pub fn creator_matches(field: &str, name: &str) -> bool {
+    let words = |s: &str| {
+        let mut w: Vec<String> = title_key(s).split(' ').filter(|w| !w.is_empty()).map(str::to_string).collect();
+        w.sort();
+        w
+    };
+    let want = words(name);
+    !want.is_empty() && split_people(field).iter().any(|p| words(p) == want)
 }
 
 /// Lowercase words only (punctuation dropped), for comparing titles.
