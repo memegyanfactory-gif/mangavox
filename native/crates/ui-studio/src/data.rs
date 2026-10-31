@@ -230,8 +230,25 @@ pub fn load() -> Result<Vec<MangaGroup>> {
             ch.output_dir = output_dir_for(&ch.manga_id, &ch.id, &ch.pages_dir);
             scan(ch);
         }
+        hide_duplicates(&mut g.chapters);
     }
     Ok(groups)
+}
+
+/// A manga can hold the same chapter twice (two groups uploaded it), which would be read and
+/// narrated twice. Of the copies with exactly the same number, the one with the most Studio work
+/// stays (else the first downloaded); 1.2 and 1.3 are different chapters and both stay.
+pub fn hide_duplicates(chapters: &mut Vec<ChapterItem>) {
+    let work = |c: &ChapterItem| (c.video.is_some(), c.audio_files > 0, c.has_text);
+    let mut keep: Vec<ChapterItem> = Vec::with_capacity(chapters.len());
+    for ch in chapters.drain(..) {
+        match keep.iter_mut().find(|k| ch.number.is_some() && k.number == ch.number) {
+            Some(k) if work(&ch) > work(k) => *k = ch,
+            Some(_) => {}
+            None => keep.push(ch),
+        }
+    }
+    *chapters = keep;
 }
 
 /// Records a finished pipeline stage on the chapter row (as the Electron orchestrator does).
@@ -346,6 +363,27 @@ mod tests {
         let two = d.path().join("proj/ch-2");
         adopt_legacy(&two, "ch-2", &manga.join("ch-2"));
         assert!(two.join("studio/read.json").is_file() && two.join("audio/p1.wav").is_file());
+    }
+
+    #[test]
+    fn a_chapter_uploaded_twice_shows_once() {
+        let ch = |id: &str, number: Option<f64>, audio_files: usize| ChapterItem {
+            id: id.into(),
+            manga_id: "m".into(),
+            manga_title: "M".into(),
+            number,
+            title: None,
+            pages_dir: PathBuf::new(),
+            output_dir: PathBuf::new(),
+            page_count: 0,
+            has_text: false,
+            video: None,
+            audio_files,
+        };
+        let mut list = vec![ch("1a", Some(1.0), 0), ch("1b", Some(1.0), 0), ch("1.2", Some(1.2), 0), ch("1.3", Some(1.3), 0), ch("2a", Some(2.0), 0), ch("2b", Some(2.0), 5), ch("x", None, 0), ch("y", None, 0)];
+        hide_duplicates(&mut list);
+        let ids: Vec<&str> = list.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["1a", "1.2", "1.3", "2b", "x", "y"], "first copy stays, unless the other already has Studio work");
     }
 
     #[test]

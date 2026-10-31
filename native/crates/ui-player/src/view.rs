@@ -198,6 +198,9 @@ pub struct PlayerView {
     controls_at: Instant,
     cursor_hidden: bool,
     last_cursor: Option<(i32, i32)>,
+    /// Where the last mouse-move event was. Hiding the cursor makes Windows send a move event
+    /// without any movement, which must not bring the controls back.
+    last_move: Option<Point<Pixels>>,
     mouse_in_bar: bool,
     /// Mouse-down point on the top bar (drag to move the window).
     title_drag: Option<Point<Pixels>>,
@@ -303,6 +306,7 @@ impl PlayerView {
             controls_at: now - FADE,
             cursor_hidden: false,
             last_cursor: None,
+            last_move: None,
             mouse_in_bar: false,
             title_drag: None,
             video_shown: false,
@@ -1302,7 +1306,9 @@ impl PlayerView {
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
         let pos = ev.position;
-        self.activity(cx);
+        if self.last_move.replace(pos) != Some(pos) || ev.pressed_button.is_some() {
+            self.activity(cx);
+        }
         if let Some(start) = self.title_drag {
             let d = pos - start;
             if ev.pressed_button == Some(MouseButton::Left) && (d.x.as_f32().abs() > 4.0 || d.y.as_f32().abs() > 4.0) {
