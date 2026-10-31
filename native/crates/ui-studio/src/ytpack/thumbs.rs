@@ -161,22 +161,21 @@ pub struct Brief<'a> {
     pub hook: &'a str,
 }
 
-const CLICK_GUIDE: &str = "What wins clicks on manhwa / manga recap thumbnails (study, then adapt to THIS story):\n\
-- Onlookers: the hero walks toward the camera carrying an oversized weapon or aura while a crowd behind (girls, classmates, rivals, knights) stares in awe, shock or desire. The audience reads status from their faces.\n\
-- Power reveal: extreme close-up of the hero, one glowing eye, aura or lightning, half the face in shadow, a calm smirk.\n\
-- Scale: a tiny hero facing a gigantic monster, dragon, army or boss; the size gap is the story.\n\
-- Before / after: split frame, weak or bullied on one side, overpowered on the other.\n\
-- Reaction: a shocked side character big in the foreground, the hero doing the impossible behind them.\n\
-- System window: a glowing status screen with an absurd number (LV 999, SSS rank) beside the hero.\n\
-- Kneeling: enemies or nobles bowing, the hero standing over them, looking down.\n\
-Rules: one clear focal point, the hero's face big and emotional, 2-3 dominant colours with a warm/cold contrast, a dark simple background so the subject pops, depth (foreground / subject / background), 2-4 words of huge text at most, nothing small. Never invent powers, weapons, places or events that are not in the story: exaggerate what is there.";
+const CLICK_GUIDE: &str = "What the biggest recap channels' thumbnails do (study, then adapt to THIS story):\n\
+- Reaction scene: the hero does something absurd or impressive in a specific, bright, story-true place, and the story's other characters (heroines, rivals, classmates) react big in the frame: shock, blush, disbelief. Their faces tell the viewer how huge it is.\n\
+- Label and arrow: a yellow arrow at the hero with a 1-2 word yellow label ('MC', 'NEWBIE', 'S-RANK?'), or one short line a character says.\n\
+- Romance beat, when the story has one: a heroine blushing at the oblivious hero.\n\
+- The hook as a scene: show the premise happening (what he does, to whom, where) instead of a generic pose.\n\
+Overused by small channels, and below average in the data: the generic aura / lightning power pose, the hero alone holding a weapon, split or multi-panel frames, dark caves and night voids, status windows and stat numbers, kneeling crowds, tiny-hero-versus-giant shots. Use one only when it IS this story's hook, and even then put people reacting in the frame.\n\
+Rules: one clear scene, readable faces, 2-3 dominant colours, yellow text with a thick black outline, 1-4 big words or one short line of dialogue, nothing small. Never invent powers, weapons, places or events that are not in the story: exaggerate what is there.";
 
 /// System and user prompt for 4 thumbnail concepts; the answer is JSON only.
 pub fn concepts_prompt(b: &Brief) -> (String, String) {
     let names: Vec<String> = b.cast.iter().map(|c| format!("@{}", handle(&c.name))).collect();
+    let learned = super::click::model().thumbnail_digest();
     let system = format!(
-        "You are a thumbnail art director for a top manhwa recap channel. You know why viewers click and you design thumbnails that are clickbait but honest to the story.\n\n{CLICK_GUIDE}\n\n\
-Write 4 different concepts, each from a different pattern that fits this manga. In each prompt, name characters ONLY with these handles so their face references get attached: {}. Describe pose, expression, what they hold, the background, the lighting and the colours concretely, in one paragraph an image model can follow. Put the words for the thumbnail in `text` and also in the prompt as \"bold text: ...\".\n\
+        "You are a thumbnail art director for a top manhwa recap channel. You know why viewers click and you design thumbnails that are clickbait but honest to the story.\n\n{CLICK_GUIDE}\n\n{learned}\n\
+Write 6 different concepts, each from a different pattern that fits this manga; where the craft guide and the learned rules disagree, the learned rules win (they are measured). Name the visual features plainly in each prompt (close-up, onlookers, aura, arrow, the text colour). In each prompt, name characters ONLY with these handles so their face references get attached: {}. Describe pose, expression, what they hold, the background, the lighting and the colours concretely, in one paragraph an image model can follow. Put the words for the thumbnail in `text` and also in the prompt as \"bold text: ...\".\n\
 Reply with JSON only: {{\"analysis\":\"2-3 sentences: what this manga's thumbnails should sell and why\",\"concepts\":[{{\"name\":\"short name\",\"why\":\"one sentence on why it gets the click\",\"prompt\":\"\",\"text\":\"\"}}]}}",
         if names.is_empty() { "(no characters known yet; describe the hero instead)".to_string() } else { names.join(", ") }
     );
@@ -212,8 +211,9 @@ Reply with JSON only: {{\"analysis\":\"2-3 sentences: what this manga's thumbnai
 pub fn improve_prompt(b: &Brief, draft: &str) -> (String, String) {
     let (_, context) = concepts_prompt(b);
     let names: Vec<String> = b.cast.iter().map(|c| format!("@{}", handle(&c.name))).collect();
+    let learned = super::click::model().thumbnail_digest();
     let system = format!(
-        "You are a thumbnail art director for a top manhwa recap channel. You turn a rough idea into one image prompt that an image model (Nano Banana, GPT image, Seedream, Flux) renders into a thumbnail people click, while staying honest to the story.\n\n{CLICK_GUIDE}\n\n\
+        "You are a thumbnail art director for a top manhwa recap channel. You turn a rough idea into one image prompt that an image model (Nano Banana, GPT image, Seedream, Flux) renders into a thumbnail people click, while staying honest to the story.\n\n{CLICK_GUIDE}\n\n{learned}\n\
 Write ONE paragraph, 60-140 words: the focal character's pose and expression, what they hold or do, who reacts behind them and how, the background, the lighting and the 2-3 colours, and the huge text as `bold text: \"...\"` (2-4 words). Name characters ONLY with these handles so their face references get attached: {}. Keep every handle the draft used. Reply with the prompt only: no title, no quotes, no markdown.",
         if names.is_empty() { "(no characters known yet)".to_string() } else { names.join(", ") }
     );

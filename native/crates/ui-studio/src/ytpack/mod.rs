@@ -4,6 +4,7 @@
 //! views prediction, and a title / description / thumbnail concept from the picked AI model.
 //! Saved per manga in `studio/<manga>/youtube_package.json`.
 mod assist;
+mod click;
 mod logic;
 mod magnific;
 mod magnific_settings;

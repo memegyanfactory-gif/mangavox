@@ -1,0 +1,2000 @@
+{
+ "version": 2,
+ "trained": "2026-11-01",
+ "data": {
+  "channels": 25,
+  "videos": 2243,
+  "labelled": 363
+ },
+ "target": "log10 views against what the video's own channel usually gets at that age",
+ "eval": {
+  "within": 0.014,
+  "within_shuffled": -0.035,
+  "within_sd": 0.061,
+  "between": 0.35,
+  "between_channels": 25,
+  "titles": 0.201,
+  "titles_shuffled": 0.007,
+  "titles_sd": 0.028
+ },
+ "pixel": {
+  "intercept": 0,
+  "features": [
+   {
+    "key": "saturation",
+    "label": "Saturation",
+    "weight": -0.0076,
+    "mean": 0.4555,
+    "std": 0.1516
+   },
+   {
+    "key": "contrast",
+    "label": "Contrast",
+    "weight": 0.001,
+    "mean": 0.2478,
+    "std": 0.0328
+   },
+   {
+    "key": "brightness",
+    "label": "Brightness",
+    "weight": 0.0047,
+    "mean": 0.4972,
+    "std": 0.1077
+   },
+   {
+    "key": "colorfulness",
+    "label": "Colourfulness",
+    "weight": -0.0032,
+    "mean": 0.347,
+    "std": 0.1078
+   },
+   {
+    "key": "red_share",
+    "label": "Red",
+    "weight": -0.0074,
+    "mean": 0.0679,
+    "std": 0.0845
+   },
+   {
+    "key": "warm_share",
+    "label": "Warm colours",
+    "weight": -0.0401,
+    "mean": 0.1816,
+    "std": 0.1452
+   },
+   {
+    "key": "cool_share",
+    "label": "Cool colours",
+    "weight": -0.0119,
+    "mean": 0.191,
+    "std": 0.1659
+   },
+   {
+    "key": "bright_share",
+    "label": "Highlights",
+    "weight": 0.002,
+    "mean": 0.1271,
+    "std": 0.0979
+   },
+   {
+    "key": "dark_share",
+    "label": "Dark areas",
+    "weight": -0.0028,
+    "mean": 0.1193,
+    "std": 0.1102
+   },
+   {
+    "key": "edge_density",
+    "label": "Clutter",
+    "weight": -0.0042,
+    "mean": 0.4008,
+    "std": 0.0853
+   },
+   {
+    "key": "center_focus",
+    "label": "Centre detail",
+    "weight": -0.0064,
+    "mean": 1.0661,
+    "std": 0.171
+   }
+  ]
+ },
+ "concept": {
+  "intercept": 0,
+  "features": [
+   {
+    "key": "face_closeup",
+    "label": "Big face close-up",
+    "weight": -0.0379,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "no_face",
+    "label": "No face",
+    "weight": -0.0001,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "expr_intense",
+    "label": "Strong emotion",
+    "weight": -0.0354,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "expr_smirk",
+    "label": "Cocky smirk",
+    "weight": -0.0072,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "expr_happy",
+    "label": "Laughing / blushing",
+    "weight": 0.0204,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "solo",
+    "label": "Lone character",
+    "weight": -0.1081,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "crowd",
+    "label": "Crowd (4+)",
+    "weight": -0.0279,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "onlookers",
+    "label": "Onlookers reacting",
+    "weight": 0.0118,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "women",
+    "label": "Female characters",
+    "weight": 0.0741,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text",
+    "label": "Has text",
+    "weight": 0.0951,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_short",
+    "label": "1-3 words of text",
+    "weight": -0.0032,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_long",
+    "label": "6+ words of text",
+    "weight": 0.0182,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_yellow",
+    "label": "Yellow outlined text",
+    "weight": 0.0689,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_label",
+    "label": "Label text ('MC')",
+    "weight": 0.0,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_exclaim",
+    "label": "Exclamation text",
+    "weight": -0.0772,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_dialogue",
+    "label": "Dialogue text",
+    "weight": 0.0089,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_stat",
+    "label": "Number / rank in text",
+    "weight": -0.0216,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_headline",
+    "label": "Headline text",
+    "weight": -0.0076,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "text_question",
+    "label": "Question text",
+    "weight": -0.0407,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "arrow_circle",
+    "label": "Arrow / circle",
+    "weight": 0.0247,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "glow_aura",
+    "label": "Aura / energy",
+    "weight": -0.1527,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "glowing_eyes",
+    "label": "Glowing eyes",
+    "weight": 0.0049,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "weapon",
+    "label": "Weapon",
+    "weight": -0.1006,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "monster",
+    "label": "Monster",
+    "weight": 0.0,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "scale_contrast",
+    "label": "Size gap",
+    "weight": -0.0562,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "split",
+    "label": "Split frame",
+    "weight": -0.0612,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "before_after",
+    "label": "Before / after",
+    "weight": -0.0029,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "system_ui",
+    "label": "System window",
+    "weight": -0.0447,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "kneeling",
+    "label": "Kneeling",
+    "weight": -0.0528,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "blood",
+    "label": "Blood",
+    "weight": 0.0197,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "humor",
+    "label": "Comedy",
+    "weight": 0.0,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "romance",
+    "label": "Romance",
+    "weight": 0.1012,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "wealth",
+    "label": "Wealth",
+    "weight": 0.0168,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "dark_setting",
+    "label": "Dark setting",
+    "weight": -0.0325,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "busy_background",
+    "label": "Busy background",
+    "weight": 0.0104,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "off_center",
+    "label": "Subject on a third",
+    "weight": 0.0236,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "dark_mood",
+    "label": "Dark mood",
+    "weight": -0.0125,
+    "mean": 0.0,
+    "std": 1.0
+   },
+   {
+    "key": "raw_panel",
+    "label": "Raw comic panel",
+    "weight": -0.0002,
+    "mean": 0.0,
+    "std": 1.0
+   }
+  ]
+ },
+ "percentiles": [
+  -0.481,
+  -0.3373,
+  -0.3224,
+  -0.2657,
+  -0.2438,
+  -0.2274,
+  -0.2223,
+  -0.2111,
+  -0.2072,
+  -0.2016,
+  -0.1902,
+  -0.1778,
+  -0.1686,
+  -0.1622,
+  -0.1538,
+  -0.1485,
+  -0.1411,
+  -0.1364,
+  -0.1281,
+  -0.1218,
+  -0.1142,
+  -0.1099,
+  -0.1012,
+  -0.0984,
+  -0.0931,
+  -0.0859,
+  -0.0815,
+  -0.0762,
+  -0.0725,
+  -0.0689,
+  -0.0675,
+  -0.0631,
+  -0.0579,
+  -0.0548,
+  -0.051,
+  -0.0459,
+  -0.0405,
+  -0.038,
+  -0.0314,
+  -0.0283,
+  -0.0247,
+  -0.0225,
+  -0.0181,
+  -0.0162,
+  -0.0127,
+  -0.006,
+  -0.0016,
+  0.0018,
+  0.005,
+  0.009,
+  0.0109,
+  0.0173,
+  0.0186,
+  0.0206,
+  0.0264,
+  0.0318,
+  0.0365,
+  0.0441,
+  0.0533,
+  0.0567,
+  0.064,
+  0.0676,
+  0.0766,
+  0.0796,
+  0.0842,
+  0.0901,
+  0.0943,
+  0.0974,
+  0.1011,
+  0.1079,
+  0.115,
+  0.1247,
+  0.1288,
+  0.1322,
+  0.1402,
+  0.1483,
+  0.1525,
+  0.1585,
+  0.1694,
+  0.1812,
+  0.1932,
+  0.2003,
+  0.2065,
+  0.2161,
+  0.2211,
+  0.2254,
+  0.2348,
+  0.2461,
+  0.2515,
+  0.2566,
+  0.268,
+  0.2748,
+  0.2891,
+  0.2971,
+  0.3093,
+  0.3282,
+  0.3417,
+  0.3794,
+  0.3975,
+  0.4348,
+  0.4723
+ ],
+ "big_channels": [
+  "Manhwa Senpai",
+  "Manhwa Fresh",
+  "Tobs Manhwa",
+  "Mamoru Manhwa",
+  "Frieren Manhwa",
+  "Yogiri Recap",
+  "GrimmyManhwa",
+  "Manhwa Plague"
+ ],
+ "rules": [
+  {
+   "feature": "romance",
+   "kind": "do",
+   "text": "A romance beat when the story has one: a heroine blushing at the hero, a couple",
+   "why": "Romance is a different audience from the power-fantasy core of recaps.",
+   "lift": 1.49,
+   "n": 24,
+   "held": 3,
+   "channels": 5,
+   "big_share": 0.13,
+   "small_share": 0.03,
+   "weight": 0.1012,
+   "examples": [
+    {
+     "id": "wVNZ3rXRBpY",
+     "title": "The Yellow-Haired Villain in the Female Main Character's Novel Wants Happiness! [MANHWA RECAP]",
+     "channel": "Hacs Recap",
+     "views": 62000,
+     "x": 10.69,
+     "text": "Yandere"
+    },
+    {
+     "id": "UD9_vcZBxDg",
+     "title": "The GENDERS ROLES Were REVERSED And Now ALL The GIRLS FIGHT For HIM - Manhwa Recap",
+     "channel": "Mamoru Manhwa",
+     "views": 5300000,
+     "x": 6.44,
+     "text": "STEPSISTER / BOSS"
+    },
+    {
+     "id": "BSq48d6q2fs",
+     "title": "7 Years as Her BACKUP—Now He’s a Billionaire CEO & She BEGS Him Back! - Manhwa Recap in Hindi",
+     "channel": "Manhwa Senpai",
+     "views": 892000,
+     "x": 3.65,
+     "text": "BETRAYED MC / EX"
+    }
+   ]
+  },
+  {
+   "feature": "women",
+   "kind": "do",
+   "text": "Put the story's heroines in the shot, reacting to the hero",
+   "why": "Heroines and reactions from women are a recurring hook in this niche.",
+   "lift": 1.0,
+   "n": 215,
+   "held": 8,
+   "channels": 17,
+   "big_share": 0.82,
+   "small_share": 0.49,
+   "weight": 0.0741,
+   "examples": [
+    {
+     "id": "JDGsUQ3spRk",
+     "title": "He Survived Hell—and Became the Strongest Hunter | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 327000,
+     "x": 133.51,
+     "text": "NEW #1"
+    },
+    {
+     "id": "lqypyQUFL1A",
+     "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+     "channel": "System Log: Manhwa",
+     "views": 555000,
+     "x": 109.19,
+     "text": "MC"
+    },
+    {
+     "id": "zahvqaNdWiE",
+     "title": "The Strongest Guilds Are Afraid of This 16-Year-Old Genius! | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 215000,
+     "x": 87.78,
+     "text": "+SSS / 16YR OLD / SOLO? / +B"
+    }
+   ]
+  },
+  {
+   "feature": "arrow_circle",
+   "kind": "do",
+   "text": "Red/yellow arrows or circles pointing at the key detail",
+   "why": "Arrows tell the eye where to look first.",
+   "lift": 1.35,
+   "n": 230,
+   "held": 10,
+   "channels": 17,
+   "big_share": 0.81,
+   "small_share": 0.68,
+   "weight": 0.0247,
+   "examples": [
+    {
+     "id": "JDGsUQ3spRk",
+     "title": "He Survived Hell—and Became the Strongest Hunter | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 327000,
+     "x": 133.51,
+     "text": "NEW #1"
+    },
+    {
+     "id": "lqypyQUFL1A",
+     "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+     "channel": "System Log: Manhwa",
+     "views": 555000,
+     "x": 109.19,
+     "text": "MC"
+    },
+    {
+     "id": "zahvqaNdWiE",
+     "title": "The Strongest Guilds Are Afraid of This 16-Year-Old Genius! | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 215000,
+     "x": 87.78,
+     "text": "+SSS / 16YR OLD / SOLO? / +B"
+    }
+   ]
+  },
+  {
+   "feature": "off_center",
+   "kind": "do",
+   "text": "The subject on a third (left or right), leaving room for text",
+   "why": "Rule of thirds leaves room for the text.",
+   "lift": 1.52,
+   "n": 80,
+   "held": 12,
+   "channels": 18,
+   "big_share": 0.25,
+   "small_share": 0.26,
+   "weight": 0.0236,
+   "examples": [
+    {
+     "id": "JDGsUQ3spRk",
+     "title": "He Survived Hell—and Became the Strongest Hunter | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 327000,
+     "x": 133.51,
+     "text": "NEW #1"
+    },
+    {
+     "id": "zahvqaNdWiE",
+     "title": "The Strongest Guilds Are Afraid of This 16-Year-Old Genius! | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 215000,
+     "x": 87.78,
+     "text": "+SSS / 16YR OLD / SOLO? / +B"
+    },
+    {
+     "id": "6xLU2LOKfIk",
+     "title": "He Was Betrayed and Killed in the Apocalypse, but Reincarnated with Infinite Supplies - Manhwa Recap",
+     "channel": "AniTiger",
+     "views": 978000,
+     "x": 28.27,
+     "text": "EX-GF"
+    }
+   ]
+  },
+  {
+   "feature": "expr_happy",
+   "kind": "do",
+   "text": "Laughing or blushing faces",
+   "why": "Warm faces read as slice-of-life, not as a power fantasy.",
+   "lift": 0.98,
+   "n": 24,
+   "held": 3,
+   "channels": 6,
+   "big_share": 0.1,
+   "small_share": 0.05,
+   "weight": 0.0204,
+   "examples": [
+    {
+     "id": "pyHwxmiveJI",
+     "title": "FAILED MAN GETS A JOB… BUT IT’S AT A Store FULL OF Monsters! - Manhwa Recap",
+     "channel": "AniTiger",
+     "views": 703000,
+     "x": 20.32,
+     "text": "NEWBIE"
+    },
+    {
+     "id": "UD9_vcZBxDg",
+     "title": "The GENDERS ROLES Were REVERSED And Now ALL The GIRLS FIGHT For HIM - Manhwa Recap",
+     "channel": "Mamoru Manhwa",
+     "views": 5300000,
+     "x": 6.44,
+     "text": "STEPSISTER / BOSS"
+    },
+    {
+     "id": "tJ-8f_rW21I",
+     "title": "He Reborn in the Poorest Village and Started an Industrial Revolution From Zero",
+     "channel": "System Log: Manhwa",
+     "views": 30000,
+     "x": 5.9,
+     "text": "MC"
+    }
+   ]
+  },
+  {
+   "feature": "text",
+   "kind": "write",
+   "text": "Print a few words of text on the thumbnail",
+   "why": "Text gives the twist a voice the image alone cannot.",
+   "lift": 1.18,
+   "n": 355,
+   "held": 1,
+   "channels": 2,
+   "big_share": 0.99,
+   "small_share": 0.94,
+   "weight": 0.0951,
+   "examples": [
+    {
+     "id": "JDGsUQ3spRk",
+     "title": "He Survived Hell—and Became the Strongest Hunter | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 327000,
+     "x": 133.51,
+     "text": "NEW #1"
+    },
+    {
+     "id": "lqypyQUFL1A",
+     "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+     "channel": "System Log: Manhwa",
+     "views": 555000,
+     "x": 109.19,
+     "text": "MC"
+    },
+    {
+     "id": "zahvqaNdWiE",
+     "title": "The Strongest Guilds Are Afraid of This 16-Year-Old Genius! | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 215000,
+     "x": 87.78,
+     "text": "+SSS / 16YR OLD / SOLO? / +B"
+    }
+   ]
+  },
+  {
+   "feature": "text_yellow",
+   "kind": "write",
+   "text": "Yellow text with a thick black outline",
+   "why": "Yellow on black is the niche's most readable, most recognisable caption style.",
+   "lift": 1.41,
+   "n": 331,
+   "held": 4,
+   "channels": 8,
+   "big_share": 0.93,
+   "small_share": 0.85,
+   "weight": 0.0689,
+   "examples": [
+    {
+     "id": "JDGsUQ3spRk",
+     "title": "He Survived Hell—and Became the Strongest Hunter | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 327000,
+     "x": 133.51,
+     "text": "NEW #1"
+    },
+    {
+     "id": "lqypyQUFL1A",
+     "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+     "channel": "System Log: Manhwa",
+     "views": 555000,
+     "x": 109.19,
+     "text": "MC"
+    },
+    {
+     "id": "zahvqaNdWiE",
+     "title": "The Strongest Guilds Are Afraid of This 16-Year-Old Genius! | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 215000,
+     "x": 87.78,
+     "text": "+SSS / 16YR OLD / SOLO? / +B"
+    }
+   ]
+  },
+  {
+   "feature": "glow_aura",
+   "kind": "avoid",
+   "text": "Aura and energy effects",
+   "why": "Glow is shorthand for power and pops against a dark frame.",
+   "lift": 0.55,
+   "n": 232,
+   "held": 15,
+   "channels": 22,
+   "big_share": 0.41,
+   "small_share": 0.75,
+   "weight": -0.1527,
+   "examples": [
+    {
+     "id": "PeV1LzAI-Ag",
+     "title": "He Was Reborn As The STRONGEST Mage Chief But Chose A CIVIL SERVANT LIFE Instead - Manhwa Recap",
+     "channel": "Magical Manhwa Recaps",
+     "views": 2100,
+     "x": 0.02,
+     "text": "H-HOW!? / GENIUS"
+    },
+    {
+     "id": "97aEYdzOcTM",
+     "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 4800,
+     "x": 0.04,
+     "text": "100% / 13% / 17%"
+    },
+    {
+     "id": "BbxcuR9rJ-Q",
+     "title": "He Was Weak But Gained The Ability To Copy Skills And Becomes Overpowered - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 5000,
+     "x": 0.04,
+     "text": "BEFORE / AFTER"
+    }
+   ]
+  },
+  {
+   "feature": "solo",
+   "kind": "avoid",
+   "text": "A lone hero with no one reacting",
+   "why": "A reaction from someone else tells the viewer how impressive the hero is.",
+   "lift": 0.73,
+   "n": 46,
+   "held": 7,
+   "channels": 11,
+   "big_share": 0.06,
+   "small_share": 0.24,
+   "weight": -0.1081,
+   "examples": [
+    {
+     "id": "FpYdelfnnvo",
+     "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! (4) - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 3800,
+     "x": 0.03,
+     "text": "100% / 13% / 17%"
+    },
+    {
+     "id": "97aEYdzOcTM",
+     "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 4800,
+     "x": 0.04,
+     "text": "100% / 13% / 17%"
+    },
+    {
+     "id": "l_MEg3qlbzs",
+     "title": "After regression he lost his memory but awakened a system and became the strongest hunter - Manhwa",
+     "channel": "System Log: Manhwa",
+     "views": 242,
+     "x": 0.05,
+     "text": "SSS / SSS / SSS / SSS / Dark Matter / Summon Skeleton / Eye of Death / Arrow Rain / REGRESSION GOD"
+    }
+   ]
+  },
+  {
+   "feature": "weapon",
+   "kind": "avoid",
+   "text": "Weapons as the focus",
+   "why": "The weapon is the hero's power made visible.",
+   "lift": 0.51,
+   "n": 104,
+   "held": 15,
+   "channels": 20,
+   "big_share": 0.23,
+   "small_share": 0.31,
+   "weight": -0.1006,
+   "examples": [
+    {
+     "id": "PeV1LzAI-Ag",
+     "title": "He Was Reborn As The STRONGEST Mage Chief But Chose A CIVIL SERVANT LIFE Instead - Manhwa Recap",
+     "channel": "Magical Manhwa Recaps",
+     "views": 2100,
+     "x": 0.02,
+     "text": "H-HOW!? / GENIUS"
+    },
+    {
+     "id": "FpYdelfnnvo",
+     "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! (4) - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 3800,
+     "x": 0.03,
+     "text": "100% / 13% / 17%"
+    },
+    {
+     "id": "97aEYdzOcTM",
+     "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 4800,
+     "x": 0.04,
+     "text": "100% / 13% / 17%"
+    }
+   ]
+  },
+  {
+   "feature": "split",
+   "kind": "avoid",
+   "text": "Split frames and multi-panel layouts: one scene reads faster",
+   "why": "Each panel shrinks; at phone size a split frame becomes three tiny pictures.",
+   "lift": 0.44,
+   "n": 94,
+   "held": 6,
+   "channels": 9,
+   "big_share": 0.11,
+   "small_share": 0.23,
+   "weight": -0.0612,
+   "examples": [
+    {
+     "id": "BbxcuR9rJ-Q",
+     "title": "He Was Weak But Gained The Ability To Copy Skills And Becomes Overpowered - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 5000,
+     "x": 0.04,
+     "text": "BEFORE / AFTER"
+    },
+    {
+     "id": "Qu1sxEtp3Cw",
+     "title": "[18-21] He Died Following the Rules - Now He Breaks Them All For Revenge | Manhwa Recap",
+     "channel": "Mangoro Manhwa Recap",
+     "views": 218,
+     "x": 0.05,
+     "text": "Betrayed / Kidnaps Princess / Waifu? / Revenge"
+    },
+    {
+     "id": "drqTp_NuY6w",
+     "title": "He Turned Into A Zombie 1000 Years Ago But Ended Up Becoming The Most Powerful Zombie |Manhwa recap",
+     "channel": "The Librarian",
+     "views": 6600,
+     "x": 0.05,
+     "text": "BEFORE / AFTER"
+    }
+   ]
+  },
+  {
+   "feature": "scale_contrast",
+   "kind": "avoid",
+   "text": "Tiny-hero-versus-giant framing",
+   "why": "The size gap is the story in one image.",
+   "lift": 0.68,
+   "n": 17,
+   "held": 3,
+   "channels": 5,
+   "big_share": 0.02,
+   "small_share": 0.05,
+   "weight": -0.0562,
+   "examples": [
+    {
+     "id": "eKW6IzJXoWI",
+     "title": "(18) He got into the Medieval Age & began to Develop the Technology of his Empire! - Manhwa Recap",
+     "channel": "Manhwa Fresh",
+     "views": 45000,
+     "x": 0.07,
+     "text": "#FINAL / ENEMY / MC ARMY"
+    },
+    {
+     "id": "j18Hr1kZ4ng",
+     "title": "The Strongest Evil Dragon Was Reborn as a Human Child! - manhwa recap",
+     "channel": "MrManhwas",
+     "views": 3400,
+     "x": 0.11,
+     "text": "REINCARNATED"
+    },
+    {
+     "id": "DAa46hLDGAw",
+     "title": "The #1 Legendary Ranker Regressed Back To LVL 1 And Must Stop The APOCALYPSE! | Manhwa Recap",
+     "channel": "Tyler's Manhwa",
+     "views": 3300,
+     "x": 0.12,
+     "text": "I'LL KILL YOU ALL.. / GOD"
+    }
+   ]
+  },
+  {
+   "feature": "kneeling",
+   "kind": "avoid",
+   "text": "Kneeling and bowing scenes",
+   "why": "Kneeling is status shown, not told.",
+   "lift": 0.7,
+   "n": 13,
+   "held": 1,
+   "channels": 2,
+   "big_share": 0.02,
+   "small_share": 0.07,
+   "weight": -0.0528,
+   "examples": [
+    {
+     "id": "U7aPO4H5Y0c",
+     "title": "He Was Treated Like a Trash Until They Find Out As The God-Level Assassin In The Wild ! Manhwa Recap",
+     "channel": "Manhwa Mob",
+     "views": 285,
+     "x": 0.13,
+     "text": "TRASH / MEDIEVAL ISLAND"
+    },
+    {
+     "id": "8KEOMcicSaM",
+     "title": "This Overworked Manager Turned the Weakest Goblins Into a Deadly Army! - Manhwa Recap",
+     "channel": "ManhwaDealer",
+     "views": 14000,
+     "x": 0.15,
+     "text": "BEFORE / AFTER"
+    },
+    {
+     "id": "XDVkxJRd-l0",
+     "title": "When Your Bedroom Is The Only SAFE ZONE In The World-End, Everyone Begs To Enter! - Manhwa Recap",
+     "channel": "Mamoru Manhwa",
+     "views": 104000,
+     "x": 0.16,
+     "text": "MC / let me in, pls!!"
+    }
+   ]
+  },
+  {
+   "feature": "system_ui",
+   "kind": "avoid",
+   "text": "System windows and stat cards",
+   "why": "A status window says 'game system' instantly to fans of the genre.",
+   "lift": 0.96,
+   "n": 42,
+   "held": 5,
+   "channels": 9,
+   "big_share": 0.1,
+   "small_share": 0.17,
+   "weight": -0.0447,
+   "examples": [
+    {
+     "id": "l_MEg3qlbzs",
+     "title": "After regression he lost his memory but awakened a system and became the strongest hunter - Manhwa",
+     "channel": "System Log: Manhwa",
+     "views": 242,
+     "x": 0.05,
+     "text": "SSS / SSS / SSS / SSS / Dark Matter / Summon Skeleton / Eye of Death / Arrow Rain / REGRESSION GOD"
+    },
+    {
+     "id": "eU7yLupdNUo",
+     "title": "She Copies the Skills of Any Hunter with a Single Touch! - Manhwa Recap",
+     "channel": "Frieren Manhwa",
+     "views": 16000,
+     "x": 0.05,
+     "text": "?? / “COPY” SKILLS / “STEAL” SKILLS"
+    },
+    {
+     "id": "Qo6wG0nWE0g",
+     "title": "Reborn with an SSS-Rank Card, He Became the Strongest in the Apocalypse!",
+     "channel": "Yogiri Recap",
+     "views": 5200,
+     "x": 0.06,
+     "text": "SSS / MC"
+    }
+   ]
+  },
+  {
+   "feature": "text_question",
+   "kind": "avoid",
+   "text": "Question-mark captions",
+   "why": "A question creates a gap the viewer wants closed.",
+   "lift": 0.74,
+   "n": 60,
+   "held": 9,
+   "channels": 14,
+   "big_share": 0.19,
+   "small_share": 0.22,
+   "weight": -0.0407,
+   "examples": [
+    {
+     "id": "PeV1LzAI-Ag",
+     "title": "He Was Reborn As The STRONGEST Mage Chief But Chose A CIVIL SERVANT LIFE Instead - Manhwa Recap",
+     "channel": "Magical Manhwa Recaps",
+     "views": 2100,
+     "x": 0.02,
+     "text": "H-HOW!? / GENIUS"
+    },
+    {
+     "id": "eU7yLupdNUo",
+     "title": "She Copies the Skills of Any Hunter with a Single Touch! - Manhwa Recap",
+     "channel": "Frieren Manhwa",
+     "views": 16000,
+     "x": 0.05,
+     "text": "?? / “COPY” SKILLS / “STEAL” SKILLS"
+    },
+    {
+     "id": "Qu1sxEtp3Cw",
+     "title": "[18-21] He Died Following the Rules - Now He Breaks Them All For Revenge | Manhwa Recap",
+     "channel": "Mangoro Manhwa Recap",
+     "views": 218,
+     "x": 0.05,
+     "text": "Betrayed / Kidnaps Princess / Waifu? / Revenge"
+    }
+   ]
+  },
+  {
+   "feature": "face_closeup",
+   "kind": "avoid",
+   "text": "Faces too small to read on a phone",
+   "why": "Viewers read emotion from faces; a big face survives the tiny mobile thumbnail.",
+   "lift": 0.87,
+   "n": 22,
+   "held": 2,
+   "channels": 4,
+   "big_share": 0.06,
+   "small_share": 0.09,
+   "weight": -0.0379,
+   "examples": [
+    {
+     "id": "BbxcuR9rJ-Q",
+     "title": "He Was Weak But Gained The Ability To Copy Skills And Becomes Overpowered - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 5000,
+     "x": 0.04,
+     "text": "BEFORE / AFTER"
+    },
+    {
+     "id": "iBruZ7_M-QM",
+     "title": "[18-20] He Goes Berserk After Copying Demon Skills By Consuming Their Blood Review Part 2",
+     "channel": "Mangoro Manhwa Recap",
+     "views": 236,
+     "x": 0.06,
+     "text": "Base / Waifu? / Insane / Berserker"
+    },
+    {
+     "id": "j18Hr1kZ4ng",
+     "title": "The Strongest Evil Dragon Was Reborn as a Human Child! - manhwa recap",
+     "channel": "MrManhwas",
+     "views": 3400,
+     "x": 0.11,
+     "text": "REINCARNATED"
+    }
+   ]
+  },
+  {
+   "feature": "expr_intense",
+   "kind": "avoid",
+   "text": "Strong shocked or angry faces on the focal character",
+   "why": "A loud emotion is the quickest hook in the feed.",
+   "lift": 0.96,
+   "n": 80,
+   "held": 13,
+   "channels": 24,
+   "big_share": 0.2,
+   "small_share": 0.28,
+   "weight": -0.0354,
+   "examples": [
+    {
+     "id": "Qu1sxEtp3Cw",
+     "title": "[18-21] He Died Following the Rules - Now He Breaks Them All For Revenge | Manhwa Recap",
+     "channel": "Mangoro Manhwa Recap",
+     "views": 218,
+     "x": 0.05,
+     "text": "Betrayed / Kidnaps Princess / Waifu? / Revenge"
+    },
+    {
+     "id": "iBruZ7_M-QM",
+     "title": "[18-20] He Goes Berserk After Copying Demon Skills By Consuming Their Blood Review Part 2",
+     "channel": "Mangoro Manhwa Recap",
+     "views": 236,
+     "x": 0.06,
+     "text": "Base / Waifu? / Insane / Berserker"
+    },
+    {
+     "id": "_vSvUli_VNc",
+     "title": "He activated the divine system and SSS-rank skills becoming the King of the Apocalypse - Manhwa",
+     "channel": "System Log: Manhwa",
+     "views": 329,
+     "x": 0.06,
+     "text": "SYSTEM / IMMORTAL: YOU ARE IMMUNE TO DEATH FROM PHYSICAL CAUSES. / SKILL / SKILL / SKILL / SYSTEM / STRENGTH: 9999 / MAGIC: 99999 / LIFE: 9999 / SSS RANK"
+    }
+   ]
+  },
+  {
+   "feature": "dark_setting",
+   "kind": "avoid",
+   "text": "Dark settings",
+   "why": "A dark backdrop makes glow, faces and text pop.",
+   "lift": 0.85,
+   "n": 63,
+   "held": 6,
+   "channels": 8,
+   "big_share": 0.03,
+   "small_share": 0.19,
+   "weight": -0.0325,
+   "examples": [
+    {
+     "id": "3JglR8cfnA8",
+     "title": "(1-32) He Has Only 1 HP, But His Undead Army Makes Him Unkillable - Manhwa Recap",
+     "channel": "Lobs Manhwa",
+     "views": 2200,
+     "x": 0.06,
+     "text": "MC / WAIFU"
+    },
+    {
+     "id": "Qo6wG0nWE0g",
+     "title": "Reborn with an SSS-Rank Card, He Became the Strongest in the Apocalypse!",
+     "channel": "Yogiri Recap",
+     "views": 5200,
+     "x": 0.06,
+     "text": "SSS / MC"
+    },
+    {
+     "id": "x3c3yurEik8",
+     "title": "[1-19] When a WEAK Swordsman Gained the Power of Darkness! - Manhwa Recap",
+     "channel": "ManhwaDealer",
+     "views": 7000,
+     "x": 0.07,
+     "text": "1-19 / BEFORE / AFTER"
+    }
+   ]
+  },
+  {
+   "feature": "crowd",
+   "kind": "avoid",
+   "text": "Crowded scenes of 4+ characters",
+   "why": "A crowd reads as status and spectacle, if the focal face stays clear.",
+   "lift": 1.06,
+   "n": 154,
+   "held": 11,
+   "channels": 22,
+   "big_share": 0.45,
+   "small_share": 0.47,
+   "weight": -0.0279,
+   "examples": [
+    {
+     "id": "PeV1LzAI-Ag",
+     "title": "He Was Reborn As The STRONGEST Mage Chief But Chose A CIVIL SERVANT LIFE Instead - Manhwa Recap",
+     "channel": "Magical Manhwa Recaps",
+     "views": 2100,
+     "x": 0.02,
+     "text": "H-HOW!? / GENIUS"
+    },
+    {
+     "id": "Qu1sxEtp3Cw",
+     "title": "[18-21] He Died Following the Rules - Now He Breaks Them All For Revenge | Manhwa Recap",
+     "channel": "Mangoro Manhwa Recap",
+     "views": 218,
+     "x": 0.05,
+     "text": "Betrayed / Kidnaps Princess / Waifu? / Revenge"
+    },
+    {
+     "id": "Qo6wG0nWE0g",
+     "title": "Reborn with an SSS-Rank Card, He Became the Strongest in the Apocalypse!",
+     "channel": "Yogiri Recap",
+     "views": 5200,
+     "x": 0.06,
+     "text": "SSS / MC"
+    }
+   ]
+  },
+  {
+   "feature": "text_stat",
+   "kind": "avoid",
+   "text": "Numbers or ranks in the text",
+   "why": "An absurd number is proof of power in one glance.",
+   "lift": 0.92,
+   "n": 110,
+   "held": 11,
+   "channels": 23,
+   "big_share": 0.34,
+   "small_share": 0.4,
+   "weight": -0.0216,
+   "examples": [
+    {
+     "id": "FpYdelfnnvo",
+     "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! (4) - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 3800,
+     "x": 0.03,
+     "text": "100% / 13% / 17%"
+    },
+    {
+     "id": "97aEYdzOcTM",
+     "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 4800,
+     "x": 0.04,
+     "text": "100% / 13% / 17%"
+    },
+    {
+     "id": "_vSvUli_VNc",
+     "title": "He activated the divine system and SSS-rank skills becoming the King of the Apocalypse - Manhwa",
+     "channel": "System Log: Manhwa",
+     "views": 329,
+     "x": 0.06,
+     "text": "SYSTEM / IMMORTAL: YOU ARE IMMUNE TO DEATH FROM PHYSICAL CAUSES. / SKILL / SKILL / SKILL / SYSTEM / STRENGTH: 9999 / MAGIC: 99999 / LIFE: 9999 / SSS RANK"
+    }
+   ]
+  }
+ ],
+ "title_rules": [
+  {
+   "feature": "length",
+   "kind": "do",
+   "text": "Make it long: a 2-hour-plus recap of many chapters",
+   "why": "Recaps over 2 hours average far more views than ones under an hour on the same channels; the binge is the product.",
+   "lift": 2.09,
+   "n": 1638,
+   "examples": [
+    {
+     "id": "JDGsUQ3spRk",
+     "title": "He Survived Hell—and Became the Strongest Hunter | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 327000,
+     "x": 133.51,
+     "text": "NEW #1"
+    },
+    {
+     "id": "lqypyQUFL1A",
+     "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+     "channel": "System Log: Manhwa",
+     "views": 555000,
+     "x": 109.19,
+     "text": "MC"
+    },
+    {
+     "id": "zahvqaNdWiE",
+     "title": "The Strongest Guilds Are Afraid of This 16-Year-Old Genius! | Manhwa Recap",
+     "channel": "OP Digest",
+     "views": 215000,
+     "x": 87.78,
+     "text": "+SSS / 16YR OLD / SOLO? / +B"
+    }
+   ]
+  },
+  {
+   "feature": "villain",
+   "kind": "do",
+   "text": "Mention the villain angle when the story has one",
+   "why": "Reincarnated-as-villain is a proven premise.",
+   "lift": 1.63,
+   "n": 64,
+   "examples": [
+    {
+     "id": "jA2Y_1hvxzk",
+     "title": "REINCARNATED As The Trashy Villain But Powerful Heroines Are Falling In Love With Him - Manga Recap!",
+     "channel": "Manhwa Mob",
+     "views": 218000,
+     "x": 99.08,
+     "text": ""
+    },
+    {
+     "id": "cgksnND7r0M",
+     "title": "He Refused To Become A Hero, So The Gods Cursed Him And He Became A Villain (1-6) - Manhwa Recap",
+     "channel": "The Librarian",
+     "views": 2400000,
+     "x": 19.23,
+     "text": "HERO / !! / VILLAIN"
+    },
+    {
+     "id": "vM14RB6a5uY",
+     "title": "He’s Forced to Be the VILLAIN in Every Novel, But the Heroines Can Hear His Thoughts! [MANHWA RECAP]",
+     "channel": "Hacs Recap",
+     "views": 96000,
+     "x": 16.55,
+     "text": ""
+    }
+   ]
+  },
+  {
+   "feature": "full_completed",
+   "kind": "do",
+   "text": "Say the recap is complete: 'FULL', 'Completed', 'The Entire Story'",
+   "why": "Viewers want the whole story in one sitting.",
+   "lift": 1.32,
+   "n": 115,
+   "examples": [
+    {
+     "id": "pyHwxmiveJI",
+     "title": "FAILED MAN GETS A JOB… BUT IT’S AT A Store FULL OF Monsters! - Manhwa Recap",
+     "channel": "AniTiger",
+     "views": 703000,
+     "x": 20.32,
+     "text": "NEWBIE"
+    },
+    {
+     "id": "C2JrGfaK6fk",
+     "title": "[COMPLETED] A mercenary becomes a dragon mage by devouring the power of an ancient dragon - Manhwa",
+     "channel": "Manhwa Recount",
+     "views": 49000,
+     "x": 18.49,
+     "text": "COMPLETED 1-138 END / Dragon Mage / Since when did he get so strong? / He is a genius. / How dare you..."
+    },
+    {
+     "id": "goNj_C3bK3U",
+     "title": "After Thousands of Years in Hell, He Returned to a World Full of Weaklings! | Manhwa Recap",
+     "channel": "Tyler's Manhwa",
+     "views": 357000,
+     "x": 18.39,
+     "text": "10,000 YEARS IN HELL"
+    }
+   ]
+  },
+  {
+   "feature": "first_person",
+   "kind": "do",
+   "text": "Write the title in first person, as the hero: 'I Was Reborn…'",
+   "why": "The first person puts the viewer in the hero's shoes.",
+   "lift": 1.31,
+   "n": 58,
+   "examples": [
+    {
+     "id": "lqypyQUFL1A",
+     "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+     "channel": "System Log: Manhwa",
+     "views": 555000,
+     "x": 109.19,
+     "text": "MC"
+    },
+    {
+     "id": "LuofbHu6S_I",
+     "title": "I Can Devour SKILLS of the MONSTER I Defeat | Manhwa",
+     "channel": "Define manhwa",
+     "views": 119000,
+     "x": 41.03,
+     "text": "WHAT?? / GRAVEHOUND KING / DEVOURING COMPLETE / FINISHED"
+    },
+    {
+     "id": "c4uxWvU7RRY",
+     "title": "My Sisters Ignored Me for 10 Years... Until They Could Hear Every Thought I Had About Them!",
+     "channel": "Yogiri Recap",
+     "views": 922000,
+     "x": 10.13,
+     "text": ""
+    }
+   ]
+  },
+  {
+   "feature": "ellipsis",
+   "kind": "do",
+   "text": "Use an ellipsis for the cliffhanger: '…Then He Awakened'",
+   "why": "The ellipsis leaves the twist unfinished.",
+   "lift": 1.17,
+   "n": 261,
+   "examples": [
+    {
+     "id": "5FceQjqbCZA",
+     "title": "Everyone Called Him USELESS… Until He Summoned the KING OF THE DEAD at the Academy! - Manhwa Recap",
+     "channel": "AniTiger",
+     "views": 555000,
+     "x": 44.68,
+     "text": "NEW STUDENT"
+    },
+    {
+     "id": "ibN8zp978gA",
+     "title": "While Everyone FROZE to Death… He Lived in a FORTIFIED SAFE HOUSE with UNLIMITED FOOD | Manhwa Recap",
+     "channel": "SHURA RECAPS ",
+     "views": 443000,
+     "x": 42.24,
+     "text": ""
+    },
+    {
+     "id": "vvpJ3KCqiN0",
+     "title": "When the WORLD Hit 100°C… He CHILLED in His COLD ROOM with UNLIMITED Supplies! | Manhwa Recap",
+     "channel": "SHURA RECAPS ",
+     "views": 252000,
+     "x": 24.03,
+     "text": ""
+    }
+   ]
+  },
+  {
+   "feature": "reborn",
+   "kind": "do",
+   "text": "Lead with the reincarnation / regression premise",
+   "why": "The genre's audience searches and clicks for the premise.",
+   "lift": 1.17,
+   "n": 392,
+   "examples": [
+    {
+     "id": "lqypyQUFL1A",
+     "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+     "channel": "System Log: Manhwa",
+     "views": 555000,
+     "x": 109.19,
+     "text": "MC"
+    },
+    {
+     "id": "jA2Y_1hvxzk",
+     "title": "REINCARNATED As The Trashy Villain But Powerful Heroines Are Falling In Love With Him - Manga Recap!",
+     "channel": "Manhwa Mob",
+     "views": 218000,
+     "x": 99.08,
+     "text": ""
+    },
+    {
+     "id": "9O3kMgL93JU",
+     "title": "REINCARNATED As An F-Tier Mage But Powerful Heroines Are Falling In Love With Him - Manga Recap!",
+     "channel": "Manhwa Mob",
+     "views": 125000,
+     "x": 56.82,
+     "text": ""
+    }
+   ]
+  },
+  {
+   "feature": "big_number",
+   "kind": "do",
+   "text": "Put an absurd number in: '1000 Years', 'Level 999', '$8M'",
+   "why": "Numbers are concrete proof of power.",
+   "lift": 1.13,
+   "n": 352,
+   "examples": [
+    {
+     "id": "JpG6OmWfVsc",
+     "title": "The System Branded Him 'Talentless', Then Gave Him A 100,000x EXP Multiplier As An APOLOGY! - Manhwa",
+     "channel": "Define manhwa",
+     "views": 476000,
+     "x": 164.13,
+     "text": ""
+    },
+    {
+     "id": "MbMDKviCrW8",
+     "title": "A 5,000-Year GRANDMASTER Possessed The 'IDIOT' They Bullied — And He REMEMBERS Everyone!",
+     "channel": "Define manhwa",
+     "views": 374000,
+     "x": 128.97,
+     "text": ""
+    },
+    {
+     "id": "g0U30uG599U",
+     "title": "This Manhwa Is So Peak - It Swept Every Major Novel Award in 2022! [MANHWA RECAP]",
+     "channel": "Hacs Recap",
+     "views": 379000,
+     "x": 65.34,
+     "text": ""
+    }
+   ]
+  },
+  {
+   "feature": "chapter_range",
+   "kind": "avoid",
+   "text": "Chapter ranges like '(1-40)': they say 'only part of the story'",
+   "why": "A range tells the viewer it is unfinished.",
+   "lift": 0.67,
+   "n": 102,
+   "examples": [
+    {
+     "id": "3JglR8cfnA8",
+     "title": "(1-32) He Has Only 1 HP, But His Undead Army Makes Him Unkillable - Manhwa Recap",
+     "channel": "Lobs Manhwa",
+     "views": 2200,
+     "x": 0.06,
+     "text": "MC / WAIFU"
+    },
+    {
+     "id": "x3c3yurEik8",
+     "title": "[1-19] When a WEAK Swordsman Gained the Power of Darkness! - Manhwa Recap",
+     "channel": "ManhwaDealer",
+     "views": 7000,
+     "x": 0.07,
+     "text": "1-19 / BEFORE / AFTER"
+    },
+    {
+     "id": "9StXzQuvuN8",
+     "title": "[1-18] When a WEAK Swordsman Gained the Power of Darkness! - Manhwa Recap",
+     "channel": "ManhwaDealer",
+     "views": 7200,
+     "x": 0.07,
+     "text": "1-18 / BEFORE / AFTER"
+    }
+   ]
+  },
+  {
+   "feature": "op_words",
+   "kind": "avoid",
+   "text": "Generic 'OP / strongest' wording: every recap says it; name the specific power instead",
+   "why": "The words are everywhere in the niche and no longer stand out.",
+   "lift": 0.92,
+   "n": 202,
+   "examples": [
+    {
+     "id": "PeV1LzAI-Ag",
+     "title": "He Was Reborn As The STRONGEST Mage Chief But Chose A CIVIL SERVANT LIFE Instead - Manhwa Recap",
+     "channel": "Magical Manhwa Recaps",
+     "views": 2100,
+     "x": 0.02,
+     "text": "H-HOW!? / GENIUS"
+    },
+    {
+     "id": "l_MEg3qlbzs",
+     "title": "After regression he lost his memory but awakened a system and became the strongest hunter - Manhwa",
+     "channel": "System Log: Manhwa",
+     "views": 242,
+     "x": 0.05,
+     "text": "SSS / SSS / SSS / SSS / Dark Matter / Summon Skeleton / Eye of Death / Arrow Rain / REGRESSION GOD"
+    },
+    {
+     "id": "_TyWSZAsI3Q",
+     "title": "This ZOMBIE Trained for Over 1,000 Years and Became an INVINCIBLE GOD!! - manhwa recap",
+     "channel": "MrManhwas",
+     "views": 2400,
+     "x": 0.08,
+     "text": "ARE YOU GOING TO TRAIN MORE? / 500KG / 500KG"
+    }
+   ]
+  }
+ ],
+ "text_wins": [
+  {
+   "id": "JDGsUQ3spRk",
+   "title": "He Survived Hell—and Became the Strongest Hunter | Manhwa Recap",
+   "channel": "OP Digest",
+   "views": 327000,
+   "x": 133.51,
+   "text": "NEW #1"
+  },
+  {
+   "id": "lqypyQUFL1A",
+   "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+   "channel": "System Log: Manhwa",
+   "views": 555000,
+   "x": 109.19,
+   "text": "MC"
+  },
+  {
+   "id": "zahvqaNdWiE",
+   "title": "The Strongest Guilds Are Afraid of This 16-Year-Old Genius! | Manhwa Recap",
+   "channel": "OP Digest",
+   "views": 215000,
+   "x": 87.78,
+   "text": "+SSS / 16YR OLD / SOLO? / +B"
+  },
+  {
+   "id": "9KWasKLRzUc",
+   "title": "She Threw Him Away For Being A Weak Slime, BUT Didn't Know He Was The Slime God ! Manhwa Recap",
+   "channel": "Manhwa Mob",
+   "views": 128000,
+   "x": 58.18,
+   "text": "How? / F- / SSS+"
+  },
+  {
+   "id": "5FceQjqbCZA",
+   "title": "Everyone Called Him USELESS… Until He Summoned the KING OF THE DEAD at the Academy! - Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 555000,
+   "x": 44.68,
+   "text": "NEW STUDENT"
+  },
+  {
+   "id": "LuofbHu6S_I",
+   "title": "I Can Devour SKILLS of the MONSTER I Defeat | Manhwa",
+   "channel": "Define manhwa",
+   "views": 119000,
+   "x": 41.03,
+   "text": "WHAT?? / GRAVEHOUND KING / DEVOURING COMPLETE / FINISHED"
+  },
+  {
+   "id": "DsCZrMkHFj8",
+   "title": "He Devoured Swords To Gain The Power & Techniques of their Previous Owner for Revenge - Manhwa Recap",
+   "channel": "Mangoro Manhwa Recap",
+   "views": 144000,
+   "x": 34.29,
+   "text": "+SKILL / +SKILL / +SKILL / +SKILL"
+  },
+  {
+   "id": "6xLU2LOKfIk",
+   "title": "He Was Betrayed and Killed in the Apocalypse, but Reincarnated with Infinite Supplies - Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 978000,
+   "x": 28.27,
+   "text": "EX-GF"
+  },
+  {
+   "id": "9ioowCqoNJ4",
+   "title": "Trapped for 20 Years, He Returns as a Monster | Manhwa Recap",
+   "channel": "OP Digest",
+   "views": 69000,
+   "x": 28.17,
+   "text": "978 LVL / 148 LVL / 243 LVL"
+  },
+  {
+   "id": "frwv3JWFdGE",
+   "title": "Cast Out by His Family, He Built a Shop That Produced SSS-Rank DIVINE BEASTS! - Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 211000,
+   "x": 28.13,
+   "text": "CHOOSE YOUR PET / RANK A+ / RANK A / RANK S / RANK SSS / RANK SS"
+  },
+  {
+   "id": "Q70PUfBpHFM",
+   "title": "When the APOCALYPSE Hit, He STOLE EVERYTHING — Now Everyone BEGS to Follow HIM! | Manhwa Recap",
+   "channel": "SHURA RECAPS ",
+   "views": 277000,
+   "x": 26.41,
+   "text": "HELP! / UNLIMITED SUPPLY!"
+  },
+  {
+   "id": "5I-baG4Liso",
+   "title": "He Reincarnated 100 Years Later With 36,000 Days of AFK Rewards![MANHWA RECAP]",
+   "channel": "Hacs Recap",
+   "views": 150000,
+   "x": 25.86,
+   "text": "SYSTEM NOTICE / AFK REWARD / 36,000 DAYS / COMPENSATION / +999,999,999 ENERGY / CLAIMED"
+  },
+  {
+   "id": "x0S1o25N8vU",
+   "title": "A Genius Reincarnates as the Duke’s Useless Son and Is Forced to Marry! – Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 628000,
+   "x": 25.72,
+   "text": "WAIT PLS! / IT'S OVER!"
+  },
+  {
+   "id": "q2q8OWqYQ-s",
+   "title": "He Sees Every Living Thing as a Pig, and Every Kill Makes Him Stronger! [MANHWA RECAP]",
+   "channel": "Hacs Recap",
+   "views": 126000,
+   "x": 21.72,
+   "text": "KILL = POWER"
+  },
+  {
+   "id": "pyHwxmiveJI",
+   "title": "FAILED MAN GETS A JOB… BUT IT’S AT A Store FULL OF Monsters! - Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 703000,
+   "x": 20.32,
+   "text": "NEWBIE"
+  },
+  {
+   "id": "cgksnND7r0M",
+   "title": "He Refused To Become A Hero, So The Gods Cursed Him And He Became A Villain (1-6) - Manhwa Recap",
+   "channel": "The Librarian",
+   "views": 2400000,
+   "x": 19.23,
+   "text": "HERO / !! / VILLAIN"
+  },
+  {
+   "id": "e1G7rCmJ_QY",
+   "title": "Everyone Gets One Class, but This Summoner Can Use Any Skill - Manhwa Recap",
+   "channel": "Lobs Manhwa",
+   "views": 437000,
+   "x": 18.52,
+   "text": "PARALYZED / WAIFU / AWAKENED"
+  },
+  {
+   "id": "C2JrGfaK6fk",
+   "title": "[COMPLETED] A mercenary becomes a dragon mage by devouring the power of an ancient dragon - Manhwa",
+   "channel": "Manhwa Recount",
+   "views": 49000,
+   "x": 18.49,
+   "text": "COMPLETED 1-138 END / Dragon Mage / Since when did he get so strong? / He is a genius. / How dare you..."
+  },
+  {
+   "id": "Q4RDDNZFDJY",
+   "title": "16 y/o REINCARNATED Rookie Was Treated Like Trash Until He Surpassed SSS-Rank Hunters! -Manhwa Recap",
+   "channel": "GrimmyManhwa",
+   "views": 314000,
+   "x": 18.47,
+   "text": "HE'S CHANGED.."
+  },
+  {
+   "id": "goNj_C3bK3U",
+   "title": "After Thousands of Years in Hell, He Returned to a World Full of Weaklings! | Manhwa Recap",
+   "channel": "Tyler's Manhwa",
+   "views": 357000,
+   "x": 18.39,
+   "text": "10,000 YEARS IN HELL"
+  },
+  {
+   "id": "lhAiVHJSkdk",
+   "title": "#1-3 He Died and Was Reborn with a Sword God System That Boosts Power by 10000%! [MANHWA RECAP]",
+   "channel": "Hacs Recap",
+   "views": 100000,
+   "x": 17.24,
+   "text": "10000% POWER! / [ SWORD GOD SYSTEM ] / POWER BOOST: +10000% / SKILL RANK: SSS / LIMIT: BROKEN"
+  },
+  {
+   "id": "97ujYHPprXU",
+   "title": "HE GAINED THE ABILITY TO EXTRACT THE CHARACTERISTICS OF DEFEATED ENEMIES | Manhwa Recap",
+   "channel": "Tyler's Manhwa",
+   "views": 887000,
+   "x": 16.38,
+   "text": "#FULL / LVL: 001 / LVL: GOD"
+  },
+  {
+   "id": "aQ0xKM2OCwQ",
+   "title": "After 99 Rejections… He Finally Walked Away — And She Lost Everything - Manhwa Recap in Hindi",
+   "channel": "Manhwa Senpai",
+   "views": 3800000,
+   "x": 15.57,
+   "text": "MC / EX-GF"
+  },
+  {
+   "id": "D7G5Iq8rbVU",
+   "title": "Betrayed #1 Hunter Returns Stronger Than Ever and Shocks Everyone! – Manhwa Recap",
+   "channel": "GrimmyManhwa",
+   "views": 253000,
+   "x": 14.88,
+   "text": "THAT BASTARD.. / HA-HA / LOSER!"
+  }
+ ],
+ "text_losses": [
+  {
+   "id": "PeV1LzAI-Ag",
+   "title": "He Was Reborn As The STRONGEST Mage Chief But Chose A CIVIL SERVANT LIFE Instead - Manhwa Recap",
+   "channel": "Magical Manhwa Recaps",
+   "views": 2100,
+   "x": 0.02,
+   "text": "H-HOW!? / GENIUS"
+  },
+  {
+   "id": "FpYdelfnnvo",
+   "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! (4) - Manhwa Recap",
+   "channel": "The Librarian",
+   "views": 3800,
+   "x": 0.03,
+   "text": "100% / 13% / 17%"
+  },
+  {
+   "id": "97aEYdzOcTM",
+   "title": "He Unlocks a SYSTEM That Can Predict Every Move in the APOCALYPSE! - Manhwa Recap",
+   "channel": "The Librarian",
+   "views": 4800,
+   "x": 0.04,
+   "text": "100% / 13% / 17%"
+  },
+  {
+   "id": "BbxcuR9rJ-Q",
+   "title": "He Was Weak But Gained The Ability To Copy Skills And Becomes Overpowered - Manhwa Recap",
+   "channel": "The Librarian",
+   "views": 5000,
+   "x": 0.04,
+   "text": "BEFORE / AFTER"
+  },
+  {
+   "id": "l_MEg3qlbzs",
+   "title": "After regression he lost his memory but awakened a system and became the strongest hunter - Manhwa",
+   "channel": "System Log: Manhwa",
+   "views": 242,
+   "x": 0.05,
+   "text": "SSS / SSS / SSS / SSS / Dark Matter / Summon Skeleton / Eye of Death / Arrow Rain / REGRESSION GOD"
+  },
+  {
+   "id": "dXtoAXm_OfQ",
+   "title": "Trapped In The DEMON REALM, He Turns His Nightmares Into DEADLY POWER - Manhwa Recap",
+   "channel": "Magical Manhwa Recaps",
+   "views": 3700,
+   "x": 0.05,
+   "text": "AWAKEN"
+  },
+  {
+   "id": "eU7yLupdNUo",
+   "title": "She Copies the Skills of Any Hunter with a Single Touch! - Manhwa Recap",
+   "channel": "Frieren Manhwa",
+   "views": 16000,
+   "x": 0.05,
+   "text": "?? / “COPY” SKILLS / “STEAL” SKILLS"
+  },
+  {
+   "id": "Qu1sxEtp3Cw",
+   "title": "[18-21] He Died Following the Rules - Now He Breaks Them All For Revenge | Manhwa Recap",
+   "channel": "Mangoro Manhwa Recap",
+   "views": 218,
+   "x": 0.05,
+   "text": "Betrayed / Kidnaps Princess / Waifu? / Revenge"
+  },
+  {
+   "id": "drqTp_NuY6w",
+   "title": "He Turned Into A Zombie 1000 Years Ago But Ended Up Becoming The Most Powerful Zombie |Manhwa recap",
+   "channel": "The Librarian",
+   "views": 6600,
+   "x": 0.05,
+   "text": "BEFORE / AFTER"
+  },
+  {
+   "id": "3JglR8cfnA8",
+   "title": "(1-32) He Has Only 1 HP, But His Undead Army Makes Him Unkillable - Manhwa Recap",
+   "channel": "Lobs Manhwa",
+   "views": 2200,
+   "x": 0.06,
+   "text": "MC / WAIFU"
+  },
+  {
+   "id": "iBruZ7_M-QM",
+   "title": "[18-20] He Goes Berserk After Copying Demon Skills By Consuming Their Blood Review Part 2",
+   "channel": "Mangoro Manhwa Recap",
+   "views": 236,
+   "x": 0.06,
+   "text": "Base / Waifu? / Insane / Berserker"
+  },
+  {
+   "id": "Qo6wG0nWE0g",
+   "title": "Reborn with an SSS-Rank Card, He Became the Strongest in the Apocalypse!",
+   "channel": "Yogiri Recap",
+   "views": 5200,
+   "x": 0.06,
+   "text": "SSS / MC"
+  }
+ ],
+ "hits": [
+  {
+   "id": "lqypyQUFL1A",
+   "title": "I was reborn in the Stone Age and now I'm building my civilization from the future - Manhwa Recap",
+   "channel": "System Log: Manhwa",
+   "views": 555000,
+   "x": 109.19,
+   "text": "MC"
+  },
+  {
+   "id": "5FceQjqbCZA",
+   "title": "Everyone Called Him USELESS… Until He Summoned the KING OF THE DEAD at the Academy! - Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 555000,
+   "x": 44.68,
+   "text": "NEW STUDENT"
+  },
+  {
+   "id": "6xLU2LOKfIk",
+   "title": "He Was Betrayed and Killed in the Apocalypse, but Reincarnated with Infinite Supplies - Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 978000,
+   "x": 28.27,
+   "text": "EX-GF"
+  },
+  {
+   "id": "x0S1o25N8vU",
+   "title": "A Genius Reincarnates as the Duke’s Useless Son and Is Forced to Marry! – Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 628000,
+   "x": 25.72,
+   "text": "WAIT PLS! / IT'S OVER!"
+  },
+  {
+   "id": "pyHwxmiveJI",
+   "title": "FAILED MAN GETS A JOB… BUT IT’S AT A Store FULL OF Monsters! - Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 703000,
+   "x": 20.32,
+   "text": "NEWBIE"
+  },
+  {
+   "id": "cgksnND7r0M",
+   "title": "He Refused To Become A Hero, So The Gods Cursed Him And He Became A Villain (1-6) - Manhwa Recap",
+   "channel": "The Librarian",
+   "views": 2400000,
+   "x": 19.23,
+   "text": "HERO / !! / VILLAIN"
+  },
+  {
+   "id": "97ujYHPprXU",
+   "title": "HE GAINED THE ABILITY TO EXTRACT THE CHARACTERISTICS OF DEFEATED ENEMIES | Manhwa Recap",
+   "channel": "Tyler's Manhwa",
+   "views": 887000,
+   "x": 16.38,
+   "text": "#FULL / LVL: 001 / LVL: GOD"
+  },
+  {
+   "id": "aQ0xKM2OCwQ",
+   "title": "After 99 Rejections… He Finally Walked Away — And She Lost Everything - Manhwa Recap in Hindi",
+   "channel": "Manhwa Senpai",
+   "views": 3800000,
+   "x": 15.57,
+   "text": "MC / EX-GF"
+  }
+ ],
+ "recent": [
+  {
+   "id": "JpG6OmWfVsc",
+   "title": "The System Branded Him 'Talentless', Then Gave Him A 100,000x EXP Multiplier As An APOLOGY! - Manhwa",
+   "channel": "Define manhwa",
+   "views": 476000,
+   "x": 164.13,
+   "text": ""
+  },
+  {
+   "id": "MbMDKviCrW8",
+   "title": "A 5,000-Year GRANDMASTER Possessed The 'IDIOT' They Bullied — And He REMEMBERS Everyone!",
+   "channel": "Define manhwa",
+   "views": 374000,
+   "x": 128.97,
+   "text": ""
+  },
+  {
+   "id": "dGRrVDY_TVo",
+   "title": "He Became a Bacteria Necromancer, and Now He Has an INFINITE Army! | Manhwa Recap",
+   "channel": "Manhwa Recount",
+   "views": 269000,
+   "x": 101.53,
+   "text": ""
+  },
+  {
+   "id": "jA2Y_1hvxzk",
+   "title": "REINCARNATED As The Trashy Villain But Powerful Heroines Are Falling In Love With Him - Manga Recap!",
+   "channel": "Manhwa Mob",
+   "views": 218000,
+   "x": 99.08,
+   "text": ""
+  },
+  {
+   "id": "9O3kMgL93JU",
+   "title": "REINCARNATED As An F-Tier Mage But Powerful Heroines Are Falling In Love With Him - Manga Recap!",
+   "channel": "Manhwa Mob",
+   "views": 125000,
+   "x": 56.82,
+   "text": ""
+  },
+  {
+   "id": "B7ZAglJfL2o",
+   "title": "REINCARNATED As a Nobody But The Most Powerful Girls Are Obsessed With Him - Manga Recap!",
+   "channel": "Manhwa Mob",
+   "views": 119000,
+   "x": 54.09,
+   "text": ""
+  },
+  {
+   "id": "L3kjTBWiAeA",
+   "title": "He Awakened as a Mage, but His Skills Evolve INFINITELY! | Manhwa Recap",
+   "channel": "Manhwa Recount",
+   "views": 133000,
+   "x": 50.2,
+   "text": ""
+  },
+  {
+   "id": "frwv3JWFdGE",
+   "title": "Cast Out by His Family, He Built a Shop That Produced SSS-Rank DIVINE BEASTS! - Manhwa Recap",
+   "channel": "AniTiger",
+   "views": 211000,
+   "x": 28.13,
+   "text": "CHOOSE YOUR PET / RANK A+ / RANK A / RANK S / RANK SSS / RANK SS"
+  }
+ ]
+}

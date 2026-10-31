@@ -279,10 +279,10 @@ pub fn thumbnail_prompt(title: &str, cast: &[Cast], has_refs: &[bool], story: &[
     if !story.is_empty() {
         p.push_str(&format!("\n\nScene from the story so far: {}", clip(&story.join(" "), 400)));
     }
-    p.push_str("\n\nComposition: the main character's intense, emotional face takes the right half, eye-level with the viewer; a dramatic action moment or power effect behind; dark, simple background so the subject pops; strong rim light.");
+    p.push_str("\n\nComposition: the main character large and readable, doing the story's hook; other characters react in the frame (shock, disbelief, a blush); a clear, specific, well-lit setting from the story, not a generic dark void; strong rim light.");
     let hook = hook.trim();
     if !hook.is_empty() {
-        p.push_str(&format!(" Large bold text on the left, 2–4 words, white with a thick black outline: \"{hook}\"."));
+        p.push_str(&format!(" Large bold text on the left, 1–4 words, yellow with a thick black outline: \"{hook}\"."));
     } else {
         p.push_str(" Leave the left third clear for large bold text.");
     }
@@ -404,13 +404,15 @@ fn video_line(v: &Video) -> String {
 pub fn suggest_prompt(b: &Brief) -> (String, String) {
     let system = "You are a YouTube strategist for manhwa / manga recap channels. You study what the best-performing recaps do and write a title, a description and a thumbnail concept that win the click without lying about the story.\n\
 Rules:\n\
-- Title: under 70 characters, curiosity + stakes, in the style of the top performers below (\"He …, but …! - Manhwa Recap\" works for this niche). Include the manga's name only if the top videos do.\n\
+- Title: under 70 characters, curiosity + stakes, in the style of the top performers below and the measured title patterns at the end. Include the manga's name only if the top videos do.\n\
 - Description: a 2-line hook, a spoiler-light summary, the manga's names (English, original, alternate) for search, a call to subscribe, then 5-8 hashtags on the last line.\n\
 - thumbnail_concept: one paragraph a designer can follow: who, expression, action, background, colours.\n\
 - thumbnail_text: 2-4 words to print on the thumbnail.\n\
 - notes: 2-3 short lines on why this should beat the comparable videos.\n\
 Reply with JSON only: {\"title\":\"\",\"alt_titles\":[\"\",\"\",\"\"],\"description\":\"\",\"thumbnail_concept\":\"\",\"thumbnail_text\":\"\",\"notes\":\"\"}"
         .to_string();
+    let m = super::click::model();
+    let system = format!("{system}\n\nWhat the data says (follow it for the title and the thumbnail text):\n{}\n{}", m.title_digest(), m.thumbnail_digest());
     let mut u = format!("Manga: {}\n", b.title);
     if !b.aliases.is_empty() {
         u.push_str(&format!("Also known as: {}\n", b.aliases.join(" / ")));

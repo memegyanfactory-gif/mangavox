@@ -9,9 +9,13 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 
 use mv_ui::{appear, glyphs, icon_ph, popup_surface, progress_bar, progress_ring_sized, spinner, Route};
 
+use super::click::{self, Score};
 use super::magnific::{self, ImageModel, Usage, CATALOG};
 use super::thumbs::{self, Concept, Gallery, Thumb};
 use super::*;
+
+mod rules;
+pub(super) use rules::guide as rules_guide;
 
 const LEFT_W: f32 = 272.;
 const TILE_W: f32 = 248.;
@@ -23,6 +27,8 @@ pub(super) const CAST_FOR_REFS: usize = 10;
 pub(super) enum Tab {
     Creations,
     Ideas,
+    /// What the click checklist learned, and each candidate's score.
+    Rules,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,6 +108,11 @@ pub(super) struct ThumbState {
     designing: bool,
     /// The thumbnail shown large, with its edit box.
     open: Option<String>,
+    /// Click scores of the made thumbnails (prompt + pixels), by id.
+    scores: HashMap<String, Score>,
+    scoring: bool,
+    /// Creations by score instead of newest first.
+    best_first: bool,
     has_key: bool,
     usage: Usage,
     error: Option<String>,
@@ -134,6 +145,9 @@ impl ThumbState {
             jobs: vec![],
             designing: false,
             open: None,
+            scores: HashMap::new(),
+            scoring: false,
+            best_first: false,
             has_key: magnific::key().is_some(),
             usage: Usage::load(),
             error: None,
@@ -517,7 +531,10 @@ impl ThumbGen {
             let _ = this.update(cx, |this, cx| {
                 this.th.designing = false;
                 match res {
-                    Ok((analysis, concepts)) => {
+                    Ok((analysis, mut concepts)) => {
+                        // Best click score first, so "Use the AI's best idea" takes the top one.
+                        let m = click::model();
+                        concepts.sort_by_key(|c| std::cmp::Reverse(m.score_idea(&c.prompt, &c.text).value));
                         this.th.gallery.analysis = analysis;
                         this.th.gallery.concepts = concepts;
                         this.th.gallery.save(&this.manga_id);
@@ -531,6 +548,29 @@ impl ThumbGen {
         cx.notify();
     }
 
+    /// Scores the made thumbnails that have no score yet, off the UI thread (it reads the images).
+    fn ensure_scores(&mut self, cx: &mut Context<Self>) {
+        if self.th.scoring {
+            return;
+        }
+        let todo: Vec<(String, String, PathBuf)> = self.th.gallery.thumbs.iter().filter(|t| !self.th.scores.contains_key(&t.id)).map(|t| (t.id.clone(), t.prompt.clone(), Gallery::image(&self.manga_id, &t.id))).collect();
+        if todo.is_empty() {
+            return;
+        }
+        self.th.scoring = true;
+        cx.spawn(async move |this, cx| {
+            let scored = mv_ui::bg::blocking(move || todo.into_iter().map(|(id, prompt, path)| (id, click::model().score_image(&prompt, &path))).collect::<Vec<_>>()).await;
+            let _ = this.update(cx, |this, cx| {
+                this.th.scoring = false;
+                if let Ok(scored) = scored {
+                    this.th.scores.extend(scored);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn set_menu(&mut self, m: Menu, cx: &mut Context<Self>) {
         self.th.menu = if self.th.menu == Some(m) { None } else { Some(m) };
         cx.notify();
@@ -540,6 +580,7 @@ impl ThumbGen {
 
     fn thumbnail_generator(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         self.ensure_inputs(window, cx);
+        self.ensure_scores(cx);
         let shell = div()
             .flex()
             .flex_wrap()
@@ -1061,7 +1102,23 @@ impl ThumbGen {
                 this.th.tab = Tab::Ideas;
                 cx.notify();
             })))
+            .child(tab("thg-tab-rules", ph::LIST_CHECKS, "Thumbnail rules".into(), self.th.tab == Tab::Rules).tooltip(tip("What wins clicks on recap thumbnails, measured on real channels, and how your candidates score")).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.th.tab = Tab::Rules;
+                cx.notify();
+            })))
             .child(div().flex_1())
+            .when(self.th.tab == Tab::Creations && self.th.gallery.thumbs.len() > 1 && self.th.open.is_none(), |d| {
+                d.child(
+                    btn("thg-sort", if self.th.best_first { "Best score first" } else { "Newest first" }, ButtonKind::Ghost)
+                        .small()
+                        .icon(if self.th.best_first { ph::SORT_DESCENDING } else { ph::CLOCK })
+                        .tooltip("Order the creations by click score or by date")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.th.best_first = !this.th.best_first;
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 btn("thg-design", if self.th.designing { "Studying the manga…" } else if self.th.gallery.concepts.is_empty() { "Design with AI" } else { "Design again" }, ButtonKind::Secondary)
                     .small()
@@ -1080,6 +1137,7 @@ impl ThumbGen {
         let body = match self.th.tab {
             Tab::Creations => self.creations(cx),
             Tab::Ideas => self.ideas(cx),
+            Tab::Rules => self.rules_tab(cx),
         };
         div().flex().flex_col().flex_1().min_w(px(320.)).gap(px(space::MD)).child(tabs).child(body)
     }
@@ -1129,7 +1187,11 @@ impl ThumbGen {
                     .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(j.label.clone())),
             );
         }
-        for (k, t) in self.th.gallery.thumbs.iter().enumerate() {
+        let mut order: Vec<&Thumb> = self.th.gallery.thumbs.iter().collect();
+        if self.th.best_first {
+            order.sort_by_key(|t| std::cmp::Reverse(self.th.scores.get(&t.id).map_or(0, |s| s.value)));
+        }
+        for (k, t) in order.into_iter().enumerate() {
             grid = grid.child(self.thumb_tile(k, t, cx));
         }
         div().child(grid)
@@ -1176,7 +1238,8 @@ impl ThumbGen {
                     }))
                     .child(img(path).size_full().object_fit(ObjectFit::Cover))
                     .child(actions)
-                    .child(div().absolute().left(px(6.)).bottom(px(6.)).child(badge(t.resolution.clone(), Tone::Neutral))),
+                    .child(div().absolute().left(px(6.)).bottom(px(6.)).child(badge(t.resolution.clone(), Tone::Neutral)))
+                    .when_some(self.th.scores.get(&t.id), |d, s| d.child(div().absolute().left(px(6.)).top(px(6.)).child(score_badge(("thg-tile-score", k), s)))),
             )
             .child(
                 div()
@@ -1251,6 +1314,7 @@ impl ThumbGen {
                 btn("thg-reuse", "Use", ButtonKind::Ghost).small().icon(ph::TEXT_T).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_prompt(prompt.clone(), window, cx))),
             )))
             .child(row("Made with", div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!("{} · {} · {}", t.model, t.resolution, if t.cost == 0. { "unlimited".to_string() } else { format!("{} credits", t.cost.round()) }))))
+            .when_some(self.th.scores.get(&t.id), |d, s| d.child(row("Click score", score_detail("thg-view-score", s))))
     }
 
     fn ideas(&self, cx: &mut Context<Self>) -> Div {
@@ -1290,6 +1354,7 @@ impl ThumbGen {
 
     fn concept_card(&self, k: usize, c: &Concept, cx: &mut Context<Self>) -> Div {
         let (p1, p2, name) = (c.prompt.clone(), c.prompt.clone(), c.name.clone());
+        let score = click::model().score_idea(&c.prompt, &c.text);
         div()
             .flex()
             .flex_col()
@@ -1302,6 +1367,7 @@ impl ThumbGen {
             .border_color(Tokens::border())
             .child(div().flex().items_center().gap(px(space::SM)).child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(c.name.clone())).when(!c.text.is_empty(), |d| d.child(badge(c.text.clone(), Tone::Accent))))
             .when(!c.why.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).whitespace_normal().child(c.why.clone())))
+            .child(score_detail(SharedString::from(format!("thg-idea-score-{k}")), &score))
             .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().line_clamp(5).child(c.prompt.clone()))
             .child(
                 div()
@@ -1311,6 +1377,44 @@ impl ThumbGen {
                     .child(btn(("thg-idea-edit", k), "Edit prompt", ButtonKind::Ghost).small().icon(ph::PENCIL_SIMPLE).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_prompt(p2.clone(), window, cx)))),
             )
     }
+}
+
+/// Green / amber / grey by where the score sits among the studied thumbnails.
+fn score_tone(v: u8) -> Tone {
+    match v {
+        65.. => Tone::Success,
+        40..=64 => Tone::Warning,
+        _ => Tone::Neutral,
+    }
+}
+
+pub(super) fn score_badge(id: impl Into<ElementId>, s: &Score) -> Stateful<Div> {
+    div()
+        .id(id)
+        .tooltip(tip(format!(
+            "Click score {}: beats {}% of the {} recap thumbnails studied on the checklist{}. It is a checklist of what the biggest recap channels do, not a views forecast (see Thumbnail rules).",
+            s.value,
+            s.value,
+            click::model().data.labelled,
+            if s.from_image { ", read from the prompt and the image" } else { ", read from the prompt" }
+        )))
+        .child(badge(format!("Score {}", s.value), score_tone(s.value)))
+}
+
+/// The score with its reasons (what helps, what hurts) and the top tips.
+pub(super) fn score_detail(id: impl Into<ElementId>, s: &Score) -> Div {
+    let reason = |r: &click::Reason| {
+        let good = r.effect > 0.;
+        let color = if good { Tokens::success() } else { Tokens::danger() };
+        div().flex().items_center().gap(px(4.)).text_size(px(size::XS)).child(icon_ph(if good { ph::ARROW_UP } else { ph::ARROW_DOWN }, color, 10.)).child(div().text_color(Tokens::text_2()).child(r.label.clone()))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(div().flex().items_center().gap(px(space::SM)).child(score_badge(id, s)).child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(if s.from_image { "prompt + image" } else { "from the prompt" })))
+        .child(div().flex().flex_wrap().gap_x(px(space::SM)).gap_y(px(2.)).children(s.reasons.iter().take(5).map(reason)))
+        .children(s.tips.iter().map(|t| div().flex().items_start().gap(px(4.)).text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().child(icon_ph(ph::LIGHTBULB, Tokens::warning(), 10.)).child(div().flex_1().child(format!("Try: {t}")))))
 }
 
 fn tile_size(aspect: &str) -> (f32, f32) {

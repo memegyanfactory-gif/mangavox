@@ -123,7 +123,13 @@ impl Render for ThumbnailsPage {
         let body: AnyElement = match &self.library {
             Load::Loading => skeleton_rows(&[None, Some(400.), None], 14.).into_any_element(),
             Load::Failed(e) => div().text_size(px(size::SM)).text_color(Tokens::danger()).child(format!("Could not load your manga. {e}")).into_any_element(),
-            Load::Ready(groups) if groups.is_empty() => muted("Download a manga's chapters and let Studio read one; its characters become the face cards used here.").into_any_element(),
+            Load::Ready(groups) if groups.is_empty() => div()
+                .flex()
+                .flex_col()
+                .gap(px(space::LG))
+                .child(muted("Download a manga's chapters and let Studio read one; its characters become the face cards used here. Meanwhile, here is what wins clicks."))
+                .child(super::thumb_view::rules_guide(None))
+                .into_any_element(),
             Load::Ready(groups) => {
                 let groups = groups.clone();
                 let current = self.selected.clone().and_then(|id| groups.iter().find(|g| g.id == id).cloned()).or_else(|| groups.first().cloned());
