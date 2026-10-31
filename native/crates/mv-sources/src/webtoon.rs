@@ -13,7 +13,7 @@ use regex::Regex;
 use scraper::{Html, Selector};
 
 use crate::source::{Result, Source, SourceCtx, SourceError};
-use crate::types::{ChapterInfo, MangaDetails, MangaSearchResult, SourceInfo};
+use crate::types::{ChapterInfo, MangaDetails, MangaSearchResult, SourceInfo, Tag};
 use crate::util::{non_empty, sel, svg_icon, text_excluding, text_of, with_ref_hint};
 
 pub const ID: &str = "webtoons";
@@ -24,11 +24,60 @@ static CARD_HREF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/en/([^/]+)/([
 
 pub struct Webtoon {
     ctx: SourceCtx,
+    /// Listing pages already read (url -> when, cards), so paging through one does not fetch it
+    /// again. Each holds hundreds of titles on one page.
+    lists: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<MangaSearchResult>)>>,
 }
+
+/// WEBTOON's genres (`/en/genres/<id>`), offered as tags.
+pub const GENRES: [(&str, &str); 17] = [
+    ("action", "Action"),
+    ("comedy", "Comedy"),
+    ("drama", "Drama"),
+    ("fantasy", "Fantasy"),
+    ("graphic-novel", "Graphic Novel"),
+    ("heartwarming", "Heartwarming"),
+    ("historical", "Historical"),
+    ("horror", "Horror"),
+    ("mystery", "Mystery"),
+    ("romance", "Romance"),
+    ("sf", "Sci-fi"),
+    ("slice-of-life", "Slice of Life"),
+    ("sports", "Sports"),
+    ("supernatural", "Supernatural"),
+    ("super-hero", "Superhero"),
+    ("thriller", "Thriller"),
+    ("tiptoon", "Informative"),
+];
+
+/// How long a listing page is reused.
+const LIST_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 impl Webtoon {
     pub fn new(ctx: SourceCtx) -> Self {
-        Self { ctx }
+        Self { ctx, lists: Default::default() }
+    }
+
+    /// Every title card of the listing pages `urls`, in order, without repeats (cached).
+    async fn listing(&self, urls: &[String]) -> Result<Vec<MangaSearchResult>> {
+        let mut out: Vec<MangaSearchResult> = Vec::new();
+        for url in urls {
+            let cached = self.lists.lock().unwrap_or_else(|e| e.into_inner()).get(url).filter(|(at, _)| at.elapsed() < LIST_TTL).map(|(_, c)| c.clone());
+            let cards = match cached {
+                Some(c) => c,
+                None => {
+                    let c = parse_title_cards(&self.html(url).await?);
+                    self.lists.lock().unwrap_or_else(|e| e.into_inner()).insert(url.clone(), (std::time::Instant::now(), c.clone()));
+                    c
+                }
+            };
+            for c in cards {
+                if !out.iter().any(|o| o.source_id == c.source_id) {
+                    out.push(c);
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn source_info() -> SourceInfo {
@@ -195,17 +244,25 @@ impl Source for Webtoon {
     }
 
     async fn get_popular_manga(&self, page: u32) -> Result<Vec<MangaSearchResult>> {
-        let html = self.html(&format!("{BASE}/en/dailySchedule")).await?;
-        Ok(paged(parse_title_cards(&html), page))
+        // Every Original: all genres by popularity, then the completed ones.
+        let urls = [format!("{BASE}/en/genres?sortOrder=MANA"), format!("{BASE}/en/dailySchedule"), format!("{BASE}/en/originals/complete")];
+        Ok(paged(self.listing(&urls).await?, page))
     }
 
     async fn get_latest_manga(&self, page: u32) -> Result<Vec<MangaSearchResult>> {
-        // The originals landing page surfaces the newest-updated batch.
-        let html = match self.html(&format!("{BASE}/en/originals")).await {
-            Ok(h) => h,
-            Err(_) => self.html(&format!("{BASE}/en/dailySchedule")).await?,
-        };
-        Ok(paged(parse_title_cards(&html), page))
+        let urls = [format!("{BASE}/en/genres?sortOrder=UPDATE"), format!("{BASE}/en/dailySchedule")];
+        Ok(paged(self.listing(&urls).await?, page))
+    }
+
+    async fn get_tag_list(&self) -> Result<Vec<Tag>> {
+        Ok(GENRES.iter().map(|(id, name)| Tag { id: id.to_string(), name: name.to_string(), ..Default::default() }).collect())
+    }
+
+    async fn get_manga_by_tag(&self, tag_id: &str, page: u32) -> Result<Vec<MangaSearchResult>> {
+        if !GENRES.iter().any(|(id, _)| *id == tag_id) {
+            return Err(SourceError::NotFound(format!("WEBTOON genre {tag_id}")));
+        }
+        Ok(paged(self.listing(&[format!("{BASE}/en/genres/{tag_id}?sortOrder=MANA")]).await?, page))
     }
 
     async fn get_manga_details(&self, manga_id: &str) -> Result<MangaDetails> {
