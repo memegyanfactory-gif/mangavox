@@ -680,3 +680,9 @@ mod tests {
         assert!(builtin_sources().iter().filter(|s| s.nsfw).count() >= 3);
     }
 }
+
+/// `fut`, or `None` after `secs` seconds: one slow or blocked source (an anti-bot check, a dead
+/// site) must not hold up a search across every source.
+pub async fn within<T>(secs: u64, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await.ok()
+}

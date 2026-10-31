@@ -144,7 +144,7 @@ async fn find_elsewhere(m: &Manga) -> Scan {
     let mut names = vec![m.title.clone()];
     let mut own_title = None;
     if let Some(src) = &own {
-        if let Ok(list) = src.search_manga(&m.title, 1).await {
+        if let Some(Ok(list)) = backend::within(20, src.search_manga(&m.title, 1)).await {
             if let Some(r) = list.into_iter().find(|r| r.source_id == m.source_id) {
                 names.push(r.title.clone());
                 names.extend(r.alt_titles.unwrap_or_default());
@@ -164,9 +164,9 @@ async fn find_elsewhere(m: &Manga) -> Scan {
         let names = names.clone();
         async move {
             for n in names.iter().take(3) {
-                let Ok(list) = src.search_manga(n, 1).await else { continue };
+                let Some(Ok(list)) = backend::within(20, src.search_manga(n, 1)).await else { continue };
                 let Some(hit) = best_match(list, &names) else { continue };
-                let chapters = src.get_chapter_list(&hit.source_id).await.ok().filter(|c| !c.is_empty())?;
+                let chapters = backend::within(40, src.get_chapter_list(&hit.source_id)).await?.ok().filter(|c| !c.is_empty())?;
                 return Some((Link { source: info.id.clone(), id: hit.source_id, title: hit.title }, info.name.clone(), chapters));
             }
             None
@@ -211,7 +211,7 @@ pub async fn sync_other_sources(manga_id: String, rescan: bool) -> Result<MergeN
     } else {
         let reg = backend::registry().await;
         let reads = known.links.iter().cloned().filter_map(|l| reg.get(&l.source).map(|s| (l, s))).map(|(l, src)| async move {
-            let chapters = src.get_chapter_list(&l.id).await.ok().filter(|c| !c.is_empty())?;
+            let chapters = backend::within(40, src.get_chapter_list(&l.id)).await?.ok().filter(|c| !c.is_empty())?;
             Some((l, src.info().name, chapters))
         });
         Scan { found: futures::future::join_all(reads).await.into_iter().flatten().collect(), ..Default::default() }

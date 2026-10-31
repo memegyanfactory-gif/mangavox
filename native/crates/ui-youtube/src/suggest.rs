@@ -107,7 +107,7 @@ async fn find_in_sources(names: Vec<String>) -> Found {
         let names = names.clone();
         async move {
             for n in names.iter().take(2) {
-                let Ok(list) = src.search_manga(n, 1).await else { continue };
+                let Some(Ok(list)) = backend::within(20, src.search_manga(n, 1)).await else { continue };
                 let best = list
                     .into_iter()
                     .map(|r| (names.iter().map(|x| trends::similarity(&r.title, x)).fold(0.0, f64::max), r))

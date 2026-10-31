@@ -322,7 +322,7 @@ impl BrowsePage {
                 let q2 = q.clone();
                 let res = mv_ui::bg::run(async move {
                     let s = backend::source(&sid).await?;
-                    s.search_manga(&q2, 1).await.map_err(|e| anyhow!("{e}"))
+                    backend::within(25, s.search_manga(&q2, 1)).await.ok_or_else(|| anyhow!("No answer in 25 seconds"))?.map_err(|e| anyhow!("{e}"))
                 })
                 .await
                 .and_then(|r| r)
