@@ -18,6 +18,7 @@ use mv_ui::{
 
 use crate::backend;
 use crate::discover::{self, SourceTags, TagRequest, TagTarget};
+use crate::foryou::ForYouView;
 use crate::ops;
 use crate::sources::source_avatar;
 use crate::tags;
@@ -37,6 +38,8 @@ enum Mode {
     Search(String),
     /// Titles carrying all of these tags.
     Tags(Vec<Tag>),
+    /// Suggestions from every installed source, picked by the user's taste ([`ForYouView`]).
+    ForYou,
 }
 
 /// `source \u{1} source_id` -> (manga id, shown in the library).
@@ -109,6 +112,8 @@ pub struct BrowsePage {
     resolving: Option<String>,
     /// A search of every installed source (the search box's Enter).
     everywhere: Option<Everywhere>,
+    /// The "For you" tab (made when first opened).
+    for_you: Option<Entity<ForYouView>>,
     _sub: Subscription,
 }
 
@@ -148,6 +153,7 @@ impl BrowsePage {
             tags_open: false,
             resolving: None,
             everywhere: None,
+            for_you: None,
             _sub: sub,
         };
         p.load_sources(cx);
@@ -295,6 +301,16 @@ impl BrowsePage {
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.everywhere = None;
+        if mode == Mode::ForYou {
+            // Not tied to the selected source: its own view, kept (with its suggestions) once made.
+            self.generation += 1;
+            self.mode = mode;
+            if self.for_you.is_none() {
+                self.for_you = Some(cx.new(ForYouView::new));
+            }
+            cx.notify();
+            return;
+        }
         self.mode = mode;
         self.fetch(cx);
     }
@@ -418,7 +434,8 @@ impl BrowsePage {
             let res = mv_ui::bg::run(async move {
                 let s = backend::source(&sid).await?;
                 match mode {
-                    Mode::Popular => s.get_popular_manga(page).await,
+                    // For you has its own view; the grid behind it shows Popular.
+                    Mode::Popular | Mode::ForYou => s.get_popular_manga(page).await,
                     Mode::Latest => s.get_latest_manga(page).await,
                     Mode::Search(q) => s.search_manga(&q, page).await,
                     Mode::Tags(t) => {
@@ -835,6 +852,7 @@ impl BrowsePage {
             .border_color(Tokens::border())
             .child(mode_tab("m-popular", ph::FIRE, "Popular", Mode::Popular))
             .child(mode_tab("m-latest", ph::CLOCK, "Latest", Mode::Latest))
+            .child(mode_tab("m-foryou", ph::SPARKLE, "For you", Mode::ForYou).tooltip(mv_ui::tip("Picked from every source by what you read, finish and like")))
             .when_some(search, |d, q| {
                 let scope = if self.everywhere.is_some() { " in all sources" } else { "" };
                 d.child(tab("m-search", Some(glyphs::SEARCH), format!("\u{201c}{}\u{201d}{scope}", short(&q, SEARCH_TAB_CHARS)), None, true).mr(px(4.)).tooltip(mv_ui::tip(format!("Results for \u{201c}{q}\u{201d}"))))
@@ -916,7 +934,10 @@ impl Render for BrowsePage {
         let tabs = self.mode_tabs(current.as_ref(), cx);
         let selected_row = self.selected_row(cx);
         let panel = self.tags_open.then(|| self.tag_panel(current.as_ref(), cx));
-        let body: AnyElement = if self.everywhere.is_some() {
+        let for_you = self.for_you.clone().filter(|_| self.mode == Mode::ForYou);
+        let body: AnyElement = if let Some(view) = for_you {
+            view.into_any_element()
+        } else if self.everywhere.is_some() {
             self.everywhere_view(grid, cx)
         } else {
             match &self.results {

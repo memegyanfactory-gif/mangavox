@@ -119,6 +119,8 @@ struct ListQuery {
     /// Tag UUIDs and `demographic:<value>` pseudo tags (see [`DEMOGRAPHICS`]), combined with AND.
     tags: Vec<String>,
     readable_only: bool,
+    /// Author / artist UUID (`authorOrArtist`).
+    creator: Option<String>,
 }
 
 /// MangaDex demographics are a field, not tags; they are offered as `demographic:<value>` tags.
@@ -168,7 +170,19 @@ fn list_query(q: &ListQuery) -> Vec<(String, String)> {
         v.push(("includedTagsMode".into(), "AND".into()));
     }
     v.extend(demos.into_iter().map(|d| ("publicationDemographic[]".to_string(), d)));
+    if let Some(c) = &q.creator {
+        v.push(("authorOrArtist".into(), c.clone()));
+    }
     v
+}
+
+/// `GET /author?name=` -> the id of the first author / artist whose name is `name`.
+pub fn pick_creator(json: &Value, name: &str) -> Option<String> {
+    json.get("data")?
+        .as_array()?
+        .iter()
+        .find(|a| a.pointer("/attributes/name").and_then(Value::as_str).is_some_and(|n| crate::util::creator_matches(n, name)))
+        .and_then(|a| a.get("id")?.as_str().map(str::to_string))
 }
 
 #[async_trait]
@@ -178,15 +192,15 @@ impl Source for MangaDex {
     }
 
     async fn search_manga(&self, query: &str, page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.manga_list(ListQuery { title: Some(query.into()), order: "relevance", page, tags: vec![], readable_only: false }).await
+        self.manga_list(ListQuery { title: Some(query.into()), order: "relevance", page, tags: vec![], readable_only: false, creator: None }).await
     }
 
     async fn get_popular_manga(&self, page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.manga_list(ListQuery { title: None, order: "followedCount", page, tags: vec![], readable_only: true }).await
+        self.manga_list(ListQuery { title: None, order: "followedCount", page, tags: vec![], readable_only: true, creator: None }).await
     }
 
     async fn get_latest_manga(&self, page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.manga_list(ListQuery { title: None, order: "latestUploadedChapter", page, tags: vec![], readable_only: true }).await
+        self.manga_list(ListQuery { title: None, order: "latestUploadedChapter", page, tags: vec![], readable_only: true, creator: None }).await
     }
 
     async fn get_manga_details(&self, manga_id: &str) -> Result<MangaDetails> {
@@ -219,11 +233,17 @@ impl Source for MangaDex {
     }
 
     async fn get_manga_by_tags(&self, tag_ids: &[String], page: u32) -> Result<Vec<MangaSearchResult>> {
-        self.manga_list(ListQuery { title: None, order: "followedCount", page, tags: tag_ids.to_vec(), readable_only: true }).await
+        self.manga_list(ListQuery { title: None, order: "followedCount", page, tags: tag_ids.to_vec(), readable_only: true, creator: None }).await
     }
 
     fn supports_multi_tag(&self) -> bool {
         true
+    }
+
+    async fn get_manga_by_creator(&self, name: &str, page: u32) -> Result<Vec<MangaSearchResult>> {
+        let q = vec![("name".to_string(), name.to_string()), ("limit".to_string(), "10".to_string())];
+        let Some(id) = pick_creator(&self.json(q, "/author").await?, name) else { return Ok(Vec::new()) };
+        self.manga_list(ListQuery { title: None, order: "followedCount", page, tags: vec![], readable_only: false, creator: Some(id) }).await
     }
 }
 
@@ -455,11 +475,23 @@ mod tests {
     use super::*;
 
     fn q(tags: &[&str]) -> Vec<(String, String)> {
-        list_query(&ListQuery { title: None, order: "followedCount", page: 2, tags: tags.iter().map(|s| s.to_string()).collect(), readable_only: false })
+        list_query(&ListQuery { title: None, order: "followedCount", page: 2, tags: tags.iter().map(|s| s.to_string()).collect(), readable_only: false, creator: None })
     }
 
     fn values<'a>(v: &'a [(String, String)], key: &str) -> Vec<&'a str> {
         v.iter().filter(|(k, _)| k == key).map(|(_, x)| x.as_str()).collect()
+    }
+
+    #[test]
+    fn creator_lookup_and_query() {
+        let json = serde_json::json!({"data": [
+            {"id": "a1", "attributes": {"name": "Oda Eiichirou Fan"}},
+            {"id": "a2", "attributes": {"name": "ODA Eiichiro"}}
+        ]});
+        assert_eq!(pick_creator(&json, "Oda Eiichiro").as_deref(), Some("a2"));
+        assert_eq!(pick_creator(&json, "Someone Else"), None);
+        let v = list_query(&ListQuery { title: None, order: "followedCount", page: 1, tags: vec![], readable_only: false, creator: Some("a2".into()) });
+        assert_eq!(values(&v, "authorOrArtist"), ["a2"]);
     }
 
     #[test]

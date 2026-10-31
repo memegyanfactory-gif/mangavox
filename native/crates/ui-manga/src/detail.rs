@@ -10,7 +10,6 @@ use gpui_kit::*;
 use mv_core::repo::category::{self, LibraryCategory};
 use mv_core::repo::chapter::Chapter;
 use mv_core::repo::manga::{self, Manga};
-use mv_sources::MangaSearchResult;
 use mv_ui::theme::{icon as icon_px, radius, ramp};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
@@ -20,7 +19,10 @@ use mv_ui::{
 
 use crate::backend::{self, ChapterExtra};
 use crate::categories;
-use crate::discover::{self, Recs};
+use crate::discover;
+use crate::foryou::{self, CardActions};
+use crate::suggest::{self, Suggestion, TitleCtx};
+use crate::taste::{self, FeedbackKind, TitleRef};
 use crate::downloads::{downloads, ChapterDl, Downloads, Job};
 use crate::logic::{self, ChapterView};
 use crate::ops;
@@ -28,7 +30,7 @@ use crate::reader::{open_read_aloud, watch_recap};
 use crate::recap::{self, RecapOutputs};
 use crate::store;
 use crate::tags::MAX_RECS;
-use crate::ui::{action_tile, cover_src, fill_menu, icon_trigger, manga_card, skeleton_cover, spawn_cover_downloads, CardInfo, Entry, Grid, Load};
+use crate::ui::{action_tile, cover_src, fill_menu, icon_trigger, skeleton_cover, spawn_cover_downloads, Entry, Grid, Load};
 
 /// Fixed list rows before the chapters: the header and the chapter toolbar.
 const LEAD: usize = 2;
@@ -74,12 +76,17 @@ pub struct DetailPage {
     lib_pop: u64,
     list: ListState,
     seen_version: u64,
-    /// "You may also like" (None until the title's tags are known).
-    recs: Option<Load<Recs>>,
+    /// "You may also like" (None until the title's tags or author are known).
+    recs: Option<Load<Vec<Suggestion>>>,
     rec_covers: HashMap<String, PathBuf>,
     recs_scroll: ScrollHandle,
     /// Recommendation being opened (`source_id`).
     rec_busy: Option<String>,
+    /// Suggested titles the user said "More like this" to (title keys).
+    rec_liked: HashSet<String>,
+    /// The user's verdict on this title ("More like this" / "Not for me").
+    verdict: Option<FeedbackKind>,
+    verdict_pop: u64,
     queue: Entity<Downloads>,
     _watch: Subscription,
 }
@@ -144,6 +151,9 @@ impl DetailPage {
             rec_covers: HashMap::new(),
             recs_scroll: ScrollHandle::new(),
             rec_busy: None,
+            rec_liked: HashSet::new(),
+            verdict: None,
+            verdict_pop: 0,
             queue,
             _watch: watch,
         };
@@ -214,6 +224,7 @@ impl DetailPage {
         for c in cs.iter_mut().filter(|c| self.pending_delete.contains(&c.id)) {
             c.download_status = "none".into();
         }
+        self.verdict = taste::verdict(&m.title);
         self.state = Load::Ready((m, cs));
         self.sync_rows();
         self.list.remeasure_items(0..LEAD.min(self.list.item_count()));
@@ -320,27 +331,41 @@ impl DetailPage {
         .detach();
     }
 
-    /// Start the recommendations once the title has tags (fresh titles get them on refresh).
+    /// Start the recommendations once the title has tags or an author (fresh titles get them on
+    /// refresh).
     fn maybe_load_recs(&mut self, cx: &mut Context<Self>) {
         if self.recs.is_some() {
             return;
         }
-        if matches!(&self.state, Load::Ready((m, _)) if !m.genres.is_empty()) {
+        if matches!(&self.state, Load::Ready((m, _)) if !m.genres.is_empty() || m.author.as_deref().is_some_and(|a| !a.trim().is_empty())) {
             self.load_recs(cx);
         }
     }
 
     fn load_recs(&mut self, cx: &mut Context<Self>) {
-        let Load::Ready((m, _)) = &self.state else { return };
-        let (src, sid, title, genres) = (m.source_plugin.clone(), m.source_id.clone(), m.title.clone(), m.genres.clone());
+        let Load::Ready((m, cs)) = &self.state else { return };
+        let mut linked: Vec<String> = cs.iter().map(|c| c.source_plugin.clone()).collect();
+        linked.extend(ops::links(&m.id).map(|l| l.links.into_iter().map(|l| l.source).collect::<Vec<_>>()).unwrap_or_default());
+        linked.sort();
+        linked.dedup();
+        let ctx = TitleCtx {
+            source: m.source_plugin.clone(),
+            source_id: m.source_id.clone(),
+            title: m.title.clone(),
+            author: m.author.clone(),
+            artist: m.artist.clone(),
+            genres: m.genres.clone(),
+            linked,
+        };
+        self.rec_liked = foryou::liked_keys();
         self.recs = Some(Load::Loading);
         self.list.remeasure_items(0..1.min(self.list.item_count()));
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let res = mv_ui::bg::run(discover::recommendations(src, sid, title, genres)).await.and_then(|r| r);
+            let res = mv_ui::bg::run(suggest::for_title(ctx)).await.and_then(|r| r);
             let covers = match &res {
-                Ok(r) => {
-                    let urls: Vec<_> = r.items.iter().filter_map(|i| i.cover_url.clone().map(|u| (u, Some(r.source_id.clone())))).collect();
+                Ok(list) => {
+                    let urls: Vec<_> = list.iter().filter_map(|s| s.item.cover_url.clone().map(|u| (u, Some(s.source.clone())))).collect();
                     mv_ui::bg::blocking(move || backend::resolve_covers(urls)).await.ok()
                 }
                 Err(_) => None,
@@ -362,30 +387,74 @@ impl DetailPage {
     }
 
     /// Open a recommended title (straight away when it is already in the database).
-    fn open_rec(&mut self, source_id: String, r: MangaSearchResult, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_rec(&mut self, s: Suggestion, window: &mut Window, cx: &mut Context<Self>) {
         if self.rec_busy.is_some() {
             return;
         }
-        self.rec_busy = Some(r.source_id.clone());
+        self.rec_busy = Some(s.item.source_id.clone());
         cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let (src, rid) = (source_id.clone(), r.source_id.clone());
-            let title = r.title.clone();
-            let known = mv_ui::bg::blocking(move || backend::with_db(|c| manga::find_by_source(c, &src, &rid))).await.ok().and_then(|r| r.ok()).flatten();
-            let res = match known {
-                Some(m) => Ok(m),
-                None => mv_ui::bg::run(ops::prepare_from_source(source_id.clone(), r)).await.and_then(|r| r),
-            };
-            let _ = this.update_in(cx, |this, w, cx| {
-                this.rec_busy = None;
-                match res {
-                    Ok(m) => mv_ui::navigate(Route::MangaDetail { manga_id: m.id, source_id: Some(source_id) }, w, cx),
-                    Err(e) => toast::show(cx, Toast::error(format!("Could not open {title}: {e:#}"))),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        foryou::open_suggestion(&s, window, cx, |this: &mut Self| this.rec_busy = None);
+    }
+
+    /// "More like this" on a suggestion (again: undo).
+    fn like_rec(&mut self, s: Suggestion, cx: &mut Context<Self>) {
+        let key = crate::tags::norm(&s.item.title);
+        let on = !self.rec_liked.contains(&key);
+        if on {
+            self.rec_liked.insert(key);
+        } else {
+            self.rec_liked.remove(&key);
+        }
+        taste::set_verdict(foryou::title_ref(&s), on.then_some(FeedbackKind::Like));
+        cx.notify();
+    }
+
+    /// "Not interested" on a suggestion: it goes (with Undo) and is never suggested again.
+    fn dismiss_rec(&mut self, s: Suggestion, cx: &mut Context<Self>) {
+        let Some(Load::Ready(list)) = &mut self.recs else { return };
+        let Some(i) = list.iter().position(|x| x.source == s.source && x.item.source_id == s.item.source_id) else { return };
+        let removed = list.remove(i);
+        taste::set_verdict(foryou::title_ref(&removed), Some(FeedbackKind::NotInterested));
+        suggest::forget_cached(&removed.source, &removed.item.source_id);
+        let weak = cx.entity().downgrade();
+        let title = removed.item.title.clone();
+        toast::show(
+            cx,
+            Toast::info(format!("You won't see {title} again")).action("Undo", move |_, cx| {
+                let back = removed.clone();
+                taste::set_verdict(foryou::title_ref(&back), None);
+                let _ = weak.update(cx, |this, cx| {
+                    if let Some(Load::Ready(list)) = &mut this.recs {
+                        list.insert(i.min(list.len()), back);
+                    }
+                    this.list.remeasure_items(0..1.min(this.list.item_count()));
+                    cx.notify();
+                });
+            }),
+        );
+        self.list.remeasure_items(0..1.min(self.list.item_count()));
+        cx.notify();
+    }
+
+    /// "More like this" / "Not for me" on this title (clicking the chosen one again clears it).
+    fn set_verdict(&mut self, kind: FeedbackKind, cx: &mut Context<Self>) {
+        let Load::Ready((m, _)) = &self.state else { return };
+        let next = (self.verdict != Some(kind)).then_some(kind);
+        taste::set_verdict(TitleRef::from_manga(m), next);
+        self.verdict = next;
+        self.verdict_pop += 1;
+        if let Some(k) = next {
+            toast::show(
+                cx,
+                Toast::success(match k {
+                    FeedbackKind::Like => "Got it: more titles like this one",
+                    _ => "Got it: fewer titles like this one",
+                })
+                .icon(if k == FeedbackKind::Like { ph::THUMBS_UP } else { ph::THUMBS_DOWN }),
+            );
+        }
+        self.list.remeasure_items(0..1.min(self.list.item_count()));
+        cx.notify();
     }
 
     /// Scroll the recommendations row by about one screen of cards (`dir` -1 or 1).
@@ -398,18 +467,13 @@ impl DetailPage {
         cx.notify();
     }
 
-    /// "You may also like": 5-8 titles sharing this one's main tags.
+    /// "You may also like": the same author / artist, the rest of the series, the series on other
+    /// sources and titles sharing this one's main tags, ranked by the user's taste, each with why.
     /// `m` is the open title (the page state is lent out while a list row renders).
-    fn recs_section(&self, m: &Manga, cx: &mut Context<Self>) -> Option<Div> {
+    fn recs_section(&self, _m: &Manga, cx: &mut Context<Self>) -> Option<Div> {
         let recs = self.recs.as_ref()?;
-        let sub = match recs {
-            Load::Ready(r) if !r.basis.is_empty() => {
-                let from = if m.source_plugin == r.source_id { String::new() } else { format!(" on {}", r.source_name) };
-                Some(format!("Tagged {}{from}", r.basis.join(" + ")))
-            }
-            _ => None,
-        };
-        let scrollable = matches!(recs, Load::Ready(r) if r.items.len() > 4);
+        let sub = matches!(recs, Load::Ready(r) if !r.is_empty()).then_some("Picked for your taste");
+        let scrollable = matches!(recs, Load::Ready(r) if r.len() > 4);
         // Scroll position from the last frame (offset runs from 0 to -max).
         let (off, max) = (-f32::from(self.recs_scroll.offset().x), f32::from(self.recs_scroll.max_offset().x));
         let at_start = off <= 1.;
@@ -424,21 +488,23 @@ impl DetailPage {
         let body: AnyElement = match recs {
             Load::Loading => div().flex().gap(px(12.)).overflow_hidden().children((0..6).map(|_| skeleton_cover(REC_GRID))).into_any_element(),
             Load::Failed(e) => inline_alert(AlertKind::Warning, "Could not load recommendations", e.clone()).action("Try again", cx.listener(|this, _, _, cx| this.load_recs(cx))).into_any_element(),
-            Load::Ready(r) if r.items.is_empty() => {
-                muted(if r.basis.is_empty() { "No similar titles: none of this title's tags can be searched." } else { "No similar titles found." }).into_any_element()
-            }
+            Load::Ready(r) if r.is_empty() => muted("No similar titles found on your sources.").into_any_element(),
             // One horizontal row (scrolls sideways) so the chapters stay close to the top; the
             // right edge fades out and arrows page through it.
             // NN/g carousels: https://www.nngroup.com/articles/designing-effective-carousels/
             Load::Ready(r) => div()
                 .relative()
                 .child(
-                    div().id("recs-row").flex().overflow_x_scroll().track_scroll(&self.recs_scroll).gap(px(12.)).children(r.items.iter().map(|it| {
-                        let item = it.clone();
-                        let src = r.source_id.clone();
-                        let busy = self.rec_busy.as_deref() == Some(it.source_id.as_str());
-                        let info = CardInfo { title: it.title.clone().into(), cover: cover_src(&self.rec_covers, it.cover_url.as_deref()), busy, ..Default::default() };
-                        manga_card(SharedString::from(format!("rec-{}", it.source_id)), info, REC_GRID).on_click(cx.listener(move |this, _, w, cx| this.open_rec(src.clone(), item.clone(), w, cx)))
+                    div().id("recs-row").flex().overflow_x_scroll().track_scroll(&self.recs_scroll).gap(px(12.)).children(r.iter().map(|s| {
+                        let busy = self.rec_busy.as_deref() == Some(s.item.source_id.as_str());
+                        let liked = self.rec_liked.contains(&crate::tags::norm(&s.item.title));
+                        let (a, b, c) = (s.clone(), s.clone(), s.clone());
+                        let act = CardActions {
+                            open: Box::new(cx.listener(move |this, _, w, cx| this.open_rec(a.clone(), w, cx))),
+                            like: Box::new(cx.listener(move |this, _, _, cx| this.like_rec(b.clone(), cx))),
+                            dismiss: Box::new(cx.listener(move |this, _, _, cx| this.dismiss_rec(c.clone(), cx))),
+                        };
+                        foryou::suggestion_card(&format!("rec-{}-{}", s.source, s.item.source_id), s, cover_src(&self.rec_covers, s.item.cover_url.as_deref()), busy, liked, REC_GRID, act)
                     })),
                 )
                 // The fade says "more this way"; it goes once the row is scrolled to its end.
@@ -479,6 +545,10 @@ impl DetailPage {
         self.lib_pop += 1;
         backend::set_in_library(&self.manga_id, on);
         self.seen_version = backend::data_version();
+        // Taking a title out of the library counts a little against its kind (Undo forgets it).
+        if let Load::Ready((m, _)) = &self.state {
+            taste::set_in_library(TitleRef::from_manga(m), on);
+        }
         let weak = cx.entity().downgrade();
         let t = if on {
             let t = Toast::success("Added to your library").icon(glyphs::SAVED);
@@ -787,6 +857,20 @@ impl DetailPage {
                     .tooltip(tip(if m.is_favorite { "Remove from Favorites" } else { "Pin to Favorites in your library" }))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_favorite(cx))),
             )
+            .child({
+                let on = self.verdict == Some(FeedbackKind::Like);
+                action_tile("act-like", ph::THUMBS_UP, "More like this", on, Tokens::accent(), false, if on { self.verdict_pop } else { 0 })
+                    .aria_toggled(if on { Toggled::True } else { Toggled::False })
+                    .tooltip(tip(if on { "You asked for more like this. Click to undo" } else { "Suggest more titles like this one" }))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_verdict(FeedbackKind::Like, cx)))
+            })
+            .child({
+                let on = self.verdict == Some(FeedbackKind::NotInterested);
+                action_tile("act-nope", ph::THUMBS_DOWN, "Not for me", on, Tokens::danger(), false, if on { self.verdict_pop } else { 0 })
+                    .aria_toggled(if on { Toggled::True } else { Toggled::False })
+                    .tooltip(tip(if on { "Suggestions avoid titles like this. Click to undo" } else { "Suggest fewer titles like this one" }))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_verdict(FeedbackKind::NotInterested, cx)))
+            })
             .when(self.in_library, |d| {
                 d.child(
                     action_tile("act-cat", ph::FOLDER_SIMPLE, cat_label, !self.member.is_empty(), Tokens::accent(), false, 0)

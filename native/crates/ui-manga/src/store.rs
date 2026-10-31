@@ -197,6 +197,37 @@ pub fn downloaded_titles(conn: &Connection) -> Result<Vec<(Manga, Vec<Chapter>)>
     Ok(out)
 }
 
+/// SQLite `datetime('now')` text ("2026-10-31 12:00:00", UTC) as unix seconds.
+pub fn sql_time(s: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S").ok().map(|d| d.and_utc().timestamp())
+}
+
+/// What the database says about every title, for the taste profile: chapters read (by the same
+/// language and one-per-number rules as the library), favorite, library membership (`hidden`
+/// = browse-only ids), categories and when it was last read.
+pub fn taste_facts(conn: &Connection, lang: &str, hidden: &HashSet<String>) -> Result<Vec<crate::taste::TitleFacts>> {
+    use mv_core::repo::category;
+    let stats = library_stats(conn, lang)?;
+    let names: HashMap<String, String> = category::list(conn)?.into_iter().map(|c| (c.id, c.name)).collect();
+    let cats = category::manga_category_map(conn)?;
+    Ok(manga::list(conn)?
+        .into_iter()
+        .map(|m| {
+            let st = stats.get(&m.id).copied().unwrap_or_default();
+            crate::taste::TitleFacts {
+                title: crate::taste::TitleRef::from_manga(&m),
+                in_library: !hidden.contains(&m.id),
+                favorite: m.is_favorite,
+                chapters: st.total,
+                read: st.total - st.unread,
+                last_read: m.last_read_at.as_deref().and_then(sql_time),
+                added: sql_time(&m.added_at).unwrap_or(0),
+                categories: cats.get(&m.id).into_iter().flatten().filter_map(|c| names.get(c).cloned()).collect(),
+            }
+        })
+        .collect())
+}
+
 /// Mark chapters read or unread (unread also resets the saved page).
 pub fn set_read(conn: &mut Connection, ids: &[String], read: bool) -> Result<()> {
     let tx = conn.transaction()?;
@@ -315,6 +346,29 @@ mod tests {
         let cs = chapters(&conn, &m.id, "en").unwrap();
         assert_eq!(cs.iter().map(|c| c.source_id.as_str()).collect::<Vec<_>>(), vec!["ot1", "mde2", "ot3", "ot4", "ot5"]);
         assert_eq!(library_stats(&conn, "en").unwrap()[&m.id], LibStats { total: 5, unread: 5, downloaded: 0 });
+    }
+
+    #[test]
+    fn taste_facts_read_counts_library_and_categories() {
+        let (_d, mut conn) = db();
+        let r = MangaSearchResult { source_id: "t1".into(), title: "Taste".into(), ..Default::default() };
+        let d = MangaDetails { genres: Some(vec!["Horror".into()]), author: Some("Ito".into()), ..Default::default() };
+        let m = ensure_manga(&conn, "src", &r, Some(&d)).unwrap();
+        let cs = apply_chapters(&mut conn, &m.id, "src", &[info("c1", 1.0), info("c2", 2.0), info("c3", 3.0)], "en").unwrap();
+        save_progress(&conn, &m.id, &cs[0].id, 4, 5).unwrap();
+        let cat = mv_core::repo::category::create(&conn, "Dropped").unwrap();
+        mv_core::repo::category::set_manga_categories(&mut conn, &m.id, &[cat.id]).unwrap();
+        let other = ensure_manga(&conn, "src", &MangaSearchResult { source_id: "t2".into(), title: "Other".into(), ..Default::default() }, None).unwrap();
+        let hidden: HashSet<String> = [other.id.clone()].into_iter().collect();
+        let facts = taste_facts(&conn, "en", &hidden).unwrap();
+        let f = facts.iter().find(|f| f.title.title == "Taste").unwrap();
+        assert_eq!((f.chapters, f.read, f.in_library), (3, 1, true));
+        assert_eq!(f.title.genres, ["Horror"]);
+        assert_eq!(f.categories, ["Dropped"]);
+        assert!(f.last_read.is_some() && f.added > 1_600_000_000);
+        assert!(!facts.iter().find(|f| f.title.title == "Other").unwrap().in_library);
+        assert_eq!(sql_time("2026-01-02 03:04:05"), Some(1_767_323_045));
+        assert_eq!(sql_time("nope"), None);
     }
 
     #[test]

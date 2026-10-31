@@ -45,6 +45,11 @@ const GENERIC: [&str; 18] = [
     "awardwinning", "usercreated", "manga", "manhwa", "manhua", "english", "japanese", "translated",
 ];
 
+/// A format / language / publishing tag ("Long Strip", "Full Color") rather than a genre.
+pub fn is_generic(name: &str) -> bool {
+    GENERIC.contains(&norm(name).as_str())
+}
+
 /// Genres so common that alone they say little ("Action" covers half the catalogue).
 const BROAD: [&str; 7] = ["action", "adventure", "comedy", "drama", "fantasy", "romance", "sliceoflife"];
 
