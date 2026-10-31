@@ -239,9 +239,18 @@ impl StudioPage {
             (None, _) => format!("{active} chapter{} waiting", plural(active)),
         };
         let p = if total > 0 { q.items.iter().map(|i| i.progress()).sum::<f32>() / total as f32 } else { 0. };
-        // Combined length of the queued chapters' videos made so far (it grows as each one
-        // finishes; cached by file time, so it is cheap per frame).
-        let made_secs: f64 = q.items.iter().filter_map(|i| self.statuses.get(&i.chapter.id).and_then(|s| s.video.clone())).filter_map(|v| crate::export::video_seconds(&v)).sum();
+        // Length of one manga's made videos, the ones its Export joins: the open manga's, else
+        // the one generating now (cached by file time, so it is cheap per frame).
+        let manga = self.dash_manga.clone().or_else(|| running.or_else(|| q.items.iter().find(|i| i.state.active())).map(|i| i.chapter.manga_id.clone()));
+        let group = match &self.library {
+            Load::Ready(groups) => manga.and_then(|id| groups.iter().find(|g| g.id == id)),
+            _ => None,
+        };
+        let made_secs: f64 = group.map(|g| self.made_videos(g).iter().filter_map(|(_, v)| crate::export::video_seconds(v)).sum()).unwrap_or(0.);
+        let timer_tip = match group {
+            Some(g) => format!("Length of {}'s chapter videos made so far: what its Export joins", g.title),
+            None => "Length of the chapter videos made so far".to_string(),
+        };
         let timer = div()
             .id("strip-length")
             .flex()
@@ -254,7 +263,7 @@ impl StudioPage {
             .bg(Tokens::surface())
             .border_1()
             .border_color(Tokens::border())
-            .tooltip(tip("Total length of the chapter videos made so far in this run"))
+            .tooltip(tip(timer_tip))
             .child(icon_ph(ph::FILM_STRIP, Tokens::text_2(), icon_px::SM))
             .child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(crate::export::fmt_duration(made_secs)))
             .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("of video"));
