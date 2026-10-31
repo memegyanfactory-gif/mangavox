@@ -5391,7 +5391,7 @@ dependencies = [
 
 [[package]]
 name = "mangavox"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -5419,7 +5419,7 @@ dependencies = [
 
 [[package]]
 name = "mangavox-setup"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -5673,7 +5673,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "mv-ai"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
@@ -5689,7 +5689,7 @@ dependencies = [
 
 [[package]]
 name = "mv-core"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5706,7 +5706,7 @@ dependencies = [
 
 [[package]]
 name = "mv-media"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "md5",
  "regex",
@@ -5719,7 +5719,7 @@ dependencies = [
 
 [[package]]
 name = "mv-net"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "bytes",
  "reqwest 0.12.28",
@@ -5732,7 +5732,7 @@ dependencies = [
 
 [[package]]
 name = "mv-plugins"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "regex",
@@ -5745,7 +5745,7 @@ dependencies = [
 
 [[package]]
 name = "mv-recap"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -5761,7 +5761,7 @@ dependencies = [
 
 [[package]]
 name = "mv-score"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "hound",
@@ -5777,7 +5777,7 @@ dependencies = [
 
 [[package]]
 name = "mv-sources"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "async-trait",
  "futures",
@@ -5793,7 +5793,7 @@ dependencies = [
 
 [[package]]
 name = "mv-studio"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "dirs 6.0.0",
  "mv-core",
@@ -5806,7 +5806,7 @@ dependencies = [
 
 [[package]]
 name = "mv-torrent"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "axum",
@@ -5825,7 +5825,7 @@ dependencies = [
 
 [[package]]
 name = "mv-ui"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "futures",
@@ -5838,7 +5838,7 @@ dependencies = [
 
 [[package]]
 name = "mv-update"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -5850,7 +5850,7 @@ dependencies = [
 
 [[package]]
 name = "mv-webwall"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "async-trait",
  "dirs 6.0.0",
@@ -5865,7 +5865,7 @@ dependencies = [
 
 [[package]]
 name = "mv-youtube"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9800,7 +9800,7 @@ dependencies = [
 
 [[package]]
 name = "ui-assistant"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9819,7 +9819,7 @@ dependencies = [
 
 [[package]]
 name = "ui-manga"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9844,7 +9844,7 @@ dependencies = [
 
 [[package]]
 name = "ui-media"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9864,7 +9864,7 @@ dependencies = [
 
 [[package]]
 name = "ui-phone"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "axum",
@@ -9901,7 +9901,7 @@ dependencies = [
 
 [[package]]
 name = "ui-player"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -9919,7 +9919,7 @@ dependencies = [
 
 [[package]]
 name = "ui-settings"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -9941,7 +9941,7 @@ dependencies = [
 
 [[package]]
 name = "ui-studio"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "futures",
@@ -9967,7 +9967,7 @@ dependencies = [
 
 [[package]]
 name = "ui-welcome"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -9983,7 +9983,7 @@ dependencies = [
 
 [[package]]
 name = "ui-youtube"
-version = "8.0.5019"
+version = "8.0.5021"
 dependencies = [
  "anyhow",
  "chrono",
