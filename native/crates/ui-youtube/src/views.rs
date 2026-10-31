@@ -369,8 +369,9 @@ impl YouTubePage {
             ))
             .child(setting_row(
                 "Release time",
-                "Local time videos go public",
-                segmented("yt-hour", ["9:00", "12:00", "15:00", "18:00", "20:00", "22:00"], HOURS.iter().position(|h| *h == s.publish_hour).unwrap_or(3)).small().on_change(save(|s, i| s.publish_hour = HOURS[i], cx)),
+                // A golden time from Schedule can be any hour; none of the presets is lit then.
+                if HOURS.contains(&s.publish_hour) { "Local time videos go public. Schedule › Golden upload time picks the best one".to_string() } else { format!("{:02}:00 your time, the golden time picked in Schedule", s.publish_hour) },
+                segmented("yt-hour", ["9:00", "12:00", "15:00", "18:00", "20:00", "22:00"], HOURS.iter().position(|h| *h == s.publish_hour).unwrap_or(HOURS.len())).small().on_change(save(|s, i| s.publish_hour = HOURS[i], cx)),
             ))
             .child(setting_row(
                 "Dip sensitivity",

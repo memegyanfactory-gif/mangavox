@@ -136,6 +136,14 @@ impl YouTubePage {
                 this.suggest(cx);
             }
         }));
+        // The rail clock ticks over to the next minute.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_secs(15)).await;
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        })
+        .detach();
         let start = if hub.read(cx).account.connected() { Tab::Dashboard } else { Tab::Settings };
         Self {
             hub,
@@ -159,6 +167,14 @@ impl YouTubePage {
     }
 
     pub(crate) fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        // The golden-time research refreshes itself when it is a week old.
+        if tab == Tab::Schedule {
+            self.hub.update(cx, |h, cx| {
+                if h.timing_stale() && !h.timing_busy && h.timing_error.is_none() {
+                    h.research_timing(cx);
+                }
+            });
+        }
         self.tab = tab;
         self.focus = None;
         self.ai = AiState::default();
@@ -241,6 +257,7 @@ impl YouTubePage {
                     .on_click(cx.listener(move |this, _, _, cx| this.set_tab(t, cx)))
             })))
             .child(div().flex_1())
+            .child(self.clock(cx))
             .child(self.status_line(cx))
     }
 

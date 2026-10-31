@@ -560,11 +560,11 @@ fn median(mut v: Vec<u64>) -> u64 {
 
 // ------------------------------------------------------------------------------- network
 
-fn client() -> Result<reqwest::Client> {
+pub(crate) fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder().user_agent(UA).timeout(Duration::from_secs(25)).build()?)
 }
 
-async fn fetch(http: &reqwest::Client, url: &str) -> Result<String> {
+pub(crate) async fn fetch(http: &reqwest::Client, url: &str) -> Result<String> {
     let r = http
         .get(url)
         .header("Accept-Language", "en-US,en;q=0.9")
@@ -579,7 +579,7 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<String> {
     Ok(r.text().await?)
 }
 
-fn search_url(query: &str, sp: &str) -> String {
+pub(crate) fn search_url(query: &str, sp: &str) -> String {
     format!("https://www.youtube.com/results?search_query={}&sp={sp}", url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>())
 }
 

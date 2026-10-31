@@ -61,6 +61,15 @@ impl Store {
         self.write("queue.json", &q)
     }
 
+    /// The last upload-time research (`timing.json`).
+    pub fn timing(&self) -> crate::timing::Research {
+        self.read("timing.json")
+    }
+
+    pub fn save_timing(&self, r: &crate::timing::Research) -> Result<()> {
+        self.write("timing.json", r)
+    }
+
     /// Load, change, save the queue in one step (the UI and the background runner both write it).
     pub fn update_queue<T>(&self, f: impl FnOnce(&mut Vec<UploadItem>) -> T) -> Result<T> {
         static LOCK: Mutex<()> = Mutex::new(());

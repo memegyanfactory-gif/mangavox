@@ -93,6 +93,7 @@ impl YouTubePage {
     // ------------------------------------------------------------ schedule
 
     pub(crate) fn schedule(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let golden = self.golden_card(cx);
         let h = self.hub.read(cx);
         let episodes = h.episodes.clone();
         let queue = h.queue.clone();
@@ -190,7 +191,7 @@ impl YouTubePage {
                 div().flex().flex_col().gap(px(space::XS)).pt(px(space::SM)).child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(label.to_uppercase())).children(items.into_iter().map(|i| self.queue_row(i, uploading, cx)))
             }));
 
-        div().flex().flex_col().gap(px(space::LG)).child(queue_card).child(ready).into_any_element()
+        div().flex().flex_col().gap(px(space::LG)).child(golden).child(queue_card).child(ready).into_any_element()
     }
 
     fn queue_row(&self, i: UploadItem, uploading: bool, cx: &mut Context<Self>) -> impl IntoElement {

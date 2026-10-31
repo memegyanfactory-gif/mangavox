@@ -11,6 +11,7 @@ mod content;
 pub mod hub;
 mod page;
 mod suggest;
+mod timing_view;
 mod views;
 
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {

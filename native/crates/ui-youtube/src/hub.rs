@@ -57,6 +57,12 @@ pub struct Hub {
     /// Progress of the upload in flight (f32 bits), polled into the queue item.
     progress: Arc<AtomicU32>,
     pub refreshed_at: Option<i64>,
+    /// The last upload-time research of other recap channels (`timing.json`).
+    pub timing: mv_youtube::timing::Research,
+    pub timing_busy: bool,
+    /// What the research is doing ("Reading upload times (40/280)").
+    pub timing_step: Arc<std::sync::Mutex<String>>,
+    pub timing_error: Option<String>,
     /// What the automation changed, newest first ("Chapter 4 moved to Fri 18:00").
     pub moves: Vec<String>,
 }
@@ -91,6 +97,10 @@ pub fn hub(cx: &mut App) -> Entity<Hub> {
         progress: Arc::new(AtomicU32::new(0)),
         refreshed_at: None,
         moves: vec![],
+        timing: s.timing(),
+        timing_busy: false,
+        timing_step: Arc::default(),
+        timing_error: None,
     });
     cx.set_global(HubGlobal(e.clone()));
     e
@@ -252,6 +262,56 @@ impl Hub {
             });
         })
         .detach();
+    }
+
+    /// The research is missing or older than a week.
+    pub fn timing_stale(&self) -> bool {
+        now() - self.timing.fetched_at > 7 * 86_400
+    }
+
+    /// When other recap channels upload and which hours do best, in local time.
+    pub fn timing_analysis(&self) -> mv_youtube::timing::Analysis {
+        mv_youtube::timing::analyze(&self.timing, utc_offset())
+    }
+
+    /// Reads recent recap uploads' exact publish times (about a minute; no API quota).
+    pub fn research_timing(&mut self, cx: &mut Context<Self>) {
+        if self.timing_busy {
+            return;
+        }
+        self.timing_busy = true;
+        self.timing_error = None;
+        let step = self.timing_step.clone();
+        *step.lock().unwrap_or_else(|e| e.into_inner()) = "Searching recap uploads".into();
+        let store = self.yt.store().clone();
+        cx.spawn(async move |this, cx| {
+            let res = bg::run(async move { mv_youtube::timing::research(move |m| *step.lock().unwrap_or_else(|e| e.into_inner()) = m).await }).await;
+            let _ = this.update(cx, |h, cx| {
+                h.timing_busy = false;
+                match res.and_then(|r| r) {
+                    Ok(r) => {
+                        let _ = store.save_timing(&r);
+                        h.timing = r;
+                    }
+                    Err(e) => h.timing_error = Some(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        // Repaints the progress line while it runs.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            let alive = this.update(cx, |h, cx| {
+                cx.notify();
+                h.timing_busy
+            });
+            if !matches!(alive, Ok(true)) {
+                break;
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     pub fn save_settings(&mut self, s: Settings, cx: &mut Context<Self>) {
