@@ -13,7 +13,8 @@ def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beat
     page segment is subdivided across that page's panels proportional to the
     narration text length, producing ``beat_segments`` with a ``panel_image``
     per entry so the video can swap panels in sync with the narration. The
-    page-level ``segments`` are kept unchanged for backward compatibility.
+    page-level ``segments`` are kept unchanged for backward compatibility. A beat's sound-effect
+    cue (``sfx`` / ``sfx_strength``, from the story) is carried onto its beat segment.
 
     Returns the sync map dict.
     """
@@ -195,10 +196,29 @@ def _build_beat_segments(segments, beats, offset=None):
             }
             if pb.get("focus_point"):
                 beat_seg["focus_point"] = pb["focus_point"]
+            # The story writer's sound-effect cue for this beat (validated; see sfx.py).
+            sfx = _sfx_name(pb.get("sfx"))
+            if sfx:
+                beat_seg["sfx"] = sfx
+                beat_seg["sfx_strength"] = _sfx_strength(pb.get("sfx_strength"))
             out.append(beat_seg)
             cursor = seg_end
 
     return out if matched_any else []
+
+def _sfx_name(name):
+    """A beat's `sfx` as one of the known sounds, else None (unknown names are dropped)."""
+    try:
+        from sfx import normalize_name
+    except Exception:
+        return None
+    return normalize_name(name)
+
+
+def _sfx_strength(v):
+    from sfx import normalize_strength
+    return normalize_strength(v)
+
 
 def _get_audio_duration_ms(audio_path):
     """Get audio duration in milliseconds using wave module."""

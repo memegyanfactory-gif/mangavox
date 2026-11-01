@@ -105,6 +105,27 @@ struct TorrentStats {
     peers: u32,
     speed: f64,
     progress: f64,
+    downloaded: u64,
+    /// Size of the file being streamed.
+    total: u64,
+    /// Verified bytes from the start of the file.
+    head: u64,
+    /// Checking files already on disk: share done.
+    checking: Option<f64>,
+}
+
+impl TorrentStats {
+    fn from_engine(s: mv_torrent::TorrentStats) -> Self {
+        Self {
+            peers: s.peers,
+            speed: s.download_speed,
+            progress: s.progress,
+            downloaded: s.downloaded,
+            total: s.total,
+            head: s.head_available,
+            checking: (s.state == "initializing").then_some(s.check_progress),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -208,6 +229,23 @@ pub struct PlayerView {
     video_shown: bool,
     /// Set once Back was requested, so repeated clicks / keys don't pop twice.
     leaving: bool,
+    /// Bumped by every `begin`, so a slow resolve of an abandoned attempt is ignored.
+    attempt: u64,
+    /// A torrent that is ready but waits for the head of its file before mpv opens it.
+    pending: Option<Resolved>,
+    ready_at: Instant,
+    progress_clock: logic::ProgressClock,
+    /// Other sources to switch to by itself when this one does not start, best first.
+    alternates: Vec<PlayRequest>,
+    alt_total: usize,
+    /// mpv load failures of the current source.
+    failures: u32,
+    /// An automatic re-open is scheduled.
+    retry_at: Option<Instant>,
+    /// Position to reopen at after a failure mid-playback.
+    resume_at: Option<f64>,
+    /// A torrent stats read is running in the background.
+    stats_busy: bool,
 }
 
 actions!(player, [StayOnPlayer]);
@@ -249,6 +287,7 @@ impl PlayerView {
         window.focus(&focus, cx);
         let ident = backend::ident(&req);
         let pending_hash = backend::source_hash(&req);
+        let alternates = backend::take_alternates(&req);
         let now = Instant::now();
         let mut this = Self {
             req,
@@ -311,6 +350,16 @@ impl PlayerView {
             title_drag: None,
             video_shown: false,
             leaving: false,
+            attempt: 0,
+            pending: None,
+            ready_at: now,
+            progress_clock: logic::ProgressClock::new(now),
+            alt_total: alternates.len() + 1,
+            alternates,
+            failures: 0,
+            retry_at: None,
+            resume_at: None,
+            stats_busy: false,
         };
         this.begin(window, cx);
         this.fetch_artwork(cx);
@@ -409,15 +458,74 @@ impl PlayerView {
     fn begin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.phase = Phase::Connecting;
         self.started = Instant::now();
+        self.attempt += 1;
+        self.pending = None;
+        self.retry_at = None;
+        self.torrent = None;
+        self.pending_hash = backend::source_hash(&self.req);
         self.set_video_shown(false);
+        mv_core::logging::breadcrumb("player: resolve");
+        let attempt = self.attempt;
         let req = self.req.clone();
         let ident = self.ident.clone();
         cx.spawn_in(window, async move |this, cx| {
             let (resume, prefs) = bg::blocking(move || (backend::load_resume(&ident), backend::load_prefs())).await.unwrap_or_default();
             let resolved = bg::run(async move { backend::resolve(&req).await }).await.and_then(|r| r);
-            let _ = this.update_in(cx, |this, window, cx| this.on_resolved(resolved, resume, prefs, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.attempt == attempt {
+                    this.on_resolved(resolved, resume, prefs, window, cx);
+                }
+            });
         })
         .detach();
+    }
+
+    fn is_torrent(&self) -> bool {
+        matches!(logic::classify_source(&self.req.source), logic::SourceKind::Torrent(_))
+    }
+
+    /// Short id of the current source for logs (truncated info-hash; never a title or link).
+    fn source_tag(&self) -> String {
+        match logic::classify_source(&self.req.source) {
+            logic::SourceKind::Torrent(_) => mv_torrent::short_hash(&logic::source_key(&self.req.source)).to_string(),
+            logic::SourceKind::Url(_) => "url".into(),
+            logic::SourceKind::File(_) => "file".into(),
+        }
+    }
+
+    /// This source is not going to play: switch to the next offered one (with a toast), or
+    /// show the error screen when there is none.
+    fn fallback(&mut self, reason: &'static str, raw: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.leaving {
+            return;
+        }
+        if self.alternates.is_empty() {
+            self.mpv = None;
+            self.pending = None;
+            self.fail(raw);
+            self.sync_video_popup();
+            cx.notify();
+            return;
+        }
+        let next = self.alternates.remove(0);
+        let from = self.source_tag();
+        if let Some(h) = self.info_hash.take() {
+            backend::release_torrent(h);
+        }
+        self.mpv = None;
+        self.pending = None;
+        self.failures = 0;
+        self.req = next;
+        let n = self.alt_total - self.alternates.len();
+        mv_core::logging::global().log_with(
+            mv_core::logging::Level::Info,
+            "player",
+            "stream fallback",
+            serde_json::json!({ "from": from, "to": self.source_tag(), "reason": reason, "error": raw, "source": n, "of": self.alt_total }),
+        );
+        toast::show(cx, Toast::info(format!("{reason}. Trying another source ({n} of {})…", self.alt_total)).icon(ph::SWAP));
+        self.begin(window, cx);
+        cx.notify();
     }
 
     /// Loader / Up Next backdrop (anime too, through its MAL id).
@@ -434,20 +542,156 @@ impl PlayerView {
         .detach();
     }
 
-    fn on_resolved(&mut self, resolved: anyhow::Result<Resolved>, resume: Option<f64>, prefs: PlaybackPrefs, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Reads the torrent's stats on a background thread (the engine's locks are shared with
+    /// its download threads), then updates the loader and decides whether to open the stream.
+    fn fetch_stats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.stats_busy {
+            return;
+        }
+        let (Some(h), Some(engine)) = (self.info_hash.clone().or_else(|| self.pending_hash.clone()), backend::engine_if_started()) else { return };
+        self.stats_busy = true;
+        let attempt = self.attempt;
+        cx.spawn_in(window, async move |this, cx| {
+            let stats = bg::blocking(move || engine.stats(&h).ok()).await.ok().flatten().map(TorrentStats::from_engine);
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.stats_busy = false;
+                if this.attempt == attempt {
+                    this.on_stats(stats, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn on_stats(&mut self, stats: Option<TorrentStats>, window: &mut Window, cx: &mut Context<Self>) {
+        if stats != self.torrent {
+            self.torrent = stats;
+            cx.notify();
+        }
+        if self.pending.is_some() && self.mpv.is_none() && !self.leaving {
+            self.check_start(window, cx);
+        }
+    }
+
+    /// A ready torrent waits for the head of its file, then opens; a dead one (no data for a
+    /// while) makes way for the next source.
+    fn check_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let t = self.torrent.unwrap_or_default();
+        let p = logic::StartProgress {
+            since_ready: now.saturating_duration_since(self.ready_at),
+            since_progress: self.progress_clock.observe(t.downloaded.max(t.head), now),
+            peers: t.peers,
+            head_bytes: t.head,
+            file_len: t.total,
+            checking: t.checking.is_some(),
+            has_alternate: !self.alternates.is_empty(),
+        };
+        match logic::start_step(&p) {
+            logic::StartStep::Wait => {}
+            logic::StartStep::Load => {
+                let Some(r) = self.pending.take() else { return };
+                mv_core::logging::global().log_with(
+                    mv_core::logging::Level::Info,
+                    "player",
+                    "torrent head ready",
+                    serde_json::json!({ "source": self.source_tag(), "headBytes": t.head, "peers": t.peers, "sinceReadyMs": p.since_ready.as_millis() as u64 }),
+                );
+                let resume = self.resume_note.take();
+                self.start_mpv(r, resume, cx);
+            }
+            logic::StartStep::Fallback => {
+                let raw = format!("no data for {} s ({} peers)", p.since_progress.as_secs(), t.peers);
+                self.fallback("No one is sharing that source", raw, window, cx);
+            }
+        }
+    }
+
+    /// mpv could not open or keep playing the stream: re-open it (a torrent is re-checked and
+    /// waits for its head again), then try the next source, then show the error.
+    fn on_load_failed(&mut self, raw: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.failures += 1;
+        let source = logic::classify_source(&self.req.source);
+        let (torrent, local) = (matches!(source, logic::SourceKind::Torrent(_)), matches!(source, logic::SourceKind::File(_)));
+        let action = logic::on_load_failed(self.failures, &raw, torrent, local, !self.alternates.is_empty());
+        let log = mv_core::logging::global();
+        // Mid-playback: reopen where it stopped.
+        if self.snap.pos > 5.0 && self.snap.dur > 0.0 {
+            self.resume_at = Some(self.snap.pos);
+        }
+        match action {
+            logic::FailAction::Retry(after) => {
+                log.log_with(
+                    mv_core::logging::Level::Warn,
+                    "player",
+                    &format!("playback failed: {raw} (retrying in {} ms)", after.as_millis()),
+                    serde_json::json!({ "source": self.source_tag(), "attempt": self.failures, "of": logic::auto_retries(torrent) + 1 }),
+                );
+                self.mpv = None;
+                self.phase = Phase::Connecting;
+                self.set_video_shown(false);
+                self.retry_at = Some(Instant::now() + after);
+                cx.notify();
+            }
+            logic::FailAction::Fallback => {
+                log_error("playback failed", &raw);
+                self.set_video_shown(false);
+                self.fallback("That source didn't play", raw, window, cx);
+            }
+            logic::FailAction::GiveUp => {
+                self.mpv = None;
+                self.fail(raw);
+                self.set_video_shown(false);
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_resolved(&mut self, resolved: anyhow::Result<Resolved>, resume: Option<f64>, prefs: PlaybackPrefs, window: &mut Window, cx: &mut Context<Self>) {
         if self.leaving {
             return;
         }
         self.prefs = prefs;
+        // Reopening after a failure mid-playback carries on where it stopped.
+        let resume = self.resume_at.take().or(resume);
+        let waited = self.started.elapsed().as_millis() as u64;
         let r = match resolved {
             Ok(r) => r,
             Err(e) => {
-                self.fail(format!("{e:#}"));
-                cx.notify();
+                let raw = format!("{e:#}");
+                log_error("source failed", &raw);
+                if self.is_torrent() {
+                    self.fallback("That source didn't start", raw, window, cx);
+                } else {
+                    self.fail(raw);
+                    cx.notify();
+                }
                 return;
             }
         };
         self.info_hash = r.info_hash.clone();
+        mv_core::logging::global().log_with(
+            mv_core::logging::Level::Info,
+            "player",
+            "stream resolved",
+            serde_json::json!({ "source": self.source_tag(), "ms": waited, "alternates": self.alternates.len() }),
+        );
+        if r.info_hash.is_some() {
+            // Torrent: wait for the head of the file (see `check_start`), then open it.
+            self.resume_note = resume;
+            self.pending = Some(r);
+            self.ready_at = Instant::now();
+            self.progress_clock = logic::ProgressClock::new(self.ready_at);
+            self.fetch_stats(window, cx);
+            cx.notify();
+            return;
+        }
+        self.start_mpv(r, resume, cx);
+    }
+
+    /// Creates mpv and opens `r` (the torrent's head is in, or a URL / file).
+    fn start_mpv(&mut self, r: Resolved, resume: Option<f64>, cx: &mut Context<Self>) {
+        mv_core::logging::breadcrumb("player: mpv create");
         let created = match self.main_hwnd {
             Some(owner) => Mpv::create(owner),
             None => Err(anyhow::anyhow!("no native window handle")),
@@ -455,25 +699,34 @@ impl PlayerView {
         match created {
             Ok(m) => {
                 // The viewer's last picks in the player win over Settings → Playback → Subtitle language.
+                // Nothing is loaded yet, so mpv's core is idle and these synchronous sets return at
+                // once; they must be in place before `loadfile`.
                 let mem = self.prefs.memory.clone();
-                let _ = m.set("slang", &logic::slang(mem.sub_lang.as_deref().unwrap_or(&self.prefs.subtitle_language)));
+                let _ = m.set_now("slang", &logic::slang(mem.sub_lang.as_deref().unwrap_or(&self.prefs.subtitle_language)));
                 if let Some(a) = &mem.audio_lang {
-                    let _ = m.set("alang", &logic::slang(a));
+                    let _ = m.set_now("alang", &logic::slang(a));
                 }
                 if mem.subs_off {
-                    let _ = m.set("sid", "no");
+                    let _ = m.set_now("sid", "no");
                 }
                 if let Some(v) = mem.volume {
-                    let _ = m.set("volume", &format!("{v:.0}"));
+                    let _ = m.set_now("volume", &format!("{v:.0}"));
                     self.snap.volume = v;
                 }
                 if let Some(s) = mem.speed {
-                    let _ = m.set("speed", &format!("{s}"));
+                    let _ = m.set_now("speed", &format!("{s}"));
                 }
                 self.resume_note = resume;
                 if let Some(t) = resume {
-                    let _ = m.set("start", &format!("{t:.1}"));
+                    let _ = m.set_now("start", &format!("{t:.1}"));
                 }
+                mv_core::logging::breadcrumb("player: loadfile");
+                mv_core::logging::global().log_with(
+                    mv_core::logging::Level::Info,
+                    "player",
+                    "opening stream",
+                    serde_json::json!({ "source": self.source_tag(), "waitedMs": self.started.elapsed().as_millis() as u64, "head": self.torrent.map(|t| t.head), "peers": self.torrent.map(|t| t.peers) }),
+                );
                 if let Err(e) = m.load_str(&r.target) {
                     self.fail(format!("{e:#}"));
                 } else {
@@ -587,21 +840,34 @@ impl PlayerView {
         self.last_poll = Instant::now();
         let mut changed = false;
 
-        // Torrent stats (connecting screen and buffering).
-        if self.polls.is_multiple_of(4) {
-            if let (Some(h), Some(engine)) = (self.info_hash.as_ref().or(self.pending_hash.as_ref()), backend::engine_if_started()) {
-                let stats = engine.stats(h).ok().map(|s| TorrentStats { peers: s.peers, speed: s.download_speed, progress: s.progress });
-                if stats != self.torrent {
-                    self.torrent = stats;
-                    changed = true;
-                }
-            }
+        // Torrent stats (connecting screen and buffering), read off the UI thread; more often
+        // while waiting for the head of the file.
+        if self.polls.is_multiple_of(4) || (self.pending.is_some() && self.polls.is_multiple_of(2)) {
+            self.fetch_stats(window, cx);
         }
         self.update_overlay_state(cx, &mut changed);
 
         let Some(mpv) = &self.mpv else {
-            if self.phase == Phase::Connecting && self.polls.is_multiple_of(2) {
-                changed = true; // slow-start hint
+            if self.phase == Phase::Connecting {
+                if self.polls.is_multiple_of(2) {
+                    changed = true; // slow-start hint
+                }
+                if self.retry_at.is_some_and(|at| Instant::now() >= at) {
+                    self.retry_at = None;
+                    self.begin(window, cx);
+                    changed = true;
+                } else if self.retry_at.is_none()
+                    && self.pending.is_none()
+                    && self.is_torrent()
+                    && !self.alternates.is_empty()
+                    && self.started.elapsed() >= logic::METADATA_FALLBACK
+                    // A cached torrent re-checking its files, or one with peers, is not dead.
+                    && self.torrent.is_none_or(|t| t.checking.is_none() && t.peers == 0)
+                {
+                    // The magnet's file list never came: no one is sharing it.
+                    self.fallback("No one is sharing that source", "torrent metadata not received".into(), window, cx);
+                    return;
+                }
             }
             if changed {
                 cx.notify();
@@ -657,9 +923,8 @@ impl PlayerView {
         }
 
         if let Some(msg) = failed {
-            self.fail(msg);
-            self.set_video_shown(false);
-            changed = true;
+            self.on_load_failed(msg, window, cx);
+            return;
         } else if loaded || (self.phase == Phase::Loading && self.snap.dur > 0.0) {
             self.phase = Phase::Playing;
             changed = true;
@@ -834,6 +1099,9 @@ impl PlayerView {
     /// Adds external subtitles (max 3 per language); `auto` keeps mpv's own language preference.
     fn add_subtitles(&mut self, subs: &[StremioSubtitle]) {
         let Some(mpv) = &self.mpv else { return };
+        // `sub-add` downloads the file: async, so a slow subtitle server never freezes the UI
+        // (it used to, once per subtitle). The tracks show up as mpv adds them.
+        mv_core::logging::breadcrumb("player: sub-add");
         let mut per_lang: std::collections::HashMap<&str, usize> = Default::default();
         for s in subs {
             let n = per_lang.entry(s.lang.as_str()).or_default();
@@ -1108,7 +1376,10 @@ impl PlayerView {
             if kind == TrackKind::Sub && id.is_some() {
                 self.last_sid = id;
             }
-            self.tracks = m.tracks();
+            // The set is async: show the pick now, mpv's track list catches up a moment later.
+            for t in self.tracks.iter_mut().filter(|t| t.kind == kind) {
+                t.selected = Some(t.id) == id;
+            }
             // Remember the language picked (or subtitles off) for the next video.
             let lang = id.and_then(|i| self.tracks.iter().find(|t| t.id == i && t.kind == kind)).map(|t| t.lang.trim().to_string()).filter(|l| !l.is_empty());
             let mem = &mut self.prefs.memory;
@@ -1213,6 +1484,7 @@ impl PlayerView {
         if std::mem::replace(&mut self.leaving, true) {
             return;
         }
+        mv_core::logging::breadcrumb("player: exit");
         if window.is_fullscreen() {
             window.toggle_fullscreen();
         }
@@ -1270,7 +1542,9 @@ impl PlayerView {
     }
 
     fn retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        mv_core::logging::global().info("player", &format!("try again ({})", self.source_tag()));
         self.mpv = None;
+        self.failures = 0;
         self.begin(window, cx);
         cx.notify();
     }
@@ -1534,20 +1808,32 @@ impl PlayerView {
     /// long wait a way out ("Try another source"). Apple HIG Loading:
     /// <https://developer.apple.com/design/human-interface-guidelines/loading>
     fn loading_screen(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let torrent = matches!(logic::classify_source(&self.req.source), logic::SourceKind::Torrent(_));
-        let status = if self.mpv.is_none() {
-            if torrent {
-                "Connecting to peers"
-            } else {
-                "Opening stream"
+        let torrent = self.is_torrent();
+        let t = self.torrent;
+        let head = t.filter(|_| self.pending.is_some()).map(|t| logic::head_fraction(t.head, t.total));
+        let status: String = if self.retry_at.is_some() {
+            "Couldn't open the stream. Trying again…".into()
+        } else if self.mpv.is_none() {
+            match (torrent, t) {
+                (false, _) => "Opening stream".into(),
+                (true, Some(TorrentStats { checking: Some(c), .. })) => format!("Checking downloaded data {:.0}%", c * 100.0),
+                (true, Some(s)) if self.pending.is_some() => {
+                    let peers = if s.peers == 1 { "1 peer".to_string() } else { format!("{} peers", s.peers) };
+                    format!("Finding peers… {peers} · buffering {:.0}%", head.unwrap_or(0.0) * 100.0)
+                }
+                (true, _) => "Finding peers… getting the torrent's file list".into(),
             }
         } else if self.snap.cache_pct > 0.0 {
-            "Buffering"
+            "Buffering".into()
         } else {
-            "Starting playback"
+            "Starting playback".into()
         };
         let episode = logic::episode_label(&self.req.title, self.req.season, self.req.episode);
-        let progress = if self.snap.cache_pct > 0.0 { Some((self.snap.cache_pct / 100.0) as f32) } else { None };
+        let progress = if self.snap.cache_pct > 0.0 {
+            Some((self.snap.cache_pct / 100.0) as f32)
+        } else {
+            head.or(t.and_then(|t| t.checking)).map(|f| f as f32)
+        };
         let slow = logic::slow_start(self.started.elapsed(), torrent, self.torrent.map(|t| t.peers));
         let calm = motion::reduced();
         let backdrop = self.artwork.clone().map(|url| {
@@ -1703,6 +1989,30 @@ impl PlayerView {
         )
     }
 
+    /// "Private" pill: private mode on / off (the shell's toggle, with its clean-up dialog).
+    fn private_btn(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = mv_core::privacy::active();
+        let label = if on { "Private on" } else { "Private" };
+        ui::ctl_shell("private", ui::ctl_box(BAR_PX), "Private mode: nothing you watch is recorded (Ctrl+Shift+N)", None, false)
+            .w_auto()
+            .px(px(14.))
+            .gap(px(8.))
+            .bg(if on { Tokens::accent_soft() } else { Tokens::glass() })
+            .border_1()
+            .border_color(if on { Tokens::accent_border() } else { Tokens::glass_border() })
+            .child(icon(ph::EYE_SLASH.bold(), if on { Tokens::accent() } else { Tokens::text_1() }, icon_px::LG))
+            .child(div().ramp(ramp::BODY_STRONG).text_color(Tokens::text_1()).child(label))
+            .on_click(cx.listener(|this, _, _w, cx| {
+                this.with_main(cx, |this, window, cx| {
+                    mv_core::logging::breadcrumb("player: private toggle");
+                    mv_ui::nav::toggle_private(window, cx);
+                    window.refresh();
+                    this.activity(cx);
+                    cx.notify();
+                })
+            }))
+    }
+
     fn top_bar(&self, o: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let episode = logic::episode_label(&self.req.title, self.req.season, self.req.episode);
         let windowed = !self.fullscreen;
@@ -1759,6 +2069,9 @@ impl PlayerView {
                     .child(div().truncate().ramp(ramp::SUBTITLE).text_color(Tokens::text_1()).child(self.req.title.clone()))
                     .children(episode.map(|e| div().ramp(ramp::BODY).text_color(Tokens::text_2()).child(e))),
             )
+            // The title bar (and its private-mode button) is hidden behind the player, so catalog
+            // titles get the toggle here too. Studio / local videos are never recorded anyway.
+            .when(self.ident.tracked, |d| d.child(self.private_btn(cx)))
             .when(windowed, |d| {
                 d.child(
                     div()

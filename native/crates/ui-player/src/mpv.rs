@@ -1,8 +1,19 @@
 //! Minimal libmpv binding loaded at runtime (no import library needed). Video renders into a
 //! borderless black popup owned by the app window; the GPUI controls live in a transparent
 //! overlay window stacked above it (see `overlay.rs`), so the video is never cut or covered.
+//!
+//! The UI thread never makes a blocking libmpv call once a file is loading. Synchronous calls
+//! (`mpv_get_property*`, `mpv_command`, `mpv_set_property*`, `mpv_terminate_destroy`) wait for
+//! mpv's core thread, which can be busy for a long time (a `sub-add` downloading a subtitle over
+//! the network, the video output initialising, a stalled stream), and the core can in turn wait
+//! for the video window, whose parent belongs to the UI thread: the app froze and ignored clicks.
+//! So: properties the player reads are *observed* (their values arrive as events and are read
+//! from a cache), writes and commands are *async*, and mpv is destroyed on a background thread.
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
 
@@ -13,14 +24,48 @@ struct Api {
     create: unsafe extern "C" fn() -> Handle,
     set_option_string: unsafe extern "C" fn(Handle, *const c_char, *const c_char) -> c_int,
     initialize: unsafe extern "C" fn(Handle) -> c_int,
-    command: unsafe extern "C" fn(Handle, *mut *const c_char) -> c_int,
+    command_async: unsafe extern "C" fn(Handle, u64, *mut *const c_char) -> c_int,
     terminate_destroy: unsafe extern "C" fn(Handle),
     get_property_string: unsafe extern "C" fn(Handle, *const c_char) -> *mut c_char,
     set_property_string: unsafe extern "C" fn(Handle, *const c_char, *const c_char) -> c_int,
+    set_property_async: unsafe extern "C" fn(Handle, u64, *const c_char, c_int, *mut c_void) -> c_int,
+    observe_property: unsafe extern "C" fn(Handle, u64, *const c_char, c_int) -> c_int,
     free: unsafe extern "C" fn(*mut c_void),
     wait_event: unsafe extern "C" fn(Handle, f64) -> *mut RawEvent,
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
 }
+
+/// `MPV_FORMAT_STRING`.
+const FORMAT_STRING: c_int = 1;
+
+/// Properties the player reads, delivered as change events (`MPV_FORMAT_STRING`, so lists such as
+/// `track-list` and `demuxer-cache-state` arrive as JSON, like `mpv_get_property_string`).
+const OBSERVED: &[&str] = &[
+    "time-pos",
+    "duration",
+    "pause",
+    "volume",
+    "mute",
+    "speed",
+    "paused-for-cache",
+    "cache-buffering-state",
+    "eof-reached",
+    "seeking",
+    "track-list",
+    "demuxer-cache-state",
+];
+
+/// Prefix of `mpv_event_property`.
+#[repr(C)]
+struct RawProperty {
+    name: *const c_char,
+    format: c_int,
+    data: *mut c_void,
+}
+
+/// The raw handle, moved to the thread that destroys it (the libmpv client API is thread-safe).
+struct SendHandle(Handle);
+unsafe impl Send for SendHandle {}
 
 /// Prefix of `mpv_event`.
 #[repr(C)]
@@ -71,10 +116,12 @@ fn load_api() -> Result<(Api, PathBuf)> {
                 create: sym!(b"mpv_create\0"),
                 set_option_string: sym!(b"mpv_set_option_string\0"),
                 initialize: sym!(b"mpv_initialize\0"),
-                command: sym!(b"mpv_command\0"),
+                command_async: sym!(b"mpv_command_async\0"),
                 terminate_destroy: sym!(b"mpv_terminate_destroy\0"),
                 get_property_string: sym!(b"mpv_get_property_string\0"),
                 set_property_string: sym!(b"mpv_set_property_string\0"),
+                set_property_async: sym!(b"mpv_set_property_async\0"),
+                observe_property: sym!(b"mpv_observe_property\0"),
                 free: sym!(b"mpv_free\0"),
                 wait_event: sym!(b"mpv_wait_event\0"),
                 error_string: sym!(b"mpv_error_string\0"),
@@ -140,10 +187,12 @@ const OPTIONS: &[(&str, &str)] = &[
 ];
 
 pub struct Mpv {
-    api: Api,
+    api: Arc<Api>,
     handle: Handle,
     surface: isize,
     lib_path: PathBuf,
+    /// Last values of the observed properties (absent while unavailable).
+    props: RefCell<HashMap<String, String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,7 +233,7 @@ impl Mpv {
                 return Err(anyhow!("mpv_create returned null"));
             }
             // From here Drop cleans up both mpv and the popup on any error.
-            let mpv = Self { api, handle, surface, lib_path };
+            let mpv = Self { api: Arc::new(api), handle, surface, lib_path, props: RefCell::default() };
             mpv.set_option("wid", &surface.to_string())?;
             for (k, v) in OPTIONS {
                 // Older builds may lack an option; none of these are essential.
@@ -196,6 +245,10 @@ impl Mpv {
             }
             if (mpv.api.initialize)(mpv.handle) < 0 {
                 return Err(anyhow!("mpv_initialize failed"));
+            }
+            for name in OBSERVED {
+                let n = CString::new(*name)?;
+                (mpv.api.observe_property)(mpv.handle, 0, n.as_ptr(), FORMAT_STRING);
             }
             Ok(mpv)
         }
@@ -222,8 +275,18 @@ impl Mpv {
         }
     }
 
-    /// `mpv_get_property_string`; `None` when unavailable.
+    /// A property's value: from the observed cache (never blocks) for the properties in
+    /// [`OBSERVED`], else a synchronous `mpv_get_property_string` (only safe before a file loads).
+    /// `None` when unavailable.
     pub fn get(&self, name: &str) -> Option<String> {
+        if OBSERVED.contains(&name) {
+            return self.props.borrow().get(name).cloned();
+        }
+        self.get_now(name)
+    }
+
+    /// `mpv_get_property_string` (blocks until mpv's core answers).
+    fn get_now(&self, name: &str) -> Option<String> {
         let n = CString::new(name).ok()?;
         unsafe {
             let p = (self.api.get_property_string)(self.handle, n.as_ptr());
@@ -244,7 +307,25 @@ impl Mpv {
         self.get(name).map(|v| v == "yes")
     }
 
+    /// Sets a property without waiting for mpv (`mpv_set_property_async`). The cached value is
+    /// updated at once so the next read already shows it; mpv's own change event follows.
     pub fn set(&self, name: &str, value: &str) -> Result<()> {
+        let (n, v) = (CString::new(name)?, CString::new(value)?);
+        let mut p = v.as_ptr();
+        // mpv copies the value before returning.
+        let rc = unsafe { (self.api.set_property_async)(self.handle, 0, n.as_ptr(), FORMAT_STRING, &mut p as *mut *const c_char as *mut c_void) };
+        if rc < 0 {
+            return Err(anyhow!("mpv set {name} failed ({})", self.err(rc)));
+        }
+        if OBSERVED.contains(&name) {
+            self.props.borrow_mut().insert(name.to_string(), value.to_string());
+        }
+        Ok(())
+    }
+
+    /// Synchronous `mpv_set_property_string`: only before the first file is loaded, while mpv's
+    /// core is idle (start position, languages), so it is applied before `loadfile`.
+    pub fn set_now(&self, name: &str, value: &str) -> Result<()> {
         let (n, v) = (CString::new(name)?, CString::new(value)?);
         let rc = unsafe { (self.api.set_property_string)(self.handle, n.as_ptr(), v.as_ptr()) };
         if rc < 0 {
@@ -254,12 +335,13 @@ impl Mpv {
         }
     }
 
-    /// `mpv_command` with string arguments.
+    /// `mpv_command_async` with string arguments: queued, never waits (`sub-add` of a subtitle
+    /// URL downloads it, `loadfile` opens the stream). Errors only for malformed requests.
     pub fn command(&self, args: &[&str]) -> Result<()> {
         let owned: Vec<CString> = args.iter().map(|a| CString::new(*a)).collect::<std::result::Result<_, _>>()?;
         let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(std::ptr::null());
-        let rc = unsafe { (self.api.command)(self.handle, ptrs.as_mut_ptr()) };
+        let rc = unsafe { (self.api.command_async)(self.handle, 0, ptrs.as_mut_ptr()) };
         if rc < 0 {
             Err(anyhow!("mpv {} failed ({})", args.first().unwrap_or(&""), self.err(rc)))
         } else {
@@ -301,33 +383,16 @@ impl Mpv {
         self.command(&["sub-add", url, "auto", title, lang])
     }
 
-    /// Audio and subtitle tracks from `track-list`.
+    /// Audio and subtitle tracks from the observed `track-list` (one JSON value, instead of six
+    /// blocking property reads per track every second).
     pub fn tracks(&self) -> Vec<Track> {
-        let count = self.get_f64("track-list/count").unwrap_or(0.0) as usize;
-        let mut out = vec![];
-        for i in 0..count {
-            let kind = match self.get(&format!("track-list/{i}/type")).as_deref() {
-                Some("audio") => TrackKind::Audio,
-                Some("sub") => TrackKind::Sub,
-                _ => continue,
-            };
-            let Some(id) = self.get_f64(&format!("track-list/{i}/id")) else { continue };
-            out.push(Track {
-                id: id as i64,
-                kind,
-                lang: self.get(&format!("track-list/{i}/lang")).unwrap_or_default(),
-                title: self.get(&format!("track-list/{i}/title")).unwrap_or_default(),
-                selected: self.get_bool(&format!("track-list/{i}/selected")).unwrap_or(false),
-                external: self.get_bool(&format!("track-list/{i}/external")).unwrap_or(false),
-            });
-        }
-        out
+        self.props.borrow().get("track-list").map(|j| crate::logic::parse_tracks(j)).unwrap_or_default()
     }
 
-    /// Drains pending events without blocking.
+    /// Drains pending events without blocking, updating the observed property cache.
     pub fn poll_events(&self) -> Vec<Event> {
         let mut out = vec![];
-        for _ in 0..32 {
+        for _ in 0..256 {
             let ev = unsafe { (self.api.wait_event)(self.handle, 0.0) };
             if ev.is_null() {
                 break;
@@ -335,6 +400,27 @@ impl Mpv {
             let (id, error, data) = unsafe { ((*ev).event_id, (*ev).error, (*ev).data) };
             match id {
                 0 => break, // MPV_EVENT_NONE
+                22 if !data.is_null() => {
+                    // MPV_EVENT_PROPERTY_CHANGE
+                    let p = unsafe { &*(data as *const RawProperty) };
+                    if p.name.is_null() {
+                        continue;
+                    }
+                    let name = unsafe { CStr::from_ptr(p.name) }.to_string_lossy().into_owned();
+                    let value = (p.format == FORMAT_STRING && !p.data.is_null())
+                        .then(|| unsafe { *(p.data as *const *const c_char) })
+                        .filter(|s| !s.is_null())
+                        .map(|s| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned());
+                    let mut props = self.props.borrow_mut();
+                    match value {
+                        Some(v) => {
+                            props.insert(name, v);
+                        }
+                        None => {
+                            props.remove(&name);
+                        }
+                    }
+                }
                 7 => {
                     // MPV_EVENT_END_FILE
                     if !data.is_null() {
@@ -367,8 +453,19 @@ impl Drop for Mpv {
     fn drop(&mut self) {
         // Hide first so the popup never lingers while mpv shuts down.
         hide_surface(self.surface);
-        unsafe { (self.api.terminate_destroy)(self.handle) };
-        destroy_surface(self.surface);
+        // `mpv_terminate_destroy` waits for mpv's threads, including the video output closing
+        // its window inside our popup (which messages the UI thread): run it off the UI thread,
+        // then have the UI thread destroy the popup through its own message queue.
+        let (api, handle, surface) = (self.api.clone(), SendHandle(self.handle), self.surface);
+        let spawned = std::thread::Builder::new().name("mpv-teardown".into()).spawn(move || {
+            let h = handle;
+            unsafe { (api.terminate_destroy)(h.0) };
+            close_surface_later(surface);
+        });
+        if spawned.is_err() {
+            unsafe { (self.api.terminate_destroy)(self.handle) };
+            destroy_surface(self.surface);
+        }
     }
 }
 
@@ -451,10 +548,16 @@ mod win {
     pub fn destroy_surface(h: isize) {
         unsafe { DestroyWindow(h as HWND) };
     }
+
+    /// From any thread: the popup closes (and is destroyed) on its own thread. Default
+    /// `WM_CLOSE` handling destroys the window.
+    pub fn close_surface_later(h: isize) {
+        unsafe { PostMessageW(h as HWND, WM_CLOSE, 0, 0) };
+    }
 }
 
 #[cfg(windows)]
-use win::{create_surface, destroy_surface, hide_surface};
+use win::{close_surface_later, create_surface, destroy_surface, hide_surface};
 
 #[cfg(not(windows))]
 fn create_surface(_: isize) -> Result<isize> {
@@ -464,3 +567,5 @@ fn create_surface(_: isize) -> Result<isize> {
 fn hide_surface(_: isize) {}
 #[cfg(not(windows))]
 fn destroy_surface(_: isize) {}
+#[cfg(not(windows))]
+fn close_surface_later(_: isize) {}

@@ -416,18 +416,6 @@ impl StudioPage {
                             }))
                             .into_any_element(),
                     ))
-                    .child(row(
-                        ph::LIGHTNING,
-                        "Sound effects",
-                        "Whooshes on scene changes, impacts and a heartbeat on reveals, hits in fights, the manga's own SFX",
-                        segmented("music-sfx", SfxAmount::ALL.map(|a| a.label()), sfx_ix)
-                            .small()
-                            .on_change(cx.listener(|this, ix: &usize, _, cx| {
-                                let a = SfxAmount::ALL[(*ix).min(SfxAmount::ALL.len() - 1)];
-                                this.music_edit(cx, |s| s.sfx = a)
-                            }))
-                            .into_any_element(),
-                    ))
                 .child(row(
                     ph::GAUGE,
                     "Level",
@@ -464,9 +452,22 @@ impl StudioPage {
                         .into_any_element(),
                 ))
                 .child(self.orchestra_row(cx))
-            });
+            })
+            // With or without music: the story's sound effects play in the video either way.
+            .child(row(
+                ph::LIGHTNING,
+                "Sound effects",
+                "A few sounds on the story's big moments (hits, blasts, reveals), cued by the AI as it writes, kept under the voice. Your own in Studio/sfx replace the built-in ones",
+                segmented("music-sfx", SfxAmount::ALL.map(|a| a.label()), sfx_ix)
+                    .small()
+                    .on_change(cx.listener(|this, ix: &usize, _, cx| {
+                        let a = SfxAmount::ALL[(*ix).min(SfxAmount::ALL.len() - 1)];
+                        this.music_edit(cx, |s| s.sfx = a)
+                    }))
+                    .into_any_element(),
+            ));
 
-        let stale = has_audio && self.music.score.is_some() && !self.music.fresh && busy.is_none() && s.enabled;
+        let stale =has_audio && self.music.score.is_some() && !self.music.fresh && busy.is_none() && s.enabled;
         let body = match self.music.score.clone() {
             Some(score) => self.timeline(&score, cx),
             None => div()

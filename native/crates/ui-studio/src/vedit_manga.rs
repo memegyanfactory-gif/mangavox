@@ -184,12 +184,14 @@ pub fn duo_aspect(w_over_h: f32) -> bool {
 
 /// Where a panel of aspect `a` (w / h) sits in a `fw` x `fh` frame's left (slot 0) or right half
 /// in the duo looks, as the renderer's `duo_geometry`: (x, y, drawn width, drawn height, visible
-/// height). A panel taller than the frame shows its top.
+/// height). The panel is always drawn whole (fitted between a 3% margin above and below), so the
+/// visible height is all of it.
 pub fn duo_box(a: f32, fw: f32, fh: f32, slot: usize) -> (f32, f32, f32, f32, f32) {
     let outer = fw * 0.04;
     let slot_w = (fw - 2. * outer - fw * 0.025) / 2.;
-    let w = slot_w.min((slot_w * 0.72).max(a.max(0.01) * fh));
-    let h = w / a.max(0.01);
+    let avail = fh * (1. - 2. * 0.03);
+    let w = slot_w.min(a.max(0.01) * avail);
+    let h = (w / a.max(0.01)).min(avail);
     let vis = h.min(fh);
     let cx = if slot == 0 { outer + slot_w / 2. } else { fw - outer - slot_w / 2. };
     (cx - w / 2., (fh - vis) / 2., w, h, vis)
@@ -255,11 +257,21 @@ pub fn music_on(ch: &ChapterItem) -> bool {
 
 /// [`look_key`] of a chapter now, from its files (blocking).
 pub fn current_key(ch: &ChapterItem) -> u64 {
+    current(ch, &crate::look::video_config()).0
+}
+
+/// What a render of the chapter would make now, from its files (blocking), with the Studio look
+/// `look` (`look::video_config`): its [`look_key`], its Video-editor edit (when it has one) and
+/// that edit's `vedit::render_key`. The captions carry the manga's caption place, as the render's
+/// (`vedit::extra_for`) do, so the key matches the editor's live one.
+pub fn current(ch: &ChapterItem, look: &Value) -> (u64, Option<ChapterEdit>, u64) {
     let pages = mv_recap::list_pages(&ch.pages_dir);
     let beats = vedit::load_beats(&ch.output_dir, &pages);
-    let edit = vedit::chapter_edit(&ch.output_dir, &ch.id).unwrap_or_default();
-    let subs = crate::video::subtitle_setting_for(ch);
-    look_key(&crate::look::video_config(), music_on(ch), &vedit::render_extra(&beats, &edit, &subs))
+    let project = ch.output_dir.parent().map(vedit::Project::load).unwrap_or_default();
+    let edit = project.chapters.get(&ch.id).cloned();
+    let subs = project.captions(&crate::video::subtitle_setting_for(ch));
+    let extra = vedit::render_extra(&beats, &edit.clone().unwrap_or_default(), &subs);
+    (look_key(look, music_on(ch), &extra), edit, vedit::render_key(&extra))
 }
 
 fn read_key(file: &Path) -> Option<u64> {
@@ -418,9 +430,9 @@ mod tests {
         assert!((h0 - w0 / 0.5).abs() < 0.01);
         assert_eq!(vis0, 900_f32.min(h0));
         assert!(y0 >= 0.);
-        // A very tall panel is drawn at least 72% of its half wide, its top showing.
+        // A very tall panel is drawn whole (narrower), never cut: all of it shows inside the frame.
         let (_, y, w, h, vis) = duo_box(0.2, 1600., 900., 0);
-        assert!(w > 0.7 * (1600. - 128. - 40.) / 2. && h > 900. && vis == 900. && y == 0.);
+        assert!((w / h - 0.2).abs() < 1e-3 && vis == h && y > 0. && y + h <= 900.);
     }
 
     #[test]

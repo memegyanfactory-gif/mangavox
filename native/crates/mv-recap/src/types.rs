@@ -142,6 +142,10 @@ pub struct StorySegment {
     /// page's scene (read.json). Exported on the passage's beat, where the narration reads it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<Delivery>,
+    /// A sound effect the writer put on this passage's moment (rare: only the beats that truly
+    /// deserve one). Exported on the beat as `sfx` / `sfx_strength`; the renderer places it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sfx: Option<SfxCue>,
     /// Part of the in-medias-res opening of the recap's first chapter: spoken first (on the
     /// chapter's first narrated page) while showing its own page and panel.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -156,6 +160,29 @@ pub struct StorySegment {
 pub struct Delivery {
     pub kind: String,
     pub intensity: u8,
+}
+
+/// The sound effects the writer may cue (`python/sfx.py` makes each one).
+pub const SFX_NAMES: &[&str] =
+    &["impact", "whoosh", "riser", "boom", "sword_clang", "magic", "heartbeat", "glass", "crowd_gasp", "thunder", "footsteps_run", "door_slam"];
+
+/// A sound-effect cue: one of [`SFX_NAMES`] and how strong it lands, 1 (light) to 3 (big).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SfxCue {
+    pub name: String,
+    pub strength: u8,
+}
+
+impl SfxCue {
+    /// The cue an AI answer gives (`"impact"`, `"Sword clang"`, `"door-slam"` ...), strength
+    /// clamped to 1-3 (2 when missing). `None` for anything outside the vocabulary.
+    pub fn parse(name: &str, strength: Option<f64>) -> Option<SfxCue> {
+        let key: String = name.trim().to_ascii_lowercase().chars().map(|c| if c == ' ' || c == '-' { '_' } else { c }).collect();
+        let name = SFX_NAMES.iter().find(|n| **n == key)?;
+        let strength = strength.filter(|s| s.is_finite()).map(|s| s.round().clamp(1.0, 3.0) as u8).unwrap_or(2);
+        Some(SfxCue { name: name.to_string(), strength })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

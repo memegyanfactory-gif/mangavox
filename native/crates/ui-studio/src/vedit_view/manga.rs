@@ -774,10 +774,15 @@ impl StudioPage {
         let viewport = window.viewport_size();
         let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
         let room_w = (vw - LEFT_W - RIGHT_W - 60.).max(240.);
-        let room_h = (vh - 52. - 38. - BOTTOM_H - 30. - 96. - 40.).max(140.);
+        // The chapter under the playhead shows its rendered video when it is current; else the
+        // banner offers to render the chapters that changed (only those).
+        let source = self.monitor_source(g);
+        let changed: Vec<ChapterItem> = self.made_chapters(g).into_iter().filter(|c| looks.get(&c.id) != Some(&LookState::Current) && self.remake_of(&c.id).is_none_or(|r| r.failed)).collect();
+        let banner = self.monitor_banner(&source, changed, cx);
+        let room_h = (vh - 52. - 38. - BOTTOM_H - 30. - 96. - 40. - if banner.is_some() { 32. } else { 0. }).max(140.);
         let aspect = if seq.reels { 9. / 16. } else { 16. / 9. };
         let (fw, fh) = if room_w / room_h > aspect { (room_h * aspect, room_h) } else { (room_w, room_w / aspect) };
-        let frame = self.frame(seq, &placed, local, fw, fh, window, cx);
+        let frame = self.program_frame(&source, seq, &placed, local, vedit::total_ms(&placed), fw, fh, window, cx);
         let scrub_frac = if total > 0 { now as f32 / total as f32 } else { 0. };
         let bars = self.vedit.bars.clone();
         let scrub = div()
@@ -801,6 +806,7 @@ impl StudioPage {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .children(banner)
             .child(div().flex().flex_1().min_h_0().items_center().justify_center().p(px(space::SM)).bg(Tokens::well()).child(frame))
             .child(
                 div()
@@ -814,6 +820,7 @@ impl StudioPage {
                     .child(div().flex_1())
                     .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(seq.item.label()))
                     .child(div().text_size(px(size::SM)).text_color(colour).child(state))
+                    .child(self.monitor_mode(&source, cx))
                     .child(div().flex_1())
                     .child(div().text_size(px(size::MD)).font_family(crate::page::MONO).text_color(Tokens::text_2()).child(vedit::timecode(total))),
             )

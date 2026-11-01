@@ -84,10 +84,35 @@ pub(crate) fn remember(req: &PlayRequest) {
     }
 }
 
-/// Opens the player on `req`, remembering a series' season and episode first.
+/// Opens the player on `req`, remembering a series' season and episode first. When `req` came
+/// from a source list seen here, the rest of that list goes along so the player can move on by
+/// itself if this source does not start.
 pub fn play_now(req: PlayRequest, window: &mut Window, cx: &mut App) {
     remember(&req);
+    let ranked = LISTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find_map(|(base, streams)| {
+            let all: Vec<(PlayRequest, Option<u64>)> = streams.iter().map(|s| (request_for(base, s), s.seeders)).collect();
+            all.iter().any(|(r, _)| r.source == req.source && r.file_idx == req.file_idx && r.episode == req.episode && r.season == req.season).then_some(all)
+        })
+        .unwrap_or_default();
+    ui_player::offer_alternates(&req, ranked);
     navigate(Route::Player { request: req }, window, cx);
+}
+
+/// The last few source lists shown (already ranked), for [`play_now`]'s fallbacks.
+static LISTS: std::sync::Mutex<Vec<(PlayBase, Vec<AnimeTorrentStream>)>> = std::sync::Mutex::new(Vec::new());
+
+fn remember_list(base: &PlayBase, streams: &[AnimeTorrentStream]) {
+    let mut g = LISTS.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(b, _)| !(b.imdb_id == base.imdb_id && b.mal_id == base.mal_id && b.season == base.season && b.episode == base.episode));
+    g.push((base.clone(), streams.iter().take(40).cloned().collect()));
+    if g.len() > 6 {
+        g.remove(0);
+    }
 }
 
 pub(crate) async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) -> Result<(PlayBase, Vec<AnimeTorrentStream>), String> {
@@ -148,6 +173,7 @@ pub fn find<V: 'static>(cx: &mut Context<V>, window: &Window, label: String, bas
         if let Some(((imdb, streams), age)) = hit {
             let mut b = base.clone();
             b.imdb_id = b.imdb_id.or(imdb);
+            remember_list(&b, &streams);
             let _ = this.update_in(cx, |v, window, cx| {
                 let best = request_for(&b, &streams[0]);
                 if autoplay {
@@ -175,6 +201,7 @@ pub fn find<V: 'static>(cx: &mut Context<V>, window: &Window, label: String, bas
         if shown {
             // Silent refresh: replace the cached links only with a newer, non-empty list.
             let Some((base, streams)) = outcome.ok().filter(|(_, s)| !s.is_empty()) else { return };
+            remember_list(&base, &streams);
             let _ = this.update(cx, |v, cx| {
                 set(v, StreamState::Picking { label, base, streams });
                 cx.notify();
@@ -188,6 +215,7 @@ pub fn find<V: 'static>(cx: &mut Context<V>, window: &Window, label: String, bas
         };
         let _ = this.update_in(cx, |v, window, cx| {
             if let StreamState::Picking { base, streams, .. } = &state {
+                remember_list(base, streams);
                 let best = request_for(base, &streams[0]);
                 if autoplay {
                     play_now(best, window, cx);

@@ -16,7 +16,7 @@ use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::{ph, ph_icon, Tokens, Weight};
 
 use crate::logic;
-use crate::reader::watch_recap;
+use crate::reader::open_player;
 use crate::recap::RecapOutputs;
 
 /// The manga's cover file, else the first page of one of its downloaded chapters.
@@ -31,10 +31,15 @@ fn first_page(c: &Chapter) -> Option<PathBuf> {
     v.into_iter().next()
 }
 
-/// The chapters Studio made a video of, in reading order, one per chapter number.
+/// The chapters Studio made a video of, in reading order, one per chapter number. Of two copies
+/// of a chapter number the earlier added stays, as in Studio's list (`ui_studio::data`: the
+/// library in chapter number then added order, the copy with a video kept), so Play all and
+/// Studio's Play / Export use the same files.
 pub(crate) fn chapter_videos(chapters: &[Chapter], recaps: &HashMap<String, RecapOutputs>) -> Vec<ChapterVideo> {
-    let mut v: Vec<ChapterVideo> = chapters
-        .iter()
+    let mut by_added: Vec<&Chapter> = chapters.iter().collect();
+    by_added.sort_by(|a, b| a.added_at.cmp(&b.added_at));
+    let mut v: Vec<ChapterVideo> = by_added
+        .into_iter()
         .filter_map(|c| {
             let r = recaps.get(&c.id)?;
             Some(ChapterVideo { chapter_id: c.id.clone(), number: c.number, label: logic::chapter_label(c), video: r.video.clone()?, thumbnail: Some(r.dir.join(media::THUMBNAIL)).filter(|p| p.is_file()) })
@@ -99,12 +104,27 @@ pub(crate) fn forget_images<'a>(paths: impl IntoIterator<Item = &'a PathBuf>, cx
     }
 }
 
-/// Plays every chapter video back to back in reading order (a playlist; nothing is re-encoded).
+/// Plays every chapter video back to back in reading order, after Studio's check for changes not
+/// rendered yet: Studio's joined `full_recap.mp4` (what its dashboard plays) while it was made from
+/// exactly these files as they are now, else a playlist of them (nothing is re-encoded).
 pub(crate) fn play_all(manga_id: &str, manga_title: &str, videos: &[ChapterVideo], window: &mut Window, cx: &mut App) {
-    match media::write_playlist(&media::manga_dir(manga_id), videos) {
-        Ok(p) => watch_recap(format!("{manga_title} · {}", thumb::badge_label(&videos.iter().map(|v| v.number).collect::<Vec<_>>())), &p, window, cx),
-        Err(e) => mv_ui::toast::show(cx, mv_ui::toast::Toast::error(format!("Could not start Play all: {e:#}"))),
-    }
+    let files: Vec<PathBuf> = videos.iter().map(|v| v.video.clone()).collect();
+    let title = format!("{manga_title} · {}", thumb::badge_label(&videos.iter().map(|v| v.number).collect::<Vec<_>>()));
+    let (id, list) = (manga_id.to_string(), videos.to_vec());
+    crate::recap::guarded(
+        files.clone(),
+        move |w, cx| {
+            if let Some(full) = media::joined_if_current(&media::full_recap_path(&id), &files) {
+                return open_player(title, &full, w, cx);
+            }
+            match media::write_playlist(&media::manga_dir(&id), &list) {
+                Ok(p) => open_player(title, &p, w, cx),
+                Err(e) => mv_ui::toast::show(cx, mv_ui::toast::Toast::error(format!("Could not start Play all: {e:#}"))),
+            }
+        },
+        window,
+        cx,
+    );
 }
 
 /// A 16:9 video picture `w` px wide with a play mark; a quiet placeholder while it is drawn.
@@ -188,6 +208,27 @@ mod tests {
         let th = Thumbs { chapters: HashMap::from([("c1.5".to_string(), PathBuf::from("a.jpg"))]), full: None, ai: false };
         assert_eq!(th.shared(&v), Some(PathBuf::from("a.jpg")));
         assert_eq!(Thumbs { full: Some(PathBuf::from("f.jpg")), ..th }.shared(&v), Some(PathBuf::from("f.jpg")));
+    }
+
+    #[test]
+    fn a_chapter_added_twice_plays_the_copy_studio_uses() {
+        // Studio keeps the earlier added copy of a chapter number (both have a video), whatever
+        // order the manga page lists them in.
+        let t = tempfile::tempdir().unwrap();
+        let mut late = ch("late", Some(4.));
+        late.added_at = "2026-02-01".into();
+        let mut early = ch("early", Some(4.));
+        early.added_at = "2026-01-01".into();
+        let chapters = vec![late, early];
+        let mut recaps = HashMap::new();
+        for c in &chapters {
+            let d = t.path().join(&c.id);
+            std::fs::create_dir_all(&d).unwrap();
+            recaps.insert(c.id.clone(), recap(&d, true));
+        }
+        let v = chapter_videos(&chapters, &recaps);
+        assert_eq!(v.iter().map(|v| v.chapter_id.as_str()).collect::<Vec<_>>(), ["early"]);
+        assert_eq!(v[0].video, t.path().join("early").join(media::VIDEO));
     }
 
     #[test]

@@ -91,10 +91,16 @@ pub fn narration_sig(spans: &[Span]) -> u64 {
     hash_str(&s)
 }
 
-/// The synth only sounds different with the orchestra; the library ignores it.
+/// The synth only sounds different with the orchestra; the library ignores it, and its sound
+/// effects too (the video's story-cued effects follow that setting, see `python/sfx.py`), so
+/// changing them keeps a library score fresh.
 fn settings_sig(s: &MusicSettings, orchestra: bool) -> u64 {
     let orchestra = orchestra && s.source == Source::Compose;
-    hash_str(&format!("{}|{orchestra}", serde_json::to_string(s).unwrap_or_default()))
+    let mut s = s.clone();
+    if s.source == Source::Library {
+        s.sfx = SfxAmount::Subtle;
+    }
+    hash_str(&format!("{}|{orchestra}", serde_json::to_string(&s).unwrap_or_default()))
 }
 
 /// What the Read phase knows about each page (scene + sound-effect lettering).
@@ -211,4 +217,19 @@ pub fn ensure(ch: &ChapterRef) -> Result<Option<PathBuf>> {
         build(ch, &settings, true)?;
     }
     Ok(Some(score_wav(ch)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_scores_ignore_the_sfx_setting() {
+        let lib = |sfx| MusicSettings { sfx, source: Source::Library, ..Default::default() };
+        let synth = |sfx| MusicSettings { sfx, source: Source::Compose, ..Default::default() };
+        assert_eq!(settings_sig(&lib(SfxAmount::Off), false), settings_sig(&lib(SfxAmount::Punchy), false));
+        assert_eq!(settings_sig(&lib(SfxAmount::Subtle), false), hash_str(&format!("{}|false", serde_json::to_string(&lib(SfxAmount::Subtle)).unwrap())), "existing library scores stay fresh");
+        assert_ne!(settings_sig(&synth(SfxAmount::Off), false), settings_sig(&synth(SfxAmount::Punchy), false), "the synth score plays its own effects");
+        assert_ne!(settings_sig(&lib(SfxAmount::Subtle), false), settings_sig(&MusicSettings { level: Level::Bold, ..lib(SfxAmount::Subtle) }, false));
+    }
 }

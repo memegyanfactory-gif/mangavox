@@ -577,10 +577,280 @@ pub fn classify_source(src: &str) -> SourceKind {
     SourceKind::File(s.strip_prefix("file://").unwrap_or(s).to_string())
 }
 
+/// Audio and subtitle tracks from mpv's `track-list` (JSON, as the observed property delivers it).
+pub fn parse_tracks(json: &str) -> Vec<Track> {
+    use crate::mpv::TrackKind;
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(json) else { return vec![] };
+    items
+        .iter()
+        .filter_map(|t| {
+            let kind = match t.get("type")?.as_str()? {
+                "audio" => TrackKind::Audio,
+                "sub" => TrackKind::Sub,
+                _ => return None,
+            };
+            let text = |k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let flag = |k: &str| t.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            Some(Track { id: t.get("id")?.as_i64()?, kind, lang: text("lang"), title: text("title"), selected: flag("selected"), external: flag("external") })
+        })
+        .collect()
+}
+
+// ── Starting a torrent: wait for the file's head, move on from dead sources, retry smartly ──
+
+/// Verified bytes at the start of the file before mpv opens it (container header, first frames).
+/// Opening earlier makes mpv's probe wait on the network and time out, or fail at once.
+pub const HEAD_READY_BYTES: u64 = 2 * 1024 * 1024;
+/// Data is trickling in but the head is not complete yet: open anyway after this long and let
+/// mpv's own buffering take over.
+pub const HEAD_MAX_WAIT: Duration = Duration::from_secs(20);
+/// No data arrived for this long after the torrent was ready: the source is dead (no seeders),
+/// try the next one.
+pub const STALL_FALLBACK: Duration = Duration::from_secs(25);
+/// The magnet's file list (metadata) has not arrived after this long: try the next source.
+pub const METADATA_FALLBACK: Duration = Duration::from_secs(30);
+
+/// What the loader knows about a torrent that is ready (metadata in) but not opened yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StartProgress {
+    /// Since the torrent became ready.
+    pub since_ready: Duration,
+    /// Since data last arrived (or since ready, if none yet).
+    pub since_progress: Duration,
+    pub peers: u32,
+    /// Verified bytes available from the start of the file.
+    pub head_bytes: u64,
+    pub file_len: u64,
+    /// Still checking files already on disk.
+    pub checking: bool,
+    /// Another source is lined up.
+    pub has_alternate: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartStep {
+    Wait,
+    /// Hand the stream to mpv.
+    Load,
+    /// Give up on this source and try the next one.
+    Fallback,
+}
+
+/// How much of the head the player waits for (smaller files: all of it).
+pub fn head_target(file_len: u64) -> u64 {
+    HEAD_READY_BYTES.min(file_len).max(1)
+}
+
+/// Share of the head that is in, 0..=1 (the loader's "buffering N %").
+pub fn head_fraction(head_bytes: u64, file_len: u64) -> f64 {
+    (head_bytes as f64 / head_target(file_len) as f64).clamp(0.0, 1.0)
+}
+
+pub fn start_step(p: &StartProgress) -> StartStep {
+    if p.checking {
+        return StartStep::Wait;
+    }
+    if p.file_len > 0 && p.head_bytes >= head_target(p.file_len) {
+        return StartStep::Load;
+    }
+    if p.head_bytes > 0 && p.since_ready >= HEAD_MAX_WAIT && p.since_progress < STALL_FALLBACK {
+        return StartStep::Load;
+    }
+    if p.has_alternate && p.since_progress >= STALL_FALLBACK {
+        return StartStep::Fallback;
+    }
+    // No other source: keep waiting (the loader offers "Try another source" after a while).
+    StartStep::Wait
+}
+
+/// Remembers when downloaded bytes last grew.
+#[derive(Clone, Copy, Debug)]
+pub struct ProgressClock {
+    bytes: u64,
+    at: std::time::Instant,
+}
+
+impl ProgressClock {
+    pub fn new(now: std::time::Instant) -> Self {
+        Self { bytes: 0, at: now }
+    }
+
+    /// Time since the last growth, given the current downloaded byte count.
+    pub fn observe(&mut self, bytes: u64, now: std::time::Instant) -> Duration {
+        if bytes > self.bytes {
+            self.bytes = bytes;
+            self.at = now;
+        }
+        now.saturating_duration_since(self.at)
+    }
+}
+
+/// What to do when mpv reports that the stream failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailAction {
+    /// Re-open the same source after this pause (the torrent is re-checked first).
+    Retry(Duration),
+    Fallback,
+    GiveUp,
+}
+
+/// Automatic re-opens of the same source before moving on: torrents get two (a cached torrent
+/// may still be restarting), plain streams one.
+pub fn auto_retries(kind_torrent: bool) -> u32 {
+    if kind_torrent {
+        2
+    } else {
+        1
+    }
+}
+
+/// `failures` counts this one. Format errors are not retried (the file is the problem); a
+/// local file is never retried or replaced.
+pub fn on_load_failed(failures: u32, raw: &str, torrent: bool, local_file: bool, has_alternate: bool) -> FailAction {
+    if local_file {
+        return FailAction::GiveUp;
+    }
+    let e = raw.to_ascii_lowercase();
+    let format_problem = ["unrecognized file format", "no audio or video", "unsupported"].iter().any(|w| e.contains(w));
+    if !format_problem && failures <= auto_retries(torrent) {
+        return FailAction::Retry(if failures <= 1 { Duration::from_millis(1500) } else { Duration::from_secs(4) });
+    }
+    if has_alternate {
+        FailAction::Fallback
+    } else {
+        FailAction::GiveUp
+    }
+}
+
+/// Identity of a source for comparisons: the info-hash for torrents, else the trimmed text.
+pub fn source_key(src: &str) -> String {
+    match classify_source(src) {
+        SourceKind::Torrent(t) => t.info_hash().unwrap_or_else(|_| src.trim().to_ascii_lowercase()),
+        _ => src.trim().to_string(),
+    }
+}
+
+/// Sources to fall back on, best first, from a ranked list `(request, seeders)` that may contain
+/// the one playing: no repeats of the same torrent, no torrent known to have no seeders, no
+/// local files; at most `max`.
+pub fn pick_alternates(primary: &mv_ui::nav::PlayRequest, ranked: Vec<(mv_ui::nav::PlayRequest, Option<u64>)>, max: usize) -> Vec<mv_ui::nav::PlayRequest> {
+    let mut seen = vec![source_key(&primary.source)];
+    let mut out = vec![];
+    for (req, seeders) in ranked {
+        if out.len() >= max {
+            break;
+        }
+        let key = source_key(&req.source);
+        if seen.contains(&key) || seeders == Some(0) || matches!(classify_source(&req.source), SourceKind::File(_)) {
+            continue;
+        }
+        seen.push(key);
+        out.push(req);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mpv::TrackKind;
+
+    #[test]
+    fn track_list_json_is_parsed() {
+        let j = r#"[{"id":1,"type":"video","selected":true},
+            {"id":1,"type":"audio","lang":"jpn","title":"Stereo","selected":true,"external":false},
+            {"id":2,"type":"audio","lang":"eng"},
+            {"id":3,"type":"sub","lang":"en","title":"English 1","selected":false,"external":true}]"#;
+        let t = parse_tracks(j);
+        assert_eq!(t.len(), 3, "video tracks are left out");
+        assert_eq!((t[0].id, t[0].kind, t[0].lang.as_str(), t[0].selected), (1, TrackKind::Audio, "jpn", true));
+        assert_eq!((t[1].title.as_str(), t[1].selected), ("", false));
+        assert!(t[2].external && t[2].kind == TrackKind::Sub);
+        assert!(parse_tracks("not json").is_empty());
+        assert!(parse_tracks("{}").is_empty());
+    }
+
+    fn progress(head: u64, ready: u64, idle: u64, peers: u32, alt: bool) -> StartProgress {
+        StartProgress {
+            since_ready: Duration::from_secs(ready),
+            since_progress: Duration::from_secs(idle),
+            peers,
+            head_bytes: head,
+            file_len: 1 << 30,
+            checking: false,
+            has_alternate: alt,
+        }
+    }
+
+    #[test]
+    fn torrent_opens_once_its_head_is_in() {
+        assert_eq!(start_step(&progress(0, 2, 2, 5, true)), StartStep::Wait);
+        assert_eq!(start_step(&progress(HEAD_READY_BYTES - 1, 5, 0, 5, true)), StartStep::Wait);
+        assert_eq!(start_step(&progress(HEAD_READY_BYTES, 1, 0, 5, true)), StartStep::Load);
+        // Slow but alive: open after HEAD_MAX_WAIT and let mpv buffer.
+        assert_eq!(start_step(&progress(512 * 1024, 21, 1, 2, true)), StartStep::Load);
+        // A small file only needs all of itself.
+        let small = StartProgress { file_len: 1000, head_bytes: 1000, ..progress(0, 0, 0, 1, false) };
+        assert_eq!(start_step(&small), StartStep::Load);
+        assert!((head_fraction(1 << 20, 1 << 30) - 0.5).abs() < 1e-9);
+        assert_eq!(head_fraction(5, 0), 1.0);
+    }
+
+    #[test]
+    fn dead_torrent_falls_back_only_when_there_is_another_source() {
+        assert_eq!(start_step(&progress(0, 26, 26, 0, true)), StartStep::Fallback);
+        assert_eq!(start_step(&progress(0, 26, 26, 0, false)), StartStep::Wait, "no other source: keep waiting");
+        // Peers connected but nothing arrives: dead too.
+        assert_eq!(start_step(&progress(0, 40, 30, 3, true)), StartStep::Fallback);
+        // Still checking files already on disk: wait, whatever the clocks say.
+        let checking = StartProgress { checking: true, ..progress(0, 100, 100, 0, true) };
+        assert_eq!(start_step(&checking), StartStep::Wait);
+    }
+
+    #[test]
+    fn progress_clock_resets_on_new_data() {
+        let t0 = std::time::Instant::now();
+        let mut c = ProgressClock::new(t0);
+        assert_eq!(c.observe(0, t0 + Duration::from_secs(3)), Duration::from_secs(3));
+        assert_eq!(c.observe(100, t0 + Duration::from_secs(4)), Duration::ZERO);
+        assert_eq!(c.observe(100, t0 + Duration::from_secs(10)), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn load_failures_retry_then_fall_back() {
+        let r = |n, alt| on_load_failed(n, "loading failed", true, false, alt);
+        assert_eq!(r(1, true), FailAction::Retry(Duration::from_millis(1500)));
+        assert_eq!(r(2, true), FailAction::Retry(Duration::from_secs(4)));
+        assert_eq!(r(3, true), FailAction::Fallback);
+        assert_eq!(r(3, false), FailAction::GiveUp);
+        // A plain URL gets one retry.
+        assert_eq!(on_load_failed(2, "loading failed", false, false, false), FailAction::GiveUp);
+        // The file itself is the problem: no point re-opening it.
+        assert_eq!(on_load_failed(1, "unrecognized file format", true, false, true), FailAction::Fallback);
+        assert_eq!(on_load_failed(1, "loading failed", false, true, true), FailAction::GiveUp, "local files are never replaced");
+    }
+
+    #[test]
+    fn alternates_skip_repeats_dead_and_local_sources() {
+        let req = |src: &str| mv_ui::nav::PlayRequest { title: "t".into(), source: src.into(), file_idx: None, imdb_id: None, mal_id: None, season: None, episode: None };
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let c = "c".repeat(40);
+        let d = "d".repeat(40);
+        let primary = req(&format!("magnet:?xt=urn:btih:{a}"));
+        let ranked = vec![
+            (req(&a), Some(90)),                                      // the one playing (bare hash)
+            (req(&b), Some(0)),                                       // no seeders
+            (req(&c), Some(40)),
+            (req(&format!("magnet:?xt=urn:btih:{}", c.to_uppercase())), Some(40)), // same torrent again
+            (req("https://cdn.example/v.mp4"), None),
+            (req("E:/video.mp4"), None),
+            (req(&d), None),
+        ];
+        let alts: Vec<String> = pick_alternates(&primary, ranked.clone(), 5).into_iter().map(|r| r.source).collect();
+        assert_eq!(alts, vec![c.clone(), "https://cdn.example/v.mp4".to_string(), d.clone()]);
+        assert_eq!(pick_alternates(&primary, ranked, 1).len(), 1);
+    }
 
     #[test]
     fn player_memory_survives_a_restart() {

@@ -48,15 +48,17 @@ FG_WINDOW = {
     "pan_right": ("{e}", "0.5"), "pan_left": ("(1-{e})", "0.5"),
 }
 # Bumped whenever the look of a rendered clip changes, so cached clips are not reused.
-CLIP_VERSION = 6
+CLIP_VERSION = 7
 
 # Looks (Studio → Video → Look): how panels are laid out and move, which transitions turn the
 # page, and what the finished picture gets. "duo" puts tall panels side by side like the big
 # manhwa recap channels: each new one slides into the older one's place while the other stays.
 # "punch" snaps action beats in with a zoom, a shake and a white flash. "ramp" times the moves
 # to the beat (a quick snap on a short beat, a slow drift on a long one). The effect switches
-# are listed in LOOK_EFFECTS; "color" is one of COLOR_PRESETS.
-_FX_OFF = {"leaks": False, "chroma": False, "parallax": False, "particles": False, "letterbox": False}
+# are listed in LOOK_EFFECTS; "color" is one of COLOR_PRESETS. "mood" lets the story drive the
+# edit (plan_moods: a grade, atmosphere particles and transitions per scene, punches only on
+# intense beats); "edge_glow" runs a thin line of light along the frame's borders.
+_FX_OFF = {"leaks": False, "chroma": False, "parallax": False, "particles": False, "letterbox": False, "mood": False, "edge_glow": False}
 LOOKS = {
     "clean": {
         "duo": False, "punch": False, "push": FG_PUSH, "transitions": PAGE_TRANSITIONS, "ramp": False,
@@ -66,7 +68,7 @@ LOOKS = {
     "cinematic": {
         "duo": False, "punch": False, "push": 0.06, "transitions": ["fade", "fadeblack", "smoothleft", "fade"], "ramp": False,
         "grade": True, "vignette": True, "grain": True, "glow": True, "impact": False,
-        **_FX_OFF, "leaks": True, "letterbox": True, "color": "warm",
+        **_FX_OFF, "leaks": True, "letterbox": True, "mood": True, "color": "warm",
     },
     "recap": {
         "duo": True, "punch": False, "push": FG_PUSH, "transitions": ["smoothleft", "smoothup", "fade", "smoothright"], "ramp": False,
@@ -75,14 +77,15 @@ LOOKS = {
     },
     "dynamic": {
         "duo": True, "punch": True, "push": 0.08, "ramp": True,
-        "transitions": ["smoothleft", "burn", "smoothup", "zoomblur", "circleopen", "smoothright", "burn", "slidedown", "zoomblur"],
+        # Smooth turns with the odd accent (a burn, a zoom blur) rather than a rotation of them.
+        "transitions": ["smoothleft", "fade", "smoothup", "zoomblur", "smoothright", "fade", "slidedown", "burn"],
         "grade": True, "vignette": True, "grain": False, "glow": True, "impact": True,
-        **_FX_OFF, "leaks": True, "chroma": True, "parallax": True, "color": "none",
+        **_FX_OFF, "leaks": True, "chroma": True, "parallax": True, "mood": True, "edge_glow": True, "color": "none",
     },
 }
 DEFAULT_LOOK = "dynamic"
 # Effects the user can switch on or off over a look.
-LOOK_EFFECTS = ("grade", "vignette", "grain", "glow", "impact", "leaks", "chroma", "parallax", "particles", "letterbox")
+LOOK_EFFECTS = ("grade", "vignette", "grain", "glow", "impact", "leaks", "chroma", "parallax", "particles", "letterbox", "mood", "edge_glow")
 # Colour presets (one lookup table, merged with the grade): Y / U / V expressions of `val`.
 COLOR_PRESETS = {
     "none": None,
@@ -129,11 +132,13 @@ ZOOM_BLUR = 0.14
 # Particle loop length (seconds): one seamless loop, made once per render.
 PARTICLE_SEC = 4.0
 # Duo layout: panels narrower than this (w/h) pair up; frame edge and middle gap (of the
-# width); the narrowest a panel is drawn (of its half), taller ones pan down instead.
+# width) and the room kept above and below (of the height). A panel is always drawn whole in
+# its half (fitted, never wider than the frame allows): a strip too tall to fill its half shows
+# narrower over the blurred fill rather than being cut and panned.
 DUO_MAX_ASPECT = 0.9
 DUO_OUTER = 0.04
 DUO_GAP = 0.025
-DUO_MIN_FILL = 0.72
+DUO_OUTER_Y = 0.03
 # How the new panel arrives (seconds, and how far it slides as a share of the frame width)
 # and how long the background takes to turn into the new panel's.
 DUO_SLIDE = 0.45
@@ -212,13 +217,301 @@ def is_impact(text):
     return bool(text) and ("!" in text or IMPACT_WORDS.search(text) is not None)
 
 
+# ── Story mood: each page's scene (read.json) drives the grade, atmosphere and transitions ──
+
+# A scene kind that says the mood by itself (read.json scene.kind).
+KIND_MOODS = {
+    "fight": "action", "action": "action", "horror": "horror", "comedy": "comedy",
+    "emotional": "sad", "flashback": "sad", "calm": "calm", "reveal": "reveal",
+}
+# Words of scene.mood for the kinds that do not (dialogue, other, ...), checked in this order.
+MOOD_WORDS = (
+    ("horror", re.compile(r"\b(eerie|creep\w*|terrif\w*|dread\w*|grotesque|sinister|unsettl\w*|horrif\w*|macabre|ominous|menac\w*|haunt\w*)\b", re.I)),
+    ("action", re.compile(r"\b(explosive|violent|brutal|savage|feroc\w*|furious|chaotic|rage|frantic|feral|battle|intense|heroic)\b", re.I)),
+    ("sad", re.compile(r"\b(sad\w*|melanchol\w*|somber|sombre|wistful|tear\w*|grie\w*|bitter|remorse\w*|lonely|mourn\w*|brooding|reflective|regret\w*)\b", re.I)),
+    ("romance", re.compile(r"\b(romantic|romance|tender|lov\w*|heartfelt|affection\w*|sweet|intimate|warm|kiss\w*|confession)\b", re.I)),
+    ("comedy", re.compile(r"\b(playful|comedic|comic\w*|absurd|cheerful|gleeful|silly|cute|awkward|wry|joyful|carefree|funny|goofy)\b", re.I)),
+    ("mystery", re.compile(r"\b(tense|suspicious|myster\w*|uneasy|quiet|curious|cryptic)\b", re.I)),
+)
+ROMANCE_WORDS = MOOD_WORDS[3][1]
+# Atmosphere particles a scene's tags call for.
+SNOW_TAGS = re.compile(r"\b(snow\w*|winter|blizzard|frost\w*|frozen|icy|freez\w*)\b", re.I)
+RAIN_TAGS = re.compile(r"\b(rain\w*|storm\w*|downpour|drizzl\w*|monsoon)\b", re.I)
+FIRE_TAGS = re.compile(r"\b(fire|fires|flame\w*|flaming|ember\w*|burn\w*|explo\w*|blaz\w*|lava|inferno|spark\w*)\b", re.I)
+GRIEF_TAGS = re.compile(r"\b(funeral|grave\w*|tears|grief|loss|death|farewell|mourning)\b", re.I)
+# Tags of a hit (with an intense scene, they make a beat a punch even without a loud line).
+IMPACT_TAGS = re.compile(
+    r"\b(explo\w*|impact|punch\w*|clash\w*|strik\w*|slash\w*|attack\w*|ambush|blast\w*|smash\w*|first blow|surprise attack|kick\w*)\b", re.I,
+)
+# Smoothing: a beat's mood is the weighted majority of this many beats either side (weights
+# 3, 2, 1 by distance), so a single odd beat never flips the grade; intensity is averaged over
+# MOOD_INT_RADIUS beats either side.
+MOOD_RADIUS = 2
+MOOD_INT_RADIUS = 1
+# Punch (zoom + shake + flash) rules with the mood on: only a beat whose page is at least this
+# intense, at least IMPACT_MIN_SEC after the last punch (and IMPACT_GAP clips); in the first
+# IMPACT_EARLY_WINDOW seconds IMPACT_EARLY_SEC (and one clip fewer) is enough.
+PUNCH_INTENSITY = 7
+IMPACT_MIN_SEC = 20.0
+IMPACT_EARLY_WINDOW = 30.0
+IMPACT_EARLY_SEC = 10.0
+# Transitions by mood: the pool a page turn into a clip of that mood rotates through, and the
+# share of the look's transition length it lasts (calm moods dissolve slowly, action whips).
+MOOD_TRANSITIONS = {
+    "action": (("whipleft", "zoomblur", "whipright", "whipup"), 0.5),
+    "horror": (("fadeblack", "fadeblack", "dissolve"), 1.6),
+    "sad": (("dissolve", "fade", "smoothleft"), 1.6),
+    "romance": (("dissolve", "fade", "smoothright"), 1.6),
+    "calm": (("dissolve", "smoothleft", "fade", "smoothup"), 1.4),
+    "mystery": (("fade", "fadeblack", "dissolve"), 1.2),
+    "comedy": (("smoothleft", "smoothup", "smoothright", "slideleft"), 0.8),
+    "reveal": (("fade", "smoothup"), 1.0),
+    "neutral": (("smoothleft", "fade", "smoothup", "smoothright"), 1.0),
+}
+# Accents (a flash, a burn, a glitch, a circle) are rare: entering a reveal, a peak of action (a
+# page this intense) or a big comic beat, at most one every ACCENT_GAP seconds.
+ACCENTS = {"reveal": (("fadewhite", 0.6), ("burn", 1.0)), "action": (("glitch", 0.6),), "comedy": (("circleopen", 1.0),)}
+ACCENT_INTENSITY = 8
+ACCENT_GAP = 25.0
+# Grade per mood, baked into each clip's stills (free per frame): (saturation, contrast,
+# brightness, shadow tint RGB, highlight tint RGB), tints as shares of full scale. Action:
+# punchier with teal shadows and orange highlights; horror: cool, drained, a little green;
+# comedy: warm and bright; sad: muted, a little cool; romance: warm and soft.
+MOOD_GRADES = {
+    "action": (1.08, 1.10, 0.0, (-0.035, 0.005, 0.035), (0.035, 0.01, -0.035)),
+    "horror": (0.70, 1.04, -0.03, (-0.02, 0.015, 0.02), (-0.02, 0.012, 0.0)),
+    "comedy": (1.10, 1.02, 0.03, (0.01, 0.005, -0.01), (0.03, 0.015, -0.02)),
+    "sad": (0.78, 0.96, -0.01, (-0.01, 0.0, 0.02), (-0.015, 0.0, 0.015)),
+    "romance": (1.02, 0.95, 0.02, (0.02, 0.0, 0.005), (0.03, 0.01, -0.01)),
+    "mystery": (0.88, 1.03, -0.01, (-0.01, 0.0, 0.02), (0.0, 0.0, 0.01)),
+    "reveal": (1.0, 1.08, 0.0, (-0.01, 0.0, 0.02), (0.01, 0.005, 0.0)),
+    "calm": (0.95, 0.98, 0.01, (0.0, 0.0, 0.005), (0.01, 0.005, 0.0)),
+}
+# Edge glow colour per mood (the halo and the travelling lights; the core line stays near white).
+EDGE_COLORS = {
+    "action": (255, 122, 52), "horror": (96, 226, 170), "comedy": (255, 208, 84), "sad": (112, 162, 255),
+    "romance": (255, 124, 190), "mystery": (172, 126, 255), "reveal": (255, 214, 140), "calm": (124, 218, 255),
+    "neutral": (255, 188, 108),
+}
+
+
+def load_scenes(output_dir):
+    """{page index: scene {kind, mood, intensity, tags}} from <output_dir>/studio/read.json
+    (the chapter's AI reading), or {} when there is none."""
+    try:
+        with open(os.path.join(output_dir, "studio", "read.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for i, p in enumerate(data.get("pages") or [] if isinstance(data, dict) else []):
+        if not isinstance(p, dict) or not isinstance(p.get("scene"), dict):
+            continue
+        idx = p.get("index", i)
+        if isinstance(idx, int):
+            out[idx] = p["scene"]
+    return out
+
+
+def scene_mood(scene):
+    """The mood (a MOOD_TRANSITIONS key) of a read.json scene."""
+    if not isinstance(scene, dict):
+        return "neutral"
+    kind = str(scene.get("kind") or "").strip().lower()
+    words = str(scene.get("mood") or "")
+    tags = " ".join(str(t) for t in scene.get("tags") or [] if isinstance(t, (str, int, float)))
+    if kind == "emotional" and (ROMANCE_WORDS.search(words) or ROMANCE_WORDS.search(tags)):
+        return "romance"
+    if kind in KIND_MOODS:
+        return KIND_MOODS[kind]
+    for name, rx in MOOD_WORDS:
+        if rx.search(words):
+            return name
+    return "romance" if ROMANCE_WORDS.search(tags) else "neutral"
+
+
+def smooth_moods(values, radius=MOOD_RADIUS):
+    """Each value replaced by the weighted majority of its neighbourhood (weight radius + 1 -
+    distance), so a lone beat between two others takes theirs while a run of two holds. A tie
+    keeps the beat's own value, else the one before it."""
+    out = []
+    n = len(values)
+    for k in range(n):
+        score = {}
+        for j in range(max(0, k - radius), min(n, k + radius + 1)):
+            score[values[j]] = score.get(values[j], 0) + radius + 1 - abs(j - k)
+        best = max(score.values())
+        tied = [v for v, s in score.items() if s == best]
+        if values[k] in tied:
+            out.append(values[k])
+        elif out and out[-1] in tied:
+            out.append(out[-1])
+        else:
+            out.append(tied[0])
+    return out
+
+
+# Atmosphere is a full-frame layer (it costs every frame it shows on), so it is kept for the
+# scenes that call for it: embers for fire or a fight at least this intense (smoothed), dust only
+# for quiet scenes at most DUST_INTENSITY.
+EMBER_INTENSITY = 7.5
+DUST_INTENSITY = 6
+
+
+def particle_kind(mood, intensity, tags):
+    """The atmosphere a scene gets: "snow" / "rain" for its weather tags, "embers" for fire or
+    an intense fight, "rain" for grief, floating "dust" for a quiet mystery, calm or romance
+    scene; None for the rest."""
+    tags = " ".join(str(t) for t in tags or [])
+    if SNOW_TAGS.search(tags):
+        return "snow"
+    if RAIN_TAGS.search(tags):
+        return "rain"
+    if FIRE_TAGS.search(tags) or (mood == "action" and intensity >= EMBER_INTENSITY):
+        return "embers"
+    if mood == "sad" and GRIEF_TAGS.search(tags):
+        return "rain"
+    if mood in ("mystery", "calm", "romance") and intensity <= DUST_INTENSITY:
+        return "dust"
+    return None
+
+
+def mood_grade(mood, intensity):
+    """The grade of MOOD_GRADES for `mood`, scaled by how intense the scene is (60% at 0, all
+    of it from 10), rounded so it names the clip's stills stably; None for no grade."""
+    g = MOOD_GRADES.get(mood)
+    if not g:
+        return None
+    s = min(1.0, max(0.6, 0.6 + 0.04 * (intensity or 0)))
+    sat, con, bri, sh, hi = g
+    lerp = lambda v, one=0.0: round(one + (v - one) * s, 3)
+    return (lerp(sat, 1.0), lerp(con, 1.0), lerp(bri), tuple(lerp(v) for v in sh), tuple(lerp(v) for v in hi))
+
+
+def grade_lut(grade):
+    """An RGB point table (768 entries, for PIL's Image.point) of a mood grade's contrast,
+    brightness and shadow / highlight tints."""
+    _, con, bri, sh, hi = grade
+    lut = []
+    for c in range(3):
+        for v in range(256):
+            x = v / 255
+            y = (x - 0.5) * con + 0.5 + bri + sh[c] * (1 - x) ** 2 + hi[c] * x * x
+            lut.append(max(0, min(255, round(y * 255))))
+    return lut
+
+
+def apply_grade(img, grade):
+    """`img` (RGB) through a mood grade (mood_grade's), or as it is for None."""
+    if not grade:
+        return img
+    from PIL import ImageEnhance
+    if abs(grade[0] - 1.0) > 1e-3:
+        img = ImageEnhance.Color(img).enhance(grade[0])
+    return img.point(grade_lut(grade))
+
+
+def plan_moods(items, scenes):
+    """The mood plan of a chapter: one entry per render item (beat), or all None without
+    scenes. Each beat takes its page's scene (a page read.json has nothing for takes the
+    nearest beat's that does); moods are smoothed over MOOD_RADIUS beats and intensity over
+    MOOD_INT_RADIUS, and from them come:
+    {"mood", "kind", "intensity" (smoothed), "raw" (the page's own), "tags",
+     "grade" (mood_grade), "particles" (particle_kind, smoothed like the mood),
+     "punch" (an intense enough page and a loud line or a hit in its tags or a fight at 8+),
+     "edge" (the edge glow's colour)}."""
+    if not scenes or not items:
+        return [None] * len(items)
+    raw = [scenes.get(it.get("page")) if isinstance(it, dict) else None for it in items]
+    if not any(raw):
+        return [None] * len(items)
+    known = [k for k, s in enumerate(raw) if s]
+    # Pages without a scene borrow the nearest beat's that has one.
+    for k in range(len(raw)):
+        if not raw[k]:
+            raw[k] = raw[min(known, key=lambda j: (abs(j - k), j))]
+    moods = smooth_moods([scene_mood(s) for s in raw])
+    ints = [_num(s.get("intensity"), 5.0, 0.0, 10.0) for s in raw]
+    smooth_i = []
+    for k in range(len(ints)):
+        part = ints[max(0, k - MOOD_INT_RADIUS): k + MOOD_INT_RADIUS + 1]
+        smooth_i.append(round(sum(part) / len(part), 2))
+    tags = [[str(t) for t in s.get("tags") or [] if isinstance(t, (str, int, float))] for s in raw]
+    parts = smooth_moods([particle_kind(m, i, t) for m, i, t in zip(moods, smooth_i, tags)])
+    out = []
+    for k, it in enumerate(items):
+        kind = str(raw[k].get("kind") or "").strip().lower()
+        text = it.get("text", "") if isinstance(it, dict) else ""
+        hit = is_impact(text) or bool(IMPACT_TAGS.search(" ".join(tags[k]))) or (kind in ("fight", "action") and ints[k] >= 8)
+        out.append({
+            "mood": moods[k], "kind": kind, "intensity": smooth_i[k], "raw": ints[k], "tags": tags[k],
+            "grade": mood_grade(moods[k], smooth_i[k]), "particles": parts[k],
+            "punch": ints[k] >= PUNCH_INTENSITY and hit, "edge": EDGE_COLORS.get(moods[k], EDGE_COLORS["neutral"]),
+        })
+    return out
+
+
+def punch_ok(t, n, last_t, last_n):
+    """May clip `n` starting at `t` seconds punch, the last punch being clip `last_n` at
+    `last_t`? IMPACT_MIN_SEC and IMPACT_GAP clips apart; IMPACT_EARLY_SEC and a clip fewer in
+    the first IMPACT_EARLY_WINDOW seconds, where the edit is busiest."""
+    early = t < IMPACT_EARLY_WINDOW
+    return n - last_n >= (IMPACT_GAP - 1 if early else IMPACT_GAP) and t - last_t >= (IMPACT_EARLY_SEC if early else IMPACT_MIN_SEC)
+
+
+def plan_impacts(starts, candidates, overrides=None):
+    """Which clips punch: candidates[k] wants it, punch_ok spaces them. overrides[k] (the
+    editor's: True for its shake, False for any other move it picked, None for the look's)
+    wins either way; an override punch counts for the spacing too."""
+    overrides = overrides or [None] * len(starts)
+    out = []
+    last_t, last_n = -1e9, -IMPACT_GAP
+    for k, t in enumerate(starts):
+        hit = overrides[k] if overrides[k] is not None else bool(candidates[k]) and punch_ok(t, k, last_t, last_n)
+        if hit:
+            last_t, last_n = t, k
+        out.append(bool(hit))
+    return out
+
+
+def mood_transition(mood, intensity, turn, base, accent=False):
+    """(transition, seconds) for a page turn into a clip of `mood` (MOOD_TRANSITIONS, the
+    `turn`th of its pool); with `accent` allowed, an intense enough reveal, action or comic beat
+    gets one of its ACCENTS instead."""
+    if accent and mood in ACCENTS and (mood == "reveal" or (intensity or 0) >= ACCENT_INTENSITY):
+        name, k = ACCENTS[mood][turn % len(ACCENTS[mood])]
+        return name, round(base * k, 3)
+    names, k = MOOD_TRANSITIONS.get(mood, MOOD_TRANSITIONS["neutral"])
+    return names[turn % len(names)], round(base * k, 3)
+
+
+def edge_segments(colors, t0=0.0, t1=float("inf")):
+    """The edge glow's colour over time as [(start, end, rgb)] covering t0..t1: `colors` is
+    [(clip start seconds, rgb)] (each clip's mood colour), runs of one colour merged; the glow
+    turns with the clip it belongs to."""
+    runs = []
+    for t, rgb in colors:
+        rgb = tuple(rgb)
+        if not runs or rgb != runs[-1][1]:
+            runs.append((t, rgb))
+    out = []
+    for i, (t, rgb) in enumerate(runs):
+        end = runs[i + 1][0] if i + 1 < len(runs) else float("inf")
+        a, b = max(t, t0) if i else t0, min(end, t1)
+        if b > a:
+            out.append((a, b, rgb))
+    return out
+
+
 def duo_geometry(iw, ih, w, h, slot):
     """Where a panel of iw x ih sits in a w x h frame's left (slot 0) or right (slot 1) half:
-    drawn at `size`, with `vis` rows visible from `pos`; `slack` rows (a tall panel) pan by."""
+    drawn whole at `size`, `vis` rows visible from `pos` (all of them: `slack`, the rows a panel
+    taller than the frame would pan by, is always 0 so nothing narrated is ever cut)."""
     outer = round(w * DUO_OUTER)
     slot_w = (w - 2 * outer - round(w * DUO_GAP)) // 2
-    dw = min(slot_w, max(round(slot_w * DUO_MIN_FILL), round(iw * h / ih))) // 2 * 2
-    dh = max(2, round(ih * dw / iw) // 2 * 2)
+    avail = h - 2 * round(h * DUO_OUTER_Y)
+    dw = max(2, min(slot_w, round(iw * avail / ih)) // 2 * 2)
+    dh = max(2, min(avail, round(ih * dw / iw)) // 2 * 2)
     vis = min(dh, h)
     cx = outer + slot_w / 2 if slot == 0 else w - outer - slot_w / 2
     return {"size": (dw, dh), "vis": vis, "pos": (int(cx - dw / 2) // 2 * 2, (h - vis) // 4 * 2), "slack": dh - vis}
@@ -262,13 +555,94 @@ def make_vignette_mask(w, h, angle, work_dir):
     return path
 
 
-def look_filters(look, w, h, src, out, particles=None, vignette=None):
+def edge_thickness(w, h):
+    """Rows of light (even) the edge glow spans inward from the frame's edge."""
+    return max(8, round(min(w, h) * 0.02) // 2 * 2)
+
+
+# The edge glow's layers at 1080 rows (scaled to the frame): distance in from the edge, thickness,
+# opacity and whether it is the near-white core (else the mood colour). Nested outlines of filled
+# boxes make a thin bright line a few pixels in with a soft halo either side, fading inward.
+EDGE_LAYERS = ((0, 3, 0.2, False), (4, 2, 0.6, True), (6, 2, 0.32, False), (8, 4, 0.16, False), (12, 8, 0.06, False))
+# Two lights chase each other clockwise round the frame once every EDGE_LAP seconds: a bright
+# head with a fading tail (length share of the perimeter, thickness, opacity, core or colour),
+# drawn over the core line.
+EDGE_LAP = 12.0
+EDGE_COMET = ((0.035, 3, 0.75, True), (0.08, 2, 0.4, True), (0.16, 8, 0.12, False))
+EDGE_CORE = (255, 242, 222)
+
+
+def _hex(rgb):
+    return "0x%02x%02x%02x" % tuple(max(0, min(255, int(v))) for v in rgb)
+
+
+def edge_glow_filters(w, h, bar=0, segments=None):
+    """The edge glow as a chain of filled drawbox filters (each touches only its own pixels, so
+    the whole ring costs next to nothing per frame): EDGE_LAYERS as nested outlines along the
+    picture's four borders (inside letterbox bars `bar` high) and two EDGE_COMET lights running
+    round it. The near-white core is drawn once; the coloured halo and tails once per colour
+    segment (edge_segments: [(start, end, rgb)]), each switched on for its time only. Captions
+    are burnt in after, over it."""
+    segments = segments or [(0.0, float("inf"), EDGE_COLORS["neutral"])]
+    k = min(w, h) / 1080
+    top, ih = bar, h - 2 * bar
+    perim = 2 * w + 2 * ih
+    speed = perim / EDGE_LAP
+
+    def ring(on, col, core):
+        out = []
+        for d, th, alpha, is_core in EDGE_LAYERS:
+            if is_core != core:
+                continue
+            d, th = round(d * k), max(1, round(th * k))
+            c = f"{col}@{alpha}"
+            # Top and bottom span the width (less this layer's inset); the sides fit between them.
+            for x, y, bw, bh in ((d, top + d, w - 2 * d, th), (d, top + ih - d - th, w - 2 * d, th),
+                                 (d, top + d + th, th, ih - 2 * d - 2 * th), (w - d - th, top + d + th, th, ih - 2 * d - 2 * th)):
+                if bw > 0 and bh > 0:
+                    out.append(f"drawbox=x={x}:y={y}:w={bw}:h={bh}:color={c}:t=fill{on}")
+        for n in (0, 1):
+            head = f"mod(t*{speed:.3f}+{n * perim / 2:.1f},{perim})"
+            for share, th, alpha, is_core in EDGE_COMET:
+                if is_core != core:
+                    continue
+                ln = round(share * perim)
+                th = max(1, round(th * k))
+                d = max(0, round(5 * k) - th // 2)
+                c = f"{col}@{alpha}"
+                # The light's span [head - ln, head] on the way round, per edge (s0 = where the edge
+                # starts on the way round; along it or against it): off screen where it does not
+                # reach. The left edge comes twice, for a tail wrapping past the top left corner.
+                for s0, size_n, horiz, fwd, fixed in ((0, w, True, True, top + d), (w, ih, False, True, w - d - th),
+                                                      (w + ih, w, True, False, top + ih - d - th), (2 * w + ih, ih, False, False, d),
+                                                      (-ih, ih, False, False, d)):
+                    lo = f"max(0,{head}-{ln}-{s0})"
+                    hi = f"min({size_n},{head}-{s0})"
+                    pos = lo if fwd else f"{size_n}-{hi}"
+                    pos = f"if(gt({hi},{lo}),{pos}{'' if horiz else f'+{top}'},-99999)"
+                    size = f"max(1,{hi}-{lo})"
+                    if horiz:
+                        out.append(f"drawbox=x='{pos}':y={fixed}:w='{size}':h={th}:color={c}:t=fill{on}")
+                    else:
+                        out.append(f"drawbox=x={fixed}:y='{pos}':w={th}:h='{size}':color={c}:t=fill{on}")
+        return out
+
+    boxes = []
+    for a, b, rgb in segments:
+        on = "" if len(segments) == 1 else f":enable='between(t,{a:.3f},{b - 0.0005:.3f})'"
+        boxes += ring(on, _hex(rgb), False)
+    boxes += ring("", _hex(EDGE_CORE), True)
+    return ",".join(boxes)
+
+
+def look_filters(look, w, h, src, out, particles=None, vignette=None, edge=None):
     """Finishing filters for `look` on [src] (a w x h picture), labelled [out]: a gentle grade
     and colour preset (one lookup table), floating particles (the looped [particles] stream,
     when given), a vignette (the [vignette] mask of make_vignette_mask laid over, when given,
-    else the vignette filter), fine film grain and letterbox bars, each only when the look has
-    it on. (The glow is baked into each still instead: it would cost more than the rest together
-    per frame.)"""
+    else the vignette filter), fine film grain, letterbox bars and the edge glow (in the colour
+    segments `edge`, edge_segments'; the neutral colour when not given), each only when the look
+    has it on. (The glow is baked into each still instead: it would cost more than the rest
+    together per frame.)"""
     parts = []
     cur = src
     lut = color_lut(look.get("grade"), look.get("color"))
@@ -292,8 +666,42 @@ def look_filters(look, w, h, src, out, particles=None, vignette=None):
     if bar:
         tail.append(f"drawbox=x=0:y=0:w={w}:h={bar}:color=black:t=fill")
         tail.append(f"drawbox=x=0:y={h - bar}:w={w}:h={bar}:color=black:t=fill")
+    if look.get("edge_glow"):
+        tail.append(edge_glow_filters(w, h, bar, edge))
     parts.append(f"[{cur}]{','.join(tail) if tail else 'null'}[{out}]")
     return ";".join(parts)
+
+
+# A filter graph longer than this goes to ffmpeg in a file (Windows caps a command line at 32k
+# characters; the edge glow and the editor's layers can make a part's graph long).
+GRAPH_INLINE = 12000
+
+
+def graph_args(graph, path):
+    """ffmpeg's arguments for the filter graph `graph`: inline, or when long written to `path`
+    and read from there (-/filter_complex on ffmpeg 7+, -filter_complex_script before)."""
+    if len(graph) <= GRAPH_INLINE:
+        return ["-filter_complex", graph]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(graph)
+    return ["-/filter_complex" if ffmpeg_major() >= 7 else "-filter_complex_script", path]
+
+
+_FFMPEG_MAJOR = None
+
+
+def ffmpeg_major():
+    """ffmpeg's major version ("ffmpeg version 6.1.1" -> 6). Development builds ("N-125365-…")
+    count as new; an unreadable answer counts as old (the option every version knows)."""
+    global _FFMPEG_MAJOR
+    if _FFMPEG_MAJOR is None:
+        try:
+            out = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10).stdout
+            m = re.match(r"ffmpeg version (?:n?(\d+)|N-)", out)
+            _FFMPEG_MAJOR = (int(m.group(1)) if m.group(1) else 99) if m else 0
+        except Exception:
+            _FFMPEG_MAJOR = 0
+    return _FFMPEG_MAJOR
 
 
 def check_ffmpeg():
@@ -430,7 +838,7 @@ def combine_audio_files(audio_paths, output_path):
 
 # ── Timeline planning (pure helpers) ──
 
-def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, joins=None, forced=None):
+def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, joins=None, forced=None, moods=None):
     """Plan crossfades between clips of `durations` seconds without moving the narration.
 
     Returns (starts, trans): starts[k] is when clip k's narration begins (running sum)
@@ -441,11 +849,14 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
     PAGE_TRANSITIONS), short clips get shorter fades, and kind "none" gives one-frame (hard)
     cuts. joins[k] "cut" cuts into clip k (it animates its own entrance: a duo slide) and
     "impact" makes it a quick dissolve (the clip flashes in itself). forced[k] (name, seconds),
-    the editor's pick for clip k, wins over all of that.
+    the editor's pick for clip k, wins over all of that. With `moods` (plan_moods entries per
+    clip) a page turn follows the mood of the clip it turns to (mood_transition), with an accent
+    at most every ACCENT_GAP seconds.
     """
     names = names or PAGE_TRANSITIONS
     joins = joins or [None] * len(durations)
     forced = forced or [None] * len(durations)
+    moods = moods or [None] * len(durations)
     starts = []
     t = 0.0
     for d in durations:
@@ -454,6 +865,7 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
     frame = 1.0 / FPS
     trans = [None]
     turn = 0
+    last_accent = -ACCENT_GAP
     for k in range(1, len(durations)):
         if forced[k]:
             name, dur = forced[k]
@@ -463,6 +875,14 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
             name, dur = "fade", 0.12
         elif pages[k] == pages[k - 1]:
             name, dur = SAME_PAGE_TRANSITION[0], min(SAME_PAGE_TRANSITION[1], base)
+        elif moods[k]:
+            m = moods[k]
+            # An accent marks entering a reveal (or a peak), not every page of one.
+            entering = not moods[k - 1] or moods[k - 1]["mood"] != m["mood"] or m["mood"] != "reveal"
+            name, dur = mood_transition(m["mood"], m.get("raw"), turn, base, entering and starts[k] - last_accent >= ACCENT_GAP)
+            if any(name == a for v in ACCENTS.values() for a, _ in v):
+                last_accent = starts[k]
+            turn += 1
         else:
             name, dur = names[turn % len(names)], base
             turn += 1
@@ -471,21 +891,23 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
     return starts, trans
 
 
-def plan_clip_fx(starts, trans, pages, joins=None, leaks=False, impacts=None, gap=None, forced=None):
+def plan_clip_fx(starts, trans, pages, joins=None, leaks=False, impacts=None, gap=None, forced=None, quiet=None):
     """The page-turn effects each clip draws itself, in its own seconds. A burn, zoom blur,
     glitch or whip into clip k is drawn by both clips (the same frames at the same moment, under
     the join, so it cannot show): clip k-1 gets "<name>_out": (when the change starts, seconds)
     and clip k "<name>_in": seconds. With `leaks`, a clip that turns to a new page some other
     way (and the opening clip) gets "leak": a flare blooming as it lands, at most one every
     `gap` seconds (a burn counts) so it stays an accent; an action beat (`impacts`) flashes
-    instead. A transition the editor picked (`forced[k]`) is drawn wherever it is."""
+    instead, and a `quiet` clip (a horror or sad scene: a warm flare would break it) gets none.
+    A transition the editor picked (`forced[k]`) is drawn wherever it is."""
     joins = joins or [None] * len(starts)
     impacts = impacts or [False] * len(starts)
     forced = forced or [None] * len(starts)
+    quiet = quiet or [False] * len(starts)
     gap = LEAK_GAP if gap is None else gap
     fx = [{} for _ in starts]
     last = -gap
-    if leaks and fx and not impacts[0]:
+    if leaks and fx and not impacts[0] and not quiet[0]:
         fx[0]["leak"] = True
         last = 0.0
     for k in range(1, len(starts)):
@@ -504,14 +926,15 @@ def plan_clip_fx(starts, trans, pages, joins=None, leaks=False, impacts=None, ga
         if joins[k] == "impact" or impacts[k] or pages[k] == pages[k - 1]:
             continue
         name, dur = trans[k]
-        if name in CLIP_TRANSITIONS and dur > 1.5 / FPS:
-            last = starts[k]
+        if name in CLIP_DRAWN and dur > 1.5 / FPS:
+            if name in CLIP_TRANSITIONS:
+                last = starts[k]
             fx[k - 1][f"{name}_out"] = (round(starts[k] - starts[k - 1], 3), dur)
             fx[k][f"{name}_in"] = dur
             if name == "burn":
                 # Burns alternate sides; both clips draw the same one.
                 fx[k - 1]["burn_flip"] = fx[k]["burn_flip_in"] = k % 2 == 0
-        elif leaks and starts[k] - last >= gap:
+        elif leaks and not quiet[k] and starts[k] - last >= gap:
             fx[k]["leak"] = True
             last = starts[k]
     return fx
@@ -667,49 +1090,9 @@ def _warp(window, zoom, frames, interp, ease=None):
 
 # ── Per-clip images ──
 
-def _crop_to_focus(page_image, focus_point, aspect, out_path):
-    """Crop `page_image` around a 0..1000 focus box (15% margin, widened to `aspect`)."""
-    from PIL import Image
-    img = Image.open(page_image)
-    img_w, img_h = img.size
-
-    ymin, xmin, ymax, xmax = focus_point
-    y_min = int(ymin * img_h / 1000)
-    x_min = int(xmin * img_w / 1000)
-    y_max = int(ymax * img_h / 1000)
-    x_max = int(xmax * img_w / 1000)
-
-    pad_w = int((x_max - x_min) * 0.15)
-    pad_h = int((y_max - y_min) * 0.15)
-    x_min = max(0, x_min - pad_w)
-    y_min = max(0, y_min - pad_h)
-    x_max = min(img_w, x_max + pad_w)
-    y_max = min(img_h, y_max + pad_h)
-
-    box_w = x_max - x_min
-    box_h = y_max - y_min
-    if box_w <= 0 or box_h <= 0:
-        return page_image
-    if box_w / box_h > aspect:
-        new_h = int(box_w / aspect)
-        center_y = (y_min + y_max) // 2
-        y_min = max(0, center_y - new_h // 2)
-        y_max = min(img_h, y_min + new_h)
-        if y_max - y_min < new_h:
-            y_min = max(0, y_max - new_h)
-    else:
-        new_w = int(box_h * aspect)
-        center_x = (x_min + x_max) // 2
-        x_min = max(0, center_x - new_w // 2)
-        x_max = min(img_w, x_min + new_w)
-        if x_max - x_min < new_w:
-            x_min = max(0, x_max - new_w)
-    img.convert("RGB").crop((x_min, y_min, x_max, y_max)).save(out_path, "JPEG", quality=95)
-    return out_path
-
-
-def _blurred_fill(img, w, h):
-    """The frame-sized background: `img` zoomed in past "cover", blurred, desaturated, darkened."""
+def _blurred_fill(img, w, h, grade=None):
+    """The frame-sized background: `img` zoomed in past "cover", blurred, desaturated, darkened
+    (and through the mood `grade`, at the small size where it is cheap)."""
     from PIL import Image, ImageEnhance, ImageFilter
     iw, ih = img.size
     # Blur at 1/8 size (much cheaper, and smoother once scaled back up).
@@ -721,7 +1104,7 @@ def _blurred_fill(img, w, h):
     small = small.crop((left, top, left + sw, top + sh))
     small = small.filter(ImageFilter.GaussianBlur(radius=max(2.0, sw * 0.03)))
     small = ImageEnhance.Color(small).enhance(0.6)
-    small = ImageEnhance.Brightness(small).enhance(0.55)
+    small = apply_grade(ImageEnhance.Brightness(small).enhance(0.55), grade)
     return small.resize((w, h), Image.BICUBIC).filter(ImageFilter.GaussianBlur(radius=max(2, w // 400)))
 
 
@@ -890,19 +1273,135 @@ def make_particle_loop(w, h, work_dir):
     return out
 
 
-def _prepare_duo_images(src, idx, w, h, slot, work_dir, glow=False, inset=0, drift=0):
+# Bumped whenever the mood atmosphere loops change (cached by size).
+ATMOS_VERSION = 1
+# Atmosphere loop length (seconds).
+ATMOS_SEC = 8.0
+ATMOS_KINDS = ("embers", "snow", "rain", "dust")
+
+
+def _encode_loop(folder, pattern, w, h, out, scale=True):
+    """PNG frames -> a seamless loop with alpha (FFV1, yuva420p) at `out`, moved into place whole."""
+    tmp = f"{out}.part{os.getpid()}_{threading.get_ident()}.mkv"
+    vf = (f"scale={w}:{h}:flags=bicubic," if scale else "") + "format=yuva420p"
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-framerate", str(FPS), "-i", os.path.join(folder, pattern),
+        "-vf", vf, "-c:v", "ffv1", "-level", "3", "-slices", "16", tmp,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    shutil.rmtree(folder, ignore_errors=True)
+    if result.returncode != 0 or not os.path.exists(tmp):
+        raise RuntimeError(f"loop encode failed: {result.stderr[:300]}")
+    try:
+        os.replace(tmp, out)
+    except OSError:
+        if not os.path.exists(out):
+            return tmp
+        os.unlink(tmp)
+    return out
+
+
+def make_atmosphere_loop(kind, w, h, work_dir):
+    """An ATMOS_SEC seamless loop (full size, with alpha) of a mood's atmosphere, laid over the
+    clips of that mood: "embers" (warm sparks rising and twinkling), "snow" (flakes drifting
+    down, the bigger ones faster), "rain" (thin slanted streaks falling fast) or "dust" (soft
+    bokeh motes circling slowly). Kept subtle (sprites peak at 0.2..0.75 alpha and fall off
+    softly, so they read at about a quarter to a third) and drawn at half size, then scaled: they
+    are soft. Made once per size and kept in the fx cache. Returns (path, frames)."""
+    from PIL import Image
+    import random
+    count = round(ATMOS_SEC * FPS)
+    root = fx_cache_dir() or work_dir
+    out = os.path.join(root, f"atmos_{kind}_{w}x{h}_v{ATMOS_VERSION}.mkv")
+    if os.path.exists(out) and os.path.getsize(out) > 1000:
+        return out, count
+    sw, sh = max(64, w // 2), max(64, h // 2)
+    unit = min(sw, sh)
+    rng = random.Random(20 + (ATMOS_KINDS.index(kind) if kind in ATMOS_KINDS else 9))
+    levels = 12
+    motes = []
+
+    def mote(sprite, alpha, **kw):
+        # The sprite at `levels` brightnesses (picked per frame by its twinkle).
+        a = sprite.getchannel("A")
+        variants = []
+        for i in range(levels):
+            s = sprite.copy()
+            s.putalpha(a.point(lambda v, f=alpha * (i + 1) / levels: int(v * f)))
+            variants.append(s)
+        m = {"x": rng.random(), "y": rng.random(), "dir": 0, "laps": 0, "sway": 0.0, "sway_n": 1, "orbit": None,
+             "phase": rng.random(), "tw_n": 2, "tw": 0.0, "variants": variants}
+        m.update(kw)
+        motes.append(m)
+
+    if kind == "embers":
+        for _ in range(36):
+            size = unit * rng.uniform(0.008, 0.018)
+            color = rng.choice(((255, 140, 50), (255, 178, 90), (255, 210, 140)))
+            mote(_glow_sprite((size * 2.4, size * 2.4), color, 1.0), rng.uniform(0.35, 0.7), dir=-1, laps=rng.choice((1, 1, 2)),
+                 sway=rng.uniform(0.01, 0.04), sway_n=rng.choice((1, 2)), tw_n=rng.choice((3, 4, 5)), tw=0.45)
+    elif kind == "snow":
+        for _ in range(80):
+            big = rng.random() < 0.3
+            size = unit * (rng.uniform(0.009, 0.014) if big else rng.uniform(0.004, 0.008))
+            mote(_glow_sprite((size * 2.2, size * 2.2), (255, 255, 255), 1.0), rng.uniform(0.45, 0.75) if big else rng.uniform(0.3, 0.55),
+                 dir=1, laps=2 if big else 1, sway=rng.uniform(0.01, 0.03), sway_n=rng.choice((1, 2)), tw_n=2, tw=0.1)
+    elif kind == "rain":
+        for _ in range(110):
+            streak = _glow_sprite((max(2.0, unit * 0.004), unit * rng.uniform(0.05, 0.09)), (205, 220, 240), 1.0)
+            streak = streak.rotate(10, resample=Image.BICUBIC, expand=True)
+            mote(streak, rng.uniform(0.22, 0.4), dir=1, laps=rng.choice((5, 6, 7, 8)))
+    else:
+        for _ in range(26):
+            size = unit * rng.uniform(0.018, 0.045)
+            mote(_glow_sprite((size * 2.0, size * 2.0), (255, 238, 210), 1.0), rng.uniform(0.16, 0.32),
+                 orbit=(rng.uniform(0.01, 0.04), rng.uniform(0.01, 0.04), rng.choice((1, 2)), rng.choice((1, 2)), rng.random()),
+                 tw_n=rng.choice((1, 2)), tw=0.5)
+
+    folder = os.path.join(work_dir, f"fx_atmos_{kind}_{os.getpid()}_{threading.get_ident()}")
+    os.makedirs(folder, exist_ok=True)
+
+    def draw(i):
+        u = i / count
+        img = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+        for m in motes:
+            # Whole laps / whole periods per loop, so it repeats seamlessly.
+            if m["orbit"]:
+                ax, ay, nx, ny, p2 = m["orbit"]
+                x = m["x"] + ax * math.sin(2 * math.pi * (nx * u + m["phase"]))
+                y = m["y"] + ay * math.sin(2 * math.pi * (ny * u + p2))
+            else:
+                y = (m["y"] + m["dir"] * m["laps"] * u) % 1.0
+                x = (m["x"] + m["sway"] * math.sin(2 * math.pi * (m["sway_n"] * u + m["phase"]))) % 1.0
+            tw = 1.0 - m["tw"] * (0.5 + 0.5 * math.sin(2 * math.pi * (m["tw_n"] * u + m["phase"])))
+            spr = m["variants"][max(0, min(levels - 1, round(tw * levels) - 1))]
+            # Drawn again across the edge it is leaving, so it never pops.
+            for dy in (-1, 0, 1):
+                py = (y + dy) * sh
+                if -spr.height < py < sh + spr.height:
+                    _paint(img, spr, x * sw, py)
+        img.save(os.path.join(folder, f"a_{i:03d}.png"), compress_level=1)
+
+    with ThreadPoolExecutor(max_workers=max(2, min(16, cpus()))) as pool:
+        list(pool.map(draw, range(count)))
+    return _encode_loop(folder, "a_%03d.png", w, h, out), count
+
+
+def _prepare_duo_images(src, idx, w, h, slot, work_dir, glow=False, inset=0, drift=0, grade=None):
     """Stills for a duo clip: the panel at its drawn size for `slot` (between letterbox bars
-    `inset` pixels high), and the blurred fill (`drift` pixels wider each side, for parallax)."""
+    `inset` pixels high), and the blurred fill (`drift` pixels wider each side, for parallax),
+    both through the mood `grade` (mood_grade's) when given."""
     from PIL import Image
     img = Image.open(src)
     img.load()
     img = img.convert("RGB")
     geo = duo_slot(img.size, w, h, slot, inset)
     fg_path = os.path.join(work_dir, f"dfg_{idx:04d}.jpg")
-    fg = img.resize(geo["size"], Image.LANCZOS)
+    fg = apply_grade(img.resize(geo["size"], Image.LANCZOS), grade)
     (_bloom(fg) if glow else fg).save(fg_path, "JPEG", quality=95)
     bg_path = os.path.join(work_dir, f"dbg_{idx:04d}{'_d' if drift else ''}.jpg")
-    _blurred_fill(img, w + 2 * drift, h).save(bg_path, "JPEG", quality=92)
+    _blurred_fill(img, w + 2 * drift, h, grade).save(bg_path, "JPEG", quality=92)
     # The stills are the same for either half (only where they go differs): see duo_slot.
     return {"fg": fg_path, "bg": bg_path, "geo": geo, "drift": drift, "src_size": img.size}
 
@@ -923,12 +1422,13 @@ def panel_margins(w, h, fill, inset=0):
     return mx, my
 
 
-def _prepare_clip_images(src, idx, w, h, fill, work_dir, glow=False, inset=0, drift=0):
+def _prepare_clip_images(src, idx, w, h, fill, work_dir, glow=False, inset=0, drift=0, grade=None):
     """Write this clip's stills: the upscaled panel and the frame-sized background it sits on.
     For the blurred fill the background is the panel zoomed in past "cover", blurred, darkened
     and desaturated, with the panel's soft drop shadow baked in; otherwise black. The
     background is composed once here; with `drift` (pixels) it is that much larger on every
-    side, for a parallax drift. Returns where everything goes."""
+    side, for a parallax drift. Both go through the mood `grade` when given (baked in, so it
+    costs nothing per frame). Returns where everything goes."""
     from PIL import Image, ImageDraw, ImageFilter
 
     img = Image.open(src)
@@ -946,12 +1446,12 @@ def _prepare_clip_images(src, idx, w, h, fill, work_dir, glow=False, inset=0, dr
     fy = (h - fh) // 4 * 2
 
     fg_path = os.path.join(work_dir, f"fg_{idx:04d}.jpg")
-    fg = img.resize((fw, fh), Image.LANCZOS)
+    fg = apply_grade(img.resize((fw, fh), Image.LANCZOS), grade)
     (_bloom(fg) if glow else fg).save(fg_path, "JPEG", quality=95)
 
     bg_path = os.path.join(work_dir, f"bg_{idx:04d}{'_d' if drift else ''}.jpg")
     if blur:
-        bg = _blurred_fill(img, w + 2 * drift, h + 2 * drift)
+        bg = _blurred_fill(img, w + 2 * drift, h + 2 * drift, grade)
         # Soft drop shadow where the panel sits.
         pad = max(8, round(min(w, h) * 0.04))
         mask = Image.new("L", (fw + 2 * pad, fh + 2 * pad), 0)
@@ -1131,6 +1631,21 @@ def _finish_clip(clip, frames, w, h, inputs, graph, cur):
             cur = _window(graph, cur, 0, max(1, round(fx[f"{whip}_in"] * FPS)), frames, _whip_blur(whip, w, h), "wi")
     if clip.get("impact") and clip.get("chroma") and ck > 0:
         cur = _window(graph, cur, 0, round(IMPACT_SEC * FPS), frames, _chroma(w, strength=ck), "ca")
+    atmos = clip.get("atmos")
+    if atmos:
+        # The mood's particles (make_atmosphere_loop), from where the loop is at this clip's first
+        # frame on the whole video's clock, so two clips with the same ones match under a join.
+        path, count, at = atmos
+        # Seeking (exact: every frame is a keyframe) rather than decoding up to it; the loop then
+        # wraps round to its start.
+        seek = ["-ss", f"{(at % count - 0.5) / FPS:.6f}"] if at % count else []
+        inputs.extend(["-stream_loop", "-1", *seek, "-i", path])
+        idx = inputs.count("-i") - 1
+        # Tagged like the clip's own picture (BT.601, limited range: the stills' conversion), so
+        # the overlay takes it as it is instead of converting every frame.
+        graph.append(f"[{idx}:v]setparams=colorspace=bt470bg:range=tv,settb=1/{FPS},setpts=N[atm]")
+        graph.append(f"[{cur}][atm]overlay=0:0:format=yuv420[atmo]")
+        cur = "atmo"
     flares = []
     if "burn_out" in fx and assets.get("burn"):
         t0, dur = fx["burn_out"]
@@ -1155,6 +1670,270 @@ def _finish_clip(clip, frames, w, h, inputs, graph, cur):
     graph.append(f"[{cur}]null[v]")
 
 
+# ── Framing: nothing narrated is ever cut ──
+#
+# Every clip has a must-see region (fractions of the picture it shows) that stays whole on
+# screen for the whole beat: a panel crop's own panel (less PANEL_TRIM each side: the crop's
+# hair of padding and the panel's border) grown to every character's face in it (FACE_PAD of
+# the face each side, for the head round it); for a beat framed on the AI's focus box, that box
+# snapped out to the panel it sits in and that panel's faces (padded REGION_PAD). Moves are
+# planned inside it (clip_camera) and checked afterwards (framing_worst); a clip that still
+# loses any of it is re-planned (frame_clip).
+PANEL_TRIM = 0.03
+FACE_PAD = 0.25
+REGION_PAD = 0.04
+# A focus box keeps to itself (grown to the faces it touches) only inside a big panel (at least
+# SPLASH_AREA of the page) this many times its area; otherwise it snaps out to the whole panel.
+FOCUS_SNAP = 6.0
+SPLASH_AREA = 0.5
+# How much of the region must stay visible (1 = all of it, less float noise).
+FULL_VIEW = 0.999
+# A studio panel crop: p<page>_<panel>.jpg (mv-recap read.rs crop_panel).
+PANEL_FILE = re.compile(r"(?:^|[\\/])p(\d+)_(\d+)\.\w+$", re.I)
+
+
+def _box(v):
+    """(x0, y0, x1, y1) of a read.json box (fractions), or None when it is not one."""
+    try:
+        b = tuple(float(x) for x in v)
+    except (TypeError, ValueError):
+        return None
+    return b if len(b) == 4 and b[2] > b[0] and b[3] > b[1] else None
+
+
+def _union(a, b):
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _clamp_box(b):
+    return tuple(min(1.0, max(0.0, v)) for v in b)
+
+
+def _grow(b, k):
+    """`b` grown by `k` of its size on every side."""
+    w, h = b[2] - b[0], b[3] - b[1]
+    return (b[0] - w * k, b[1] - h * k, b[2] + w * k, b[3] + h * k)
+
+
+def _area(b):
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _meet(a, b):
+    return (max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3]))
+
+
+def load_panels(output_dir):
+    """{page index: [panel {bbox, characters: [{face}]}, ...]} from <output_dir>/studio/read.json
+    (boxes are x0, y0, x1, y1 fractions of the page), or {}."""
+    try:
+        with open(os.path.join(output_dir, "studio", "read.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for i, p in enumerate(data.get("pages") or [] if isinstance(data, dict) else []):
+        if isinstance(p, dict) and isinstance(p.get("panels"), list) and isinstance(p.get("index", i), int):
+            out[p.get("index", i)] = [x if isinstance(x, dict) else {} for x in p["panels"]]
+    return out
+
+
+def beat_panel(seg, panels):
+    """The read.json panel a beat shows (its studio crop p<page>_<n>.jpg), or None."""
+    m = PANEL_FILE.search(str(seg.get("panel") or seg.get("panel_image") or ""))
+    if not m:
+        return None
+    page, n = int(m.group(1)), int(m.group(2))
+    lst = panels.get(page) or []
+    return lst[n] if n < len(lst) else None
+
+
+def panel_faces(panel):
+    """The face boxes (page fractions) of a read.json panel's characters."""
+    faces = []
+    for c in (panel or {}).get("characters") or []:
+        b = _box(c.get("face")) if isinstance(c, dict) else None
+        if b:
+            faces.append(b)
+    return faces
+
+
+def crop_region(panel):
+    """The must-see region of a beat that shows a studio panel crop, in fractions of the crop:
+    the panel less PANEL_TRIM each side, grown to its faces (mapped through the crop's 1%
+    padding, read.rs crop_panel) with FACE_PAD round each."""
+    region = (PANEL_TRIM, PANEL_TRIM, 1 - PANEL_TRIM, 1 - PANEL_TRIM)
+    b = _box((panel or {}).get("bbox"))
+    if b:
+        px, py = (b[2] - b[0]) * 0.01, (b[3] - b[1]) * 0.01
+        c = _clamp_box((b[0] - px, b[1] - py, b[2] + px, b[3] + py))
+        cw, ch = c[2] - c[0], c[3] - c[1]
+        for f in panel_faces(panel):
+            f = _grow(f, FACE_PAD)
+            region = _union(region, ((f[0] - c[0]) / cw, (f[1] - c[1]) / ch, (f[2] - c[0]) / cw, (f[3] - c[1]) / ch))
+    return _clamp_box(region)
+
+
+def focus_region(focus_point, page_panels):
+    """The page area (fractions) a beat framed on the AI's focus box (ymin, xmin, ymax, xmax of
+    0..1000) must show whole: the box snapped out to the panel it overlaps most and that panel's
+    faces, padded REGION_PAD; only inside a splash panel (SPLASH_AREA of the page, over FOCUS_SNAP
+    times its area) it keeps to the box, grown to every face it touches. Without panels the box
+    gets a wide margin instead."""
+    ymin, xmin, ymax, xmax = (float(v) / 1000 for v in focus_point)
+    f = _clamp_box((xmin, ymin, xmax, ymax))
+    best, overlap = None, 0.0
+    for p in page_panels or []:
+        b = _box(p.get("bbox"))
+        if b and _area(_meet(b, f)) > overlap:
+            best, overlap = p, _area(_meet(b, f))
+    if best is None:
+        return _clamp_box(_grow(f, 0.25))
+    b = _box(best["bbox"])
+    region = f
+    if _area(b) < SPLASH_AREA or _area(b) <= FOCUS_SNAP * max(1e-6, _area(f)):
+        region = _union(f, b)
+        for face in panel_faces(best):
+            region = _union(region, _grow(face, FACE_PAD))
+    else:
+        for face in panel_faces(best):
+            g = _grow(face, FACE_PAD)
+            if _area(_meet(g, f)) > 0:
+                region = _union(region, g)
+    return _clamp_box(_grow(region, REGION_PAD))
+
+
+def crop_to_region(page_image, region, aspect, out_path):
+    """Crop `page_image` to `region` (page fractions), only ever widened towards `aspect` (w/h),
+    never cut into. Returns (the crop's path, the region in fractions of the crop)."""
+    from PIL import Image
+    img = Image.open(page_image)
+    iw, ih = img.size
+    x0, y0, x1, y1 = region[0] * iw, region[1] * ih, region[2] * iw, region[3] * ih
+    bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
+    if bw / bh < aspect:
+        grow = max(0.0, min(iw, bh * aspect) - bw)
+        x0, x1 = x0 - grow / 2, x1 + grow / 2
+    else:
+        grow = max(0.0, min(ih, bw / aspect) - bh)
+        y0, y1 = y0 - grow / 2, y1 + grow / 2
+    # Slid back inside the page where widening ran over an edge.
+    if x0 < 0:
+        x0, x1 = 0, min(iw, x1 - x0)
+    if x1 > iw:
+        x0, x1 = max(0, x0 - (x1 - iw)), iw
+    if y0 < 0:
+        y0, y1 = 0, min(ih, y1 - y0)
+    if y1 > ih:
+        y0, y1 = max(0, y0 - (y1 - ih)), ih
+    box = (int(x0), int(y0), max(int(x0) + 1, math.ceil(x1)), max(int(y0) + 1, math.ceil(y1)))
+    img.convert("RGB").crop(box).save(out_path, "JPEG", quality=95)
+    cw, ch = box[2] - box[0], box[3] - box[1]
+    inner = ((region[0] * iw - box[0]) / cw, (region[1] * ih - box[1]) / ch,
+             (region[2] * iw - box[0]) / cw, (region[3] * ih - box[1]) / ch)
+    return out_path, _clamp_box(inner)
+
+
+def region_zoom_max(region):
+    """The most the camera may zoom into a picture and still show `region` whole."""
+    return 1.0 / max(1e-6, region[2] - region[0], region[3] - region[1])
+
+
+def region_window(r0, r1, z):
+    """(lo, hi): where the window (a fraction of the slack, as FG_WINDOW) may sit along one axis
+    at zoom `z` with [r0, r1] of that axis in view; the middle of it when it cannot be."""
+    a = 1 - 1 / z
+    if a <= 1e-9:
+        return 0.0, 1.0
+    lo, hi = max(0.0, 1 - (1 - r1) / a), min(1.0, r0 / a)
+    if lo > hi:
+        mid = min(1.0, max(0.0, ((r0 + r1) / 2 - 1 / (2 * z)) / a))
+        return mid, mid
+    return lo, hi
+
+
+def _centre(r0, r1, z):
+    lo, hi = region_window(r0, r1, z)
+    a = 1 - 1 / z
+    p = 0.5 if a <= 1e-9 else ((r0 + r1) / 2 - 1 / (2 * z)) / a
+    return min(hi, max(lo, p))
+
+
+def framed_window(motion, region, z):
+    """FG_WINDOW for an auto move at (its largest) zoom `z` kept on `region`: a push, pull,
+    punch or still centred on it (as near as its window allows), a pan travelling only the part
+    of the slack that keeps it in view. A window that holds the region at the largest zoom holds
+    it at every smaller one, so this holds for the whole move."""
+    cx, cy = _centre(region[0], region[2], z), _centre(region[1], region[3], z)
+    axis = {"pan_right": 0, "pan_left": 0, "pan_down": 1, "pan_up": 1}.get(motion)
+    if axis is None:
+        return (f"{cx:.4f}", f"{cy:.4f}")
+    lo, hi = region_window(region[axis], region[axis + 2], z)
+    if motion in ("pan_left", "pan_up"):
+        lo, hi = hi, lo
+    path = f"({lo:.4f}+{hi - lo:.4f}*{{e}})"
+    return (path, f"{cy:.4f}") if axis == 0 else (f"{cx:.4f}", path)
+
+
+def camera_at(clip, frames, on):
+    """(zoom, x, y) of clip_camera at frame `on`, worked out from the very expressions the
+    render uses."""
+    zoom, window, ease = clip_camera(clip, frames)
+    env = {"__builtins__": {}, "min": min, "max": max, "pow": pow, "cos": math.cos, "sin": math.sin,
+           "exp": math.exp, "PI": math.pi, "on": on}
+    e = f"({eval(ease, env)!r})"
+    return tuple(eval(x.format(e=e), env) for x in (zoom, *window))
+
+
+def visible_share(region, z, px, py):
+    """The share of `region` the window at zoom `z` and position (px, py) shows."""
+    v = 1 / max(1.0, z)
+    x0, y0 = px * (1 - v), py * (1 - v)
+    return _area(_meet(region, (x0, y0, x0 + v, y0 + v))) / max(1e-12, _area(region))
+
+
+def framing_worst(clip, frames):
+    """The least of the clip's must-see region on screen at any moment of it (geometry only):
+    a duo panel shows its visible rows of its height, a single panel what the camera's window
+    shows, checked every few frames and at both ends."""
+    duo = clip.get("duo")
+    if duo:
+        g = duo["geo"]
+        return 1.0 if g["slack"] <= 0 else g["vis"] / g["size"][1]
+    region = clip.get("region") or (0.0, 0.0, 1.0, 1.0)
+    step = max(1, frames // 90)
+    worst = 1.0
+    for on in sorted(set(range(0, frames, step)) | {frames - 1}):
+        z, px, py = camera_at(clip, frames, on)
+        worst = min(worst, visible_share(region, z, px, py))
+    return worst
+
+
+def frame_clip(clip, frames):
+    """The framing QA of one clip: its worst coverage (framing_worst) and, when it loses any of
+    its region, the safest re-plan: a push centred on the region, else a still panel without the
+    punch zoom. The editor's own moves are left as picked (and reported). Returns the record
+    written to video_framing.json."""
+    worst = round(framing_worst(clip, frames), 4)
+    rec = {"layout": "duo" if clip.get("duo") else "single", "region": [round(v, 4) for v in clip.get("region") or ()],
+           "motion": clip.get("motion"), "worst": worst, "fix": None}
+    if worst >= FULL_VIEW or clip.get("duo"):
+        return rec
+    if clip.get("move"):
+        rec["fix"] = "editor move kept"
+        return rec
+    clip["motion"] = "push"
+    rec["fix"] = "push centred on the region"
+    worst = framing_worst(clip, frames)
+    if worst < FULL_VIEW:
+        clip["motion"] = "still"
+        clip["impact"] = False
+        rec["fix"] = "still, no punch zoom"
+        worst = framing_worst(clip, frames)
+    rec["worst_after"] = round(worst, 4)
+    return rec
+
+
 def clip_camera(clip, frames):
     """The single-panel camera of a clip `frames` frames long: (zoom, window, ease). The zoom is
     an ffmpeg expression of the eased progress {e} and the frame counter `on`; the window is the
@@ -1163,7 +1942,10 @@ def clip_camera(clip, frames):
     tests/fixtures/frame_transforms.json pins both.
 
     `clip`: motion (an auto move of FG_WINDOW, "still" or "edit"), move (edit_move's), impact,
-    ramp, push (the look's), motion_k and punch."""
+    ramp, push (the look's), motion_k, punch and region: the must-see box (x0, y0, x1, y1
+    fractions of the panel, see the Framing section). With a region the look's own moves never
+    cut it: the zoom is capped to what still shows it whole (region_zoom_max), pushes, pulls and
+    the punch are centred on it and pans travel only as far as it stays in view (framed_window)."""
     motion = clip["motion"]
     move = clip.get("move")
     ramp = clip.get("ramp", False)
@@ -1173,16 +1955,28 @@ def clip_camera(clip, frames):
     if ramp and frames < 2 * FPS:
         k = max(k, 0.7)
     push = round(clip.get("push", FG_PUSH) * k, 4)
-    fg_zoom = _motion_zoom(motion, push, round(1 + (FG_PAN_ZOOM - 1) * k * clip.get("motion_k", 1.0), 4))
+    pan_zoom = round(1 + (FG_PAN_ZOOM - 1) * k * clip.get("motion_k", 1.0), 4)
+    region = clip.get("region") if not move else None
+    zmax = region_zoom_max(region) if region else None
+    if zmax:
+        push = round(max(0.0, min(push, zmax - 1)), 4)
+        pan_zoom = round(max(1.0, min(pan_zoom, zmax)), 4)
+    fg_zoom = _motion_zoom(motion, push, pan_zoom)
     window = FG_WINDOW.get(motion, FG_WINDOW["still"])
+    if zmax:
+        window = framed_window(motion, region, pan_zoom if motion.startswith("pan_") else 1 + push)
     if move:
         # The editor's own move (its amount as given: the editor chose it).
         fg_zoom, window = edit_move(move, push)
     # The punch zoom of an action beat (the editor's shake amount, else 12%).
     if clip.get("impact") and motion != "still":
         n = max(2, round(IMPACT_SEC * FPS * 0.6))
-        fg_zoom = f"1+{clip.get('punch', 0.12)}*pow(1-min(1,on/{n}),3)+{push}*{{e}}"
+        punch = clip.get("punch", 0.12)
         window = FG_WINDOW["push"]
+        if zmax:
+            punch = round(max(0.0, min(punch, zmax - 1)), 4)
+            window = framed_window("push", region, 1 + max(punch, push))
+        fg_zoom = f"1+{punch}*pow(1-min(1,on/{n}),3)+{push}*{{e}}"
     return fg_zoom, window, ramp_ease("on", frames, ramp)
 
 
@@ -1693,6 +2487,17 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         use_beats = True
     if not render_items:
         raise RuntimeError("No segments in sync map — nothing to render")
+    # The story's mood per beat (from the chapter's AI reading next to the sync map, or
+    # config["scenes"] {page: scene}): grade, atmosphere, transitions and punches follow it.
+    scenes = config.get("scenes") if isinstance(config.get("scenes"), dict) else None
+    if scenes is not None:
+        scenes = {int(k): v for k, v in scenes.items() if str(k).lstrip("-").isdigit() and isinstance(v, dict)}
+    elif look.get("mood"):
+        scenes = load_scenes(output_dir)
+    moods = plan_moods(render_items, scenes) if look.get("mood") else [None] * len(render_items)
+    mood_on = any(moods)
+    # The panels of the reading (boxes and faces): what each clip must keep in frame.
+    panels = load_panels(output_dir)
 
     audio_dir = os.path.join(output_dir, "audio")
     final_video = os.path.join(output_dir, "video_final.mp4")
@@ -1726,6 +2531,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     # The duo clip before this one (its panel stays in the other half), and the last punch.
     duo_prev = None
     last_impact = -IMPACT_GAP
+    last_impact_t = -1e9
 
     def prepare(idx, seg):
         """The clip's source, focus crop and stills (independent of every other clip, so they
@@ -1754,23 +2560,24 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             return None
         source_image = page_image
 
-        # Crop to focus point if present (aspect matched to the panel box, or to a half of
-        # the frame when a tall focus goes side by side)
+        # What must stay whole on screen (see Framing): a studio panel crop is its panel, grown
+        # to its faces; a page framed on the AI's focus box is cropped to that box snapped out to
+        # its panel (aspect matched to the panel box, or to a half of the frame when a tall
+        # focus goes side by side; only ever widened, never cut into).
+        crop = PANEL_FILE.search(str(page_image)) is not None
+        region = crop_region(beat_panel(seg, panels)) if crop else (PANEL_TRIM, PANEL_TRIM, 1 - PANEL_TRIM, 1 - PANEL_TRIM)
         focus_point = seg.get("focus_point")
-        if focus_point and len(focus_point) == 4:
+        if focus_point and len(focus_point) == 4 and not crop:
             try:
+                want = focus_region(focus_point, panels.get(page_num))
                 aspect = box_aspect
                 if duo_on:
                     from PIL import Image
                     with Image.open(page_image) as im:
                         fw_, fh_ = im.size
-                    ymin, xmin, ymax, xmax = focus_point
-                    if (xmax - xmin) * fw_ < DUO_MAX_ASPECT * (ymax - ymin) * fh_:
+                    if (want[2] - want[0]) * fw_ < DUO_MAX_ASPECT * (want[3] - want[1]) * fh_:
                         aspect = 0.75
-                page_image = _crop_to_focus(
-                    page_image, focus_point, aspect,
-                    os.path.join(video_dir, f"crop_{idx:04d}.jpg"),
-                )
+                page_image, region = crop_to_region(page_image, want, aspect, os.path.join(video_dir, f"crop_{idx:04d}.jpg"))
             except Exception as e:
                 print(f"[video] Failed to crop page to focus point: {e}", file=sys.stderr)
         else:
@@ -1785,15 +2592,16 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 from PIL import Image
                 with Image.open(page_image) as im:
                     tall = im.width < DUO_MAX_ASPECT * im.height
+            grade = moods[idx]["grade"] if moods[idx] else None
             if tall:
                 # Placed in its half below (the stills are the same for either half).
-                duo, images = _prepare_duo_images(page_image, idx, w, h, 0, video_dir, look["glow"], inset, drift), None
+                duo, images = _prepare_duo_images(page_image, idx, w, h, 0, video_dir, look["glow"], inset, drift, grade), None
             else:
-                duo, images = None, _prepare_clip_images(page_image, idx, w, h, fill, video_dir, look["glow"], inset, drift)
+                duo, images = None, _prepare_clip_images(page_image, idx, w, h, fill, video_dir, look["glow"], inset, drift, grade)
         except Exception as e:
             print(f"[video] Skipping unreadable image for page {page_num}: {e}", file=sys.stderr)
             return None
-        return {"audio_path": audio_path, "source": source_image, "focus": focus_point, "duo": duo, "images": images}
+        return {"audio_path": audio_path, "source": source_image, "focus": focus_point, "duo": duo, "images": images, "region": region}
 
     prepared = [None] * total
     with ThreadPoolExecutor(max_workers=max(2, min(16, cpus()))) as pool:
@@ -1862,12 +2670,20 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 prev_motion = motion
             if override == "shake" and motion == "still":
                 motion = "push"
+        mood = moods[idx]
         if override:
+            # The editor's move wins: its shake punches, any other move does not.
             impact = override == "shake"
+        elif mood_on:
+            # The story decides: an intense page with a loud line or a hit (the words alone
+            # without a reading), spaced in time as well as in clips (punch_ok).
+            want = mood["punch"] if mood else is_impact(seg.get("text", ""))
+            impact = look["impact"] and want and punch_ok(timeline, len(clips), last_impact_t, last_impact)
         else:
             impact = look["impact"] and len(clips) - last_impact >= IMPACT_GAP and is_impact(seg.get("text", ""))
         if impact:
             last_impact = len(clips)
+            last_impact_t = timeline
 
         clips.append({
             "idx": idx, "page": page_num, "images": images, "motion": motion, "move": move,
@@ -1877,6 +2693,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             "source": source_image, "focus": focus_point,
             "audio_path": audio_path, "offset": audio_offset, "speed": speed, "src_duration": src_duration,
             "start": timeline, "duration": duration, "cut": bool(seg.get("cut")), "trans": seg.get("transition"),
+            "mood": mood, "grade": mood["grade"] if mood else None, "region": p["region"],
         })
         caption_segments.append({
             "text": seg.get("text", ""),
@@ -1909,12 +2726,13 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     forced = [None] + [tuple(c["trans"]) if c.get("trans") and not c["cut"] else None for c in clips[1:]]
     starts, trans = plan_transitions(
         durations, [c["page"] for c in clips], trans_kind, trans_dur, look["transitions"], joins, forced,
+        [c["mood"] for c in clips] if mood_on else None,
     )
     frame_counts = [clip_frames(starts, trans, k, durations[-1]) for k in range(len(clips))]
     # Page-turn effects the clips draw themselves, and the light frames they share (made once).
     clip_fx = plan_clip_fx(
         starts, trans, [c["page"] for c in clips], joins, look.get("leaks", False), [c["impact"] for c in clips],
-        forced=forced,
+        forced=forced, quiet=[bool(c["mood"]) and c["mood"]["mood"] in ("horror", "sad") for c in clips],
     )
     assets = {}
     for kind, key in (("leak", "leak"), ("burn", "burn_in")):
@@ -1923,17 +2741,39 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 assets[kind] = make_flare_frames(kind, w, h, video_dir)
             except Exception as e:
                 print(f"[video] Could not make the {kind} frames: {e}", file=sys.stderr)
+    # The mood's atmosphere per clip (with the particles switch on, dust where the mood has none).
+    atmos = {}
+    for c in clips:
+        kind = c["mood"]["particles"] if c["mood"] else None
+        if mood_on and look.get("particles") and not kind:
+            kind = "dust"
+        c["atmos_kind"] = kind if mood_on else None
+        if c["atmos_kind"] and c["atmos_kind"] not in atmos:
+            try:
+                atmos[c["atmos_kind"]] = make_atmosphere_loop(c["atmos_kind"], w, h, video_dir)
+            except Exception as e:
+                print(f"[video] Could not make the {c['atmos_kind']} loop: {e}", file=sys.stderr)
+                atmos[c["atmos_kind"]] = None
+    for k, c in enumerate(clips):
+        loop = atmos.get(c["atmos_kind"]) if c["atmos_kind"] else None
+        c["atmos"] = (loop[0], loop[1], round(starts[k] * FPS)) if loop else None
     all_frames = max(1, sum(frame_counts))
     rendered = 0
     clip_paths = []
     todo = []
+    framing = []
     for k, c in enumerate(clips):
         frames = frame_counts[k]
         c["fx"], c["assets"] = clip_fx[k], assets
+        # Framing QA: the clip's must-see region on screen the whole time, else re-planned.
+        rec = frame_clip(c, frames)
+        framing.append({"clip": k, "idx": c["idx"], "page": c["page"], **rec})
         drawn = lambda n: n.split("_")[0] in assets or "zoom" in n or n.split("_")[0] in CLIP_DRAWN and not n.startswith("burn")
         spec = [c["motion"], c["impact"], c["push"], look["glow"], c["ramp"], c["chroma"] and c["impact"],
                 inset, drift, sorted((n, v) for n, v in clip_fx[k].items() if drawn(n)),
-                c["move"], c["punch"], c["chroma_k"], c["motion_k"]]
+                c["move"], c["punch"], c["chroma_k"], c["motion_k"], c["grade"],
+                (c["atmos_kind"], c["atmos"][2] % c["atmos"][1]) if c["atmos"] else None,
+                None if c["duo"] else c["region"]]
         if c["duo"]:
             # The pan ends where the next clip cuts in, so the panel left behind does not jump.
             nxt = round(starts[k + 1] * FPS) if k + 1 < len(starts) else round(starts[k] * FPS) + frames
@@ -1950,6 +2790,14 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         else:
             todo.append((c, frames, path))
     report("clips", rendered / all_frames)
+    fixed = [f for f in framing if f["fix"]]
+    print(f"[video] Framing: {len(framing)} clips, worst {min(f.get('worst_after', f['worst']) for f in framing):.3f} of the "
+          f"must-see region on screen, {len(fixed)} re-planned", file=sys.stderr)
+    try:
+        with open(os.path.join(output_dir, "video_framing.json"), "w", encoding="utf-8") as f:
+            json.dump({"clips": framing}, f, indent=1)
+    except OSError as e:
+        print(f"[video] Could not save the framing report: {e}", file=sys.stderr)
 
     def render_one(c, frames, path):
         try:
@@ -1957,7 +2805,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         except Exception as e:
             print(f"[video] {e} (page {c['page']}); retrying as a still", file=sys.stderr)
             if c["duo"]:
-                c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift)
+                c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift, c["grade"])
                 c["duo"] = None
             c["motion"] = "still"
             c["move"] = None
@@ -1995,6 +2843,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         music_volume = 1.0
     # MangaVox's own score (mv-score): already timed to the narration, ducked and limited.
     score = config.get("score")
+    # Sound effects on the story's big moments (sfx.py): a sparse stem under the narration.
+    sfx_track = _build_sfx_stem(config, output_dir, render_items, clips, starts, trans, timeline, narration, narration_volume, video_dir)
 
     ass_path = None
     try:
@@ -2009,16 +2859,20 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         "inputs": video_inputs, "starts": video_starts, "trans": video_trans, "look": look,
         "overlays": edit.get("overlays") or [], "work_dir": video_dir,
     }
-    if look.get("particles"):
+    if look.get("particles") and not mood_on:
+        # (With the mood on, each clip carries its own atmosphere instead.)
         try:
             video["particles"] = make_particle_loop(w, h, video_dir)
         except Exception as e:
             print(f"[video] Could not make the particles: {e}", file=sys.stderr)
+    if look.get("edge_glow"):
+        # The glow takes each clip's mood colour as it lands.
+        video["edge_colors"] = [(c["start"], c["mood"]["edge"] if c["mood"] else EDGE_COLORS["neutral"]) for c in clips]
     on_final = lambda f: report("finalize", f)
     success = _finalize_video_with_audio_mix_and_captions(
         video, narration, final_video, ass_path, bg_music,
         narration_volume, bg_music_volume, bg_music_loop, w, h, timeline,
-        score=score, music_volume=music_volume, on_fraction=on_final,
+        score=score, music_volume=music_volume, on_fraction=on_final, sfx=sfx_track,
     )
     if not success:
         print("[video] Finalization failed, retrying without captions, music and finish", file=sys.stderr)
@@ -2054,24 +2908,71 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     return final_video
 
 
-def _audio_mix_graph(first, has_music, narration_vol, music_vol, solo=False):
-    """Narration (input `first`) plus optional music (input `first + 1`) mixed at unity into
-    [mix]; the music is ducked under the narration by a gentle sidechain compressor. With
-    `solo` (and music) the narration alone is also left in [solo]."""
+# Music duck when the gain curve (sfx.make_duck_gain) cannot be made: a sidechain compressor
+# keyed by the narration. The old gentle one (threshold 0.03, ratio 4) only took the music down
+# ~7 dB under a -20 dBFS voice; this one takes it down ~19 dB (see tests/test_audio_mix.py).
+SIDECHAIN_DUCK = "threshold=0.01:ratio=20:attack=10:release=300:makeup=1"
+
+
+def _audio_mix_graph(first, has_music, narration_vol, music_vol, solo=False, duck=None, sfx=None):
+    """Narration (input `first`) plus optional music (input `first + 1`) and SFX stem (input
+    `sfx`) mixed at unity into [mix]. The music is ducked under the narration by the gain curve
+    on input `duck` (sfx.make_duck_gain), else by SIDECHAIN_DUCK. With `solo` (and music) the
+    narration alone is also left in [solo]."""
     fmt = f"aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo"
     nar = f"[{first}:a]{fmt},volume={narration_vol}"
-    if not has_music:
+    if not has_music and sfx is None:
         return f"{nar}[mix]"
-    if solo:
-        split = f"{nar},asplit=3[nar][key][solo];"
-    else:
-        split = f"{nar},asplit=2[nar][key];"
-    return (
-        split +
-        f"[{first + 1}:a]{fmt},volume={music_vol}[mus];"
-        "[mus][key]sidechaincompress=threshold=0.03:ratio=4:attack=20:release=400[duck];"
-        "[nar][duck]amix=inputs=2:duration=first:normalize=0[mix]"
-    )
+    outs = ["nar"] + (["key"] if has_music and duck is None else []) + (["solo"] if solo and has_music else [])
+    parts = [f"{nar}[nar]" if len(outs) == 1 else f"{nar},asplit={len(outs)}" + "".join(f"[{o}]" for o in outs)]
+    labels = ["[nar]"]
+    if has_music:
+        parts.append(f"[{first + 1}:a]{fmt},volume={music_vol}[mus]")
+        if duck is not None:
+            # The same gain on both sides (an up-mix would take it down 3 dB).
+            parts.append(f"[{duck}:a]aresample={AUDIO_RATE},aformat=sample_fmts=fltp,pan=stereo|c0=c0|c1=c0[gain]")
+            parts.append("[mus][gain]amultiply[duck]")
+        else:
+            parts.append(f"[mus][key]sidechaincompress={SIDECHAIN_DUCK}[duck]")
+        labels.append("[duck]")
+    if sfx is not None:
+        parts.append(f"[{sfx}:a]{fmt}[fx]")
+        labels.append("[fx]")
+    parts.append("".join(labels) + f"amix=inputs={len(labels)}:duration=first:normalize=0[mix]")
+    return ";".join(parts)
+
+
+def _build_sfx_stem(config, output_dir, items, clips, starts, trans, total, narration, narration_vol, work_dir):
+    """The SFX stem (sfx.build_track) for the rendered clips, or None: switched off (config
+    `sfx`: false / "off"; on by default), nothing worth a sound, or it failed (the video never
+    waits on its effects)."""
+    try:
+        import sfx as sfxlib
+        mode = sfxlib.mode_of(config.get("sfx", True))
+        if mode == "off":
+            return None
+        out = os.path.join(work_dir, "sfx.wav")
+        events = sfxlib.build_track(
+            items, clips, starts, trans, total, narration, out, mode=mode,
+            user_dir=sfxlib.user_dir_for(config, output_dir), scenes=sfxlib.load_scenes(output_dir),
+            narration_vol=narration_vol,
+        )
+        if events:
+            print("[video] Sound effects: " + ", ".join(f"{e['name']} at {e['at']:.1f}s ({e['rel_db']:+.0f} dB)" for e in events), file=sys.stderr)
+            return out
+    except Exception as e:
+        print(f"[video] Sound effects skipped: {e}", file=sys.stderr)
+    return None
+
+
+def _music_duck(narration, music_args, music_vol, narration_vol, total, work_dir):
+    """The music's gain curve under the voice (sfx.make_duck_gain), or None."""
+    try:
+        import sfx as sfxlib
+        return sfxlib.make_duck_gain(narration, music_args, music_vol, narration_vol, total, os.path.join(work_dir, "music_duck.wav"))
+    except Exception as e:
+        print(f"[video] Music duck unavailable: {e}", file=sys.stderr)
+        return None
 
 
 def _measure_loudness(audio_inputs, mix_graph):
@@ -2141,7 +3042,7 @@ def _concat_list(paths, list_path):
 
 def _finalize_video_with_audio_mix_and_captions(
     video, narration, output_video, ass_path, bg_music,
-    narration_vol, bg_vol, bg_loop, w, h, total, score=None, music_volume=1.0, on_fraction=None,
+    narration_vol, bg_vol, bg_loop, w, h, total, score=None, music_volume=1.0, on_fraction=None, sfx=None,
 ):
     """
     Joins the clip videos with their crossfades, gives them the look, burns subtitles, and
@@ -2154,6 +3055,8 @@ def _finalize_video_with_audio_mix_and_captions(
 
     Loudness is two-pass and linear: the mix is measured first, then one fixed gain brings
     it to LOUD_I and a limiter catches peaks, so music never swells in narration pauses.
+    The music is ducked under the voice by a gain curve made from both (sfx.make_duck_gain),
+    and `sfx` (an SFX stem, levelled against the narration already) is mixed in at unity.
     """
     import bisect
     import threading
@@ -2174,18 +3077,31 @@ def _finalize_video_with_audio_mix_and_captions(
         audio_inputs += ["-i", bg_music]
         music_vol = bg_vol * music_volume
     has_music = has_score or has_bg
+    has_sfx = bool(sfx) and os.path.exists(sfx)
     if on_fraction:
         on_fraction(0.0)
 
-    # ── Audio (made beside the picture): measure, then one gain, a limiter, AAC ──
+    # ── Audio (made beside the picture): duck, measure, then one gain, a limiter, AAC ──
     audio_path = os.path.join(work, "final_audio.m4a")
 
     def make_audio():
-        measured = _measure_loudness(audio_inputs, _audio_mix_graph(0, has_music, narration_vol, music_vol))
+        inputs = list(audio_inputs)
+        n = 2 if has_music else 1
+        duck = fx = None
+        if has_music:
+            gain = _music_duck(narration, audio_inputs[2:], music_vol, narration_vol, total, work)
+            if gain:
+                inputs += ["-i", gain]
+                duck, n = n, n + 1
+        if has_sfx:
+            inputs += ["-i", sfx]
+            fx = n
+        mix_graph = lambda solo=False: _audio_mix_graph(0, has_music, narration_vol, music_vol, solo=solo, duck=duck, sfx=fx)
+        measured = _measure_loudness(inputs, mix_graph())
         gain_db = 0.0 if measured is None else max(-20.0, min(20.0, LOUD_I - measured))
         limit = round(10 ** (LOUD_TP / 20), 4)
         graph = [
-            _audio_mix_graph(0, has_music, narration_vol, music_vol, solo=has_music),
+            mix_graph(solo=has_music),
             f"[mix]volume={gain_db:.2f}dB,alimiter=limit={limit}:level=0:latency=1,aresample={AUDIO_RATE}[a]",
         ]
         maps = ["-map", "[a]"]
@@ -2193,7 +3109,7 @@ def _finalize_video_with_audio_mix_and_captions(
             graph.append(f"[solo]volume={gain_db:.2f}dB,alimiter=limit={limit}:level=0:latency=1,aresample={AUDIO_RATE}[a2]")
             maps += ["-map", "[a2]"]
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *audio_inputs,
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
             "-filter_complex", ";".join(graph), *maps,
             "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-t", f"{total:.3f}", audio_path,
         ]
@@ -2286,14 +3202,15 @@ def _finalize_video_with_audio_mix_and_captions(
             plabel = vlabel = None
             if particles:
                 loop = round(PARTICLE_SEC * FPS)
-                graph.append(f"[{len(labels) + extra.count('-i')}:v]trim=start_frame={a % loop},settb=AVTB,setpts=(N+{a})/({FPS}*TB)[ptc]")
+                graph.append(f"[{len(labels) + extra.count('-i')}:v]trim=start_frame={a % loop},setparams=colorspace=bt470bg:range=tv,settb=AVTB,setpts=(N+{a})/({FPS}*TB)[ptc]")
                 extra += ["-stream_loop", "-1", "-i", particles]
                 plabel = "ptc"
             if vmask:
                 # One still: overlay repeats it on every frame.
                 vlabel = f"{len(labels) + extra.count('-i')}:v"
                 extra += ["-i", vmask]
-            graph.append(look_filters(video["look"], w, h, "vraw", "vx", plabel, vlabel))
+            edge = edge_segments(video.get("edge_colors") or [], t0, b / FPS) if video["look"].get("edge_glow") else None
+            graph.append(look_filters(video["look"], w, h, "vraw", "vx", plabel, vlabel, edge))
         else:
             graph.append("[vraw]null[vx]")
         overlay_inputs, overlays = overlay_graph(
@@ -2308,7 +3225,7 @@ def _finalize_video_with_audio_mix_and_captions(
         return [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-filter_complex_threads", str(threads),
             *inputs, *extra, *overlay_inputs,
-            "-filter_complex", ";".join(graph),
+            *graph_args(";".join(graph), os.path.join(work, f"graph_{a:07d}.txt")),
             "-map", "[v]", "-frames:v", str(b - a), "-r", str(FPS),
             *codec, "-an", path,
         ]

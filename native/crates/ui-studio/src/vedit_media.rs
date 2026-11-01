@@ -374,6 +374,187 @@ pub fn paint_waveform(bounds: Bounds<Pixels>, slice: &[(f32, f32)], window: &mut
     window.paint_quad(fill(Bounds::new(point(bounds.origin.x, cy), gpui_kit::size(w, px(1.))), Hsla::from(mid)));
 }
 
+// ------------------------------------------------------------------ rendered video
+
+/// Frames a second the Video editor's monitor keeps of a rendered chapter video, and their height.
+pub const RENDER_FPS: u32 = 8;
+pub const RENDER_FRAME_H: u32 = 360;
+/// Rendered videos whose frames stay cached (the least recently used go when another is decoded).
+const RENDERED_KEEP: usize = 4;
+
+/// A rendered chapter video (`video_final.mp4`) made ready for the monitor: its length, its sound
+/// as a WAV (for the preview's player), and the folder its frames are decoded into. Frames appear
+/// while they are decoded; `done` marks the end.
+#[derive(Debug)]
+pub struct Rendered {
+    pub dir: PathBuf,
+    pub duration_ms: u64,
+    pub audio: Option<PathBuf>,
+}
+
+/// The frame number (ffmpeg's, from 1) that shows time `ms` of a video decoded at [`RENDER_FPS`].
+pub fn frame_index(ms: u64) -> usize {
+    (ms * RENDER_FPS as u64 / 1000) as usize + 1
+}
+
+fn frame_file(dir: &Path, i: usize) -> PathBuf {
+    dir.join(format!("f{i:06}.jpg"))
+}
+
+/// The time on a rendered video of `video_ms` that matches time `t` of a `total` long timeline. A
+/// render runs a little longer or shorter than the editor's timeline (its crossfades), so time is
+/// spread evenly over it.
+pub fn video_ms(t: u64, total: u64, video_ms: u64) -> u64 {
+    if total == 0 || video_ms == 0 {
+        return t.min(video_ms);
+    }
+    ((t.min(total) as f64) * video_ms as f64 / total as f64).round() as u64
+}
+
+impl Rendered {
+    /// The decoded frame for time `ms`: the last one past the end; `None` while it is still
+    /// being decoded (a frame is complete once the next one exists).
+    pub fn frame(&self, ms: u64) -> Option<PathBuf> {
+        let i = frame_index(ms.min(self.duration_ms));
+        if self.dir.join("done").is_file() {
+            return (i.saturating_sub(16).max(1)..=i).rev().map(|k| frame_file(&self.dir, k)).find(|p| p.is_file());
+        }
+        frame_file(&self.dir, i + 1).is_file().then(|| frame_file(&self.dir, i))
+    }
+}
+
+/// The ffmpeg arguments decoding `video`'s frames into `dir` ([`RENDER_FPS`], [`RENDER_FRAME_H`] tall).
+pub fn rendered_frames_args(video: &Path, dir: &Path) -> Vec<String> {
+    vec![
+        "-v".into(),
+        "error".into(),
+        "-y".into(),
+        "-i".into(),
+        video.to_string_lossy().into_owned(),
+        "-an".into(),
+        "-vf".into(),
+        format!("fps={RENDER_FPS},scale=-2:{RENDER_FRAME_H}"),
+        "-q:v".into(),
+        "6".into(),
+        dir.join("f%06d.jpg").to_string_lossy().into_owned(),
+    ]
+}
+
+/// The ffmpeg arguments saving `video`'s first sound track (what plays: narration and music) as
+/// 16-bit stereo WAV at `out`.
+pub fn rendered_audio_args(video: &Path, out: &Path) -> Vec<String> {
+    let mut a: Vec<String> = ["-v", "error", "-y", "-i"].map(String::from).to_vec();
+    a.push(video.to_string_lossy().into_owned());
+    a.extend(["-vn", "-map", "0:a:0", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", "-f", "wav"].map(String::from));
+    a.push(out.to_string_lossy().into_owned());
+    a
+}
+
+enum RSlot {
+    Pending,
+    Ready(Arc<Rendered>),
+    Failed,
+}
+
+fn rendered_slots() -> &'static Mutex<HashMap<String, RSlot>> {
+    static S: OnceLock<Mutex<HashMap<String, RSlot>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// One worker for rendered videos (each is a long decode; the timeline's worker stays free).
+fn rendered_worker() -> &'static Mutex<std::sync::mpsc::Sender<(String, PathBuf)>> {
+    static W: OnceLock<Mutex<std::sync::mpsc::Sender<(String, PathBuf)>>> = OnceLock::new();
+    W.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, PathBuf)>();
+        std::thread::Builder::new()
+            .name("vedit-rendered".into())
+            .spawn(move || {
+                for (key, video) in rx {
+                    if prepare_rendered(&key, &video).is_err() {
+                        rendered_slots().lock().unwrap().insert(key, RSlot::Failed);
+                    }
+                    LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .ok();
+        Mutex::new(tx)
+    })
+}
+
+/// Makes `video` ready (its sound and length first, so the monitor can start; then its frames).
+fn prepare_rendered(key: &str, video: &Path) -> Result<()> {
+    let root = cache_dir("rendered");
+    let prefix = format!("{:016x}-", fnv(&video.to_string_lossy()));
+    let dir = root.join(format!("{prefix}{key}"));
+    // An older render of the same chapter, and the least recently used beyond the few kept, go.
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        let mut others: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+        for e in rd.flatten() {
+            let p = e.path();
+            if p == dir {
+                continue;
+            }
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_dir_all(&p);
+            } else if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                others.push((t, p));
+            }
+        }
+        others.sort();
+        let extra = others.len().saturating_sub(RENDERED_KEEP - 1);
+        for (_, p) in others.into_iter().take(extra) {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+    std::fs::create_dir_all(&dir)?;
+    let duration_ms = (probe_duration(video)? * 1000.).round() as u64;
+    let wav = dir.join("audio.wav");
+    if !wav.is_file() {
+        let part = dir.join("audio.part");
+        let ok = quiet_command("ffmpeg").args(rendered_audio_args(video, &part)).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        if ok {
+            let _ = std::fs::rename(&part, &wav);
+        }
+    }
+    let audio = Some(wav).filter(|w| w.is_file());
+    rendered_slots().lock().unwrap().insert(key.to_string(), RSlot::Ready(Arc::new(Rendered { dir: dir.clone(), duration_ms, audio })));
+    LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !dir.join("done").is_file() {
+        let st = quiet_command("ffmpeg").args(rendered_frames_args(video, &dir)).stderr(Stdio::null()).status().context("run ffmpeg")?;
+        if st.success() {
+            std::fs::write(dir.join("done"), b"")?;
+        }
+    }
+    Ok(())
+}
+
+/// The rendered video `video` when it is ready for the monitor; otherwise starts making it ready
+/// (in the background) and returns `None`. A video made again is a new file: it is decoded again.
+pub fn rendered_ready(video: &Path) -> Option<Arc<Rendered>> {
+    let key = file_key(video).ok()?;
+    let mut slots = rendered_slots().lock().unwrap();
+    match slots.get(&key) {
+        // Its cache was cleared (another video took its place): decoded again.
+        Some(RSlot::Ready(r)) if r.dir.is_dir() => return Some(r.clone()),
+        Some(RSlot::Pending | RSlot::Failed) => return None,
+        _ => {}
+    }
+    slots.insert(key.clone(), RSlot::Pending);
+    drop(slots);
+    let _ = rendered_worker().lock().unwrap().send((key, video.to_path_buf()));
+    None
+}
+
+/// A decoded frame (JPEG) as an image GPUI draws directly (BGRA), so the monitor keeps one frame
+/// in memory instead of every frame it showed in the image cache.
+pub fn decode_frame(file: &Path) -> Option<Arc<RenderImage>> {
+    let mut rgba = ::image::open(file).ok()?.to_rgba8();
+    for p in rgba.chunks_exact_mut(4) {
+        p.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new(vec![::image::Frame::new(rgba)])))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +600,53 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["-ac", "1"]) && a.windows(2).any(|w| w == ["-f", "f32le"]));
         let f = filmstrip_args(Path::new("v.mp4"), Path::new("o.jpg"), 12, 90, 6.0);
         assert!(f.contains(&"fps=2.000000,scale=-2:90,tile=12x1".to_string()));
+    }
+
+    #[test]
+    fn the_monitor_maps_timeline_time_onto_the_rendered_video() {
+        assert_eq!(frame_index(0), 1);
+        assert_eq!(frame_index(124), 1);
+        assert_eq!(frame_index(125), 2);
+        assert_eq!(frame_index(10_000), 81);
+        // A render 2% longer than the timeline: spread evenly, the ends meet.
+        assert_eq!(video_ms(0, 50_000, 51_000), 0);
+        assert_eq!(video_ms(25_000, 50_000, 51_000), 25_500);
+        assert_eq!(video_ms(50_000, 50_000, 51_000), 51_000);
+        assert_eq!(video_ms(99_000, 50_000, 51_000), 51_000, "past the end: the end");
+        assert_eq!(video_ms(10, 0, 500), 10);
+        let a = rendered_frames_args(Path::new("v.mp4"), Path::new("d"));
+        assert!(a.contains(&format!("fps={RENDER_FPS},scale=-2:{RENDER_FRAME_H}")) && a.last().unwrap().ends_with("f%06d.jpg"));
+        let w = rendered_audio_args(Path::new("v.mp4"), Path::new("a.part"));
+        assert!(w.windows(2).any(|p| p == ["-map", "0:a:0"]) && w.windows(2).any(|p| p == ["-f", "wav"]));
+    }
+
+    #[test]
+    fn frames_show_once_they_are_complete() {
+        let d = tempfile::tempdir().unwrap();
+        let r = Rendered { dir: d.path().to_path_buf(), duration_ms: 1_000, audio: None };
+        assert_eq!(r.frame(0), None, "nothing decoded yet");
+        std::fs::write(frame_file(d.path(), 1), "1").unwrap();
+        assert_eq!(r.frame(0), None, "frame 1 may still be written");
+        std::fs::write(frame_file(d.path(), 2), "2").unwrap();
+        assert_eq!(r.frame(0), Some(frame_file(d.path(), 1)));
+        assert_eq!(r.frame(130), None);
+        // Decoded to the end: past the last frame shows the last.
+        std::fs::write(d.path().join("done"), "").unwrap();
+        assert_eq!(r.frame(130), Some(frame_file(d.path(), 2)));
+        assert_eq!(r.frame(60_000), Some(frame_file(d.path(), 2)));
+    }
+
+    #[test]
+    fn a_frame_decodes_for_drawing() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("f.jpg");
+        ::image::RgbImage::from_pixel(8, 4, ::image::Rgb([255, 0, 0])).save(&f).unwrap();
+        let img = decode_frame(&f).unwrap();
+        let px = img.as_bytes(0).unwrap();
+        assert_eq!(px.len(), 8 * 4 * 4);
+        // BGRA: red lands in the third byte.
+        assert!(px[2] > 200 && px[0] < 50);
+        assert!(decode_frame(&d.path().join("missing.jpg")).is_none());
     }
 
     #[test]

@@ -150,6 +150,8 @@ pub struct StudioRuns {
     runs: HashMap<String, Run>,
     /// Pipeline and job versions last read.
     seen: Option<(u64, u64)>,
+    /// A queue read is running in the background.
+    reading: bool,
     _poll: Task<()>,
 }
 
@@ -161,22 +163,44 @@ impl StudioRuns {
                 break;
             }
         });
-        StudioRuns { items: vec![], held: false, interrupted: false, runs: HashMap::new(), seen: None, _poll: poll }
+        StudioRuns { items: vec![], held: false, interrupted: false, runs: HashMap::new(), seen: None, reading: false, _poll: poll }
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
         let seen = Some((pipeline::version(), ui_studio::service::version()));
-        let mut changed = false;
         if seen != self.seen {
-            self.seen = seen;
-            let q = pipeline::snapshot();
-            let items: Vec<Item> = q.items.iter().map(item).collect();
-            changed = items != self.items || (q.paused, q.interrupted) != (self.held, self.interrupted);
-            (self.items, self.held, self.interrupted) = (items, q.paused, q.interrupted);
-        } else if self.runs.is_empty() {
+            // Read off the UI thread: the queue's lock is also held while the pipeline saves
+            // the queue to disk, and every player frame would wait behind a slow write.
+            if !self.reading {
+                self.reading = true;
+                cx.spawn(async move |this, cx| {
+                    let read = mv_ui::bg::blocking(|| {
+                        let q = pipeline::snapshot();
+                        (q.items.iter().map(item).collect::<Vec<Item>>(), q.paused, q.interrupted)
+                    })
+                    .await;
+                    let _ = this.update(cx, |s, cx| {
+                        s.reading = false;
+                        if let Ok((items, held, interrupted)) = read {
+                            s.seen = seen;
+                            let changed = items != s.items || (held, interrupted) != (s.held, s.interrupted);
+                            (s.items, s.held, s.interrupted) = (items, held, interrupted);
+                            s.retrack(changed, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+            return;
+        }
+        if self.runs.is_empty() {
             // Idle and unchanged.
             return;
         }
+        self.retrack(false, cx);
+    }
+
+    fn retrack(&mut self, changed: bool, cx: &mut Context<Self>) {
         let before = self.runs.clone();
         track(&mut self.runs, &self.items, Instant::now());
         if changed || before != self.runs {

@@ -133,6 +133,9 @@ fn manga_json(m: &Manga, chapters: &[Chapter], recaps: &HashMap<String, RecapOut
         "genres": m.genres,
         "status": m.status,
         "cover": cover_url(m),
+        "source": m.source_plugin,
+        "in_library": crate::api_browse::in_library(&m.id),
+        "favorite": m.is_favorite,
         "chapters": chapters.iter().map(|c| chapter_json(c, recaps.get(&c.id))).collect::<Vec<_>>(),
     })
 }

@@ -78,6 +78,8 @@ pub struct Sources {
     pub ai: Option<AiActivity>,
     pub exports: Vec<ExportActivity>,
     pub joins: Vec<Join>,
+    /// "Make in Studio" chains from the phone (download, then Generate).
+    pub chains: Vec<crate::studio_chain::Chain>,
     /// Manga id -> (title, has a cover).
     pub manga: HashMap<String, (String, bool)>,
     /// Chapter id -> manga id, for AI runs and Python jobs.
@@ -175,7 +177,7 @@ fn rank(state: &str) -> u8 {
 fn kind_order(kind: &str) -> u8 {
     match kind {
         "download" => 0,
-        "generate" => 1,
+        "studio" | "generate" => 1,
         "voice" => 2,
         "read" => 3,
         _ => 4,
@@ -274,6 +276,24 @@ fn track(runs: &mut Runs, key: &str, first_active: Option<u64>, any: bool) -> Op
 }
 
 // ---------------------------------------------------------------- build
+
+/// A "Make in Studio" chain: chapters downloading, then handed to Generate.
+fn chain_task(c: &crate::studio_chain::Chain) -> Task {
+    let key = format!("chain:{}", c.manga_id);
+    let (total, w) = (c.total(), c.waiting.len());
+    let progress = c.sent as f32 / total.max(1) as f32;
+    let mut t = if w > 0 {
+        task(key, "studio", "Make in Studio", "running", format!("Downloading {w} chapter{}, then Generate", plural(w)), progress)
+    } else if c.failed > 0 {
+        let mut t = task(key, "studio", "Make in Studio", "failed", format!("{} of {total} chapters sent to Generate", c.sent), progress);
+        t.error = Some(format!("{} chapter{} could not be downloaded or queued", c.failed, plural(c.failed)));
+        t
+    } else {
+        task(key, "studio", "Make in Studio", "done", format!("{} chapter{} sent to Generate", c.sent, plural(c.sent)), 1.)
+    };
+    (t.at, t.total) = (c.sent, total);
+    t
+}
 
 fn download_task(d: &Dl) -> Task {
     let key = format!("dl:{}", d.manga_id);
@@ -471,6 +491,9 @@ pub fn build(src: &Sources, runs: &mut Runs) -> Vec<MangaCard> {
 
     for d in &src.downloads {
         put(&d.manga_id, &d.title, download_task(d));
+    }
+    for c in &src.chains {
+        put(&c.manga_id, &c.title, chain_task(c));
     }
 
     // Generate, per manga.
@@ -718,7 +741,7 @@ async fn gather() -> Sources {
     let downloads = tokio::time::timeout(Duration::from_secs(2), ui).await.ok().and_then(Result::ok).unwrap_or_default();
     tokio::task::spawn_blocking(move || {
         let q = pipeline::snapshot();
-        let mut s = Sources { downloads, queue: q.items, held: q.paused, interrupted: q.interrupted, jobs: service::snapshot(), ai: pipeline::ai_activity(), exports: pipeline::exports(), joins: crate::api_studio::recap_activity(), ..Default::default() };
+        let mut s = Sources { downloads, queue: q.items, held: q.paused, interrupted: q.interrupted, jobs: service::snapshot(), ai: pipeline::ai_activity(), exports: pipeline::exports(), joins: crate::api_studio::recap_activity(), chains: crate::studio_chain::activity(), ..Default::default() };
         lookup(&mut s);
         s
     })
@@ -1008,6 +1031,22 @@ mod tests {
         assert_eq!(a.manga[0].state, "limit");
         // Still waiting: no new event.
         assert_eq!(tr.observe(build(&src, &mut runs), t0, 3).events.len(), 1);
+    }
+
+    #[test]
+    fn studio_chains_show_downloading_then_sent() {
+        use crate::studio_chain::Chain;
+        let mut c = Chain { manga_id: "m".into(), title: "Solo".into(), waiting: vec!["c2".into(), "c3".into()], sent: 1, failed: 0, ended: None };
+        let cards = build(&Sources { chains: vec![c.clone()], ..Default::default() }, &mut Runs::new());
+        let t = &cards[0].tasks[0];
+        assert_eq!((t.kind, t.label, t.state, t.at, t.total), ("studio", "Make in Studio", "running", 1, 3));
+        assert_eq!(t.line, "Downloading 2 chapters, then Generate");
+        (c.waiting, c.sent, c.failed) = (vec![], 2, 1);
+        let t = build(&Sources { chains: vec![c.clone()], ..Default::default() }, &mut Runs::new())[0].tasks[0].clone();
+        assert_eq!((t.state, t.line.as_str()), ("failed", "2 of 3 chapters sent to Generate"));
+        c.failed = 0;
+        let t = build(&Sources { chains: vec![c], ..Default::default() }, &mut Runs::new())[0].tasks[0].clone();
+        assert_eq!((t.state, t.line.as_str()), ("done", "2 chapters sent to Generate"));
     }
 
     #[test]

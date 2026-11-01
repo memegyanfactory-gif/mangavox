@@ -10,7 +10,7 @@ use gpui_kit::*;
 
 actions!(
     mangavox,
-    [CommandPalette, ToggleSidebar, ToggleAssistant, OpenSettings, ShowManga, ShowAnime, ShowMovies, GoBack, GoForward, ToggleFullscreen]
+    [CommandPalette, ToggleSidebar, ToggleAssistant, OpenSettings, ShowManga, ShowAnime, ShowMovies, GoBack, GoForward, ToggleFullscreen, TogglePrivate]
 );
 
 /// What a shortcut does.
@@ -26,6 +26,8 @@ pub enum Shortcut {
     Back,
     Forward,
     Fullscreen,
+    /// Private mode (like a browser's incognito window: Ctrl+Shift+N).
+    Private,
 }
 
 /// The one table: key, what it does. `bindings()` and `shortcut_for()` both read it.
@@ -40,6 +42,7 @@ pub const SHORTCUTS: &[(&str, Shortcut)] = &[
     ("alt-left", Shortcut::Back),
     ("alt-right", Shortcut::Forward),
     ("f11", Shortcut::Fullscreen),
+    ("ctrl-shift-n", Shortcut::Private),
 ];
 
 impl Shortcut {
@@ -55,6 +58,7 @@ impl Shortcut {
             Shortcut::Back => Box::new(GoBack),
             Shortcut::Forward => Box::new(GoForward),
             Shortcut::Fullscreen => Box::new(ToggleFullscreen),
+            Shortcut::Private => Box::new(TogglePrivate),
         }
     }
 
@@ -81,6 +85,7 @@ fn binding(keys: &str, s: Shortcut) -> KeyBinding {
         Shortcut::Back => KeyBinding::new(keys, GoBack, None),
         Shortcut::Forward => KeyBinding::new(keys, GoForward, None),
         Shortcut::Fullscreen => KeyBinding::new(keys, ToggleFullscreen, None),
+        Shortcut::Private => KeyBinding::new(keys, TogglePrivate, None),
     }
 }
 

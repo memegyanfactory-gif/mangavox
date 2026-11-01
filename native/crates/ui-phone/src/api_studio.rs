@@ -109,7 +109,7 @@ fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
 // ---------------------------------------------------------------- setup
 
 /// The last Studio setup check, or a fresh one when none ran yet (Studio was never opened).
-async fn studio_env() -> Option<Env> {
+pub(crate) async fn studio_env() -> Option<Env> {
     if let Some(c) = setup::latest() {
         return Some(c.env);
     }
@@ -122,7 +122,7 @@ async fn studio_env() -> Option<Env> {
 }
 
 /// (ready, reason): Studio mode, Python + scripts, FFmpeg.
-fn readiness(studio_mode: bool, env: Option<&Env>) -> (bool, Option<String>) {
+pub(crate) fn readiness(studio_mode: bool, env: Option<&Env>) -> (bool, Option<String>) {
     if !studio_mode {
         return (false, Some("Studio mode is off on the PC. Turn it on in Settings to make recaps.".into()));
     }
@@ -141,7 +141,7 @@ fn readiness(studio_mode: bool, env: Option<&Env>) -> (bool, Option<String>) {
     (true, None)
 }
 
-async fn studio_mode() -> bool {
+pub(crate) async fn studio_mode() -> bool {
     // Without the UI bridge (still starting) the flag is unknown: don't block on it.
     bridge::on_ui(|_, cx| mv_ui::mode::studio_enabled(cx)).await.unwrap_or(true)
 }

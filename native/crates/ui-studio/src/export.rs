@@ -10,14 +10,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{radius, space};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, glyphs, icon_button, muted, ph, segmented, size, switch, ButtonKind, Tokens};
+use mv_ui::{btn, glyphs, icon_button, muted, ph, segmented, size, switch, ButtonKind, RampExt as _, Tokens};
 use serde_json::{json, Value};
 
-use crate::data::MangaGroup;
+use crate::data::{fresh, MangaGroup};
 use crate::page::{plural, StudioPage};
 use crate::restyle::safe_file_name;
 
@@ -506,9 +507,10 @@ pub(crate) struct Joined {
     pub music_kept: usize,
 }
 
-/// Where a manga's joined video is kept.
+/// Where a manga's joined video is kept (the one file the manga section's Play all plays too,
+/// while it is current: `mv_recap::media::joined_if_current`).
 pub(crate) fn joined_path(manga_id: &str) -> PathBuf {
-    mv_core::paths::studio_projects().join(mv_core::paths::safe_name(manga_id)).join("full_recap.mp4")
+    mv_recap::media::full_recap_path(manga_id)
 }
 
 /// Joins a manga's chapter videos (`files`, in order) into its `full_recap.mp4`, as Play full /
@@ -519,19 +521,13 @@ pub fn join_full_recap(manga_id: &str, files: &[PathBuf], progress: Arc<Mutex<(f
 }
 
 /// What the joined video was made from (path, size, modified) - a match means it is current.
+/// Shared with the manga section (`mv_recap::media`), so both agree on when it is.
 fn sources_key(files: &[PathBuf]) -> Value {
-    json!(files
-        .iter()
-        .map(|f| {
-            let m = f.metadata().ok();
-            let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-            json!([f.to_string_lossy(), m.map(|m| m.len()).unwrap_or(0), t])
-        })
-        .collect::<Vec<_>>())
+    mv_recap::media::join_sources(files)
 }
 
 /// Bumped when the joined video's makeup changes, so an older one is made again.
-const JOIN_VERSION: u64 = 2;
+const JOIN_VERSION: u64 = mv_recap::media::JOIN_VERSION;
 
 /// The narration of a chapter video made before videos carried a "Narration only" track,
 /// rebuilt from the chapter's audio clips: each beat's slice of its clip (as the sync map
@@ -1103,28 +1099,7 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
             args.extend(m.inputs());
         }
         args.extend(["-t".into(), format!("{d:.3}")]);
-        // The picture before the watermark, and its frame.
-        let (mut graph, base, (w, h)) = if mode == Mode::Reels {
-            // A landscape recap keeps the page in the middle: crop to it (a little wider than
-            // square, so captions survive) so the page fills the upright frame.
-            let (w, h) = q.reel_size();
-            (format!("[0:v:0]crop=w='min(iw\\,ih*9/10)':h=ih[src];{}", fit_blur("src", "fit", w, h)), "fit", (w, h))
-        } else if let Some(sc) = &scale {
-            (format!("[0:v:0]{sc}[sc]"), "sc", size)
-        } else {
-            (String::new(), "0:v:0", size)
-        };
-        match &mark {
-            Some(m) => {
-                if !graph.is_empty() {
-                    graph.push(';');
-                }
-                graph.push_str(&watermark_graph(&m.wm, base, "v", w, h, 1));
-                args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into()]);
-            }
-            None if !graph.is_empty() => args.extend(["-filter_complex".into(), graph, "-map".into(), format!("[{base}]")]),
-            None => args.extend(["-map".into(), "0:v:0".into()]),
-        }
+        args.extend(picture_args(mode, q, scale.as_deref(), size, mark.as_ref()));
         args.extend(["-map".into(), format!("0:a:{track}")]);
         args.extend(extras.video_args());
         args.extend(extras.audio_args(false));
@@ -1138,6 +1113,89 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         out.push(file);
     }
     Ok(out)
+}
+
+/// The arguments that make an export's picture from the joined video (input 0; the logo, when
+/// there is one, input 1): the reel crop over a blurred fill, or the scaling, then the watermark,
+/// mapped as the output's video. `size` is the frame after `scale`. Used by the export's parts
+/// and reels and by the export preview's still, so the preview draws exactly what the export does.
+fn picture_args(mode: Mode, q: Quality, scale: Option<&str>, size: (u32, u32), mark: Option<&Mark>) -> Vec<String> {
+    let (mut graph, base, (w, h)) = if mode == Mode::Reels {
+        // A landscape recap keeps the page in the middle: crop to it (a little wider than
+        // square, so captions survive) so the page fills the upright frame.
+        let (w, h) = q.reel_size();
+        (format!("[0:v:0]crop=w='min(iw\\,ih*9/10)':h=ih[src];{}", fit_blur("src", "fit", w, h)), "fit", (w, h))
+    } else if let Some(sc) = scale {
+        (format!("[0:v:0]{sc}[sc]"), "sc", size)
+    } else {
+        (String::new(), "0:v:0", size)
+    };
+    match mark {
+        Some(m) => {
+            if !graph.is_empty() {
+                graph.push(';');
+            }
+            graph.push_str(&watermark_graph(&m.wm, base, "v", w, h, 1));
+            vec!["-filter_complex".into(), graph, "-map".into(), "[v]".into()]
+        }
+        None if !graph.is_empty() => vec!["-filter_complex".into(), graph, "-map".into(), format!("[{base}]")],
+        None => vec!["-map".into(), "0:v:0".into()],
+    }
+}
+
+/// One frame of the export of `j` (at `at` seconds into the joined video) as the export draws it:
+/// the same size, reel crop and watermark ([`picture_args`]), saved as a JPEG at `out`.
+pub(crate) fn export_still(j: &Joined, mode: Mode, extras: &Extras, at: f64, out: &Path) -> Result<()> {
+    let mark = Mark::prepare(extras.watermark.clone(), extras.font.as_deref())?;
+    let cwd = mark.as_ref().and_then(|m| m.dir.clone());
+    let q = extras.quality;
+    let size = probe(&j.path)?.size;
+    let (size, scale) = match q.short_side() {
+        Some(s) if size.0 > 0 => {
+            let to = scaled_size(size, s);
+            (to, Some(scale_filter(to.0, to.1)))
+        }
+        _ => (size, None),
+    };
+    let mut args: Vec<String> = vec!["-ss".into(), format!("{:.3}", at.max(0.)), "-i".into(), j.path.to_string_lossy().into()];
+    if let Some(m) = &mark {
+        args.extend(m.inputs());
+    }
+    args.extend(picture_args(mode, q, scale.as_deref(), size, mark.as_ref()));
+    args.extend(["-frames:v".into(), "1".into(), "-q:v".into(), "3".into(), out.to_string_lossy().into()]);
+    let r = Reporter { state: Default::default(), cancel: Default::default(), turn: Default::default() };
+    ffmpeg(&args, 0., &r, cwd.as_deref(), &mut |_| {})
+}
+
+/// Where the last export's hook is kept, so the export preview can play it.
+fn kept_hook_path(manga_id: &str) -> PathBuf {
+    joined_path(manga_id).with_file_name("full_recap_hook.mp4")
+}
+
+/// What a kept hook was made for: the joined video's sources (its `.json` record) and its length.
+fn hook_record(joined: &Path, secs: u32) -> Value {
+    let sources = std::fs::read(joined.with_extension("json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|m| m["sources"].clone()).unwrap_or(Value::Null);
+    json!({ "sources": sources, "secs": secs })
+}
+
+/// Keeps a hook an export made at `to` (next to the joined video) for the export preview.
+fn keep_hook(to: &Path, hook: &Path, joined: &Path, secs: u32) {
+    if std::fs::copy(hook, to).is_ok() {
+        let _ = std::fs::write(to.with_extension("json"), hook_record(joined, secs).to_string());
+    }
+}
+
+/// The hook kept at `file` when it was made for the joined video at `joined` as it is now, `secs`
+/// long; else `None` (the export writes a new one).
+fn hook_if_current(file: &Path, joined: &Path, secs: u32) -> Option<PathBuf> {
+    let saved: Value = serde_json::from_slice(&std::fs::read(file.with_extension("json")).ok()?).ok()?;
+    let now = hook_record(joined, secs);
+    (file.is_file() && !now["sources"].is_null() && saved == now).then(|| file.to_path_buf())
+}
+
+/// [`hook_if_current`] for a manga's kept hook.
+pub(crate) fn kept_hook(manga_id: &str, joined: &Path, secs: u32) -> Option<PathBuf> {
+    hook_if_current(&kept_hook_path(manga_id), joined, secs)
 }
 
 // ------------------------------------------------------------------ hook
@@ -1366,6 +1424,8 @@ pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &Backg
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: ExportPrefs, dir: PathBuf, name: String, font: Option<PathBuf>, r: Reporter, ex: BackgroundExecutor) -> (Result<Vec<PathBuf>>, String) {
     let hook_dir = hook.as_ref().map(HookJob::work_dir);
+    // Where the hook is kept for the export preview, and its length.
+    let keep_at = hook.as_ref().map(|h| (kept_hook_path(&h.manga_id), h.seconds));
     if hook.is_some() {
         let rr = r.clone();
         if let Err(e) = mv_ui::bg::blocking(move || rr.take_turn()).await.and_then(|x| x) {
@@ -1380,6 +1440,10 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
             Ok((path, why)) => {
                 if let Some(why) = why {
                     hook_note = format!(" · the AI hook script failed ({why}), so the hook uses the narration's own lines");
+                }
+                if let Some((to, secs)) = keep_at {
+                    let (hook, joined) = (path.clone(), j.path.clone());
+                    let _ = mv_ui::bg::blocking(move || keep_hook(&to, &hook, &joined, secs)).await;
                 }
                 hook_path = Some(path);
                 Ok(())
@@ -1438,6 +1502,93 @@ pub(crate) fn fmt_duration(secs: f64) -> String {
     } else {
         format!("{}:{:02}", s / 60, s % 60)
     }
+}
+
+/// What the export preview shows.
+struct ExportPreview {
+    manga_id: String,
+    title: String,
+    /// One frame of the export, drawn as the export draws it.
+    still: PathBuf,
+    joined: PathBuf,
+    /// `None`: no hook (it is off, or not one video); `Some(None)`: the export writes one (none
+    /// was made for these videos yet); `Some(Some(file))`: the one the last export made for them.
+    hook: Option<Option<PathBuf>>,
+    prefs: ExportPrefs,
+    /// The Look has a watermark.
+    marked: bool,
+}
+
+/// The export preview's lines under the picture: what is made, the hook, the watermark.
+fn preview_lines(prefs: &ExportPrefs, hook: &Option<Option<PathBuf>>, marked: bool) -> Vec<String> {
+    let what = match prefs.mode() {
+        Mode::Whole => "One video".to_string(),
+        Mode::Parts(n) => format!("{n} parts"),
+        Mode::Reels => "Upright reels of up to a minute".to_string(),
+    };
+    let size = match prefs.quality {
+        Quality::Source => "at source quality".to_string(),
+        q => format!("in {}", q.label()),
+    };
+    let mut out = vec![format!("{what} {size}, {}.", if prefs.music { "with music" } else { "narration only (no music)" })];
+    out.push(match hook {
+        None => "No hook.".to_string(),
+        Some(Some(_)) => "The hook plays first (the one the last export made for these chapters).".to_string(),
+        Some(None) => "A hook is written and voiced when you export, then plays first (none was made for these chapters yet).".to_string(),
+    });
+    out.push(if marked { "The watermark is drawn as in the picture.".to_string() } else { "No watermark (add one in Look & branding).".to_string() });
+    out
+}
+
+/// The export preview dialog: the frame, what the export holds, and Play.
+fn show_export_preview(p: ExportPreview, window: &mut Window, cx: &mut App) {
+    // The frame file is drawn again each time: drop the old picture.
+    ImageSource::from(p.still.clone()).remove_asset(cx);
+    let lines = preview_lines(&p.prefs, &p.hook, p.marked);
+    let upright = p.prefs.mode() == Mode::Reels;
+    let play_list: Vec<(String, PathBuf)> = match &p.hook {
+        Some(Some(h)) => vec![("Hook".into(), h.clone()), (format!("{} · Full recap", p.title), p.joined.clone())],
+        _ => vec![(format!("{} · Full recap", p.title), p.joined.clone())],
+    };
+    let (title, manga_id, still) = (p.title, p.manga_id, p.still);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let list = play_list.clone();
+        let (t, mid) = (title.clone(), manga_id.clone());
+        let picture = div()
+            .flex()
+            .justify_center()
+            .rounded(px(radius::MD))
+            .overflow_hidden()
+            .bg(Tokens::well())
+            .child(img(still.clone()).h(px(if upright { 360. } else { 324. })).w(px(if upright { 203. } else { 576. })).object_fit(ObjectFit::Contain));
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap(px(space::SM))
+            .w_full()
+            .child(btn("vid-preview-close", "Close", ButtonKind::Secondary).on_click(|_, w, cx| w.close_dialog(cx)))
+            .child(btn("vid-preview-play", if list.len() > 1 { "Play hook + video" } else { "Play" }, ButtonKind::Primary).icon(ph::PLAY).on_click(move |_, w, cx| {
+                w.close_dialog(cx);
+                let target = if list.len() > 1 {
+                    let videos: Vec<mv_recap::media::ChapterVideo> = list.iter().map(|(label, video)| mv_recap::media::ChapterVideo { chapter_id: String::new(), number: None, label: label.clone(), video: video.clone(), thumbnail: None }).collect();
+                    let file = mv_recap::media::manga_dir(&mid).join("export_preview.m3u8");
+                    match std::fs::write(&file, mv_recap::media::playlist_m3u(&videos)) {
+                        Ok(()) => file,
+                        Err(_) => list[list.len() - 1].1.clone(),
+                    }
+                } else {
+                    list[0].1.clone()
+                };
+                crate::phases::play_video(&format!("{t} · Export preview"), &target, w, cx);
+            }));
+        dialog
+            .w(px(624.))
+            .title(div().ramp(mv_ui::theme::ramp::SUBTITLE_2).text_color(Tokens::text_1()).child(format!("Export preview · {title}")))
+            .child(picture)
+            .child(div().flex().flex_col().gap(px(4.)).mt(px(space::MD)).children(lines.iter().map(|l| div().text_size(px(size::MD)).text_color(Tokens::text_2()).child(l.clone()))))
+            .child(div().mt(px(space::SM)).text_size(px(size::SM)).text_color(Tokens::text_3()).child("Play shows the joined chapter videos (and the hook); the watermark and size are applied when the file is saved, exactly as in the picture."))
+            .footer(footer)
+    });
 }
 
 impl StudioPage {
@@ -1505,8 +1656,28 @@ impl StudioPage {
         .detach();
     }
 
-    /// Plays every made chapter of `g` as one video.
+    /// The made chapters of `g` (what Play and Export use), in order.
+    fn made_chapters_of(&self, g: &MangaGroup) -> Vec<crate::data::ChapterItem> {
+        self.made_videos(g).into_iter().map(|(c, _)| c).collect()
+    }
+
+    /// Plays every made chapter of `g` as one video, after asking about chapters that changed
+    /// since they were rendered (`data::fresh`).
     pub(crate) fn play_full(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
+        let (page, group) = (cx.entity().downgrade(), g.clone());
+        fresh::guard(
+            self.made_chapters_of(g),
+            "playing",
+            fresh::After::Offer("Play"),
+            move |window, cx| {
+                let _ = page.update(cx, |this, cx| this.play_full_now(&group, window, cx));
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn play_full_now(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
         let title = format!("{} · Full recap", g.title);
         self.with_joined(
             g,
@@ -1514,6 +1685,63 @@ impl StudioPage {
             move |this, j, _, window, cx| {
                 this.export_ended(window, cx);
                 crate::phases::play_video(&title, &j.path, window, cx);
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// "Preview export": what the export will hold, from the same files: one frame of it drawn
+    /// exactly as the export draws it (its size, the reel crop, the Look's watermark), whether
+    /// the hook plays first, and Play (the hook, when one was made for these videos, then the
+    /// joined video). Asks about changed chapters first, like Play and Export.
+    pub(crate) fn preview_export(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
+        let (page, group) = (cx.entity().downgrade(), g.clone());
+        let font = mark_font(self.setup.read(cx).env.as_ref());
+        fresh::guard(
+            self.made_chapters_of(g),
+            "previewing the export",
+            fresh::After::Auto,
+            move |window, cx| {
+                let _ = page.update(cx, |this, cx| this.preview_export_now(group, font, window, cx));
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn preview_export_now(&mut self, g: MangaGroup, font: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let prefs = self.export_prefs;
+        let (id, title) = (g.id.clone(), g.title.clone());
+        self.with_joined(
+            &g,
+            "Preparing the export preview",
+            move |_, j, _, window, cx| {
+                let still = joined_path(&id).with_file_name("export_preview.jpg");
+                let watermark = load_watermark(&video_look_path());
+                let marked = watermark.is_some();
+                let extras = Extras { watermark, font, quality: prefs.quality, ..Extras::default() };
+                // Past the opening, where the picture is typical.
+                let at = (j.total * 0.15).min(90.);
+                cx.spawn_in(window, async move |this, cx| {
+                    let (jj, s, mid) = (j.clone(), still.clone(), id.clone());
+                    let res = mv_ui::bg::blocking(move || -> Result<Option<Option<PathBuf>>> {
+                        export_still(&jj, prefs.mode(), &extras, at, &s)?;
+                        Ok((prefs.mode() == Mode::Whole && prefs.hook).then(|| kept_hook(&mid, &jj.path, prefs.hook_secs)))
+                    })
+                    .await
+                    .and_then(|r| r);
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.export_ended(window, cx);
+                        match res {
+                            Ok(hook) => show_export_preview(ExportPreview { manga_id: id, title, still, joined: j.path.clone(), hook, prefs, marked }, window, cx),
+                            Err(e) if e.to_string() == CANCELLED => {}
+                            Err(e) => toast::show(cx, Toast::error(format!("Could not preview the export: {e:#}"))),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
             },
             window,
             cx,
@@ -1551,45 +1779,19 @@ impl StudioPage {
             None
         };
         let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Export here".into()) });
+        let chapters: Vec<crate::data::ChapterItem> = videos.iter().map(|(c, _)| c.clone()).collect();
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else { return };
             let Some(dir) = paths.into_iter().next() else { return };
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.with_joined(
-                    &group,
-                    "Joining the chapters",
-                    move |_, j, r, window, cx| {
-                        let r = r.clone();
-                        // Chapters whose music could not be taken out (said in the result).
-                        let kept = if prefs.music { 0 } else { j.music_kept };
-                        let ex = cx.background_executor().clone();
-                        cx.spawn_in(window, async move |this, cx| {
-                            let (res, hook_note) = export_joined(j, hook, prefs, dir, name, font, r, ex).await;
-                            let _ = this.update_in(cx, |this, window, cx| {
-                                this.export_ended(window, cx);
-                                match res {
-                                    Ok(files) => {
-                                        let n = files.len();
-                                        let shown = files.first().cloned().unwrap_or_default();
-                                        let what = match prefs.mode() {
-                                            Mode::Whole => "the full video".to_string(),
-                                            Mode::Parts(_) => format!("{n} part{}", plural(n)),
-                                            Mode::Reels => format!("{n} reel{}", plural(n)),
-                                        };
-                                        let what = match prefs.quality {
-                                            Quality::Source => format!("{what} at source quality"),
-                                            q => format!("{what} in {}", q.label()),
-                                        };
-                                        let note = if kept > 0 { format!(" · {kept} chapter{} still ha{} music: re-make {} with Redo → Video", plural(kept), if kept == 1 { "s" } else { "ve" }, if kept == 1 { "it" } else { "them" }) } else { String::new() };
-                                        toast::show(cx, Toast::success(format!("Exported {what}{note}{hook_note}")).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
-                                    }
-                                    Err(e) if e.to_string() == CANCELLED => toast::show(cx, Toast::info("Export cancelled")),
-                                    Err(e) => toast::show(cx, Toast::error(format!("Could not export: {e:#}"))),
-                                }
-                                cx.notify();
-                            });
-                        })
-                        .detach();
+            let page = this.clone();
+            let _ = this.update_in(cx, |_, window, cx| {
+                // Chapters changed since they were rendered: render them first, or not.
+                fresh::guard(
+                    chapters,
+                    "exporting",
+                    fresh::After::Auto,
+                    move |window, cx| {
+                        let _ = page.update(cx, |this, cx| this.export_now(group, prefs, dir, name, font, hook, window, cx));
                     },
                     window,
                     cx,
@@ -1597,6 +1799,50 @@ impl StudioPage {
             });
         })
         .detach();
+    }
+
+    /// [`Self::start_export`] once the folder is picked and the chapters are as they will be.
+    #[allow(clippy::too_many_arguments)]
+    fn export_now(&mut self, group: MangaGroup, prefs: ExportPrefs, dir: PathBuf, name: String, font: Option<PathBuf>, hook: Option<HookJob>, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_joined(
+            &group,
+            "Joining the chapters",
+            move |_, j, r, window, cx| {
+                let r = r.clone();
+                // Chapters whose music could not be taken out (said in the result).
+                let kept = if prefs.music { 0 } else { j.music_kept };
+                let ex = cx.background_executor().clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    let (res, hook_note) = export_joined(j, hook, prefs, dir, name, font, r, ex).await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.export_ended(window, cx);
+                        match res {
+                            Ok(files) => {
+                                let n = files.len();
+                                let shown = files.first().cloned().unwrap_or_default();
+                                let what = match prefs.mode() {
+                                    Mode::Whole => "the full video".to_string(),
+                                    Mode::Parts(_) => format!("{n} part{}", plural(n)),
+                                    Mode::Reels => format!("{n} reel{}", plural(n)),
+                                };
+                                let what = match prefs.quality {
+                                    Quality::Source => format!("{what} at source quality"),
+                                    q => format!("{what} in {}", q.label()),
+                                };
+                                let note = if kept > 0 { format!(" · {kept} chapter{} still ha{} music: re-make {} with Redo → Video", plural(kept), if kept == 1 { "s" } else { "ve" }, if kept == 1 { "it" } else { "them" }) } else { String::new() };
+                                toast::show(cx, Toast::success(format!("Exported {what}{note}{hook_note}")).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
+                            }
+                            Err(e) if e.to_string() == CANCELLED => toast::show(cx, Toast::info("Export cancelled")),
+                            Err(e) => toast::show(cx, Toast::error(format!("Could not export: {e:#}"))),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            },
+            window,
+            cx,
+        );
     }
 
     /// The Video mode's Export: asks for a folder, joins the rendered chapters and saves them with
@@ -1611,40 +1857,19 @@ impl StudioPage {
         let group = g.clone();
         let font = mark_font(self.setup.read(cx).env.as_ref());
         let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Export here".into()) });
+        let chapters: Vec<crate::data::ChapterItem> = videos.into_iter().map(|(c, _)| c).collect();
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else { return };
             let Some(dir) = paths.into_iter().next() else { return };
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.with_joined(
-                    &group,
-                    "Joining the chapters",
-                    move |_, j, r, window, cx| {
-                        let r = r.clone();
-                        cx.spawn_in(window, async move |this, cx| {
-                            let res = mv_ui::bg::blocking(move || {
-                                let enc = crate::encode::usable(p.gpu);
-                                let codec = enc.pick(p.preset == crate::encode::Preset::Youtube4k).name();
-                                let extras = Extras { watermark: load_watermark(&video_look_path()), font, ..p.extras(&enc) };
-                                export(&j, p.mode(), p.music, &dir, &name, &extras, &r).map(|files| (files, codec))
-                            })
-                            .await
-                            .and_then(|r| r);
-                            let _ = this.update_in(cx, |this, window, cx| {
-                                this.export_ended(window, cx);
-                                match res {
-                                    Ok((files, codec)) => {
-                                        let n = files.len();
-                                        let shown = files.first().cloned().unwrap_or_default();
-                                        let what = if p.mode() == Mode::Reels { format!("{n} reel{}", plural(n)) } else { "the video".to_string() };
-                                        toast::show(cx, Toast::success(format!("Exported {what} · {} · {codec}{}", p.preset.label(), if p.loudness { " · -14 LUFS" } else { "" })).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
-                                    }
-                                    Err(e) if e.to_string() == CANCELLED => toast::show(cx, Toast::info("Export cancelled")),
-                                    Err(e) => toast::show(cx, Toast::error(format!("Could not export: {e:#}"))),
-                                }
-                                cx.notify();
-                            });
-                        })
-                        .detach();
+            let page = this.clone();
+            let _ = this.update_in(cx, |_, window, cx| {
+                // Chapters changed since they were rendered: render them first, or not.
+                fresh::guard(
+                    chapters,
+                    "exporting",
+                    fresh::After::Auto,
+                    move |window, cx| {
+                        let _ = page.update(cx, |this, cx| this.preset_export_now(group, p, dir, name, font, window, cx));
                     },
                     window,
                     cx,
@@ -1652,6 +1877,45 @@ impl StudioPage {
             });
         })
         .detach();
+    }
+
+    /// [`Self::start_preset_export`] once the folder is picked and the chapters are as they will be.
+    #[allow(clippy::too_many_arguments)]
+    fn preset_export_now(&mut self, group: MangaGroup, p: PresetExport, dir: PathBuf, name: String, font: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_joined(
+            &group,
+            "Joining the chapters",
+            move |_, j, r, window, cx| {
+                let r = r.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    let res = mv_ui::bg::blocking(move || {
+                        let enc = crate::encode::usable(p.gpu);
+                        let codec = enc.pick(p.preset == crate::encode::Preset::Youtube4k).name();
+                        let extras = Extras { watermark: load_watermark(&video_look_path()), font, ..p.extras(&enc) };
+                        export(&j, p.mode(), p.music, &dir, &name, &extras, &r).map(|files| (files, codec))
+                    })
+                    .await
+                    .and_then(|r| r);
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.export_ended(window, cx);
+                        match res {
+                            Ok((files, codec)) => {
+                                let n = files.len();
+                                let shown = files.first().cloned().unwrap_or_default();
+                                let what = if p.mode() == Mode::Reels { format!("{n} reel{}", plural(n)) } else { "the video".to_string() };
+                                toast::show(cx, Toast::success(format!("Exported {what} · {} · {codec}{}", p.preset.label(), if p.loudness { " · -14 LUFS" } else { "" })).icon(ph::CHECK_CIRCLE).action("Show in folder", move |_, cx| cx.reveal_path(&shown)));
+                            }
+                            Err(e) if e.to_string() == CANCELLED => toast::show(cx, Toast::info("Export cancelled")),
+                            Err(e) => toast::show(cx, Toast::error(format!("Could not export: {e:#}"))),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            },
+            window,
+            cx,
+        );
     }
 
     /// The export in flight (this manga's or another's): progress, label, time left; and Cancel.
@@ -1695,6 +1959,15 @@ impl StudioPage {
                 .tooltip("Play every made chapter as one video")
                 .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.play_full(&group, window, cx)))
+        };
+        let preview = {
+            let group = g.clone();
+            btn("vid-preview", "Preview export", ButtonKind::Ghost)
+                .small()
+                .icon(ph::EYE)
+                .tooltip("See what the export holds with these choices: a frame drawn exactly as it will be saved (size, reel crop, watermark), and the hook")
+                .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.preview_export(&group, window, cx)))
         };
         let small = |t: String| div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(t);
 
@@ -1762,6 +2035,7 @@ impl StudioPage {
                             .child(muted(if prefs.music { "Music" } else { "No music · narration only" })),
                     )
                     .child(div().flex_1())
+                    .child(preview)
                     .child(play)
                     .child(
                         btn("vid-export", "Export…", ButtonKind::Secondary)
@@ -1817,6 +2091,53 @@ mod tests {
     };
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn the_preview_draws_the_picture_as_the_export_does() {
+        let mark = super::Mark { wm: Watermark { logo: Some((PathBuf::from("logo.png"), "br".into(), 0.1, 1.)), text: None }, dir: None };
+        // Reels: the crop over a blurred fill, then the watermark on the upright frame.
+        let a = super::picture_args(Mode::Reels, Quality::Source, None, (1920, 1080), Some(&mark));
+        assert_eq!(a[0], "-filter_complex");
+        assert!(a[1].starts_with("[0:v:0]crop=") && a[1].contains(&watermark_graph(&mark.wm, "fit", "v", 1080, 1920, 1)), "{}", a[1]);
+        assert_eq!(&a[2..], ["-map", "[v]"]);
+        // Scaled: the scale, then the watermark on the scaled frame.
+        let a = super::picture_args(Mode::Whole, Quality::P720, Some("scale=1280:720:flags=lanczos"), (1280, 720), Some(&mark));
+        assert_eq!(a[1], format!("[0:v:0]scale=1280:720:flags=lanczos[sc];{}", watermark_graph(&mark.wm, "sc", "v", 1280, 720, 1)));
+        // Nothing to draw: the picture as it is.
+        assert_eq!(super::picture_args(Mode::Whole, Quality::Source, None, (1920, 1080), None), ["-map", "0:v:0"]);
+    }
+
+    #[test]
+    fn a_kept_hook_plays_only_for_the_videos_it_was_made_for() {
+        let d = tempfile::tempdir().unwrap();
+        let joined = d.path().join("full_recap.mp4");
+        std::fs::write(&joined, "v").unwrap();
+        std::fs::write(joined.with_extension("json"), json!({"v": 2, "sources": [["a.mp4", 1, 2]]}).to_string()).unwrap();
+        let made = d.path().join("hook.mp4");
+        std::fs::write(&made, "hook").unwrap();
+        let kept = d.path().join("full_recap_hook.mp4");
+        assert_eq!(super::hook_if_current(&kept, &joined, 30), None, "nothing kept yet");
+        super::keep_hook(&kept, &made, &joined, 30);
+        assert_eq!(super::hook_if_current(&kept, &joined, 30), Some(kept.clone()));
+        // Another length, or the joined video made from other chapter videos: a new hook is made.
+        assert_eq!(super::hook_if_current(&kept, &joined, 45), None);
+        std::fs::write(joined.with_extension("json"), json!({"v": 2, "sources": [["a.mp4", 9, 2]]}).to_string()).unwrap();
+        assert_eq!(super::hook_if_current(&kept, &joined, 30), None);
+    }
+
+    #[test]
+    fn the_preview_says_what_the_export_holds() {
+        let prefs = super::ExportPrefs { hook: true, ..Default::default() };
+        let l = super::preview_lines(&prefs, &Some(Some(PathBuf::from("h.mp4"))), true);
+        assert_eq!(l[0], "One video at source quality, with music.");
+        assert!(l[1].starts_with("The hook plays first"));
+        assert!(l[2].contains("watermark is drawn"));
+        let l = super::preview_lines(&super::ExportPrefs { kind: 2, music: false, quality: Quality::P1080, ..prefs }, &None, false);
+        assert_eq!(l[0], "Upright reels of up to a minute in 1080p, narration only (no music).");
+        assert_eq!(l[1], "No hook.");
+        assert!(l[2].starts_with("No watermark"));
+        assert!(super::preview_lines(&prefs, &Some(None), false)[1].starts_with("A hook is written and voiced when you export"));
+    }
 
     #[test]
     fn parts_snap_to_nearby_boundaries_and_cover_everything() {

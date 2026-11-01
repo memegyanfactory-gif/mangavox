@@ -26,6 +26,17 @@ pub fn prefetch(request: &mv_ui::nav::PlayRequest) {
     backend::prefetch(request);
 }
 
+/// Start the torrent engine in the background (app start, when Anime / Movies are used).
+pub fn warm_up() {
+    backend::warm_up();
+}
+
+/// Other sources the player may switch to by itself if `primary` does not start (see
+/// [`backend::offer_alternates`]). Call right before opening the player on `primary`.
+pub fn offer_alternates(primary: &mv_ui::nav::PlayRequest, ranked: Vec<(mv_ui::nav::PlayRequest, Option<u64>)>) {
+    backend::offer_alternates(primary, ranked);
+}
+
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     match route {
         Route::Player { request } => Some(view::open_view(request.clone(), window, cx)),

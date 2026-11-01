@@ -138,6 +138,7 @@ fn main() {
                 mv_ui::whats_new::check_on_start(window, cx);
                 // The app was closed while private mode was on: offer to clear that session.
                 privacy::check_on_start(window, cx);
+                mv_ui::nav::set_private_toggle(privacy::toggle);
                 cx.new(|cx| shell::Shell::new(window, cx))
             },
         )
@@ -150,6 +151,9 @@ fn main() {
         ui_manga::register_assistant_tools();
         ui_media::register_assistant_tools();
         ui_studio::register_assistant_tools();
+        // The manga section plays Studio's chapter videos: Studio checks first whether any
+        // changed since it was rendered (the same check as its own Play and Export).
+        ui_manga::recap::set_guard(ui_studio::data::fresh::guard_files);
         #[cfg(windows)]
         tray::install(main.0, cx);
     });

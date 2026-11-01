@@ -369,6 +369,39 @@ pub fn playlist_m3u(videos: &[ChapterVideo]) -> String {
     s
 }
 
+/// A manga's chapter videos joined into one (Studio's Play / Export make it, in its folder), with
+/// `full_recap.json` next to it saying what it was made from.
+pub const FULL_RECAP: &str = "full_recap.mp4";
+/// Bumped when the joined video's makeup changes, so an older one is made again.
+pub const JOIN_VERSION: u64 = 2;
+
+/// Where a manga's joined video is kept.
+pub fn full_recap_path(manga_id: &str) -> PathBuf {
+    manga_dir(manga_id).join(FULL_RECAP)
+}
+
+/// What a joined video is made from (each file's path, size and modified second): a joined video
+/// whose record matches is the same chapter videos, as they are now.
+pub fn join_sources(files: &[PathBuf]) -> Value {
+    Value::Array(
+        files
+            .iter()
+            .map(|f| {
+                let m = f.metadata().ok();
+                let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                serde_json::json!([f.to_string_lossy(), m.map(|m| m.len()).unwrap_or(0), t])
+            })
+            .collect(),
+    )
+}
+
+/// The joined video at `joined` when it was made from exactly `files` as they are now (its
+/// `.json` record matches), else `None`.
+pub fn joined_if_current(joined: &Path, files: &[PathBuf]) -> Option<PathBuf> {
+    let m: Value = serde_json::from_slice(&std::fs::read(joined.with_extension("json")).ok()?).ok()?;
+    (!files.is_empty() && m["v"].as_u64() == Some(JOIN_VERSION) && m["sources"] == join_sources(files) && joined.is_file()).then(|| joined.to_path_buf())
+}
+
 /// Writes the "Play all" playlist of a manga (`videos.m3u8` in its Studio folder) and returns it.
 pub fn write_playlist(manga_dir: &Path, videos: &[ChapterVideo]) -> Result<PathBuf> {
     if videos.is_empty() {
@@ -566,5 +599,27 @@ mod tests {
         let p = write_playlist(&t.path().join("m"), &list).unwrap();
         assert_eq!(p, t.path().join("m").join("videos.m3u8"));
         assert!(std::fs::read_to_string(p).unwrap().starts_with("#EXTM3U\n"));
+    }
+
+    #[test]
+    fn the_joined_video_counts_only_when_made_from_these_files() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a.mp4"), t.path().join("b.mp4"));
+        std::fs::write(&a, "aa").unwrap();
+        std::fs::write(&b, "bbb").unwrap();
+        let joined = t.path().join(FULL_RECAP);
+        let files = vec![a.clone(), b.clone()];
+        assert_eq!(joined_if_current(&joined, &files), None, "no joined video yet");
+        std::fs::write(&joined, "ab").unwrap();
+        std::fs::write(joined.with_extension("json"), json!({"v": JOIN_VERSION, "sources": join_sources(&files)}).to_string()).unwrap();
+        assert_eq!(joined_if_current(&joined, &files), Some(joined.clone()));
+        // Other files, another order, an older makeup, or a chapter video made again: not current.
+        assert_eq!(joined_if_current(&joined, &files[..1]), None);
+        assert_eq!(joined_if_current(&joined, &[b.clone(), a.clone()]), None);
+        assert_eq!(joined_if_current(&joined, &[]), None);
+        std::fs::write(&b, "bbbb").unwrap();
+        assert_eq!(joined_if_current(&joined, &files), None);
+        std::fs::write(joined.with_extension("json"), json!({"v": JOIN_VERSION + 1, "sources": join_sources(&files)}).to_string()).unwrap();
+        assert_eq!(joined_if_current(&joined, &files), None);
     }
 }

@@ -106,6 +106,27 @@ Known limits (design tradeoffs, not bugs):
 - `GET /api/media/<opaque>` -> the file, with HTTP Range support (video/audio streaming + download).
   `<opaque>` maps to a path under `<root>/studio/projects` only (never a raw path from the client).
 
+### Browse (api_browse.rs, studio_chain.rs)
+- `GET /api/sources` -> `{ "sources": [{ "id", "name", "lang", "nsfw" }] }`: exactly what the desktop Browse lists
+  (installed plugins + built-in sites the user added; adult sites only if added there after the 18+ check).
+- `GET /api/sources/<sid>/browse?kind=popular|latest|search&q=&page=n` -> `{ "items": [{ "id", "title", "cover",
+  "author", "status", "adult" }], "more": bool, ... }`. 404 for a source Browse does not list, 400 for a bad kind /
+  empty or >200-char search, 422 when the source has no such list, 502/504 when the site fails or is slow.
+- `GET /api/sources/cover?s=&u=&k=` -> the cover, fetched by the source's own backend into the shared covers cache.
+  `k` is a keyed hash (per-run secret) of source + URL: only covers this server listed are fetched, else 403.
+- `POST /api/sources/<sid>/open` body `{ "id" }` -> `{ "manga_id" }`: saves the title and its chapters like the
+  desktop (`ops::prepare_from_source`: browse-only until added; noted for clearing in private mode). Then the usual
+  `/api/manga/<id>`, `/api/chapter/<id>/page/<n>` (pages stream from the source without a download) apply.
+- `POST /api/manga/<id>/library` body `{ "on" }` -> `{ "in_library", "favorite" }` (off also unpins).
+- `POST /api/manga/<id>/favorite` body `{ "on" }` -> `{ "favorite", "in_library" }` (on also adds to the library).
+- `POST /api/manga/<id>/download` body `{ "chapters": [ids]|null }` -> `{ "queued", "saved" }`: the desktop download
+  manager; only this manga's chapters (else 400), at most 3000.
+- `POST /api/manga/<id>/studio` body `{ "chapters": [ids]|null (all) }` -> `{ "chapters", "downloading", "sent",
+  "waiting" }`: Make in Studio. 409 when Studio can't run the whole pipeline (Studio mode, Python, FFmpeg). Adds the
+  manga to the library, queues missing chapters for download and enqueues saved ones in Generate (until Video); a
+  watcher enqueues each downloading chapter once it is saved. Shown in `/api/activity` as kind `studio`.
+- `/api/manga/<id>` also returns `"source"`, `"in_library"`, `"favorite"`.
+
 ### Chapter media (api_chapter_media.rs)
 - `GET /api/chapter/<id>/media` -> `{ "listen": bool, "narration": url|null, "video": url|null, "thumbnail": url|null,
    "total_ms", "timeline": [{ "start_ms", "end_ms", "page", "focus": [x, y, w, h]|null }] }`. `page` is a reader page

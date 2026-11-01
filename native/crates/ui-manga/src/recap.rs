@@ -29,6 +29,26 @@ impl RecapOutputs {
     }
 }
 
+/// Runs before chapter videos play (Watch video, Play all): checks whether any of them changed in
+/// Studio since it was rendered and offers to render those first, then calls the continuation.
+/// Studio provides it (`ui_studio::data::fresh::guard_files`); the app registers it at startup.
+pub type Guard = fn(Vec<PathBuf>, Box<dyn FnOnce(&mut gpui_kit::Window, &mut gpui_kit::App)>, &mut gpui_kit::Window, &mut gpui_kit::App);
+
+static GUARD: std::sync::OnceLock<Guard> = std::sync::OnceLock::new();
+
+/// Registers the [`Guard`] (once, at startup).
+pub fn set_guard(g: Guard) {
+    let _ = GUARD.set(g);
+}
+
+/// Plays `videos` through the [`Guard`] when one is registered (else at once).
+pub(crate) fn guarded(videos: Vec<PathBuf>, then: impl FnOnce(&mut gpui_kit::Window, &mut gpui_kit::App) + 'static, window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
+    match GUARD.get() {
+        Some(g) => g(videos, Box::new(then), window, cx),
+        None => then(window, cx),
+    }
+}
+
 /// The Studio folder of a chapter.
 pub fn chapter_dir(manga_id: &str, chapter_id: &str) -> PathBuf {
     mv_core::paths::studio_chapter(manga_id, chapter_id)

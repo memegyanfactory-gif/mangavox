@@ -38,6 +38,9 @@ pub fn warm_up() {
     rt.spawn_blocking(move || {
         // Let the first frames and the start page have the network first.
         std::thread::sleep(std::time::Duration::from_millis(1500));
+        // The torrent engine (DHT bootstrap, trackers, cache restore) starts now rather than on
+        // the first Play, which used to wait for all of it.
+        ui_player::warm_up();
         let imgs = common::images();
         imgs.warm();
         imgs.evict(1536 * 1024 * 1024, std::time::Duration::from_secs(60 * 86_400));

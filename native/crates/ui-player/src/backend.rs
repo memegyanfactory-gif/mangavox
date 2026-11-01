@@ -20,16 +20,56 @@ const SUBTITLES_ENDPOINT: &str = "https://opensubtitles-v3.strem.io";
 
 static ENGINE: OnceCell<Arc<Engine>> = OnceCell::const_new();
 
-/// The shared torrent engine, started lazily on first use.
+/// The shared torrent engine, started on first use (or by [`warm_up`] at app start).
 pub async fn engine() -> Result<Arc<Engine>> {
     ENGINE
         .get_or_try_init(|| async {
+            let t = std::time::Instant::now();
             let dir: PathBuf = mv_core::paths::root().join("cache").join("torrents");
             std::fs::create_dir_all(&dir)?;
-            Ok::<_, anyhow::Error>(Arc::new(Engine::new(EngineConfig::new(dir)).await?))
+            let engine = Engine::new(EngineConfig::new(dir)).await;
+            match &engine {
+                Ok(_) => mv_core::logging::global().info("torrent", &format!("torrent engine started in {} ms", t.elapsed().as_millis())),
+                Err(e) => mv_core::logging::global().warn("torrent", &format!("torrent engine failed to start: {e:#}")),
+            }
+            Ok::<_, anyhow::Error>(Arc::new(engine?))
         })
         .await
         .cloned()
+}
+
+/// Starts the torrent engine in the background (DHT bootstrap, trackers, cache restore), so the
+/// first Play of the session does not pay for it. Cheap to call more than once.
+pub fn warm_up() {
+    if ENGINE.get().is_some() {
+        return;
+    }
+    mv_ui::bg::runtime().spawn(async {
+        let _ = engine().await;
+    });
+}
+
+/// Sources to fall back on for the next player opening `primary` (set by the page it is opened
+/// from, which knows the ranked list).
+static ALTERNATES: std::sync::Mutex<Option<(String, Vec<PlayRequest>)>> = std::sync::Mutex::new(None);
+
+/// Offers the player other sources for `primary`, best first: `ranked` is the page's whole ranked
+/// list `(request, seeders)`; the playing source, dead torrents and repeats are dropped.
+pub fn offer_alternates(primary: &PlayRequest, ranked: Vec<(PlayRequest, Option<u64>)>) {
+    let alts = logic::pick_alternates(primary, ranked, MAX_ALTERNATES);
+    *ALTERNATES.lock().unwrap_or_else(|e| e.into_inner()) = Some((logic::source_key(&primary.source), alts));
+}
+
+/// At most this many automatic source switches per Play.
+const MAX_ALTERNATES: usize = 4;
+
+/// The alternates offered for `req` (once).
+pub fn take_alternates(req: &PlayRequest) -> Vec<PlayRequest> {
+    let mut g = ALTERNATES.lock().unwrap_or_else(|e| e.into_inner());
+    match g.take() {
+        Some((key, alts)) if key == logic::source_key(&req.source) => alts,
+        _ => vec![],
+    }
 }
 
 /// The engine if it has already started (non-blocking, for stats polling).

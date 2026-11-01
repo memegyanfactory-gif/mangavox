@@ -337,6 +337,13 @@ impl Downloads {
         cx.notify();
     }
 
+    /// [`Self::enqueue`] for callers outside this crate (the phone companion): each chapter as
+    /// `(manga id, manga title, chapter id, label like "Ch. 12")`.
+    pub fn enqueue_chapters(&mut self, chapters: Vec<(String, String, String, String)>, cx: &mut Context<Self>) {
+        let jobs = chapters.into_iter().map(|(manga_id, manga_title, chapter_id, label)| Job { manga_id, manga_title, chapter_id, label }).collect();
+        self.enqueue(jobs, cx);
+    }
+
     pub fn enqueue(&mut self, jobs: Vec<Job>, cx: &mut Context<Self>) {
         let jobs: Vec<Job> = jobs.into_iter().filter(|j| self.status(&j.chapter_id).is_none()).collect();
         if jobs.is_empty() {

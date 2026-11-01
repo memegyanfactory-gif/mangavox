@@ -20,7 +20,7 @@ mod http;
 
 pub use engine::{
     extract_info_hash, pick_file, AddOptions, AddedTorrent, Engine, EngineConfig, FileEntry,
-    Source, TorrentStats, DEFAULT_TRACKERS,
+    short_hash, Source, TorrentStats, DEFAULT_TRACKERS, HEAD_PROBE_BYTES,
 };
 pub use http::{
     build_response, mime_from_name, parse_range, BoxReader, ByteSource, LocalFileSource,

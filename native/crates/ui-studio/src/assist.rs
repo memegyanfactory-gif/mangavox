@@ -602,6 +602,9 @@ async fn export_tool(a: Map<String, Value>) -> ToolResult {
         return Err(format!("{} already has {}. Ask the user whether to replace them, then call again with overwrite: true (or pick another folder).", dir.display(), existing.join(", ")));
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    // Chapters changed since their render are exported as rendered; the result says which.
+    let check = made.clone();
+    let stale: Vec<String> = mv_ui::bg::blocking(move || crate::data::fresh::stale_of(&check)).await.unwrap_or_default().iter().map(|s| s.item.label()).collect();
     let env = studio_env().await;
     let font = export::mark_font(env.as_ref());
     let job = export::Job::new(&g.id, "Joining the chapters");
@@ -631,11 +634,24 @@ async fn export_tool(a: Map<String, Value>) -> ToolResult {
     })
     .await
     .ok();
+    let mut note = hook_note.trim_start_matches(" · ").to_string();
+    if !stale.is_empty() {
+        let n = stale.len();
+        let line = format!(
+            "{n} chapter{} changed since {} rendered ({}) and {} exported as rendered: the user can render {} (Studio → Video → Render changes, or video_render) and export again to include the changes.",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it was" } else { "they were" },
+            stale.join(", "),
+            if n == 1 { "was" } else { "were" },
+            if n == 1 { "it" } else { "them" }
+        );
+        note = if note.is_empty() { line } else { format!("{note}. {line}") };
+    }
     Ok(ToolOutput::Value(json!({
         "manga": g.title,
         "chapters": made.len(),
         "files": files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-        "note": hook_note.trim_start_matches(" · "),
+        "note": note,
     })))
 }
 

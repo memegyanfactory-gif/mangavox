@@ -100,15 +100,17 @@ Each chapter comes with a LENGTH TARGET worked out from how much it says. Land n
 
 SEGMENTS
 The voice-over is a list of segments in story order. Each segment is 1-3 sentences (about 12-45 words) and is shown over ONE panel: pick the panel that best shows what the segment says, preferably one with the characters or the action in it; never a text-only box, an empty or nearly black panel, or a sound effect. A segment may sum up several pages; anchor it to the most telling panel among them. Move to a new panel every segment or two so the picture keeps up with the story. Plain text only: no markdown, emojis, brackets, stage directions or page numbers, because a text-to-speech voice reads it.
+A segment that lands a truly big moment (a blow, a blast, a clash of blades, a shock, a reveal) may add "sfx" (one of: {sfx}) and "sfx_strength" 1-3. Leave it out everywhere else: a handful per chapter at most.
 
 OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
 {{"title": "short catchy title for this chapter's recap",
   "summary_so_far": "6-10 sentences with names: the whole story so far, this chapter included, used as memory for what comes next",
   "segments": [
     {{"page": 3, "panel": 2, "text": "For one year, Arhan has hunted a single name: Karlos, the man who slaughtered his family."}},
-    {{"page": 7, "panel": 1, "text": "..."}}
+    {{"page": 7, "panel": 1, "text": "...", "sfx": "impact", "sfx_strength": 2}}
   ]}}
-"page" and "panel" use the numbers shown in the reading (both start at 1). Segments must be in story order. Only the opening of the very first chapter may mark segments "hook": true (see its instructions)."##
+"page" and "panel" use the numbers shown in the reading (both start at 1). Segments must be in story order. Only the opening of the very first chapter may mark segments "hook": true (see its instructions)."##,
+        sfx = SFX_NAMES.join(", "),
     )
 }
 
@@ -234,7 +236,8 @@ pub(crate) fn parse_segments(v: &Value, chunk_pages: &[usize], read: &ChapterRea
         }
         let panels = read.pages.iter().find(|p| p.index == page).map(|p| p.panels.len()).unwrap_or(0);
         let panel = num_of(sv, "panel").filter(|n| *n >= 1.0).map(|n| n as usize - 1).filter(|n| *n < panels);
-        out.push(StorySegment { page, panel, text, delivery: None, hook });
+        let sfx = SfxCue::parse(&str_of(sv, "sfx"), num_of(sv, "sfx_strength"));
+        out.push(StorySegment { page, panel, text, delivery: None, sfx, hook });
     }
     // Stable: keeps the model's order of the hook, and of the panels within a page.
     out.sort_by_key(|s| (!s.hook, if s.hook { 0 } else { s.page }));

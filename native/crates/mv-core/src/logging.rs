@@ -277,6 +277,135 @@ pub fn global() -> &'static Logger {
     GLOBAL.get_or_init(Logger::from_env)
 }
 
+// ---- UI-thread watchdog --------------------------------------------------------------------
+//
+// The UI thread calls [`heartbeat`] on a short timer; a background thread ([`start_watchdog`])
+// notices when the beats stop and logs `ui stalled N ms` with the last [`breadcrumb`] (what the
+// UI was doing), then `ui recovered after N ms` once the beats come back. Cheap and always on.
+
+static WATCH_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+/// Last heartbeat, in ms since `WATCH_EPOCH` (0 = none yet).
+static LAST_BEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CRUMB: Mutex<String> = Mutex::new(String::new());
+
+fn watch_now_ms() -> u64 {
+    WATCH_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Notes what the UI is doing ("player: loadfile", "route: Player"), for the watchdog's report.
+/// Keep labels short and free of personal data (no titles, paths or links).
+pub fn breadcrumb(label: impl Into<String>) {
+    let mut g = CRUMB.lock().unwrap_or_else(|e| e.into_inner());
+    *g = label.into();
+}
+
+/// The last [`breadcrumb`].
+pub fn last_breadcrumb() -> String {
+    CRUMB.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Called by the UI thread on every tick: "I am alive".
+pub fn heartbeat() {
+    LAST_BEAT_MS.store(watch_now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A UI stall is reported once the UI missed its beats this long.
+pub const STALL_AFTER_MS: u64 = 1000;
+/// A stall still going on is reported again at these lengths.
+const STALL_REPEAT_MS: [u64; 4] = [5_000, 15_000, 60_000, 300_000];
+/// The watchdog's own wake-up period.
+const WATCH_EVERY_MS: u64 = 250;
+/// The watchdog itself woke this late: the whole machine slept (suspend), not the UI.
+const SUSPEND_GAP_MS: u64 = 3_000;
+
+/// What the watchdog reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallEvent {
+    Stalled(u64),
+    StillStalled(u64),
+    Recovered(u64),
+}
+
+/// Stall bookkeeping, separate from the thread so the thresholds can be tested.
+#[derive(Debug, Default, Clone)]
+pub struct StallDetector {
+    /// A stall is being reported: the last beat before it and how many repeat warnings went out.
+    stalled: Option<(u64, usize)>,
+    last_check_ms: u64,
+    /// After a machine suspend, beats older than this count as "now" (the UI gets a fresh start).
+    floor_ms: u64,
+}
+
+impl StallDetector {
+    /// `now_ms` / `last_beat_ms` on the same clock (`last_beat_ms == 0`: the UI never beat yet).
+    pub fn observe(&mut self, now_ms: u64, last_beat_ms: u64) -> Option<StallEvent> {
+        let gap = now_ms.saturating_sub(self.last_check_ms);
+        let suspended = self.last_check_ms != 0 && gap > SUSPEND_GAP_MS;
+        self.last_check_ms = now_ms;
+        if last_beat_ms == 0 {
+            return None;
+        }
+        if suspended {
+            // The watchdog itself was frozen: the machine slept, nothing to blame the UI for.
+            self.floor_ms = now_ms;
+            self.stalled = None;
+            return None;
+        }
+        let beat = last_beat_ms.max(self.floor_ms);
+        let behind = now_ms.saturating_sub(beat);
+        match self.stalled {
+            None if behind > STALL_AFTER_MS => {
+                self.stalled = Some((beat, 0));
+                Some(StallEvent::Stalled(behind))
+            }
+            None => None,
+            // From the last beat before the stall to the first beat after it.
+            Some((from, _)) if beat != from => {
+                self.stalled = None;
+                Some(StallEvent::Recovered(beat.saturating_sub(from)))
+            }
+            Some((from, n)) => match STALL_REPEAT_MS.get(n) {
+                Some(&at) if behind >= at => {
+                    self.stalled = Some((from, n + 1));
+                    Some(StallEvent::StillStalled(behind))
+                }
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Starts the watchdog thread (once). The UI must call [`heartbeat`] regularly from then on.
+pub fn start_watchdog() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    heartbeat();
+    let _ = std::thread::Builder::new().name("mv-ui-watchdog".into()).spawn(|| {
+        let mut det = StallDetector::default();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(WATCH_EVERY_MS));
+            let now = watch_now_ms();
+            let beat = LAST_BEAT_MS.load(std::sync::atomic::Ordering::Relaxed);
+            let Some(ev) = det.observe(now, beat) else { continue };
+            let crumb = last_breadcrumb();
+            let log = global();
+            match ev {
+                StallEvent::Stalled(ms) => {
+                    log.log_with(Level::Warn, "ui", &format!("ui stalled {ms} ms"), json!({ "stallMs": ms, "breadcrumb": crumb }));
+                }
+                StallEvent::StillStalled(ms) => {
+                    log.log_with(Level::Warn, "ui", &format!("ui still stalled {ms} ms"), json!({ "stallMs": ms, "breadcrumb": crumb }));
+                }
+                StallEvent::Recovered(ms) => {
+                    log.log_with(Level::Info, "ui", &format!("ui recovered after {ms} ms"), json!({ "stallMs": ms, "breadcrumb": crumb }));
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +436,49 @@ mod tests {
         assert_eq!((ipc[0]["stack"].as_str(), ipc[0]["msg"].as_str()), (Some("s"), Some("failed")));
         assert_eq!(log.recent(10).len(), 2);
         assert_eq!(log.read_tail(LogFile::Main, Some(1), Level::Debug, 1 << 20).len(), 1);
+    }
+
+    #[test]
+    fn watchdog_reports_stalls_once_then_recovery() {
+        let mut d = StallDetector::default();
+        // No beat yet: nothing to judge.
+        assert_eq!(d.observe(250, 0), None);
+        // Beating every 250 ms: quiet.
+        assert_eq!(d.observe(500, 400), None);
+        assert_eq!(d.observe(750, 700), None);
+        // Just under the threshold: still quiet.
+        assert_eq!(d.observe(1700, 700), None);
+        // Over it: one warning, not one per check.
+        assert_eq!(d.observe(1950, 700), Some(StallEvent::Stalled(1250)));
+        assert_eq!(d.observe(2200, 700), None);
+        assert_eq!(d.observe(3500, 700), None);
+        assert_eq!(d.observe(5000, 700), None);
+        // A long stall is reported again at 5 s.
+        assert_eq!(d.observe(5800, 700), Some(StallEvent::StillStalled(5100)));
+        assert_eq!(d.observe(6000, 700), None);
+        // The UI beats again: recovered, with the stall's length.
+        assert_eq!(d.observe(6250, 6200), Some(StallEvent::Recovered(5500)));
+        assert_eq!(d.observe(6500, 6450), None);
+    }
+
+    #[test]
+    fn watchdog_ignores_a_machine_suspend() {
+        let mut d = StallDetector::default();
+        assert_eq!(d.observe(250, 200), None);
+        // The watchdog itself slept 60 s (system suspend): not the UI's fault.
+        assert_eq!(d.observe(60_250, 200), None);
+        // The UI has not beaten since the wake-up yet: it gets a fresh start.
+        assert_eq!(d.observe(60_500, 200), None);
+        assert_eq!(d.observe(60_750, 60_700), None);
+        // A real stall after the wake-up is still caught.
+        assert_eq!(d.observe(62_000, 60_700), Some(StallEvent::Stalled(1300)));
+    }
+
+    #[test]
+    fn breadcrumbs_keep_the_last_label() {
+        breadcrumb("player: loadfile");
+        breadcrumb("route: Player");
+        assert_eq!(last_breadcrumb(), "route: Player");
     }
 
     #[test]

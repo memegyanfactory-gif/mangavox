@@ -129,6 +129,22 @@ pub fn current_route(cx: &App) -> Option<Route> {
     cx.try_global::<CurrentRoute>().and_then(|r| r.0.clone())
 }
 
+/// Turns private mode on or off (the app registers it: ending it opens the clean-up offer).
+type PrivateToggle = fn(&mut Window, &mut App);
+static PRIVATE_TOGGLE: std::sync::OnceLock<PrivateToggle> = std::sync::OnceLock::new();
+
+/// Registers what [`toggle_private`] runs (once, at startup).
+pub fn set_private_toggle(f: PrivateToggle) {
+    let _ = PRIVATE_TOGGLE.set(f);
+}
+
+/// Private mode on or off, from any area that offers it (the player's own controls).
+pub fn toggle_private(window: &mut Window, cx: &mut App) {
+    if let Some(f) = PRIVATE_TOGGLE.get() {
+        f(window, cx);
+    }
+}
+
 static KEEP_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The player is being replaced by the next episode: the shell leaves full screen as it closes

@@ -559,6 +559,7 @@ async function forgetOffline() {
    ====================================================================== */
 const ROUTES = [
   ['library', 'library', /^\/library$/, viewLibrary],
+  ['browse', 'library', /^\/browse$/, viewBrowse],
   ['manga', 'library', /^\/manga\/([^/]+)$/, viewManga],
   ['reader', 'library', /^\/read\/([^/]+)$/, viewReader],
   ['movies', 'movies', /^\/movies$/, viewMovies],
@@ -694,10 +695,16 @@ function skelGrid(n = 9) {
     h('div', null, h('div', { class: 'cov skel' }), h('div', { class: 'skel skel-line', style: { width: '80%' } }))));
 }
 
+/** "My library | Browse" at the top of the Library tab. */
+function libSwitch(cur) {
+  return h('div', { class: 'libsw' }, segmented([['library', 'My library', 'book'], ['browse', 'Browse', 'search']], cur,
+    v => { location.hash = v === 'browse' ? '#/browse' : '#/library'; }, 'Library or Browse'));
+}
+
 function viewLibrary(ctx) {
   setTitle('Library');
   const root = h('div', { class: 'page' }, h('div', { class: 'skel', style: { height: '86px', margin: '8px 16px 24px' } }), skelGrid());
-  view.append(root);
+  view.append(libSwitch('library'), root);
   let filter = '';
   const refreshBtn = iconBtn('refresh', 'Refresh library', () => load());
 
@@ -812,6 +819,7 @@ function viewManga(ctx, id) {
         refresh,
         h('button', { class: 'btn', type: 'button', onclick: () => openPc({ page: 'library', manga_id: id }) }, icon('pc'), 'On PC'),
         h('a', { class: 'btn', href: '#/studio?manga=' + enc(id) }, icon('sparkle'), 'Studio')),
+      mangaActions(m, d => { if (ctx.alive) draw(d); }),
       descEl || '',
       vidSec || (vidSec = videosSection(id, m.title)),
       h('div', { class: 'sec-row', style: { marginTop: '16px', marginBottom: '6px' } },
@@ -824,6 +832,203 @@ function viewManga(ctx, id) {
   ctx.refresh = load;
   load();
 }
+/** Library, Favorites, Download and "Make in Studio" for a manga (from the library or Browse).
+ *  `redraw(m)` repaints the page with the changed manga. */
+function mangaActions(m, redraw) {
+  const key = '/api/manga/' + enc(m.id);
+  const keep = patch => {
+    const d = Object.assign({}, m, patch);
+    cache.set(key, { data: d, json: JSON.stringify(d) });
+    invalidate('/api/library');
+    redraw(d);
+  };
+  const toggle = (path, on, done) => async ev => {
+    const b = ev.currentTarget;
+    b.disabled = true;
+    try { done(await post(key + path, { on })); } catch (e) { toast(e.message, 'err'); b.disabled = false; }
+  };
+  const fav = h('button', { class: 'btn' + (m.favorite ? ' on' : ''), type: 'button', 'aria-pressed': String(!!m.favorite),
+    onclick: toggle('/favorite', !m.favorite, r => { toast(r.favorite ? (m.in_library ? 'Added to Favorites' : 'Added to your library and Favorites') : 'Removed from Favorites', 'ok'); keep({ favorite: !!r.favorite, in_library: !!r.in_library }); }) },
+  icon('star'), m.favorite ? 'Favorite' : 'Favorite');
+  const lib = h('button', { class: 'btn' + (m.in_library ? ' on' : ''), type: 'button', 'aria-pressed': String(!!m.in_library),
+    onclick: toggle('/library', !m.in_library, r => { toast(r.in_library ? 'Added to your library' : 'Removed from your library', 'ok'); keep({ in_library: !!r.in_library, favorite: !!r.favorite }); }) },
+  icon(m.in_library ? 'check' : 'book'), m.in_library ? 'In library' : 'Add to library');
+  const chs = arr(m.chapters);
+  const dl = h('button', { class: 'btn', type: 'button', disabled: !chs.length, onclick: () => chapterPicker(m, {
+    title: 'Download chapters', verb: 'Download', pick: c => !c.downloaded,
+    note: 'Saved on your PC for offline reading. Already saved chapters are skipped.',
+    send: async ids => {
+      const r = await post(key + '/download', { chapters: ids });
+      toast(r.queued ? 'Downloading ' + r.queued + ' chapter' + (r.queued > 1 ? 's' : '') + ' on your PC' : 'Those chapters are already saved', 'ok');
+    },
+  }) }, icon('download'), 'Download');
+  const studio = h('button', { class: 'btn primary block mstudio', type: 'button', disabled: !chs.length, onclick: () => chapterPicker(m, {
+    title: 'Make in Studio', verb: 'Make in Studio', pick: () => true,
+    note: 'Adds the manga to your library, downloads the chapters on your PC and sends each one through Read → Transcript → Story → Audio → Music → Video as soon as it is saved.',
+    send: async ids => {
+      const r = await post(key + '/studio', { chapters: ids.length === chs.length ? null : ids });
+      const parts = [r.sent && r.sent + ' sent to Generate', r.waiting && r.waiting + ' downloading first'].filter(Boolean);
+      toast('Make in Studio: ' + (parts.join(', ') || 'queued'), 'ok', 4200);
+      keep({ in_library: true });
+      location.hash = '#/activity';
+    },
+  }) }, icon('sparkle'), 'Make in Studio');
+  return h('div', { class: 'mlib' }, h('div', { class: 'mlib-row' }, lib, fav, dl), studio);
+}
+
+/** A sheet to pick chapters: all / none / not saved, a number range, or one by one. */
+function chapterPicker(m, o) {
+  const chs = arr(m.chapters);
+  const sel = new Set(chs.filter(o.pick).map(c => c.id));
+  if (!sel.size) chs.forEach(c => sel.add(c.id));
+  openSheet((p, s) => {
+    const go = h('button', { class: 'btn primary block', type: 'button' });
+    const boxes = new Map();
+    const sync = () => {
+      for (const [id, cb] of boxes) cb.checked = sel.has(id);
+      go.disabled = !sel.size;
+      go.replaceChildren(icon(o.verb === 'Download' ? 'download' : 'sparkle'), o.verb + ' · ' + sel.size + ' chapter' + (sel.size === 1 ? '' : 's'));
+    };
+    const setAll = f => () => { sel.clear(); chs.filter(f).forEach(c => sel.add(c.id)); sync(); };
+    const num = c => (c.number != null && c.number !== '' ? +c.number : NaN);
+    const nums = chs.map(num).filter(n => !Number.isNaN(n));
+    const from = h('input', { type: 'number', inputmode: 'decimal', 'aria-label': 'From chapter', value: nums.length ? String(Math.min(...nums)) : '' });
+    const to = h('input', { type: 'number', inputmode: 'decimal', 'aria-label': 'To chapter', value: nums.length ? String(Math.max(...nums)) : '' });
+    const range = () => { const a = +from.value, b = +to.value; if (Number.isNaN(a) || Number.isNaN(b)) return; setAll(c => num(c) >= Math.min(a, b) && num(c) <= Math.max(a, b))(); };
+    const list = h('div', { class: 'pick-list' }, chs.map(c => {
+      const cb = h('input', { type: 'checkbox', checked: sel.has(c.id) });
+      cb.addEventListener('change', () => { if (cb.checked) sel.add(c.id); else sel.delete(c.id); sync(); });
+      boxes.set(c.id, cb);
+      return h('label', { class: 'crow' }, cb, h('span', { class: 't' }, chLabel(c)), c.downloaded && h('span', { title: 'Saved on your PC', 'aria-label': 'Saved on your PC' }, icon('check')));
+    }));
+    go.addEventListener('click', async () => {
+      go.classList.add('busy'); go.disabled = true;
+      try { await o.send(chs.filter(c => sel.has(c.id)).map(c => c.id)); s.close(); }
+      catch (e) { if (e.status !== 401) toast(e.message, 'err'); go.classList.remove('busy'); go.disabled = false; }
+    });
+    p.append(h('div', { class: 'grip' }), h('h2', { class: 'sheet-h' }, o.title), o.note && h('p', { class: 'muted small rc-lead' }, o.note),
+      h('div', { class: 'pick-ctl' },
+        h('button', { class: 'chip', type: 'button', onclick: setAll(() => true) }, 'All'),
+        h('button', { class: 'chip', type: 'button', onclick: setAll(() => false) }, 'None'),
+        chs.some(c => c.downloaded) && h('button', { class: 'chip', type: 'button', onclick: setAll(c => !c.downloaded) }, 'Not saved')),
+      nums.length > 1 && h('div', { class: 'pick-range' }, h('span', null, 'Chapters'), from, h('span', null, 'to'), to,
+        h('button', { class: 'btn sm', type: 'button', onclick: range }, 'Select')),
+      list, h('div', { class: 'pick-go' }, go));
+    sync();
+  }, { label: o.title });
+}
+
+/* ======================================================================
+   Browse: the PC's manga sources (MangaDex, plugins...), Popular / Latest / Search
+   ====================================================================== */
+// Kept while the app is open, so coming back from a title shows the same list and place.
+let browseMemo = null;
+function viewBrowse(ctx) {
+  setTitle('Browse');
+  const chipsBox = h('div', { class: 'hscroll src-chips', role: 'group', 'aria-label': 'Sources' });
+  const modes = h('div', { class: 'bmodes' });
+  const q = h('input', { type: 'search', placeholder: 'Search this source', 'aria-label': 'Search this source', enterkeyhint: 'search' });
+  const form = h('form', { class: 'search', role: 'search', onsubmit: e => { e.preventDefault(); q.blur(); const t = q.value.trim(); start(st.sid, t ? 'search' : st.lastMode, t); } }, icon('search'), q);
+  const grid = h('div', { class: 'grid' });
+  const status = h('div', { class: 'bstatus' });
+  const sentinel = h('div', { class: 'bsentinel', 'aria-hidden': 'true' });
+  const root = h('div', { class: 'page' }, chipsBox, form, modes, grid, status, sentinel);
+  view.append(libSwitch('browse'), root);
+  let sources = [];
+  const st = browseMemo || { sid: LS.get('mv.browse.src', null), kind: 'popular', lastMode: 'popular', q: '', items: [], page: 0, done: false, scroll: 0 };
+  let busy = false, token = 0;
+  const refreshBtn = iconBtn('refresh', 'Reload', () => start(st.sid, st.kind, st.q));
+  setActions(refreshBtn);
+  ctx.onLeave(() => { st.scroll = scrollY; browseMemo = st; io.disconnect(); });
+
+  function card(it) {
+    const c = art(it.cover, W.poster, 'cov', initials(it.title));
+    if (it.adult) c.append(h('span', { class: 'badge adult', 'aria-label': 'Adult' }, '18+'));
+    const b = h('button', { class: 'mcard bcard', type: 'button', 'aria-label': 'Open ' + it.title, onclick: async () => {
+      if (b.classList.contains('busy')) return;
+      b.classList.add('busy');
+      try {
+        const r = await post('/api/sources/' + enc(st.sid) + '/open', { id: it.id });
+        invalidate('/api/manga/' + enc(r.manga_id));
+        location.hash = '#/manga/' + enc(r.manga_id);
+      } catch (e) { if (e.status !== 401) toast(e.message, 'err'); }
+      b.classList.remove('busy');
+    } }, c, h('div', { class: 'mcard-t' }, it.title), it.author && h('div', { class: 'mcard-s' }, it.author));
+    return b;
+  }
+  function drawModes() {
+    modes.replaceChildren(segmented([['popular', 'Popular'], ['latest', 'Latest']], st.kind === 'search' ? null : st.kind,
+      v => { q.value = ''; start(st.sid, v, ''); }, 'List'));
+  }
+  function drawChips() {
+    chipsBox.replaceChildren(...sources.map(s => h('button', { class: 'chip src', type: 'button', 'aria-pressed': String(s.id === st.sid),
+      onclick: () => { if (s.id !== st.sid) { q.value = ''; start(s.id, 'popular', ''); } } }, s.name, s.nsfw && h('span', { class: 'src-18' }, '18+'))));
+    const on = chipsBox.querySelector('[aria-pressed="true"]');
+    if (on) on.scrollIntoView({ block: 'nearest', inline: 'center' });
+  }
+  function start(sid, kind, text) {
+    st.sid = sid; st.kind = kind; st.q = text || ''; st.items = []; st.page = 0; st.done = false;
+    if (kind !== 'search') st.lastMode = kind;
+    LS.set('mv.browse.src', sid);
+    grid.replaceChildren(...Array.from({ length: 9 }, () => h('div', null, h('div', { class: 'cov skel' }), h('div', { class: 'skel skel-line', style: { width: '80%' } }))));
+    status.replaceChildren();
+    drawChips(); drawModes();
+    token++; busy = false;
+    more();
+  }
+  async function more() {
+    if (busy || st.done || !st.sid) return;
+    busy = true;
+    const my = token, page = st.page + 1;
+    if (page > 1) status.replaceChildren(h('div', { class: 'spin-ring', role: 'progressbar', 'aria-label': 'Loading more' }));
+    const qs = '?kind=' + st.kind + '&page=' + page + (st.kind === 'search' ? '&q=' + enc(st.q) : '');
+    try {
+      const d = await api('/api/sources/' + enc(st.sid) + '/browse' + qs);
+      if (my !== token || !ctx.alive) return;
+      if (page === 1) grid.replaceChildren();
+      const items = arr(d.items).filter(it => !st.items.some(x => x.id === it.id));
+      st.items.push(...items); st.page = page;
+      grid.append(...items.map(card));
+      st.done = !d.more || !items.length;
+      status.replaceChildren();
+      if (!st.items.length) {
+        status.append(stateBox('search', st.kind === 'search' ? 'No results' : 'Nothing here', st.kind === 'search' ? 'Try another name, or another source.' : 'This source listed no titles.'));
+      } else if (st.done) status.append(h('p', { class: 'muted small bend' }, st.items.length + ' titles'));
+    } catch (e) {
+      if (my !== token || !ctx.alive || e.status === 401) return;
+      if (e.status === 422 && st.kind === 'popular' && page === 1) { busy = false; start(st.sid, 'latest', ''); return; }
+      if (page === 1) grid.replaceChildren();
+      st.done = true;
+      status.replaceChildren(e.status === 422 ? stateBox('info', 'Not on this source', e.message + '. Try Search instead.')
+        : errorState(e, () => { st.done = false; status.replaceChildren(); more(); }));
+    } finally { if (my === token) busy = false; }
+    // A short page leaves the sentinel on screen: keep going.
+    if (!st.done && sentinel.getBoundingClientRect().top < innerHeight + 600) more();
+  }
+  const io = new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) more(); }, { rootMargin: '0px 0px 800px 0px' });
+  io.observe(sentinel);
+  ctx.refresh = () => { start(st.sid, st.kind, st.q); return Promise.resolve(); };
+
+  api('/api/sources').then(d => {
+    if (!ctx.alive) return;
+    sources = arr(d.sources);
+    if (!sources.length) {
+      root.replaceChildren(stateBox('search', 'No sources yet', 'Add MangaDex or another source in Browse in MangaVox on your PC, and it shows up here.',
+        h('button', { class: 'btn', type: 'button', onclick: () => openPc({ page: 'library' }, 'Opened MangaVox on your PC') }, icon('pc'), 'Open on PC')));
+      return;
+    }
+    if (!sources.some(s => s.id === st.sid)) { st.sid = sources[0].id; st.items = []; }
+    q.value = st.kind === 'search' ? st.q : '';
+    if (st.items.length) {
+      // Back from a title: the same list, the same place.
+      drawChips(); drawModes();
+      grid.replaceChildren(...st.items.map(card));
+      if (st.done) status.append(h('p', { class: 'muted small bend' }, st.items.length + ' titles'));
+      requestAnimationFrame(() => scrollTo(0, st.scroll || 0));
+    } else start(st.sid, st.kind === 'search' && !st.q ? 'popular' : st.kind, st.q);
+  }).catch(e => { if (ctx.alive && e.status !== 401) root.replaceChildren(errorState(e, () => route())); });
+}
+
 /** The chapter videos Studio made for a manga, with its one shared thumbnail: play one, or
  *  "Play all" in chapter order (`/api/manga/<id>/videos`). Hidden when there are none. */
 function videosSection(mangaId, title) {

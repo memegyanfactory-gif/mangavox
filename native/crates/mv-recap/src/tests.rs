@@ -211,8 +211,8 @@ fn export_formats() {
     std::fs::write(panel_path(&ch, 1, 0), b"x").unwrap();
     let story = Story {
         segments: vec![
-            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None, hook: false },
-            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }), hook: false },
+            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None, sfx: None, hook: false },
+            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }), sfx: SfxCue::parse("boom", Some(3.0)), hook: false },
         ],
         ..Default::default()
     };
@@ -230,9 +230,43 @@ fn export_formats() {
     // A passage without a delivery follows its scene; one with a delivery carries it (capped at 10).
     assert!(b[1].get("kind").is_none());
     assert_eq!((b[2]["kind"].as_str(), b[2]["intensity"].as_u64()), (Some("fight"), Some(10)));
+    // A sound-effect cue rides on its beat; beats without one carry nothing.
+    assert_eq!((b[2]["sfx"].as_str(), b[2]["sfx_strength"].as_u64()), (Some("boom"), Some(3)));
+    assert!(b[1].get("sfx").is_none() && b[1].get("sfx_strength").is_none());
     // Old story files without the field still load.
     let old: StorySegment = serde_json::from_str(r#"{"page":2,"panel":null,"text":"x"}"#).unwrap();
     assert_eq!(old.delivery, None);
+    assert_eq!(old.sfx, None);
+}
+
+#[test]
+fn story_sfx_cues_are_validated() {
+    // The vocabulary only: spelling variants map onto it, anything else is dropped.
+    assert_eq!(SfxCue::parse("impact", Some(2.0)), Some(SfxCue { name: "impact".into(), strength: 2 }));
+    assert_eq!(SfxCue::parse(" Sword Clang ", Some(7.0)).map(|c| (c.name, c.strength)), Some(("sword_clang".into(), 3)));
+    assert_eq!(SfxCue::parse("door-slam", None).map(|c| c.strength), Some(2), "missing strength: 2");
+    assert_eq!(SfxCue::parse("whoosh", Some(0.0)).map(|c| c.strength), Some(1));
+    assert_eq!(SfxCue::parse("explosion", Some(2.0)), None);
+    assert_eq!(SfxCue::parse("", Some(2.0)), None);
+
+    let read = ChapterRead { pages: (0..3).map(|i| PageRead { index: i, ..Default::default() }).collect(), ..Default::default() };
+    let v: serde_json::Value = serde_json::from_str(
+        r#"{"segments": [
+            {"page": 1, "text": "Calm."},
+            {"page": 2, "text": "He strikes.", "sfx": "Impact", "sfx_strength": "3"},
+            {"page": 2, "text": "Laser.", "sfx": "laser", "sfx_strength": 2},
+            {"page": 3, "text": "Boom.", "sfx": "boom"}
+        ]}"#,
+    )
+    .unwrap();
+    let segs = crate::story::parse_segments(&v, &[0, 1, 2], &read, false);
+    let cues: Vec<Option<(String, u8)>> = segs.iter().map(|s| s.sfx.clone().map(|c| (c.name, c.strength))).collect();
+    assert_eq!(cues, vec![None, Some(("impact".into(), 3)), None, Some(("boom".into(), 2))]);
+    // Saved stories keep the cue; segments without one write no key (old readers unaffected).
+    let json = serde_json::to_string(&segs).unwrap();
+    assert_eq!(json.matches("\"sfx\"").count(), 2);
+    let back: Vec<StorySegment> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, segs);
 }
 
 fn panels_for(ch: &ChapterRef) -> std::path::PathBuf {
@@ -320,8 +354,8 @@ async fn story_chunks_and_saves() {
     let s = &out[0].1;
     assert_eq!(s.title, "Duel");
     assert_eq!(s.segments, vec![
-        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None, hook: false },
-        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None, hook: false },
+        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None, sfx: None, hook: false },
+        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None, sfx: None, hook: false },
     ]);
     let req = story.seen.lock().unwrap();
     let sys = &req[0].messages[0].content;
@@ -356,7 +390,7 @@ fn saved_provider_messages_are_found() {
     use crate::store::provider_message_in;
     let note = "You've hit your session limit · resets 8am (Asia/Kolkata)";
     let read = |s: &str| ChapterRead { pages: vec![PageRead { index: 0, summary: s.into(), ..Default::default() }], ..Default::default() };
-    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None, hook: false }], ..Default::default() };
+    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None, sfx: None, hook: false }], ..Default::default() };
     assert_eq!(provider_message_in(Some(&read(note)), Some(&story(note))), Some(Step::Read));
     assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story(note))), Some(Step::Story));
     assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story("He has no limit to his rage."))), None);
@@ -397,7 +431,7 @@ fn export_skips_silent_pages_and_blank_panels() {
     let panel = |chars: bool| Panel { bbox: None, description: String::new(), characters: if chars { vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }] } else { vec![] }, lines: vec![] };
     let read = ChapterRead { pages: vec![PageRead { index: 1, panels: vec![panel(false), panel(true)], ..Default::default() }], ..Default::default() };
     save_read(&ch, &read).unwrap();
-    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None, hook: false }], ..Default::default() };
+    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None, sfx: None, hook: false }], ..Default::default() };
     export_for_pipeline(&ch, &story).unwrap();
     let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
     let b = beats["beats"].as_array().unwrap();

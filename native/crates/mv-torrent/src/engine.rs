@@ -27,8 +27,8 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::dht::{DhtPersistenceConfig, Id20};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, DhtSessionConfig, FileStream,
-    ListenerMode, ListenerOptions, Magnet, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
-    SessionPersistenceConfig,
+    ListenerMode, ListenerOptions, Magnet, ManagedTorrent, ManagedTorrentState, PeerConnectionOptions, Session,
+    SessionOptions, SessionPersistenceConfig,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncSeekExt, ReadBuf};
@@ -225,6 +225,40 @@ pub struct TorrentStats {
     pub paused: bool,
     pub state: String,
     pub error: Option<String>,
+    /// Verified bytes of the selected file available from its start (capped at
+    /// [`HEAD_PROBE_BYTES`]): the player waits for the head before opening it.
+    pub head_available: u64,
+    /// 0.0..=1.0 of the on-disk check while `state == "initializing"`.
+    pub check_progress: f64,
+}
+
+/// An HTTP stream request waits this long for a torrent that is still checking its files.
+const STREAM_INIT_WAIT: Duration = Duration::from_secs(60);
+
+/// How far [`TorrentStats::head_available`] looks.
+pub const HEAD_PROBE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// First 8 hex digits of an info-hash: enough to tell torrents apart in logs.
+pub fn short_hash(hash: &str) -> &str {
+    &hash[..hash.len().min(8)]
+}
+
+fn log() -> &'static mv_core::logging::Logger {
+    mv_core::logging::global()
+}
+
+fn is_initializing(h: &ManagedTorrent) -> bool {
+    h.with_state(|s| matches!(s, ManagedTorrentState::Initializing(_)))
+}
+
+fn is_error(h: &ManagedTorrent) -> bool {
+    h.with_state(|s| matches!(s, ManagedTorrentState::Error(_)))
+}
+
+/// Not downloading: paused by request, or a check that was started paused (at startup) ended
+/// in the paused state even though the pause flag was cleared since.
+fn needs_start(h: &ManagedTorrent) -> bool {
+    h.is_paused() || h.with_state(|s| matches!(s, ManagedTorrentState::Paused(_)))
 }
 
 struct Entry {
@@ -434,6 +468,12 @@ impl Engine {
     /// idle torrents (prefetches, lingering ones) are paused so playback gets
     /// the whole downlink.
     pub async fn add(&self, source: Source, opts: AddOptions) -> Result<AddedTorrent> {
+        // Pause idle torrents first, not only once this one is ready: restored torrents still
+        // re-checking their files hold the session's few "initialize" slots, and a new torrent
+        // would queue behind them (minutes for big season packs) before it even starts.
+        if let Ok(h) = source.info_hash() {
+            self.registry.pause_others(&h).await;
+        }
         let entry = self.registry.clone().ensure(source, opts, true).await?;
         let hash = entry.handle.info_hash().as_string();
         self.registry.pause_others(&hash).await;
@@ -534,7 +574,11 @@ impl Engine {
             Some(l) => (l.download_speed.mbps * MIB, l.upload_speed.mbps * MIB, l.snapshot.peer_stats.live),
             None => (0.0, 0.0, 0),
         };
+        let checking = matches!(s.state, librqbit::TorrentStatsState::Initializing { .. });
+        let check_progress = if checking && s.total_bytes > 0 { (s.progress_bytes as f64 / s.total_bytes as f64).min(1.0) } else { 0.0 };
         Ok(TorrentStats {
+            head_available: e.handle.available_from(idx, 0, HEAD_PROBE_BYTES),
+            check_progress,
             download_speed: down,
             upload_speed: up,
             peers,
@@ -628,11 +672,27 @@ impl Registry {
     fn ensure(self: Arc<Self>, source: Source, opts: AddOptions, play: bool) -> BoxFuture<'static, Result<Arc<Entry>>> {
         async move {
             let hash = source.info_hash()?;
+            let mut readded = false;
             loop {
                 let existing = self.entries.lock().unwrap().get(&hash).cloned();
                 if let Some(e) = existing {
-                    self.reuse(&e, &opts, play).await;
-                    return Ok(e);
+                    match self.reuse(&e, &opts, play).await {
+                        Ok(()) => return Ok(e),
+                        Err(err) if readded || !play => return Err(err),
+                        Err(err) => {
+                            readded = true;
+                            // A cached torrent stuck in an error state (files removed or
+                            // locked, a failed check): drop it and add it fresh.
+                            log().log_with(
+                                mv_core::logging::Level::Warn,
+                                "torrent",
+                                "cached torrent unusable, re-adding",
+                                serde_json::json!({ "hash": short_hash(&hash), "error": format!("{err:#}") }),
+                            );
+                            self.evict(&hash).await;
+                            continue;
+                        }
+                    }
                 }
                 let pending = self.pending.lock().unwrap().get(&hash).cloned();
                 if let Some(p) = pending {
@@ -646,6 +706,14 @@ impl Registry {
                     async move {
                         let res = reg.clone().add_new(source, opts, play).await.map_err(|e| format!("{e:#}"));
                         reg.pending.lock().unwrap().remove(&hash);
+                        if let Err(e) = &res {
+                            log().log_with(
+                                mv_core::logging::Level::Warn,
+                                "torrent",
+                                if play { "torrent add failed" } else { "torrent prefetch failed" },
+                                serde_json::json!({ "hash": short_hash(&hash), "error": e }),
+                            );
+                        }
                         res
                     }
                     .boxed()
@@ -657,7 +725,7 @@ impl Registry {
                 let res = self.runtime.spawn(fut).await.map_err(|e| anyhow!("add task: {e}"))?;
                 let e = res.map_err(|e| anyhow!(e))?;
                 if play {
-                    self.reuse(&e, &opts, play).await;
+                    self.reuse(&e, &opts, play).await?;
                 }
                 return Ok(e);
             }
@@ -665,7 +733,11 @@ impl Registry {
         .boxed()
     }
 
-    async fn reuse(&self, e: &Arc<Entry>, opts: &AddOptions, play: bool) {
+    /// Makes a managed torrent usable for streaming. A cached torrent can be paused, still
+    /// re-checking its files ("initializing", e.g. restored at startup) or in an error state;
+    /// its stream URL fails at once in all three (HTTP 503 → mpv "loading failed"), so this
+    /// starts it and waits until it is really live instead of returning straight away.
+    async fn reuse(&self, e: &Arc<Entry>, opts: &AddOptions, play: bool) -> Result<()> {
         e.touch();
         if play {
             e.played.store(true, Ordering::Relaxed);
@@ -673,10 +745,35 @@ impl Registry {
         if opts.keep {
             e.keep.store(true, Ordering::Relaxed);
         }
-        if e.handle.is_paused() {
+        let hash = e.handle.info_hash().as_string();
+        let started = Instant::now();
+        let was = e.handle.with_state(|s| s.name());
+        // Paused (also "initializing, pause requested") and error states restart here; an error
+        // re-checks the files first.
+        if needs_start(&e.handle) || is_error(&e.handle) {
             if let Err(err) = self.session.unpause(&e.handle).await {
-                tracing::warn!("unpause failed: {err:#}");
+                log().warn("torrent", &format!("unpause {} failed: {err:#}", short_hash(&hash)));
             }
+        }
+        if is_initializing(&e.handle) {
+            tokio::time::timeout(self.cfg.metadata_timeout, e.handle.wait_until_initialized())
+                .await
+                .map_err(|_| anyhow!("checking the cached files took longer than {:?}", self.cfg.metadata_timeout))??;
+            // A check started paused (startup restore) ends paused.
+            if needs_start(&e.handle) {
+                self.session.unpause(&e.handle).await?;
+            }
+        }
+        if is_error(&e.handle) {
+            bail!("torrent is in an error state: {}", e.handle.stats().error.unwrap_or_default());
+        }
+        if play && was != "live" {
+            log().log_with(
+                mv_core::logging::Level::Info,
+                "torrent",
+                "cached torrent resumed",
+                serde_json::json!({ "hash": short_hash(&hash), "from": was, "ms": started.elapsed().as_millis() as u64 }),
+            );
         }
         if let Some(want) = opts.file_idx.filter(|&i| i < e.files.len()) {
             if want != e.file_idx() {
@@ -685,6 +782,7 @@ impl Registry {
                 self.start_warmers(e, want);
             }
         }
+        Ok(())
     }
 
     async fn select_files(&self, e: &Entry, idx: usize) {
@@ -702,6 +800,7 @@ impl Registry {
 
     async fn add_new(self: Arc<Self>, source: Source, opts: AddOptions, play: bool) -> Result<Arc<Entry>> {
         let hash = source.info_hash()?;
+        let started = Instant::now();
         // "Clear cache" may have wiped these while we run.
         let _ = std::fs::create_dir_all(&self.cfg.download_dir);
         if self.cfg.persist_session {
@@ -743,8 +842,11 @@ impl Registry {
                 }
             }
         };
-        handle.wait_until_initialized().await?;
-        if handle.is_paused() {
+        let metadata_ms = started.elapsed().as_millis() as u64;
+        tokio::time::timeout(self.cfg.metadata_timeout, handle.wait_until_initialized())
+            .await
+            .map_err(|_| anyhow!("checking the torrent's files took longer than {:?}", self.cfg.metadata_timeout))??;
+        if needs_start(&handle) {
             self.session.unpause(&handle).await?;
         }
 
@@ -767,6 +869,19 @@ impl Registry {
         });
         self.select_files(&entry, file_idx).await;
         self.start_warmers(&entry, file_idx);
+        log().log_with(
+            mv_core::logging::Level::Info,
+            "torrent",
+            if play { "torrent ready" } else { "torrent prefetched" },
+            serde_json::json!({
+                "hash": short_hash(&hash),
+                "metadataMs": metadata_ms,
+                "readyMs": started.elapsed().as_millis() as u64,
+                "files": entry.files.len(),
+                "fileBytes": entry.files[file_idx].len,
+                "peers": handle.stats().live.map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
+            }),
+        );
         self.entries.lock().unwrap().insert(hash, entry.clone());
         Ok(entry)
     }
@@ -798,12 +913,19 @@ impl Registry {
     }
 
     /// Torrents restored from the fastresume store: track them as idle
-    /// cache entries (paused; resumed on demand).
+    /// cache entries (paused; resumed on demand by `reuse`, which waits for
+    /// them to be usable).
+    ///
+    /// Never waits: this used to give each restored torrent up to 5 s to
+    /// finish its file check, one after the other, before the engine (and so
+    /// the first play of the session) could start. Checks still running are
+    /// asked to stop instead, so they neither hold the session's few
+    /// "initialize" slots nor the disk while something new is starting.
     async fn adopt_restored(&self) {
         let handles: Vec<Arc<ManagedTorrent>> =
             self.session.with_torrents(|it| it.map(|(_, h)| h.clone()).collect());
+        let (mut adopted, mut checking) = (0usize, 0usize);
         for h in handles {
-            let _ = tokio::time::timeout(Duration::from_secs(5), h.wait_until_initialized()).await;
             let Ok(files) = files_of(&h) else { continue };
             if files.is_empty() {
                 continue;
@@ -811,12 +933,15 @@ impl Registry {
             let pairs: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.len)).collect();
             let only = h.only_files().and_then(|o| o.first().copied());
             let Some(idx) = pick_file(&pairs, only) else { continue };
-            if !h.is_paused() {
+            let init = is_initializing(&h);
+            checking += init as usize;
+            if !h.is_paused() || init {
                 let _ = self.session.pause(&h).await;
             }
+            adopted += 1;
             let hash = h.info_hash().as_string();
-            self.entries.lock().unwrap().insert(
-                hash,
+            // A play may have registered it meanwhile: keep that entry.
+            self.entries.lock().unwrap().entry(hash).or_insert_with(|| {
                 Arc::new(Entry {
                     handle: h,
                     file_idx: AtomicUsize::new(idx),
@@ -826,12 +951,16 @@ impl Registry {
                     active_streams: AtomicUsize::new(0),
                     last_active: Mutex::new(Instant::now()),
                     warmers: Mutex::new(Vec::new()),
-                }),
-            );
+                })
+            });
+        }
+        if adopted > 0 {
+            log().info("torrent", &format!("restored {adopted} cached torrents ({checking} were still checking their files)"));
         }
     }
 
-    /// Playback focus: pause every other idle torrent (prefetches, lingering).
+    /// Playback focus: pause every other idle torrent (prefetches, lingering), including ones
+    /// still checking their files (that frees the session's initialize slots and the disk).
     async fn pause_others(&self, keep_hash: &str) {
         let others: Vec<Arc<Entry>> = self
             .entries
@@ -843,7 +972,7 @@ impl Registry {
             .collect();
         for e in others {
             e.warmers.lock().unwrap().clear();
-            if !e.handle.is_paused() {
+            if !e.handle.is_paused() || is_initializing(&e.handle) {
                 let _ = self.session.pause(&e.handle).await;
             }
         }
@@ -940,10 +1069,13 @@ impl SourceResolver for Registry {
         let entry = self.entries.lock().unwrap().get(&info_hash).cloned();
         let session = self.session.clone();
         Box::pin(async move {
-            let entry = entry?;
+            let Some(entry) = entry else {
+                log().warn("torrent", &format!("stream request for an unknown torrent {}", short_hash(&info_hash)));
+                return None;
+            };
             let file = entry.files.get(file_idx)?.clone();
             entry.touch();
-            if entry.handle.is_paused() {
+            if needs_start(&entry.handle) || is_error(&entry.handle) {
                 let _ = session.unpause(&entry.handle).await;
             }
             Some(Arc::new(TorrentFileSource {
@@ -979,7 +1111,24 @@ impl ByteSource for TorrentFileSource {
             // The player is reading the head itself now; its warmer would only
             // compete with the real read position.
             entry.warmers.lock().unwrap().retain(|w| !(w.head && w.file_idx == idx));
-            let mut stream = entry.handle.clone().stream(idx).await.map_err(io::Error::other)?;
+            // Still checking its files (a cached torrent just restarted): wait for that instead
+            // of failing the request, which mpv reports as "loading failed" at once.
+            if is_initializing(&entry.handle) {
+                let _ = tokio::time::timeout(STREAM_INIT_WAIT, entry.handle.wait_until_initialized()).await;
+            }
+            let mut stream = match entry.handle.clone().stream(idx).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let hash = entry.handle.info_hash().as_string();
+                    log().log_with(
+                        mv_core::logging::Level::Warn,
+                        "torrent",
+                        "stream open failed",
+                        serde_json::json!({ "hash": short_hash(&hash), "state": entry.handle.with_state(|s| s.name()), "error": format!("{e:#}") }),
+                    );
+                    return Err(io::Error::other(e));
+                }
+            };
             if start > 0 {
                 // A seek: re-prioritises around `start` and pre-empts the old
                 // window inside librqbit.
@@ -1049,6 +1198,22 @@ mod tests {
         assert!(matches!(Source::parse("magnet:?xt=urn:btih:abc").unwrap(), Source::Magnet(_)));
         assert!(Source::parse("http://x").is_err());
         assert_eq!(Source::parse(h).unwrap().info_hash().unwrap(), h);
+    }
+
+    /// Every torrent gets the public tracker list on top of its own `tr=` (librqbit merges the
+    /// session list into each announce), so a bare info-hash magnet still finds peers without
+    /// waiting for the DHT. An entry that does not parse would be dropped silently.
+    #[test]
+    fn default_trackers_are_valid_and_used() {
+        let cfg = EngineConfig::new("x");
+        assert_eq!(cfg.trackers.len(), DEFAULT_TRACKERS.len());
+        assert!(DEFAULT_TRACKERS.len() >= 10);
+        for t in DEFAULT_TRACKERS {
+            let u = url::Url::parse(t).unwrap_or_else(|e| panic!("{t}: {e}"));
+            assert!(matches!(u.scheme(), "udp" | "http" | "https"), "{t}");
+        }
+        assert_eq!(short_hash("dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"), "dd8255ec");
+        assert_eq!(short_hash("abc"), "abc");
     }
 
     #[test]
@@ -1126,6 +1291,9 @@ mod tests {
         let st = engine.stats(&added.info_hash).unwrap();
         assert_eq!(st.total, 300_000);
         assert!(st.finished && (st.progress - 1.0).abs() < 1e-9);
+        // The whole (small) file is verified, so its head is ready for the player.
+        assert_eq!(st.head_available, 300_000);
+        assert_eq!(st.state, "live");
 
         // Release keeps it (instant replay), evict drops it.
         engine.remove(&added.info_hash, false).await.unwrap();

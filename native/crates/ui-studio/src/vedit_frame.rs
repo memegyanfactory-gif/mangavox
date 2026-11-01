@@ -3,8 +3,11 @@
 //! screen and how far into it, the panel's camera (zoom and window: `clip_camera` / `edit_move`),
 //! where the panel sits (`panel_margins`), which transition joins two shots and how far it is
 //! (`plan_transitions`, `clip_frames`), the action punch (`_flash`, `_shake`, the IMPACT_GAP
-//! rule) and the side-by-side duo panels. `tests/fixtures/frame_transforms.json` pins the camera
-//! of both sides to the same numbers.
+//! rule, and with the story mood on the renderer's time spacing `punch_ok`) and the side-by-side
+//! duo panels. `tests/fixtures/frame_transforms.json` pins the camera of both sides to the same
+//! numbers. The look's own moves keep the panel whole (the renderer's framing: zoom capped to
+//! its must-see region, here the panel less `PANEL_TRIM`); faces and the mood reading are the
+//! renderer's alone, so with them the preview is close rather than exact.
 //!
 //! Pure functions only; `vedit_view` draws from them.
 use std::f64::consts::PI;
@@ -23,6 +26,13 @@ const PUNCH_SEC: f64 = 0.25;
 const LETTERBOX_ASPECT: f64 = 2.39;
 const SAME_PAGE: (&str, f64) = ("fade", 0.35);
 const PAGE_TRANSITIONS: [&str; 4] = ["smoothleft", "fade", "smoothup", "fadeblack"];
+/// The share of a panel's edge the look's moves may trim (`PANEL_TRIM`).
+const PANEL_TRIM: f64 = 0.03;
+/// Punch spacing with the mood on (`punch_ok`): seconds apart, and in the first
+/// `IMPACT_EARLY_WINDOW` seconds `IMPACT_EARLY_SEC` and one clip fewer.
+const IMPACT_MIN_SEC: f64 = 20.;
+const IMPACT_EARLY_WINDOW: f64 = 30.;
+const IMPACT_EARLY_SEC: f64 = 10.;
 /// The look's own page-change transition length (`transition_duration` of every render).
 const BASE_TRANSITION: f64 = 0.5;
 
@@ -102,7 +112,7 @@ impl LookParams {
             Preset::Clean => &PAGE_TRANSITIONS,
             Preset::Cinematic => &["fade", "fadeblack", "smoothleft", "fade"],
             Preset::Recap => &["smoothleft", "smoothup", "fade", "smoothright"],
-            Preset::Dynamic => &["smoothleft", "burn", "smoothup", "zoomblur", "circleopen", "smoothright", "burn", "slidedown", "zoomblur"],
+            Preset::Dynamic => &["smoothleft", "fade", "smoothup", "zoomblur", "smoothright", "fade", "slidedown", "burn"],
         }
     }
 }
@@ -120,6 +130,8 @@ fn set(fx: &mut Effects, e: crate::look::Effect, on: bool) {
         Parallax => &mut fx.parallax,
         Particles => &mut fx.particles,
         Letterbox => &mut fx.letterbox,
+        Mood => &mut fx.mood,
+        EdgeGlow => &mut fx.edge_glow,
     } = on;
 }
 
@@ -171,6 +183,8 @@ pub struct ClipCam {
     pub motion_k: f64,
     /// The action punch's zoom.
     pub punch: f64,
+    /// The look's moves keep the panel whole (the renderer's must-see region, `clip_camera`).
+    pub framed: bool,
 }
 
 /// The panel's visible rectangle: 1/`zoom` of it, at `x` / `y` of the slack the zoom leaves.
@@ -201,18 +215,28 @@ pub fn camera(c: &ClipCam, frames: u32, on: f64) -> View {
     if c.ramp && (frames as f64) < 2. * FPS {
         k = k.max(0.7);
     }
-    let push = round_to(c.push * k, 4);
+    let mut push = round_to(c.push * k, 4);
+    let mut pan_zoom = round_to(1. + (FG_PAN_ZOOM - 1.) * k * c.motion_k, 4);
+    // The renderer's framing (`clip_camera` with a region): the look's own zoom never trims more
+    // of the panel than PANEL_TRIM a side, and pans travel only the slack that keeps it whole.
+    let framed = c.framed && matches!(c.cam, Cam::Auto(_));
+    let zmax = 1. / (1. - 2. * PANEL_TRIM);
+    if framed {
+        push = round_to(push.min(zmax - 1.).max(0.), 4);
+        pan_zoom = round_to(pan_zoom.min(zmax).max(1.), 4);
+    }
     let e = ease(on, frames, c.ramp);
+    let (lo, hi) = if framed { region_window(PANEL_TRIM, 1. - PANEL_TRIM, pan_zoom) } else { (0., 1.) };
+    let along = |fwd: bool| if fwd { lo + (hi - lo) * e } else { hi + (lo - hi) * e };
     let window = |a: Auto| match a {
-        Auto::PanDown => (0.5, e),
-        Auto::PanUp => (0.5, 1. - e),
-        Auto::PanRight => (e, 0.5),
-        Auto::PanLeft => (1. - e, 0.5),
+        Auto::PanDown => (0.5, along(true)),
+        Auto::PanUp => (0.5, along(false)),
+        Auto::PanRight => (along(true), 0.5),
+        Auto::PanLeft => (along(false), 0.5),
         _ => (0.5, 0.5),
     };
     let (mut zoom, (mut x, mut y)) = match c.cam {
         Cam::Auto(a) => {
-            let pan_zoom = round_to(1. + (FG_PAN_ZOOM - 1.) * k * c.motion_k, 4);
             let z = match a {
                 Auto::Push => 1. + push * e,
                 Auto::Pull => round_to(1. + push, 4) - push * e,
@@ -257,10 +281,35 @@ pub fn camera(c: &ClipCam, frames: u32, on: f64) -> View {
     };
     if c.impact && c.cam != Cam::Auto(Auto::Still) {
         let n = round_py(IMPACT_SEC * FPS * 0.6).max(2.);
-        zoom = 1. + c.punch * (1. - (on / n).min(1.)).powi(3) + push * e;
+        let punch = if framed { round_to(c.punch.min(zmax - 1.).max(0.), 4) } else { c.punch };
+        zoom = 1. + punch * (1. - (on / n).min(1.)).powi(3) + push * e;
         (x, y) = (0.5, 0.5);
     }
     View { zoom, x, y }
+}
+
+/// Where the window may sit along one axis at zoom `z` with [r0, r1] in view (`region_window`),
+/// at the renderer's 4 decimals.
+fn region_window(r0: f64, r1: f64, z: f64) -> (f64, f64) {
+    let a = 1. - 1. / z;
+    if a <= 1e-9 {
+        return (0., 1.);
+    }
+    let (lo, hi) = ((1. - (1. - r1) / a).max(0.), (r0 / a).min(1.));
+    let (lo, hi) = if lo > hi {
+        let mid = (((r0 + r1) / 2. - 1. / (2. * z)) / a).clamp(0., 1.);
+        (mid, mid)
+    } else {
+        (lo, hi)
+    };
+    (round_to(lo, 4), round_to(hi - lo, 4) + round_to(lo, 4))
+}
+
+/// May a punch land on a clip `n` starting at `t` seconds, the last being clip `last_n` at
+/// `last_t` (the renderer's `punch_ok`, used with the story mood on)?
+pub fn punch_ok(t: f64, n: i64, last_t: f64, last_n: i64) -> bool {
+    let early = t < IMPACT_EARLY_WINDOW;
+    n - last_n >= if early { IMPACT_GAP - 1 } else { IMPACT_GAP } && t - last_t >= if early { IMPACT_EARLY_SEC } else { IMPACT_MIN_SEC }
 }
 
 /// The white flash over an action beat `t` seconds in (`_flash`: brightness added).
@@ -400,6 +449,7 @@ pub fn plan(beats: &[Beat], placed: &[Placed], look: &LookParams, cuts: bool, re
     let duo_on = look.duo() && !reels;
     let (mut turn, mut prev) = (0usize, None);
     let mut last_impact = -IMPACT_GAP;
+    let mut last_impact_t = -1e9;
     let mut shots: Vec<Shot> = vec![];
     for (i, p) in placed.iter().enumerate() {
         let b = beats.get(p.clip.src);
@@ -423,13 +473,18 @@ pub fn plan(beats: &[Beat], placed: &[Placed], look: &LookParams, cuts: bool, re
             }
         };
         let text = p.clip.text.as_deref().or(b.map(|b| b.text.as_str())).unwrap_or("");
+        let t = p.start_ms as f64 / 1000.;
         let impact = if p.clip.motion != Motion::Auto {
             p.clip.motion == Motion::Shake
+        } else if look.fx.mood {
+            // The renderer weighs the scene's intensity too (read.json); the words and the spacing here.
+            look.fx.impact && crate::vedit_manga::is_impact(text) && punch_ok(t, i as i64, last_impact_t, last_impact)
         } else {
             look.fx.impact && i as i64 - last_impact >= IMPACT_GAP && crate::vedit_manga::is_impact(text)
         };
         if impact {
             last_impact = i as i64;
+            last_impact_t = t;
         }
         let punch = match (p.clip.motion, p.clip.amount) {
             (Motion::Shake, Some(a)) => sent(a.clamp(0., 0.5)),
@@ -439,7 +494,7 @@ pub fn plan(beats: &[Beat], placed: &[Placed], look: &LookParams, cuts: bool, re
             index: p.index,
             start: p.start_ms as f64 / 1000.,
             frames: 0,
-            cam: ClipCam { cam, impact, ramp: look.ramp(), push: look.push(), motion_k: look.k("motion"), punch },
+            cam: ClipCam { cam, impact, ramp: look.ramp(), push: look.push(), motion_k: look.k("motion"), punch, framed: true },
             duo,
             impact,
             trans: None,
@@ -568,7 +623,7 @@ mod tests {
         } else {
             Cam::Auto(Auto::parse(motion).unwrap())
         };
-        ClipCam { cam, impact: c.get("impact").and_then(Value::as_bool).unwrap_or(false), ramp: c.get("ramp").and_then(Value::as_bool).unwrap_or(false), push: f("push", FG_PUSH), motion_k: f("motion_k", 1.), punch: f("punch", 0.12) }
+        ClipCam { cam, impact: c.get("impact").and_then(Value::as_bool).unwrap_or(false), ramp: c.get("ramp").and_then(Value::as_bool).unwrap_or(false), push: f("push", FG_PUSH), motion_k: f("motion_k", 1.), punch: f("punch", 0.12), framed: false }
     }
 
     /// The preview's camera gives the renderer's numbers (the fixture `tests/test_frame_transforms.py`
@@ -655,6 +710,22 @@ mod tests {
         let (_, y, _, h) = panel_box(1., 1920., 1080., true);
         assert!(y >= 138. && y + h <= 1080. - 138.);
         assert!((flash(0.) - 0.35).abs() < 1e-9 && flash(0.4) == 0.);
+        // The look's own moves keep the panel whole: no frame shows less than all but PANEL_TRIM a side.
+        for cam in [Auto::Push, Auto::Pull, Auto::PanLeft, Auto::PanRight, Auto::PanUp, Auto::PanDown] {
+            for impact in [false, true] {
+                let c = ClipCam { cam: Cam::Auto(cam), impact, ramp: true, push: 0.08, motion_k: 1.5, punch: 0.12, framed: true };
+                for on in [0., 10., 45., 89.] {
+                    let v = camera(&c, 90, on);
+                    let vis = 1. / v.zoom;
+                    let (x0, y0) = (v.x * (1. - vis), v.y * (1. - vis));
+                    assert!(x0 <= PANEL_TRIM + 1e-3 && x0 + vis >= 1. - PANEL_TRIM - 1e-3, "{cam:?} {impact} {on}: x {x0} {vis}");
+                    assert!(y0 <= PANEL_TRIM + 1e-3 && y0 + vis >= 1. - PANEL_TRIM - 1e-3, "{cam:?} {impact} {on}: y {y0} {vis}");
+                }
+            }
+        }
+        // Punches with the mood on: 20 s apart, 10 s (and a clip fewer) in the first 30 s.
+        assert!(punch_ok(12., 3, 1., 0) && !punch_ok(12., 2, 1., 0) && !punch_ok(8., 3, 1., 0));
+        assert!(!punch_ok(45., 10, 30., 5) && punch_ok(51., 10, 30., 5));
         assert_eq!(mix("slideleft", 0.25).in_dx, 0.75);
         assert_eq!(mix("fadeblack", 0.5).dip, Some((false, 1.)));
     }

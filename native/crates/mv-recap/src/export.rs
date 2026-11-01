@@ -6,7 +6,8 @@
 //!   beats to audio by `min(audio page) - min(beat page)`, so there is a beat for every page (page 0
 //!   included) and numbering is 0-based like the audio files. A page the story leaves out gets one
 //!   `"skip": true` beat, which `sync_map` cuts from the video. A passage the user gave a delivery
-//!   carries it as the beat's `kind` / `intensity`, which the narration follows.
+//!   carries it as the beat's `kind` / `intensity`, which the narration follows. A passage the writer
+//!   cued a sound effect on carries `sfx` / `sfx_strength` (1-3), which the renderer places.
 //!
 //! A passage is shown over its panel's crop. When it names no panel, or that crop is blank (an empty or
 //! nearly black / white panel), the page's most telling panel is used instead: one with characters in
@@ -90,6 +91,11 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
             if let Some(d) = s.delivery.as_ref().filter(|d| !d.kind.is_empty()) {
                 beat["kind"] = json!(d.kind);
                 beat["intensity"] = json!(d.intensity.min(10));
+            }
+            // The writer's sound-effect cue (sync_map carries it; the renderer places it).
+            if let Some(x) = s.sfx.as_ref().filter(|x| SFX_NAMES.contains(&x.name.as_str())) {
+                beat["sfx"] = json!(x.name);
+                beat["sfx_strength"] = json!(x.strength.clamp(1, 3));
             }
             beats.push(beat);
         }

@@ -166,6 +166,14 @@ impl Shell {
         subs.push(cx.observe(&dl, |_, _, cx| cx.notify()));
         let studio_runs = cx.new(StudioRuns::new);
         subs.push(cx.observe(&studio_runs, |_, _, cx| cx.notify()));
+        // UI-thread heartbeat for the hang watchdog (mv_core::logging): logs "ui stalled N ms"
+        // with the last breadcrumb when this stops ticking for over a second.
+        mv_core::logging::start_watchdog();
+        cx.spawn(async move |_, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            mv_core::logging::heartbeat();
+        })
+        .detach();
         // Title bar dims while the window is inactive.
         subs.push(cx.observe_window_activation(window, |_, _, cx| cx.notify()));
         let saved = prefs::load();
@@ -429,6 +437,9 @@ impl Shell {
     }
 
     fn after_nav(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The route's kind only ("Player", "MovieDetail"): no titles or ids in the log.
+        let kind = format!("{:?}", self.route);
+        mv_core::logging::breadcrumb(format!("route: {}", kind.split([' ', '{', '(']).next().unwrap_or("")));
         self.nav_serial += 1;
         self.sync_back(cx);
         self.watch_settings(window, cx);
@@ -843,6 +854,7 @@ impl Shell {
             Shortcut::Back => self.back(window, cx),
             Shortcut::Forward => self.forward(window, cx),
             Shortcut::Fullscreen => window.toggle_fullscreen(),
+            Shortcut::Private => crate::privacy::toggle_here(&self.route, window, cx),
         }
     }
 

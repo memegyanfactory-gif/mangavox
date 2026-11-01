@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -273,7 +274,30 @@ pub(crate) struct Editor {
     favs_at: Option<SystemTime>,
     /// The whole-manga timeline ("All chapters") and Re-edit full timeline (see `manga`).
     whole: manga::Whole,
+    /// The monitor draws the live (approximate) preview although the rendered video is current
+    /// (to place layers and captions on it).
+    live: bool,
+    /// The rendered frame the monitor shows (one in memory; dropped from the GPU when replaced).
+    shown: RefCell<Option<(PathBuf, Arc<RenderImage>)>>,
     _subs: Vec<Subscription>,
+}
+
+/// What the Program monitor shows.
+#[derive(Clone)]
+enum MonitorSource {
+    /// The chapter's rendered video: it is current.
+    Rendered(Arc<crate::vedit_media::Rendered>),
+    /// The rendered video is current and being made ready for the monitor.
+    Loading,
+    /// The rendered video is current, but the live preview was asked for (or a layer or the
+    /// captions are being placed).
+    Live,
+    /// The chapter changed since its render (or its video predates look stamps).
+    Stale,
+    /// It is being rendered now.
+    Rendering,
+    /// No rendered video.
+    Nothing,
 }
 
 impl Default for Editor {
@@ -322,6 +346,8 @@ impl Default for Editor {
             favs: vec![],
             favs_at: None,
             whole: Default::default(),
+            live: false,
+            shown: RefCell::new(None),
             _subs: vec![],
         }
     }
@@ -989,6 +1015,20 @@ impl StudioPage {
             (MusicSource::Score, false) => seq.score.clone().map(|p| (p, from, vol * 0.8)),
             (MusicSource::File { path }, false) => Some((path.clone(), from, vol * 0.25)),
         };
+        // The monitor shows the rendered video: its own sound plays (narration, music, effects as
+        // rendered), spread over the timeline like its frames.
+        let rendered = match self.video_manga().map(|g| self.monitor_source(&g)) {
+            Some(MonitorSource::Rendered(r)) => r.audio.clone().map(|wav| (wav, r.duration_ms)),
+            _ => None,
+        };
+        let (narration, skip_ms, music) = match rendered {
+            Some((wav, video_ms)) => {
+                let k = video_ms as f32 / total as f32;
+                let speed = if (0.9..=1.1).contains(&k) { k } else { 1. };
+                (vec![vedit_play::Slice { file: wav, offset_ms: crate::vedit_media::video_ms(from, total, video_ms), dur_ms: total - from, speed }], 0, None)
+            }
+            None => (narration, skip_ms, music),
+        };
         vedit_play::play(vedit_play::Play { narration, skip_ms, music, music_parts: vec![] });
         self.vedit.playing = Some((Instant::now(), from));
         cx.spawn(async move |this, cx| loop {
@@ -1540,10 +1580,12 @@ impl StudioPage {
         let seq = self.vedit.seq.as_ref();
         let item = seq.map(|s| s.item.clone());
         let queued = item.as_ref().and_then(|c| self.queue.for_chapter(&c.id)).filter(|q| q.state.active()).map(|q| q.progress());
-        let this_pending = item.as_ref().is_some_and(|c| pending.iter().any(|p| p.id == c.id));
+        // Not rendered with what the editor shows now: its edit, or the Look, captions or music
+        // (the same check as the monitor, Play and Export).
+        let this_pending = item.as_ref().is_some_and(|c| pending.iter().any(|p| p.id == c.id) || self.looks_for(g).get(&c.id) != Some(&crate::vedit_manga::LookState::Current));
         let status = match (queued, this_pending) {
             (Some(p), _) => format!("Rendering · {}%", (p * 100.).round()),
-            (None, true) => "Edited · not rendered yet".to_string(),
+            (None, true) => "Changed · not rendered yet".to_string(),
             (None, false) => "Rendered".to_string(),
         };
         let title = item.as_ref().map(|c| format!("{} · {}", g.title, c.label())).unwrap_or_default();
@@ -1669,6 +1711,137 @@ impl StudioPage {
         cx.notify();
     }
 
+    // ------------------------------------------------------------------------------ rendered monitor
+
+    /// What the Program monitor shows for the open chapter: its rendered video when that is
+    /// current (the very file Play, Export and the manga section use), else the live preview,
+    /// which only approximates the renderer's looks.
+    fn monitor_source(&self, g: &MangaGroup) -> MonitorSource {
+        let Some(seq) = &self.vedit.seq else { return MonitorSource::Nothing };
+        let video = seq.item.video.clone().or_else(|| self.statuses.get(&seq.item.id).and_then(|s| s.video.clone())).filter(|p| p.is_file());
+        let Some(video) = video else { return MonitorSource::Nothing };
+        if self.remake_of(&seq.item.id).is_some_and(|r| !r.failed) {
+            return MonitorSource::Rendering;
+        }
+        if self.looks_for(g).get(&seq.item.id) != Some(&crate::vedit_manga::LookState::Current) {
+            return MonitorSource::Stale;
+        }
+        // Placing a layer or the captions needs the live preview's handles.
+        let placing = matches!(self.vedit.sel, Some(Sel::Layer(_))) || matches!(self.vedit.drag, Some(Drag::Place { .. } | Drag::Caption { .. }));
+        if self.vedit.live || placing {
+            return MonitorSource::Live;
+        }
+        match crate::vedit_media::rendered_ready(&video) {
+            Some(r) => MonitorSource::Rendered(r),
+            None => MonitorSource::Loading,
+        }
+    }
+
+    /// The monitor's picture at time `now` of the open chapter (`total` long): the rendered
+    /// video's frame when the monitor shows it and it is decoded that far, else the live preview.
+    #[allow(clippy::too_many_arguments)]
+    fn program_frame(&self, source: &MonitorSource, seq: &Seq, placed: &[Placed], now: u64, total: u64, fw: f32, fh: f32, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+        if let MonitorSource::Rendered(r) = source {
+            let image = r.frame(crate::vedit_media::video_ms(now, total, r.duration_ms)).and_then(|f| self.frame_image(&f, window, cx));
+            if let Some(image) = image {
+                let mon = self.vedit.monitor.clone();
+                return div()
+                    .id("vedit-frame")
+                    .relative()
+                    .flex_none()
+                    .w(px(fw))
+                    .h(px(fh))
+                    .overflow_hidden()
+                    .bg(video::paint(hex("#000000"), 1.))
+                    .child(img(image).size_full().object_fit(ObjectFit::Contain))
+                    .child(canvas(move |b, _, _| mon.set(b), |_, _, _, _| {}).absolute().inset_0());
+            }
+        }
+        self.frame(seq, placed, now, fw, fh, window, cx)
+    }
+
+    /// The decoded rendered frame `file`, kept while it shows (the one before leaves the GPU).
+    fn frame_image(&self, file: &Path, window: &mut Window, cx: &mut App) -> Option<Arc<RenderImage>> {
+        let mut shown = self.vedit.shown.borrow_mut();
+        if let Some((f, image)) = shown.as_ref() {
+            if f == file {
+                return Some(image.clone());
+            }
+        }
+        let image = crate::vedit_media::decode_frame(file)?;
+        if let Some((_, old)) = shown.replace((file.to_path_buf(), image.clone())) {
+            cx.drop_image(old, Some(window));
+        }
+        Some(image)
+    }
+
+    /// Above the monitor, when it cannot show the exact video: "Preview is approximate — Render
+    /// changes to see the exact video" with Render changes (`targets`: the changed chapters only),
+    /// or that the changes are being rendered.
+    fn monitor_banner(&self, source: &MonitorSource, targets: Vec<ChapterItem>, cx: &mut Context<Self>) -> Option<Div> {
+        let (icon, text, offer) = match source {
+            MonitorSource::Stale => (ph::INFO, "Preview is approximate — Render changes to see the exact video", true),
+            MonitorSource::Rendering => (ph::FILM_STRIP, "Rendering the changes — the exact video shows here when it's done", false),
+            _ => return None,
+        };
+        let n = targets.len();
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(space::SM))
+                .h(px(32.))
+                .px(px(space::MD))
+                .bg(Tokens::accent_soft())
+                .border_b_1()
+                .border_color(Tokens::border())
+                .child(icon_ph(icon, Tokens::accent(), icon_px::SM))
+                .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).text_color(Tokens::text_1()).child(text))
+                .when(offer && n > 0, |d| {
+                    d.child(
+                        btn("vedit-render-changes", "Render changes", ButtonKind::Primary)
+                            .small()
+                            .icon(ph::FILM_STRIP)
+                            .tooltip(if n == 1 { "Re-make this chapter's video with the changes (only it is rendered)".to_string() } else { format!("Re-make the {n} chapters that changed (only those are rendered)") })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.render_chapters(targets.clone(), cx))),
+                    )
+                }),
+        )
+    }
+
+    /// Under the monitor: what it shows, and the switch between the rendered video and the live
+    /// preview (to place layers and captions) when the render is current.
+    fn monitor_mode(&self, source: &MonitorSource, cx: &mut Context<Self>) -> Div {
+        let (label, colour, toggle) = match source {
+            MonitorSource::Rendered(_) => ("Rendered video", Tokens::success(), Some(("Live preview", true))),
+            MonitorSource::Loading => ("Loading the rendered video…", Tokens::text_3(), Some(("Live preview", true))),
+            MonitorSource::Live => ("Live preview", Tokens::text_2(), Some(("Show rendered", false))),
+            MonitorSource::Stale | MonitorSource::Rendering => ("Approximate preview", Tokens::warning(), None),
+            MonitorSource::Nothing => ("Live preview", Tokens::text_3(), None),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(space::XS))
+            .ml(px(space::XS))
+            .child(div().text_size(px(size::SM)).text_color(colour).child(label))
+            .when_some(toggle, |d, (text, live)| {
+                d.child(
+                    btn("vedit-monitor-mode", text, ButtonKind::Ghost)
+                        .small()
+                        .tooltip(if live { "Draw the live preview (to place layers and captions); it only approximates the render" } else { "Show the rendered video: exactly what Play and Export use" })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.vedit.live = live;
+                            if !live && matches!(this.vedit.sel, Some(Sel::Layer(_))) {
+                                this.vedit.sel = None;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
     // ------------------------------------------------------------------------------ monitor
 
     fn monitor_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -1677,6 +1850,8 @@ impl StudioPage {
         let total = vedit::total_ms(&placed);
         let now = self.playhead_now().min(total);
         let playing = self.vedit.playing.is_some();
+        let source = self.video_manga().map(|g| self.monitor_source(&g)).unwrap_or(MonitorSource::Nothing);
+        let banner = self.monitor_banner(&source, vec![seq.item.clone()], cx);
         let video = seq.item.video.clone().or_else(|| self.statuses.get(&seq.item.id).and_then(|s| s.video.clone()));
         let title = format!("{} · Rendered", seq.item.label());
         let play_rendered = btn("vedit-play-rendered", "Play rendered", ButtonKind::Ghost)
@@ -1693,10 +1868,10 @@ impl StudioPage {
         let viewport = window.viewport_size();
         let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
         let room_w = (vw - LEFT_W - RIGHT_W - 60.).max(240.);
-        let room_h = (vh - 52. - 38. - BOTTOM_H - 30. - 96. - 40.).max(140.);
+        let room_h = (vh - 52. - 38. - BOTTOM_H - 30. - 96. - 40. - if banner.is_some() { 32. } else { 0. }).max(140.);
         let aspect = if seq.reels { 9. / 16. } else { 16. / 9. };
         let (fw, fh) = if room_w / room_h > aspect { (room_h * aspect, room_h) } else { (room_w, room_w / aspect) };
-        let frame = self.frame(seq, &placed, now, fw, fh, window, cx);
+        let frame = self.program_frame(&source, seq, &placed, now, total, fw, fh, window, cx);
         let transport = |id: &'static str, icon, label: &'static str| icon_button(id, icon, label).small();
         let scrub_frac = if total > 0 { now as f32 / total as f32 } else { 0. };
         let bars = self.vedit.bars.clone();
@@ -1719,6 +1894,7 @@ impl StudioPage {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .children(banner)
             .child(div().flex().flex_1().min_h_0().items_center().justify_center().p(px(space::SM)).bg(Tokens::well()).child(frame))
             .child(
                 div()
@@ -1729,7 +1905,8 @@ impl StudioPage {
                     .px(px(space::MD))
                     .child(div().text_size(px(size::MD)).font_family(crate::page::MONO).text_color(Tokens::accent()).child(vedit::timecode(now)))
                     .child(div().flex_1())
-                    .child(muted(if seq.reels { "9:16 · Fit" } else { "16:9 · Fit" }))
+                    .child(muted(if seq.reels { "9:16 ·" } else { "16:9 ·" }))
+                    .child(self.monitor_mode(&source, cx))
                     .child(div().flex_1())
                     .child(div().text_size(px(size::MD)).font_family(crate::page::MONO).text_color(Tokens::text_2()).child(vedit::timecode(total))),
             )

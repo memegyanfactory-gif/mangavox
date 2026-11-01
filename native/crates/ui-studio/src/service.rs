@@ -150,6 +150,17 @@ pub struct NarrationRequest {
     pub new_take: bool,
 }
 
+/// The renderer's `sfx` setting for a chapter: "off", "subtle" or "punchy". A synth score that is
+/// mixed in already carries its own sound effects, so the story's are not laid on top of them.
+pub fn sfx_mode(music: &mv_score::MusicSettings, with_score: bool) -> &'static str {
+    match music.sfx {
+        mv_score::SfxAmount::Off => "off",
+        _ if with_score && music.source == mv_score::Source::Compose => "off",
+        mv_score::SfxAmount::Subtle => "subtle",
+        mv_score::SfxAmount::Punchy => "punchy",
+    }
+}
+
 /// The pipeline job for one chapter. Text extraction is skipped when the chapter
 /// already has a script or OCR result (the worker then reuses it).
 pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> PipelineJob {
@@ -194,6 +205,10 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
     if req.video && music.enabled && mv_score::is_fresh(&r, &music) {
         job.video_config["score"] = json!(mv_score::score_wav(&r).to_string_lossy());
     }
+    // Sound effects on the story's big moments (python/sfx.py), switched by the Music step's
+    // "Sound effects"; the user's own sounds in `<data>/studio/sfx` replace the built-in ones.
+    job.video_config["sfx"] = json!(sfx_mode(&music, job.video_config.get("score").is_some()));
+    job.video_config["sfx_dir"] = json!(mv_core::paths::studio().join("sfx").to_string_lossy());
     // The chapter's caption style (its own, else the Studio default; see `video`).
     if req.video {
         let subs = crate::video::subtitle_setting_for(ch);
@@ -507,6 +522,8 @@ mod tests {
         assert_eq!(job.video_config["format"], "reels");
         assert!(job.video_config["subtitles"].is_object(), "a render carries the chapter's caption setting");
         assert!(job.video_config["look"]["preset"].is_string(), "a render carries the Studio look");
+        assert!(["off", "subtle", "punchy"].contains(&job.video_config["sfx"].as_str().unwrap()), "and the sound-effects switch");
+        assert!(job.video_config["sfx_dir"].as_str().unwrap().ends_with("sfx"));
         assert_eq!(job.output_dir, PathBuf::from("/lib/m/c1/pipeline"));
         assert!(!job.ollama_url.is_empty());
 
@@ -525,6 +542,18 @@ mod tests {
         // New take: the page's next take, recorded by tts_bridge once the clip is in place.
         let take = NarrationRequest { new_take: true, ..one };
         assert_eq!(build_job(&take, &env(OcrProvider::Gemini), &chapter(true)).tts_config["new_take"], true);
+    }
+
+    #[test]
+    fn sound_effects_follow_the_music_step() {
+        use mv_score::{MusicSettings, SfxAmount, Source};
+        let m = |sfx, source| MusicSettings { sfx, source, ..Default::default() };
+        assert_eq!(sfx_mode(&MusicSettings::default(), false), "subtle", "on by default");
+        assert_eq!(sfx_mode(&m(SfxAmount::Off, Source::Library), false), "off");
+        assert_eq!(sfx_mode(&m(SfxAmount::Punchy, Source::Library), true), "punchy");
+        // The synth score has its own effects: not doubled while it plays, back on without it.
+        assert_eq!(sfx_mode(&m(SfxAmount::Subtle, Source::Compose), true), "off");
+        assert_eq!(sfx_mode(&m(SfxAmount::Subtle, Source::Compose), false), "subtle");
     }
 
     #[test]

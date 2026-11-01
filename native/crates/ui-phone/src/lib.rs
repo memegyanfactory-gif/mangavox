@@ -18,6 +18,7 @@ use gpui_kit::*;
 use mv_ui::Route;
 
 pub mod api_anime;
+mod api_browse;
 mod api_chapter_media;
 pub mod api_img;
 pub mod api_manga;
@@ -25,6 +26,7 @@ pub mod api_media;
 pub mod api_studio;
 pub mod api_watch;
 mod activity;
+mod studio_chain;
 pub mod auth;
 pub mod bridge;
 pub mod firewall;

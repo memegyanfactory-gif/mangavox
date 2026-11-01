@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::watch;
 
-use crate::{activity, api_anime, api_chapter_media, api_img, api_manga, api_media, api_studio, api_watch, auth, screen, state, touchpad};
+use crate::{activity, api_anime, api_browse, api_chapter_media, api_img, api_manga, api_media, api_studio, api_watch, auth, screen, state, studio_chain, touchpad};
 
 /// Ports tried after the configured one when it is busy.
 const PORT_TRIES: u16 = 20;
@@ -245,6 +245,8 @@ pub(crate) fn router() -> Router {
         .merge(touchpad::routes())
         .merge(activity::routes())
         .merge(api_chapter_media::routes())
+        .merge(api_browse::routes())
+        .merge(studio_chain::routes())
         .fallback(not_found)
         // Request bodies are small JSON (an input gesture, a chapter list): cap them well below
         // axum's 2 MiB default.

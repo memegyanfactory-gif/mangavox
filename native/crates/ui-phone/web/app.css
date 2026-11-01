@@ -274,6 +274,40 @@ body[data-route="reader"] .toasts, body[data-route="watch"] .toasts { bottom: ca
 .macts { display: flex; gap: 8px; padding: 0 var(--gut); flex-wrap: wrap; }
 .macts .btn.primary { flex: 1 1 100%; }
 .macts .btn:not(.primary) { flex: 1; padding: 0 10px; font-size: 14px; }
+/* Library / Favorites / Download / Make in Studio */
+.mlib { display: flex; flex-direction: column; gap: 8px; padding: 10px var(--gut) 0; }
+.mlib-row { display: flex; gap: 8px; }
+.mlib-row .btn { flex: 1; padding: 0 8px; font-size: 13.5px; min-width: 0; }
+.mlib-row .btn.on { background: var(--ac-soft); color: var(--ac); border-color: var(--ac-line); }
+.mlib-row .btn.on .ic { color: var(--gold); }
+.mlib-row .btn.on:first-child .ic { color: var(--ac); }
+/* Chapter picker */
+.pick-ctl { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.pick-ctl .chip { min-height: 34px; padding: 0 14px; font-size: 13px; }
+.pick-range { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 13px; color: var(--t3); }
+.pick-range input { width: 76px; height: 38px; padding: 0 10px; border-radius: 10px; background: var(--s2); border: 1px solid var(--line); color: var(--t1); font-size: 16px; outline: none; }
+.pick-range input:focus { border-color: var(--ac-line); }
+.pick-list { margin: 0 -20px; border-top: 1px solid var(--line); }
+.pick-list .crow { padding: 6px 20px; }
+.pick-go { position: sticky; bottom: calc(-20px - var(--sab)); margin: 0 -20px; padding: 12px 20px calc(12px + var(--sab)); background: linear-gradient(180deg, transparent, var(--s1) 30%); }
+.pick-go .btn.block { margin-top: 0; }
+/* Library | Browse */
+.libsw { padding: 10px var(--gut) 0; }
+.libsw .seg button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.libsw .seg .ic { width: 18px; height: 18px; }
+.src-chips { padding-top: 10px; padding-bottom: 10px; }
+.chip.src { min-height: 38px; padding: 0 14px; font-size: 13.5px; gap: 6px; background: var(--s1); border: 1px solid var(--line); color: var(--t1); }
+.chip.src[aria-pressed="true"] { background: #fff; color: #0b0b12; border-color: #fff; }
+.src-18 { font-size: 10px; font-weight: 800; color: var(--err); }
+.bmodes { padding: 0 var(--gut) 14px; }
+.bcard { text-align: left; position: relative; align-self: start; display: flex; flex-direction: column; }
+.bcard.busy .cov { opacity: .5; }
+.bcard.busy::after { content: ""; position: absolute; left: 50%; top: 30%; width: 28px; height: 28px; margin-left: -14px; border-radius: 50%; border: 3px solid rgba(255, 255, 255, .25); border-top-color: var(--ac); animation: spin .8s linear infinite; }
+.badge.adult { background: var(--err); color: #1a0606; left: 6px; right: auto; }
+.bstatus { display: flex; justify-content: center; padding: 18px 0; }
+.bstatus:empty { padding: 0; }
+.bend { text-align: center; }
+.bsentinel { height: 1px; }
 .desc { margin: 16px var(--gut) 6px; color: var(--t2); font-size: 14px; white-space: pre-line; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
 .desc.open { -webkit-line-clamp: unset; display: block; }
 .chlist { margin: 0 var(--gut); border-top: 1px solid var(--line); }

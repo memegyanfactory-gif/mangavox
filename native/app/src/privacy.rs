@@ -8,9 +8,9 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::privacy::{self, human_bytes, Choice, CleanPlan, Probe, Session};
-use mv_ui::theme::{icon as icon_px, radius, ramp};
+use mv_ui::theme::{icon as icon_px, ramp};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, checkbox, icon_button, icon_tag, ph, ph_icon, size, ButtonKind, RampExt as _, Route, Tokens, Tone, Weight};
+use mv_ui::{btn, checkbox, ph, ph_icon, size, ButtonKind, RampExt as _, Route, Tokens, Weight};
 
 use crate::routes::is_workspace;
 
@@ -38,12 +38,14 @@ pub fn title_controls(route: &Route) -> Option<Div> {
             .flex_none()
             .items_center()
             .gap(px(4.))
-            .when(on, |d| d.child(icon_tag(ph::EYE_SLASH, "Private", Tone::Info).rounded(px(radius::PILL))))
             .child(
-                icon_button("private-mode", ph::EYE_SLASH.on(on), tip)
+                // Labelled (not a bare icon), so it is found at a glance, like a browser's incognito.
+                btn("private-mode", if on { "Private on" } else { "Private" }, if on { ButtonKind::Secondary } else { ButtonKind::Ghost })
+                    .small()
+                    .icon(ph::EYE_SLASH.on(on))
                     .selected(on)
-                    .when(on, |b| b.color(Tokens::info()))
-                    .occlude()
+                    .tooltip(tip)
+                    .kbd(crate::keys::Shortcut::Private.keys())
                     .on_click(|_, w, cx| toggle(w, cx)),
             ),
     )
@@ -54,7 +56,16 @@ pub fn page_tint(route: &Route) -> Option<Div> {
     (privacy::active() && in_scope(route)).then(|| div().absolute().inset_0().border_1().border_color(Tokens::info().alpha(0.45)))
 }
 
-fn toggle(window: &mut Window, cx: &mut App) {
+/// Ctrl+Shift+N: the toggle where private mode is offered, else a note saying where it is.
+pub fn toggle_here(route: &Route, window: &mut Window, cx: &mut App) {
+    if in_scope(route) || privacy::active() {
+        toggle(window, cx);
+    } else {
+        toast::show(cx, Toast::info("Private mode is for Manga, Anime and Movies.").icon(ph::EYE_SLASH));
+    }
+}
+
+pub fn toggle(window: &mut Window, cx: &mut App) {
     if privacy::active() {
         offer(privacy::end(), false, window, cx);
     } else {

@@ -79,6 +79,14 @@ const API_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/chapter/c1/media/thumbnail"),
     ("GET", "/api/manga/m1/videos"),
     ("GET", "/api/manga/m1/thumbnail"),
+    ("GET", "/api/sources"),
+    ("GET", "/api/sources/mangadex/browse?kind=popular&page=1"),
+    ("GET", "/api/sources/cover?s=mangadex&u=https%3A%2F%2Fa.example%2Fb.jpg&k=00"),
+    ("POST", "/api/sources/mangadex/open"),
+    ("POST", "/api/manga/m1/library"),
+    ("POST", "/api/manga/m1/favorite"),
+    ("POST", "/api/manga/m1/download"),
+    ("POST", "/api/manga/m1/studio"),
     // Unknown routes and methods.
     ("GET", "/api/nope"),
     ("GET", "/api"),
@@ -104,6 +112,9 @@ fn body_for(path: &str) -> &'static str {
         "/api/studio/generate" => r#"{"chapters":["c1"],"what":"audio"}"#,
         "/api/screen/input" => r#"{"t":"text","s":"rm -rf /"}"#,
         "/api/mouse" => MOUSE,
+        "/api/sources/mangadex/open" => r#"{"id":"x"}"#,
+        "/api/manga/m1/library" | "/api/manga/m1/favorite" => r#"{"on":true}"#,
+        "/api/manga/m1/download" | "/api/manga/m1/studio" => r#"{"chapters":["c1"]}"#,
         _ => "{}",
     }
 }
@@ -414,7 +425,7 @@ async fn revoked_devices_are_locked_out_at_once() {
 async fn state_changes_need_the_csrf_header_and_same_origin() {
     let _g = setup();
     let cookie = pair().await;
-    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress"];
+    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress", "/api/sources/mangadex/open", "/api/manga/m1/library", "/api/manga/m1/favorite", "/api/manga/m1/download", "/api/manga/m1/studio"];
     for path in paths {
         let body = body_for(path);
         let base = || req("POST", path, PEER).header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json");
@@ -952,6 +963,89 @@ async fn chapter_media_serves_only_studio_files_by_fixed_name() {
     assert_eq!(text(get_with(&format!("/api/manga/{}/thumbnail", mid), &cookie).await).await, "JPEG-SHARED");
     assert_eq!(get_with("/api/manga/nope/videos", &cookie).await.status(), StatusCode::NOT_FOUND);
     assert_eq!(get_with("/api/manga/nope/thumbnail", &cookie).await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn browse_lists_only_installed_sources_and_signed_covers() {
+    let _g = setup();
+    let cookie = pair().await;
+    // A fresh data folder has no source switched on: nothing listed, and no source can be used.
+    let r = get_with("/api/sources", &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(json_of(&text(r).await)["sources"], serde_json::json!([]));
+    for path in ["/api/sources/mangadex/browse?kind=popular", "/api/sources/nhentai/browse?kind=latest", "/api/sources/..%2F..%2Fx/browse"] {
+        assert_eq!(get_with(path, &cookie).await.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let open = |sid: &str, body: &'static str| send(post(&format!("/api/sources/{sid}/open"), PEER).header(header::COOKIE, &cookie).body(Body::from(body)).unwrap());
+    assert_eq!(open("mangadex", r#"{"id":"abc"}"#).await.status(), StatusCode::NOT_FOUND);
+    // Bad requests are refused before any source is asked.
+    for path in ["/api/sources/mangadex/browse?kind=evil", "/api/sources/mangadex/browse?kind=search", "/api/sources/mangadex/browse?kind=search&q=%20%20"] {
+        assert_eq!(get_with(path, &cookie).await.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    let long = format!("/api/sources/mangadex/browse?kind=search&q={}", "a".repeat(300));
+    assert_eq!(get_with(&long, &cookie).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(open("mangadex", "not json").await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(open("mangadex", r#"{"id":""}"#).await.status(), StatusCode::BAD_REQUEST);
+    // The cover proxy fetches only URLs it handed out itself (keyed per source and URL).
+    for path in [
+        "/api/sources/cover?s=mangadex&u=http%3A%2F%2F192.168.1.1%2Fadmin&k=00000000000000000000000000000000",
+        "/api/sources/cover?s=mangadex&u=https%3A%2F%2Fa.example%2Fb.jpg&k=",
+        "/api/sources/cover?s=mangadex&u=file%3A%2F%2F%2Fetc%2Fpasswd&k=deadbeef",
+    ] {
+        let r = get_with(path, &cookie).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    assert!(get_with("/api/sources/cover?s=x", &cookie).await.status().is_client_error());
+}
+
+#[tokio::test]
+async fn library_favorites_downloads_and_studio_from_the_phone() {
+    let _g = setup();
+    let cookie = pair().await;
+    let (mid, cid, _) = recap_fixture("browse");
+    let (other_mid, other_cid, _) = recap_fixture("browse2");
+    let act = |path: String, body: String| send(post(&path, PEER).header(header::COOKIE, &cookie).body(Body::from(body)).unwrap());
+    let manga = || async { json_of(&text(get_with(&format!("/api/manga/{mid}"), &cookie).await).await) };
+
+    // Browse-only (as a title opened from a source is): not in the library yet.
+    ui_manga::backend::set_in_library(&mid, false);
+    let m = manga().await;
+    assert_eq!((m["in_library"].clone(), m["favorite"].clone()), (serde_json::json!(false), serde_json::json!(false)));
+    // Favouriting adds it to the library too.
+    let r = act(format!("/api/manga/{mid}/favorite"), r#"{"on":true}"#.into()).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(json_of(&text(r).await), serde_json::json!({ "favorite": true, "in_library": true }));
+    let m = manga().await;
+    assert_eq!((m["in_library"].clone(), m["favorite"].clone()), (serde_json::json!(true), serde_json::json!(true)));
+    let lib = json_of(&text(get_with("/api/library", &cookie).await).await);
+    assert!(lib.to_string().contains(&mid), "now in the library list");
+    // Taking it out of the library unpins it.
+    let r = act(format!("/api/manga/{mid}/library"), r#"{"on":false}"#.into()).await;
+    assert_eq!(json_of(&text(r).await), serde_json::json!({ "in_library": false, "favorite": false }));
+    assert_eq!(manga().await["favorite"], false);
+    let r = act(format!("/api/manga/{mid}/library"), r#"{"on":true}"#.into()).await;
+    assert_eq!(json_of(&text(r).await)["in_library"], true);
+
+    // Unknown titles, bad bodies.
+    for path in ["/api/manga/nope/library", "/api/manga/nope/favorite"] {
+        assert_eq!(act(path.into(), r#"{"on":true}"#.into()).await.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    assert_eq!(act(format!("/api/manga/{mid}/favorite"), r#"{"on":"yes"}"#.into()).await.status(), StatusCode::BAD_REQUEST);
+
+    // Downloads: only this manga's chapters; saved ones are not queued again.
+    let r = act(format!("/api/manga/{mid}/download"), format!(r#"{{"chapters":["{cid}"]}}"#)).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(json_of(&text(r).await), serde_json::json!({ "queued": 0, "saved": 1 }));
+    let r = act(format!("/api/manga/{mid}/download"), format!(r#"{{"chapters":["{other_cid}"]}}"#)).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "another manga's chapter");
+    let many = format!(r#"{{"chapters":[{}]}}"#, vec!["\"c\""; 4000].join(","));
+    assert_eq!(act(format!("/api/manga/{mid}/download"), many.clone()).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(act("/api/manga/nope/download".into(), "{}".into()).await.status(), StatusCode::NOT_FOUND);
+    // Make in Studio: the same checks run before Studio is asked anything.
+    assert_eq!(act(format!("/api/manga/{mid}/studio"), format!(r#"{{"chapters":["{other_cid}"]}}"#)).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(act("/api/manga/nope/studio".into(), "{}".into()).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(act(format!("/api/manga/{other_mid}/studio"), many).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(act(format!("/api/manga/{mid}/studio"), "[".into()).await.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

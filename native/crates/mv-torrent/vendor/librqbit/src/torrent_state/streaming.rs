@@ -414,6 +414,41 @@ impl Drop for FileStream {
 }
 
 impl ManagedTorrent {
+    /// MV-PATCH: verified bytes of `file_id` available contiguously from
+    /// `position`, at most `max` (piece granularity; 0 while initializing or
+    /// before metadata). Lets the player wait for the file's head before it
+    /// hands the stream to the demuxer, without opening a stream of its own.
+    pub fn available_from(&self, file_id: usize, position: u64, max: u64) -> u64 {
+        let metadata = self.metadata.load();
+        let Some(metadata) = metadata.as_ref() else { return 0 };
+        let Some(fi) = metadata.file_infos.get(file_id) else { return 0 };
+        if position >= fi.len || max == 0 {
+            return 0;
+        }
+        let want_end = position.saturating_add(max).min(fi.len);
+        let abs_start = fi.offset_in_torrent + position;
+        let abs_end = fi.offset_in_torrent + want_end;
+        let dpl = metadata.lengths().default_piece_length() as u64;
+        if dpl == 0 {
+            return 0;
+        }
+        let first = (abs_start / dpl) as usize;
+        let last = abs_end.div_ceil(dpl) as usize;
+        let have_until = self
+            .with_chunk_tracker(|ct| {
+                let have = ct.get_have_pieces();
+                let have = have.as_slice();
+                let mut i = first;
+                while i < last && have.get(i).map(|v| *v).unwrap_or(false) {
+                    i += 1;
+                }
+                i
+            })
+            .unwrap_or(first);
+        let end = (have_until as u64 * dpl).min(abs_end);
+        end.saturating_sub(abs_start)
+    }
+
     fn with_storage_and_file<F, R>(
         &self,
         file_id: usize,

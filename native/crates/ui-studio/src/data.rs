@@ -6,6 +6,8 @@ use std::sync::Mutex;
 use anyhow::Result;
 use rusqlite::Connection;
 
+pub mod fresh;
+
 /// File names written by the Python pipeline into `<chapter>/pipeline/`.
 pub const VIDEO_FILE: &str = "video_final.mp4";
 const TEXT_FILES: [&str; 2] = ["script_edited.json", "ocr_results.json"];
@@ -306,6 +308,21 @@ pub fn forget_manga_rows(conn: &Connection, manga_id: &str) -> Result<usize> {
 /// [`manga_chapters`] on Studio's connection (blocking).
 pub fn chapters_of(manga_id: &str) -> Result<Vec<(String, Option<PathBuf>)>> {
     with_db(|c| manga_chapters(c, manga_id))
+}
+
+/// The Studio chapters whose video is one of `videos` (`<chapter folder>/video_final.mp4`, as the
+/// manga section finds them), scanned, in library order (blocking).
+pub fn chapters_with_videos(videos: &[PathBuf]) -> Result<Vec<ChapterItem>> {
+    let groups = with_db(query_chapters)?;
+    let mut out = vec![];
+    for mut ch in groups.into_iter().flat_map(|g| g.chapters) {
+        if videos.iter().any(|v| *v == mv_core::paths::studio_chapter(&ch.manga_id, &ch.id).join(VIDEO_FILE)) {
+            ch.output_dir = output_dir_for(&ch.manga_id, &ch.id, &ch.pages_dir);
+            scan(&mut ch);
+            out.push(ch);
+        }
+    }
+    Ok(out)
 }
 
 /// [`forget_manga_rows`] on Studio's connection (blocking).

@@ -140,7 +140,7 @@ class LookTests(unittest.TestCase):
         self.assertFalse(is_impact("A year has passed since then."))
         self.assertFalse(is_impact(""))
 
-    def test_duo_halves_sit_apart_and_tall_panels_pan(self):
+    def test_duo_halves_sit_apart_and_tall_panels_show_whole(self):
         from python.video_generator import duo_geometry
         w, h = 1920, 1080
         left = duo_geometry(800, 1290, w, h, 0)
@@ -149,9 +149,13 @@ class LookTests(unittest.TestCase):
         self.assertLessEqual(right["pos"][0] + right["size"][0], w)
         self.assertEqual(left["slack"], 0)
         self.assertEqual(left["vis"], left["size"][1])
+        # A strip far taller than the frame is drawn whole (narrower), never cut and panned.
         strip = duo_geometry(400, 2400, w, h, 0)
-        self.assertEqual(strip["vis"], h)
-        self.assertGreater(strip["slack"], 0)
+        self.assertEqual(strip["slack"], 0)
+        self.assertEqual(strip["vis"], strip["size"][1])
+        self.assertLessEqual(strip["pos"][1] + strip["size"][1], h)
+        self.assertGreaterEqual(strip["pos"][1], 0)
+        self.assertAlmostEqual(strip["size"][0] / strip["size"][1], 400 / 2400, delta=0.01)
         self.assertTrue(all(v % 2 == 0 for v in strip["size"] + strip["pos"]))
 
     def test_duo_cuts_and_impact_flashes(self):

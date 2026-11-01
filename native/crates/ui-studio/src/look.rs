@@ -5,7 +5,7 @@
 //! File: `<data>/studio/video_look.json`. The export reads the same file on its own, so the keys
 //! are a fixed contract:
 //! `{"preset", "grade"?, "vignette"?, "grain"?, "glow"?, "impact"?, "leaks"?, "chroma"?,
-//! "parallax"?, "particles"?, "letterbox"?, "color"?: "none|warm|cool|noir|vivid", "logo": {on,
+//! "parallax"?, "particles"?, "letterbox"?, "mood"?, "edge_glow"?, "color"?: "none|warm|cool|noir|vivid", "logo": {on,
 //! path, pos, size, opacity}, "text": {on, text, pos, size, opacity}}`. A missing effect or colour
 //! key means "the preset's own default" (so files written before a switch existed keep working). A picked logo is copied into `<data>/studio/brand/logo.<ext>`: it is the user's
 //! own data and lives with the app data, never in the repo.
@@ -64,9 +64,9 @@ impl Preset {
     pub fn blurb(self) -> &'static str {
         match self {
             Preset::Clean => "Single panel, gentle Ken Burns.",
-            Preset::Cinematic => "Letterboxed and warm-graded: glow, grain, light leaks, soft fades.",
+            Preset::Cinematic => "Letterboxed and warm-graded: glow, grain, light leaks, soft fades; the grade and transitions follow the story's mood.",
             Preset::Recap => "Tall panels side by side like the big manhwa recap channels: each new panel slides in.",
-            Preset::Dynamic => "Duo panels over a drifting background, punch zooms, shakes, flashes and RGB splits on action beats, film-burn and zoom-blur page turns.",
+            Preset::Dynamic => "Duo panels over a drifting background, a glowing edge, and an edit that follows the story: mood grades and atmosphere, punches on the intense beats, transitions by scene.",
         }
     }
 
@@ -74,9 +74,9 @@ impl Preset {
     pub fn effects(self) -> Effects {
         match self {
             Preset::Clean => Effects::default(),
-            Preset::Cinematic => Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, ..Effects::default() },
+            Preset::Cinematic => Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, mood: true, ..Effects::default() },
             Preset::Recap => Effects { grade: true, vignette: true, ..Effects::default() },
-            Preset::Dynamic => Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, ..Effects::default() },
+            Preset::Dynamic => Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, ..Effects::default() },
         }
     }
 
@@ -146,14 +146,28 @@ pub enum Effect {
     Parallax,
     Particles,
     Letterbox,
+    Mood,
+    EdgeGlow,
 }
 
 /// How many effect switches there are.
-pub const EFFECT_COUNT: usize = 10;
+pub const EFFECT_COUNT: usize = 12;
 
 impl Effect {
-    pub const ALL: [Effect; EFFECT_COUNT] =
-        [Effect::Grade, Effect::Glow, Effect::Vignette, Effect::Grain, Effect::Impact, Effect::Leaks, Effect::Chroma, Effect::Parallax, Effect::Particles, Effect::Letterbox];
+    pub const ALL: [Effect; EFFECT_COUNT] = [
+        Effect::Mood,
+        Effect::Grade,
+        Effect::Glow,
+        Effect::Vignette,
+        Effect::Grain,
+        Effect::Impact,
+        Effect::Leaks,
+        Effect::Chroma,
+        Effect::Parallax,
+        Effect::Particles,
+        Effect::Letterbox,
+        Effect::EdgeGlow,
+    ];
 
     /// The JSON key.
     pub fn key(self) -> &'static str {
@@ -168,6 +182,8 @@ impl Effect {
             Effect::Parallax => "parallax",
             Effect::Particles => "particles",
             Effect::Letterbox => "letterbox",
+            Effect::Mood => "mood",
+            Effect::EdgeGlow => "edge_glow",
         }
     }
 
@@ -183,6 +199,26 @@ impl Effect {
             Effect::Parallax => "Parallax background drift",
             Effect::Particles => "Floating embers (a little slower)",
             Effect::Letterbox => "Cinematic bars (2.39:1)",
+            Effect::Mood => "Follow the story's mood",
+            Effect::EdgeGlow => "Edge glow",
+        }
+    }
+
+    /// What the switch does, in a sentence (the row's tooltip).
+    pub fn tip(self) -> &'static str {
+        match self {
+            Effect::Grade => "A little more contrast and richer colour over the whole video.",
+            Effect::Glow => "A soft bloom on the panels' highlights.",
+            Effect::Vignette => "Darkens the corners to draw the eye to the panel.",
+            Effect::Grain => "Fine moving film grain. Slower to render and makes bigger files.",
+            Effect::Impact => "A zoom, shake and white flash on action beats (with the mood on, only on intense ones, at most every 20 seconds).",
+            Effect::Leaks => "A warm light flare blooming as a new page lands, every so often.",
+            Effect::Chroma => "Splits the red and blue apart for a moment on the punch.",
+            Effect::Parallax => "The blurred background drifts slower than the panel, for depth.",
+            Effect::Particles => "Floating particles over the picture. With the mood on: dust wherever the scene has no atmosphere of its own.",
+            Effect::Letterbox => "Black bars top and bottom for a widescreen film look.",
+            Effect::Mood => "Uses the chapter's AI reading: each scene gets its own colour grade, atmosphere (embers, rain, snow, dust) and transitions, and punches land only on the intense beats.",
+            Effect::EdgeGlow => "A thin line of light along the frame's edges, with two lights circling it, in the scene's mood colour. Never covers the captions.",
         }
     }
 
@@ -198,6 +234,8 @@ impl Effect {
             Effect::Parallax => ph::STACK,
             Effect::Particles => ph::FIRE,
             Effect::Letterbox => ph::FILM_SLATE,
+            Effect::Mood => ph::MASK_HAPPY,
+            Effect::EdgeGlow => ph::FRAME_CORNERS,
         }
     }
 
@@ -219,6 +257,8 @@ pub struct Effects {
     pub parallax: bool,
     pub particles: bool,
     pub letterbox: bool,
+    pub mood: bool,
+    pub edge_glow: bool,
 }
 
 impl Effects {
@@ -234,6 +274,8 @@ impl Effects {
             Effect::Parallax => self.parallax,
             Effect::Particles => self.particles,
             Effect::Letterbox => self.letterbox,
+            Effect::Mood => self.mood,
+            Effect::EdgeGlow => self.edge_glow,
         }
     }
 
@@ -249,6 +291,8 @@ impl Effects {
             Effect::Parallax => &mut self.parallax,
             Effect::Particles => &mut self.particles,
             Effect::Letterbox => &mut self.letterbox,
+            Effect::Mood => &mut self.mood,
+            Effect::EdgeGlow => &mut self.edge_glow,
         } = on;
     }
 }
@@ -693,12 +737,14 @@ impl LookPanel {
                     .gap(px(space::SM))
                     .child(
                         div()
+                            .id(("look-fx-label", e.index()))
                             .flex()
                             .items_center()
                             .gap(px(6.))
                             .min_w_0()
                             .text_size(px(size::SM))
                             .text_color(Tokens::text_2())
+                            .tooltip(tip(e.tip()))
                             .child(icon_ph(e.icon(), Tokens::text_3(), icon_px::SM))
                             .child(e.label())
                             .when(changed, |d| d.child(div().size(px(6.)).rounded_full().bg(Tokens::accent()))),
@@ -1009,7 +1055,7 @@ mod tests {
     fn defaults_match_the_contract() {
         let l = Look::default();
         assert_eq!(l.preset, Preset::Dynamic);
-        assert_eq!(l.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, ..Effects::default() });
+        assert_eq!(l.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, ..Effects::default() });
         assert_eq!(l.color(), ColorPreset::None);
         assert_eq!((l.logo.pos, l.logo.size, l.logo.opacity), (2, 0.12, 0.85));
         assert_eq!((l.text.pos, l.text.size, l.text.opacity), (0, 0.05, 0.6));
@@ -1027,9 +1073,13 @@ mod tests {
     #[test]
     fn preset_effects_mirror_the_renderer() {
         assert_eq!(Preset::Clean.effects(), Effects::default());
-        assert_eq!(Preset::Cinematic.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, ..Effects::default() });
+        assert_eq!(Preset::Cinematic.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, mood: true, ..Effects::default() });
         assert_eq!(Preset::Recap.effects(), Effects { grade: true, vignette: true, ..Effects::default() });
-        assert_eq!(Preset::Dynamic.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, ..Effects::default() });
+        assert_eq!(Preset::Dynamic.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, ..Effects::default() });
+        // Every switch has a key, a label and a tooltip.
+        for e in Effect::ALL {
+            assert!(!e.key().is_empty() && !e.label().is_empty() && !e.tip().is_empty());
+        }
         assert_eq!(Preset::Cinematic.color(), ColorPreset::Warm);
         assert_eq!(Preset::Dynamic.color(), ColorPreset::None);
     }
@@ -1045,12 +1095,15 @@ mod tests {
         assert_eq!(
             l.render_config(),
             json!({"preset": "recap", "grade": false, "vignette": true, "grain": true, "glow": false, "impact": false,
-                   "leaks": false, "chroma": false, "parallax": false, "particles": true, "letterbox": false, "color": "noir"})
+                   "leaks": false, "chroma": false, "parallax": false, "particles": true, "letterbox": false,
+                   "mood": false, "edge_glow": false, "color": "noir"})
         );
         // Setting a switch back to the preset's own value drops the override.
         l.set_effect(Effect::Grade, true);
         l.set_effect(Effect::Particles, false);
-        assert_eq!(l.overrides, [None, None, None, Some(true), None, None, None, None, None, None]);
+        let mut only_grain = [None; super::EFFECT_COUNT];
+        only_grain[Effect::ALL.iter().position(|e| *e == Effect::Grain).unwrap()] = Some(true);
+        assert_eq!(l.overrides, only_grain);
         l.set_color(ColorPreset::None);
         assert_eq!(l.color, None);
         // A new preset starts from its own defaults.
@@ -1059,8 +1112,15 @@ mod tests {
         assert_eq!(
             l.render_config(),
             json!({"preset": "clean", "grade": false, "vignette": false, "grain": false, "glow": false, "impact": false,
-                   "leaks": false, "chroma": false, "parallax": false, "particles": false, "letterbox": false, "color": "none"})
+                   "leaks": false, "chroma": false, "parallax": false, "particles": false, "letterbox": false,
+                   "mood": false, "edge_glow": false, "color": "none"})
         );
+        // The edge glow is its own switch: off over the dynamic look, everything else stays.
+        l.set_preset(Preset::Dynamic);
+        l.set_effect(Effect::EdgeGlow, false);
+        let cfg = l.render_config();
+        assert_eq!((cfg["edge_glow"].as_bool(), cfg["mood"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(l.to_json()["edge_glow"], false);
     }
 
     #[test]
@@ -1071,6 +1131,7 @@ mod tests {
         assert_eq!(l.color(), ColorPreset::Warm, "absent colour: the preset's own");
         let old = Look::from_json(&json!({"preset": "dynamic", "glow": false, "color": "sepia"}));
         assert!(!old.effects().glow && old.effects().parallax, "a file from before the new switches keeps the preset's");
+        assert!(old.effects().mood && old.effects().edge_glow, "a file from before mood / edge glow gets the preset's");
         assert_eq!(old.color, None, "an unknown colour falls back to the preset's");
         assert_eq!((l.logo.pos, l.logo.size), (2, 0.4));
         assert_eq!((l.text.pos, l.text.size, l.text.opacity), (7, 0.02, 1.0));

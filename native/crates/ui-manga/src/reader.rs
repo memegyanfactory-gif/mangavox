@@ -61,8 +61,15 @@ pub(crate) fn open_read_aloud(manga_id: String, chapter_id: String, window: &mut
     mv_ui::navigate(Route::Reader { manga_id, chapter_id }, window, cx);
 }
 
-/// Plays a chapter's recap video in the app's player.
+/// Plays a chapter's recap video (its Studio `video_final.mp4`, the file Studio's dashboard and
+/// export use) in the app's player, after Studio's check for changes not rendered yet.
 pub(crate) fn watch_recap(title: String, video: &Path, window: &mut Window, cx: &mut App) {
+    let file = video.to_path_buf();
+    crate::recap::guarded(vec![file.clone()], move |w, cx| open_player(title, &file, w, cx), window, cx);
+}
+
+/// Opens `video` (a file or a playlist) in the app's player.
+pub(crate) fn open_player(title: String, video: &Path, window: &mut Window, cx: &mut App) {
     let request = mv_ui::nav::PlayRequest { title, source: video.display().to_string(), file_idx: None, imdb_id: None, mal_id: None, season: None, episode: None };
     mv_ui::navigate(Route::Player { request }, window, cx);
 }
