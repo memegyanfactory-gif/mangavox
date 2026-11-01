@@ -115,3 +115,16 @@ pub fn set_current_route(cx: &mut App, route: Route) {
 pub fn current_route(cx: &App) -> Option<Route> {
     cx.try_global::<CurrentRoute>().and_then(|r| r.0.clone())
 }
+
+static KEEP_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The player is being replaced by the next episode: the shell leaves full screen as it closes
+/// the player, so this keeps it on for that one change.
+pub fn keep_fullscreen_once() {
+    KEEP_FULLSCREEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the closing player asked to stay in full screen (clears the request).
+pub fn take_keep_fullscreen() -> bool {
+    KEEP_FULLSCREEN.swap(false, std::sync::atomic::Ordering::SeqCst)
+}

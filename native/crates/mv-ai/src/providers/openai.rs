@@ -1,5 +1,6 @@
 //! OpenAI-compatible `/chat/completions` (OpenAI, OpenRouter, Groq, DeepSeek, Mistral, xAI,
-//! LM Studio, llama.cpp, custom endpoints) over SSE.
+//! Together, Fireworks, Cerebras, Moonshot, Qwen, Z.ai, Hugging Face, NVIDIA, SambaNova,
+//! DeepInfra, Azure OpenAI, Bedrock, LM Studio, llama.cpp, custom endpoints) over SSE.
 
 use super::{emit_reasoning, emit_text, non_empty, ImageData, StepContext};
 use crate::stream::{for_each_line, get_json, hdr, new_call_id, post_json, safe_json_parse, sse_data, AiError, Result};
@@ -41,7 +42,12 @@ pub fn to_openai_messages(messages: &[AiMessage]) -> Vec<Value> {
 fn auth_headers(api_key: Option<&str>, provider: AiProviderId) -> Vec<(String, String)> {
     let mut h = Vec::new();
     if let Some(k) = api_key.filter(|k| !k.is_empty()) {
-        h.push(hdr("authorization", format!("Bearer {k}")));
+        // Azure OpenAI takes resource keys in `api-key`; `Authorization: Bearer` is for Entra tokens.
+        if provider == AiProviderId::Azure {
+            h.push(hdr("api-key", k));
+        } else {
+            h.push(hdr("authorization", format!("Bearer {k}")));
+        }
     }
     if provider == AiProviderId::Openrouter {
         h.push(hdr("HTTP-Referer", "https://mangavox.app"));
@@ -190,7 +196,7 @@ fn tool_unsupported(msg: &str) -> bool {
     static A: OnceLock<Regex> = OnceLock::new();
     static B: OnceLock<Regex> = OnceLock::new();
     A.get_or_init(|| Regex::new(r"(?i)tool|function").unwrap()).is_match(msg)
-        && B.get_or_init(|| Regex::new(r"(?i)support|not allowed|unsupported|invalid").unwrap()).is_match(msg)
+        && B.get_or_init(|| Regex::new(r"(?i)support|not allowed|unsupported|invalid|cannot be used").unwrap()).is_match(msg)
 }
 
 pub async fn openai_compat_step(ctx: &StepContext) -> Result<AiStepResult> {
@@ -309,6 +315,19 @@ data: [DONE]
         let out = to_openai_messages(&[m]);
         assert_eq!(out[0]["content"], Value::Null);
         assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{\"q\":\"x\"}");
+    }
+
+    #[test]
+    fn auth_header_per_host() {
+        assert_eq!(auth_headers(Some("k"), AiProviderId::Together), vec![hdr("authorization", "Bearer k")]);
+        assert_eq!(auth_headers(Some("k"), AiProviderId::Azure), vec![hdr("api-key", "k")]);
+        assert!(auth_headers(None, AiProviderId::Cerebras).is_empty());
+        assert_eq!(auth_headers(Some("k"), AiProviderId::Openrouter).len(), 3);
+    }
+
+    #[test]
+    fn tool_stream_refusal_falls_back() {
+        assert!(tool_unsupported("400: tools cannot be used with stream=True"));
     }
 
     #[test]

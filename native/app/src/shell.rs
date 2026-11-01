@@ -331,6 +331,10 @@ impl Shell {
     }
 
     fn leave_fullscreen(&self, window: &mut Window) {
+        // The next episode replaces the player: full screen stays on.
+        if mv_ui::nav::take_keep_fullscreen() {
+            return;
+        }
         if matches!(self.route, Route::Player { .. }) && window.is_fullscreen() {
             window.toggle_fullscreen();
         }

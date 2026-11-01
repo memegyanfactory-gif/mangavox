@@ -36,6 +36,19 @@ pub fn provider_logo(id: AiProviderId, size: f32) -> AnyElement {
         AiProviderId::Groq => Mark::Mono("brand/groq.svg", Tokens::hue(Hue::Orange)),
         AiProviderId::Deepseek => Mark::Color("brand/deepseek.svg"),
         AiProviderId::Mistral => Mark::Color("brand/mistral.svg"),
+        // No marks in `brand/` for these yet: a distinct glyph each, so the picker rail tells them apart.
+        AiProviderId::Together => Mark::Glyph(ph::USERS),
+        AiProviderId::Fireworks => Mark::Glyph(ph::FIRE),
+        AiProviderId::Cerebras => Mark::Glyph(ph::LIGHTNING),
+        AiProviderId::Moonshot => Mark::Glyph(ph::MOON),
+        AiProviderId::Qwen => Mark::Glyph(ph::CLOUD),
+        AiProviderId::Zai => Mark::Glyph(ph::SPARKLE),
+        AiProviderId::Huggingface => Mark::Glyph(ph::SMILEY),
+        AiProviderId::Nvidia => Mark::Glyph(ph::CUBE),
+        AiProviderId::Sambanova => Mark::Glyph(ph::ROCKET_LAUNCH),
+        AiProviderId::Deepinfra => Mark::Glyph(ph::STACK),
+        AiProviderId::Azure => Mark::Glyph(ph::GLOBE),
+        AiProviderId::Bedrock => Mark::Glyph(ph::GLOBE_SIMPLE),
         AiProviderId::Custom => Mark::Mono("brand/generic.svg", Tokens::text_3()),
     };
     match mark {

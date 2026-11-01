@@ -9,6 +9,7 @@ pub mod cli_updates;
 mod data;
 pub mod models;
 mod storage;
+mod services;
 mod system;
 mod tabs;
 mod ui;
@@ -64,6 +65,7 @@ pub enum Tab {
     Sources,
     Addons,
     Providers,
+    Services,
     Models,
     CliTools,
     Storage,
@@ -78,7 +80,7 @@ const GROUPS: &[(&str, &[Tab])] = &[
     ("", &[Tab::Profile, Tab::Mode]),
     ("Look and feel", &[Tab::Appearance, Tab::Playback, Tab::Audio]),
     ("Content", &[Tab::Sources, Tab::Addons]),
-    ("AI", &[Tab::Providers, Tab::Models, Tab::CliTools]),
+    ("AI", &[Tab::Providers, Tab::Services, Tab::Models, Tab::CliTools]),
     ("Device", &[Tab::Storage, Tab::System]),
 ];
 
@@ -103,6 +105,7 @@ impl Tab {
             "addons" | "streaming" => Tab::Addons,
             "storage" => Tab::Storage,
             "providers" => Tab::Providers,
+            "services" | "ai-services" | "api-keys" => Tab::Services,
             "models" | "model-library" => Tab::Models,
             "cli-tools" | "cli" => Tab::CliTools,
             "studio" => Tab::Studio,
@@ -124,6 +127,7 @@ impl Tab {
             Tab::Addons => "addons",
             Tab::Storage => "storage",
             Tab::Providers => "providers",
+            Tab::Services => "services",
             Tab::Models => "models",
             Tab::CliTools => "cli-tools",
             Tab::Studio => "studio",
@@ -144,6 +148,7 @@ impl Tab {
             Tab::Addons => "Streaming addons",
             Tab::Storage => "Storage",
             Tab::Providers => "AI providers",
+            Tab::Services => "AI services",
             Tab::Models => "Model Library",
             Tab::CliTools => "CLI tools",
             Tab::Studio => "Studio",
@@ -163,7 +168,8 @@ impl Tab {
             Tab::Sources => "Where manga comes from: installed sources, plugins and repositories.",
             Tab::Addons => "Stremio-compatible addons that find streams for movies, series and anime.",
             Tab::Storage => "Where MangaVox keeps your data, what takes up space, and how to free it.",
-            Tab::Providers => "Local and cloud AI services for the assistant, with keys and default models.",
+            Tab::Providers => "Local and cloud AI models for the assistant and Studio, with keys and default models.",
+            Tab::Services => "API keys for image, video and voice services, each checked with a free test call.",
             Tab::Models => "Models on this PC and what MangaVox uses them for.",
             Tab::CliTools => "Installed coding-agent CLIs, their versions and updates.",
             Tab::Studio => "Defaults for narration and video output in Studio projects.",
@@ -186,6 +192,7 @@ impl Tab {
             Tab::Addons => ph::PLUGS_CONNECTED,
             Tab::Storage => glyphs::STORAGE,
             Tab::Providers => ph::HEAD_CIRCUIT,
+            Tab::Services => ph::KEY,
             Tab::Models => glyphs::MODEL,
             Tab::CliTools => ph::TERMINAL_WINDOW,
             Tab::Studio => glyphs::STUDIO,
@@ -205,6 +212,7 @@ impl Tab {
             Tab::Sources => Hue::Blue,
             Tab::Addons => Hue::Violet,
             Tab::Providers => Hue::Amber,
+            Tab::Services => Hue::Cyan,
             Tab::Models => Hue::Green,
             Tab::CliTools => Hue::Slate,
             Tab::Storage => Hue::Blue,
@@ -227,7 +235,8 @@ impl Tab {
             Tab::Sources => "manga plugins repositories extensions",
             Tab::Addons => "stremio streams torrent movies series anime",
             Tab::Storage => "folder disk space delete reset cache downloads data move factory",
-            Tab::Providers => "api key openai claude gemini ollama lm studio openrouter cloud",
+            Tab::Providers => "api key openai claude gemini ollama lm studio openrouter cloud together fireworks cerebras kimi moonshot qwen glm z.ai hugging face nvidia sambanova deepinfra azure bedrock",
+            Tab::Services => "api key keys higgsfield fal replicate runway luma kling stability ideogram leonardo flux bfl elevenlabs cartesia deepgram fish hume image video voice tts",
             Tab::Models => "gguf ollama whisper comfyui local models engines",
             Tab::CliTools => "claude code codex gemini cli update terminal grok antigravity mcp app tools",
             Tab::Studio => "resolution speed default voice video export",
@@ -244,7 +253,7 @@ impl Tab {
 
     /// Tabs whose body is an embedded panel from another crate.
     fn is_panel(self) -> bool {
-        matches!(self, Tab::Sources | Tab::Addons | Tab::Providers | Tab::Magnific)
+        matches!(self, Tab::Sources | Tab::Addons | Tab::Providers | Tab::Services | Tab::Magnific)
     }
 }
 
@@ -552,6 +561,7 @@ impl SettingsView {
             Tab::Sources => ui_manga::sources_panel(window, cx),
             Tab::Addons => ui_media::addons_panel(window, cx),
             Tab::Magnific => ui_studio::magnific_settings(window, cx),
+            Tab::Services => services::create(window, cx),
             _ => ui_assistant::providers_panel(window, cx),
         };
         self.panels.insert(tab, view);
@@ -937,6 +947,9 @@ mod tests {
         assert!(Tab::System.matches("resource limit"));
         assert!(Tab::Audio.matches("chatterbox"));
         assert!(Tab::Storage.matches("cache"));
+        assert!(Tab::Services.matches("elevenlabs") && Tab::Services.matches("higgsfield"));
+        assert!(Tab::Providers.matches("together") && Tab::Providers.matches("bedrock"));
+        assert_eq!(Tab::from_id("api-keys"), Some(Tab::Services));
         assert!(!Tab::About.matches("subtitle"));
         assert!(Tab::About.matches(""));
     }

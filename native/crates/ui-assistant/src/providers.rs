@@ -343,7 +343,8 @@ impl ProvidersPanel {
                     ))
                     .when_some(key_url, |d, u| d.child(div().pl(px(116.)).child(external_link("Get an API key", u))))
                 })
-                .when(st.kind != AiProviderKind::Cli && (st.default_base_url.is_some() || id == AiProviderId::Custom), |d| d.child(field_row("Server URL", div().flex_1().min_w_0().child(field(&url).small()))))
+                // Every server-backed provider; Custom and Azure have no default URL and need one.
+                .when(st.kind != AiProviderKind::Cli, |d| d.child(field_row("Server URL", div().flex_1().min_w_0().child(field(&url).small()))))
                 .child(field_row("Default model", div().flex_1().min_w_0().child(field(&model).small())))
                 .child(div().pl(px(116.)).child(muted("Fields save when you press Enter or click away.")))
                 .child(

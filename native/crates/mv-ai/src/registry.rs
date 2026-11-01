@@ -104,8 +104,14 @@ const fn with_base(mut d: ProviderDef, base: &'static str) -> ProviderDef {
     d
 }
 
-/// The 18-provider catalog (order matters: it is the UI order).
-pub static PROVIDERS: [ProviderDef; 18] = [
+/// A provider whose server URL the user must supply (no shared endpoint).
+const fn no_base(mut d: ProviderDef) -> ProviderDef {
+    d.base_url = None;
+    d
+}
+
+/// The provider catalog (order matters: it is the UI order).
+pub static PROVIDERS: [ProviderDef; 30] = [
     with_hint(
         with_base(def(AiProviderId::Ollama, "Ollama", AiProviderKind::Local, "Local models on this PC", StepKind::Ollama), "http://127.0.0.1:11434"),
         "Install from ollama.com, then start Ollama.",
@@ -148,6 +154,66 @@ pub static PROVIDERS: [ProviderDef; 18] = [
     api(AiProviderId::Deepseek, "DeepSeek", "DeepSeek chat and reasoner", "https://api.deepseek.com/v1", &["DEEPSEEK_API_KEY"], "https://platform.deepseek.com/api_keys", StepKind::OpenAi),
     api(AiProviderId::Mistral, "Mistral", "Mistral and Codestral", "https://api.mistral.ai/v1", &["MISTRAL_API_KEY"], "https://console.mistral.ai/api-keys", StepKind::OpenAi),
     api(AiProviderId::Xai, "xAI", "Grok models", "https://api.x.ai/v1", &["XAI_API_KEY"], "https://console.x.ai", StepKind::OpenAi),
+    // OpenAI-compatible hosts (docs checked 2026-11). Static models only cover hosts whose
+    // `/models` list is missing or undocumented; a live list adds to them.
+    api(AiProviderId::Together, "Together AI", "Open models, many with vision", "https://api.together.ai/v1", &["TOGETHER_API_KEY"], "https://api.together.ai/settings/projects/~current/api-keys", StepKind::OpenAi),
+    with_models(
+        api(AiProviderId::Fireworks, "Fireworks AI", "Fast open models", "https://api.fireworks.ai/inference/v1", &["FIREWORKS_API_KEY"], "https://app.fireworks.ai/settings/users/api-keys", StepKind::OpenAi),
+        &["accounts/fireworks/models/kimi-k3", "accounts/fireworks/models/glm-5p3", "accounts/fireworks/models/gpt-oss-120b"],
+    ),
+    api(AiProviderId::Cerebras, "Cerebras", "Very fast open models", "https://api.cerebras.ai/v1", &["CEREBRAS_API_KEY"], "https://cloud.cerebras.ai", StepKind::OpenAi),
+    api(AiProviderId::Moonshot, "Moonshot Kimi", "Kimi models, with vision", "https://api.moonshot.ai/v1", &["MOONSHOT_API_KEY"], "https://platform.kimi.ai/console/api-keys", StepKind::OpenAi),
+    with_models(
+        api(
+            AiProviderId::Qwen,
+            "Qwen (Alibaba)",
+            "Qwen models from Model Studio",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            &["DASHSCOPE_API_KEY"],
+            "https://modelstudio.console.alibabacloud.com/model/settings/api-key",
+            StepKind::OpenAi,
+        ),
+        &["qwen3.8-max", "qwen-plus", "qwen3-vl-plus"],
+    ),
+    with_models(
+        api(AiProviderId::Zai, "Z.ai GLM", "GLM models", "https://api.z.ai/api/paas/v4", &["ZAI_API_KEY"], "https://z.ai/manage-apikey/apikey-list", StepKind::OpenAi),
+        &["glm-5.3", "glm-5.3-flash"],
+    ),
+    api(
+        AiProviderId::Huggingface,
+        "Hugging Face",
+        "Inference Providers, one token",
+        "https://router.huggingface.co/v1",
+        &["HF_TOKEN", "HUGGINGFACE_API_KEY"],
+        "https://huggingface.co/settings/tokens",
+        StepKind::OpenAi,
+    ),
+    with_models(
+        api(AiProviderId::Nvidia, "NVIDIA NIM", "Hosted models on build.nvidia.com", "https://integrate.api.nvidia.com/v1", &["NVIDIA_API_KEY"], "https://build.nvidia.com", StepKind::OpenAi),
+        &["openai/gpt-oss-120b", "deepseek-ai/deepseek-v4-pro"],
+    ),
+    with_models(
+        api(AiProviderId::Sambanova, "SambaNova", "Fast open models", "https://api.sambanova.ai/v1", &["SAMBANOVA_API_KEY"], "https://cloud.sambanova.ai/apis", StepKind::OpenAi),
+        &["gpt-oss-120b", "Meta-Llama-3.3-70B-Instruct"],
+    ),
+    api(AiProviderId::Deepinfra, "DeepInfra", "Cheap open models", "https://api.deepinfra.com/v1/openai", &["DEEPINFRA_API_KEY"], "https://deepinfra.com/dash/api_keys", StepKind::OpenAi),
+    // Azure has no shared URL: each resource has its own, and the model is the deployment name.
+    with_hint(
+        no_base(api(AiProviderId::Azure, "Azure OpenAI", "Your Azure OpenAI resource", "", &["AZURE_OPENAI_API_KEY"], "https://portal.azure.com", StepKind::OpenAi)),
+        "Add your resource URL, like https://NAME.openai.azure.com/openai/v1, and use your deployment name as the model",
+    ),
+    with_models(
+        api(
+            AiProviderId::Bedrock,
+            "Amazon Bedrock",
+            "Bedrock API key (us-east-1; change the URL for another region)",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+            &["AWS_BEARER_TOKEN_BEDROCK"],
+            "https://console.aws.amazon.com/bedrock",
+            StepKind::OpenAi,
+        ),
+        &["openai.gpt-oss-120b-1:0", "openai.gpt-oss-20b-1:0"],
+    ),
     def(AiProviderId::Custom, "Custom endpoint", AiProviderKind::Api, "Any OpenAI-compatible server", StepKind::OpenAi),
     with_hint(
         with_models(
@@ -294,6 +360,12 @@ impl Registry {
                 return Some(k);
             }
         }
+        // The Model Hub's Hugging Face token works for Inference Providers when it has that permission.
+        if def.id == AiProviderId::Huggingface {
+            if let Some(k) = cfg.get("aiAssistant").and_then(|a| a.get("hub")).and_then(|h| h.get("hfToken")).and_then(Value::as_str).and_then(|k| truthy(Some(k.trim()))) {
+                return Some(k);
+            }
+        }
         def.key_env.iter().find_map(|e| truthy((self.env)(e).as_deref()))
     }
 
@@ -385,8 +457,8 @@ impl Registry {
                 }
             }
             AiProviderKind::Api => {
-                if def.id == AiProviderId::Custom && base_url.is_empty() {
-                    return set(AiProviderState::NeedsKey, Some("Add the server URL".into()), None);
+                if base_url.is_empty() {
+                    return set(AiProviderState::NeedsKey, Some(def.install_hint.unwrap_or("Add the server URL").into()), None);
                 }
                 if def.needs_key && api_key.is_none() {
                     return set(AiProviderState::NeedsKey, Some("Add an API key".into()), None);
@@ -503,8 +575,8 @@ impl Registry {
             if def.needs_key && ctx.api_key.is_none() {
                 return Err(AiError::msg(format!("{} needs an API key — add it in Settings → AI Providers", def.label)));
             }
-            if def.id == AiProviderId::Custom && ctx.base_url.is_empty() {
-                return Err(AiError::msg("Set the custom endpoint URL in Settings → AI Providers"));
+            if def.kind == AiProviderKind::Api && ctx.base_url.is_empty() {
+                return Err(AiError::msg(format!("Set the {} server URL in Settings → AI Providers", def.label)));
             }
             match def.step {
                 StepKind::Ollama => providers::ollama::ollama_step(&ctx).await,
@@ -611,10 +683,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_18_unique_providers() {
-        assert_eq!(PROVIDERS.len(), 18);
+    fn catalog_has_unique_providers() {
+        assert_eq!(PROVIDERS.len(), 30);
         let ids: HashSet<_> = PROVIDERS.iter().map(|p| p.id).collect();
-        assert_eq!(ids.len(), 18);
+        assert_eq!(ids.len(), 30);
+        // as_str matches the serde name, so settings keys and the wire format agree.
+        for p in &PROVIDERS {
+            assert_eq!(serde_json::to_value(p.id).unwrap(), Value::String(p.id.as_str().into()), "{}", p.label);
+        }
         assert!(!provider_def(AiProviderId::Codex).supports_tools);
         assert!(provider_def(AiProviderId::Ollama).supports_tools);
         assert_eq!(provider_def(AiProviderId::Gemini).key_env, &["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
@@ -622,6 +698,69 @@ mod tests {
         assert_eq!(serde_json::to_string(&AiProviderId::GrokCli).unwrap(), "\"grok-cli\"");
         assert_eq!(serde_json::to_string(&AiProviderId::Antigravity).unwrap(), "\"antigravity\"");
         assert_eq!(provider_def(AiProviderId::Antigravity).label, "Antigravity");
+    }
+
+    #[test]
+    fn openai_compatible_hosts_are_complete() {
+        let hosts = [
+            (AiProviderId::Together, "https://api.together.ai/v1", "TOGETHER_API_KEY"),
+            (AiProviderId::Fireworks, "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY"),
+            (AiProviderId::Cerebras, "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY"),
+            (AiProviderId::Moonshot, "https://api.moonshot.ai/v1", "MOONSHOT_API_KEY"),
+            (AiProviderId::Qwen, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY"),
+            (AiProviderId::Zai, "https://api.z.ai/api/paas/v4", "ZAI_API_KEY"),
+            (AiProviderId::Huggingface, "https://router.huggingface.co/v1", "HF_TOKEN"),
+            (AiProviderId::Nvidia, "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY"),
+            (AiProviderId::Sambanova, "https://api.sambanova.ai/v1", "SAMBANOVA_API_KEY"),
+            (AiProviderId::Deepinfra, "https://api.deepinfra.com/v1/openai", "DEEPINFRA_API_KEY"),
+            (AiProviderId::Bedrock, "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1", "AWS_BEARER_TOKEN_BEDROCK"),
+        ];
+        for (id, base, env) in hosts {
+            let d = provider_def(id);
+            assert!(matches!(d.step, StepKind::OpenAi) && d.kind == AiProviderKind::Api && d.needs_key && d.supports_tools, "{}", d.label);
+            assert_eq!(d.base_url, Some(base), "{}", d.label);
+            assert!(!base.ends_with('/'), "{}", d.label);
+            assert_eq!(d.key_env[0], env, "{}", d.label);
+            assert!(d.key_url.is_some_and(|u| u.starts_with("https://")), "{}", d.label);
+        }
+        // Azure has no shared endpoint: the user adds the resource URL.
+        let az = provider_def(AiProviderId::Azure);
+        assert!(az.base_url.is_none() && az.needs_key && az.install_hint.is_some_and(|h| h.contains("openai.azure.com/openai/v1")));
+    }
+
+    #[tokio::test]
+    async fn hosts_without_a_model_list_still_offer_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = registry(dir.path(), &[]);
+        // No key: no network call, the static list alone.
+        let qwen = r.list_models(AiProviderId::Qwen, true).await;
+        assert!(qwen.iter().any(|m| m.id == "qwen-plus") && qwen.iter().all(|m| m.provider_id == AiProviderId::Qwen));
+        assert!(r.list_models(AiProviderId::Together, true).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn azure_needs_url_then_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = registry(dir.path(), &[]);
+        let st = |all: Vec<AiProviderStatus>| all.into_iter().find(|s| s.id == AiProviderId::Azure).unwrap();
+        let s = st(r.list_providers(true).await);
+        assert_eq!(s.state, AiProviderState::NeedsKey);
+        assert!(s.detail.unwrap().contains("resource URL"));
+        r.update_provider_settings(AiProviderId::Azure, &AiProviderSettings { base_url: Some("https://x.openai.azure.com/openai/v1/".into()), ..Default::default() }).unwrap();
+        let s = st(r.list_providers(true).await);
+        assert_eq!((s.state, s.detail.as_deref(), s.base_url.as_deref()), (AiProviderState::NeedsKey, Some("Add an API key"), Some("https://x.openai.azure.com/openai/v1")));
+        r.update_provider_settings(AiProviderId::Azure, &AiProviderSettings { api_key: Some("k".into()), ..Default::default() }).unwrap();
+        assert_eq!(st(r.list_providers(true).await).state, AiProviderState::Ready);
+    }
+
+    #[test]
+    fn hugging_face_reuses_the_model_hub_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = registry(dir.path(), &[("HF_TOKEN", "env-hf")]);
+        let hf = provider_def(AiProviderId::Huggingface);
+        assert_eq!(r.resolve_key(hf, &r.read_settings(hf.id)).as_deref(), Some("env-hf"));
+        std::fs::write(dir.path().join("config.json"), r#"{"aiAssistant":{"hub":{"hfToken":"hub-hf"}}}"#).unwrap();
+        assert_eq!(r.resolve_key(hf, &r.read_settings(hf.id)).as_deref(), Some("hub-hf"));
     }
 
     #[test]
@@ -683,7 +822,7 @@ mod tests {
         r.update_provider_settings(AiProviderId::Xai, &AiProviderSettings { enabled: Some(false), ..Default::default() }).unwrap();
         let by = |v: &[AiProviderStatus], id| v.iter().find(|s| s.id == id).unwrap().clone();
         let all = r.list_providers(true).await;
-        assert_eq!(all.len(), 18);
+        assert_eq!(all.len(), PROVIDERS.len());
         assert_eq!(by(&all, AiProviderId::Anthropic).state, AiProviderState::Ready);
         assert!(by(&all, AiProviderId::Anthropic).has_key);
         assert_eq!(by(&all, AiProviderId::Openai).state, AiProviderState::NeedsKey);

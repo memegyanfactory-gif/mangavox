@@ -1260,8 +1260,12 @@ impl PlayerView {
         toast::dismiss(cx);
         // Back first so history stays `detail → player`.
         window.defer(cx, move |window, cx| {
+            if window.is_fullscreen() {
+                mv_ui::nav::keep_fullscreen_once();
+            }
             navigate(Route::Back, window, cx);
             navigate(Route::Player { request: next }, window, cx);
+            mv_ui::nav::take_keep_fullscreen();
         });
     }
 
