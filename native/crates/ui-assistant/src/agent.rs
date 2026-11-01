@@ -23,6 +23,10 @@ use crate::tools::{self, needs_approval, ToolOutput, ToolRunner, ToolScope};
 pub const MAX_ROUNDS: usize = 40;
 /// A tool result is cut to about this many characters (saying so, and how to get the rest).
 pub const RESULT_MAX: usize = 8000;
+/// The cut for small local models (their context windows are small).
+pub const RESULT_MAX_LEAN: usize = 4000;
+/// Times a reply whose text tool calls cannot be read is sent back for a retry.
+pub const MAX_TEXT_RETRIES: usize = 2;
 /// Tool results of earlier turns are shortened in the history; the newest few stay whole.
 const KEEP_FULL_RESULTS: usize = 4;
 const SHORT_RESULT: usize = 300;
@@ -60,6 +64,11 @@ pub enum AgentEvent {
     Navigate(Route),
     /// Buttons to show under the reply (`suggest_replies`).
     Suggest(Vec<crate::suggest::Suggestion>),
+    /// What a running tool is doing now.
+    StepProgress { id: String, text: String },
+    /// The round's text so far is dropped: it is being asked again (the model switched to the
+    /// text protocol, or its tool call could not be read).
+    RoundRestart,
     /// Always the last event; carries the model-side history to persist.
     Finished { outcome: Outcome, history: Vec<AiMessage> },
 }
@@ -83,6 +92,24 @@ pub struct AgentParams {
     pub page: Option<Route>,
     /// Images attached to the user's message; sent with the first round only.
     pub images: Vec<std::path::PathBuf>,
+    /// A small model (local, or the text protocol): a core tool set plus `find_tools`, shorter
+    /// tool results.
+    pub lean: bool,
+}
+
+impl AgentParams {
+    fn result_max(&self) -> usize {
+        if self.lean {
+            RESULT_MAX_LEAN
+        } else {
+            RESULT_MAX
+        }
+    }
+}
+
+/// Providers that run a model on this PC: they get the lean tool set.
+pub fn is_local(p: AiProviderId) -> bool {
+    matches!(p, AiProviderId::Ollama | AiProviderId::Lmstudio | AiProviderId::Llamacpp)
 }
 
 /// System prompt with live app context (port of `systemPrompt`).
@@ -100,7 +127,7 @@ pub fn system_prompt(tools_enabled: bool, page: Option<&str>, section: Option<&s
     }
     if tools_enabled {
         lines.push("You can operate the app with tools. When the user asks you to do something in the app (open, find, play, switch, change a setting), do it with the tools rather than explaining how.".into());
-        lines.push("You get the tools for the current page; when a request needs others (manga, anime / movies, Studio, the Video editor, YouTube), call load_tools first.".into());
+        lines.push("You get the tools for the current page. When the tool you need is not in your list, call find_tools with what you want to do (or load_tools for a whole group); app_guide explains the order of steps (find → library → download → Studio steps → export).".into());
         lines.push("Use search and list tools before naming specific titles, chapters or ids — never invent them.".into());
         lines.push("Only act on the manga and chapters the user named or clearly agreed to. Never widen a request to other chapters (\"all\" only when the user said all). If it is unclear which chapters they mean, list them and ask.".into());
         lines.push("Studio work goes through the same queue as the Studio dashboard: list chapters with studio_library, then studio_generate for exactly those chapters (use redo_from only when the user wants a step made again). Check progress with studio_status.".into());
@@ -115,7 +142,7 @@ pub fn system_prompt(tools_enabled: bool, page: Option<&str>, section: Option<&s
 }
 
 /// Added to the system prompt of a CLI agent that gets the tools over MCP.
-pub const MCP_PROMPT: &str = "The app's tools are the tools of the \"mangavox\" MCP server (your client may show them as mcp__mangavox__<name>, mangavox__<name> or mangavox_<name>, or behind its own tool search). Operate the app only through them, never with shell, file or web tools. A tool that load_tools returns but your tool list does not show is called through run_tool.";
+pub const MCP_PROMPT: &str = "The app's tools are the tools of the \"mangavox\" MCP server (your client may show them as mcp__mangavox__<name>, mangavox__<name> or mangavox_<name>, or behind its own tool search). Operate the app only through them, never with shell, file or web tools. A tool that load_tools or find_tools returns but your tool list does not show is called through run_tool; find_tools searches all of the app's tools by what you want to do.";
 
 /// The fence a model without native tool calling uses to call an app tool.
 pub const TOOL_FENCE: &str = "```mangavox";
@@ -123,7 +150,7 @@ pub const TOOL_FENCE: &str = "```mangavox";
 /// The tools as instructions, for providers that take no tool definitions (the CLI agents).
 pub fn text_tool_prompt(specs: &[AiToolSpec]) -> String {
     let mut out = String::from(
-        "App actions: you control MangaVox only through the actions below (not with your own shell, file or web tools). To run actions, put one block per action in your reply, exactly like this, and nothing after the blocks:\n\n```mangavox\n{\"tool\": \"studio_status\", \"args\": {}}\n```\n\nThe app runs them (asking the user where needed) and sends the results back as \"Tool result\" messages; then continue. Never claim an action happened before its result came back. Reply without blocks when you are done.\n\nActions (name(arguments): what it does):",
+        "App actions: you control MangaVox only through the actions below (not with your own shell, file or web tools). To run actions, put one block per action in your reply, exactly like this (valid JSON, double quotes), and nothing after the blocks:\n\n```mangavox\n{\"tool\": \"studio_status\", \"args\": {}}\n```\n\nThe app runs them (asking the user where needed) and sends the results back as \"Tool result\" messages; then continue. Never claim an action happened before its result came back. Reply without blocks when you are done. If the action you need is not listed, call find_tools {\"query\": \"what you want to do\"}.\n\nActions (name(arguments): what it does):",
     );
     for t in specs {
         out.push_str(&format!("\n- {}", tools::signature(t)));
@@ -131,53 +158,31 @@ pub fn text_tool_prompt(specs: &[AiToolSpec]) -> String {
     out
 }
 
-/// The ```mangavox blocks of a reply as tool calls (`{"tool": name, "args": {...}}`, or a list
-/// of those). Blocks that are not valid JSON are skipped.
+/// The tool calls written in a reply (see [`crate::textcall`]); unreadable blocks are skipped.
 pub fn parse_text_calls(text: &str) -> Vec<AiToolCall> {
-    let mut calls = vec![];
-    let mut rest = text;
-    while let Some(start) = rest.find(TOOL_FENCE) {
-        let body_start = start + TOOL_FENCE.len();
-        let Some(len) = rest[body_start..].find("```") else { break };
-        let body = rest[body_start..body_start + len].trim();
-        rest = &rest[body_start + len + 3..];
-        let items = match serde_json::from_str::<Value>(body) {
-            Ok(Value::Array(a)) => a,
-            Ok(v) => vec![v],
-            Err(_) => continue,
-        };
-        for v in items {
-            let name = v.get("tool").or_else(|| v.get("name")).and_then(Value::as_str).unwrap_or("").trim().to_string();
-            if name.is_empty() {
-                continue;
-            }
-            let args = v.get("args").or_else(|| v.get("arguments")).and_then(Value::as_object).cloned().unwrap_or_default();
-            calls.push(AiToolCall { id: new_id("t"), name, args });
-        }
-    }
-    calls
+    crate::textcall::parse(text).calls
 }
 
-/// A reply without its ```mangavox blocks (also one still streaming), for display.
+/// A reply without its tool-call blocks (also one still streaming), for display.
 pub fn visible_text(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains(TOOL_FENCE) {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(TOOL_FENCE) {
-        out.push_str(&rest[..start]);
-        let after = start + TOOL_FENCE.len();
-        match rest[after..].find("```") {
-            Some(len) => rest = &rest[after + len + 3..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    std::borrow::Cow::Owned(out.trim().to_string())
+    crate::textcall::visible(text)
+}
+
+/// Models whose provider dropped the tool definitions ("does not support tools") this session:
+/// they use the text protocol from then on.
+static NO_NATIVE: Mutex<Option<HashSet<(AiProviderId, String)>>> = Mutex::new(None);
+
+fn native_dropped(id: AiProviderId, model: &str) -> bool {
+    NO_NATIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(id, model.to_string())))
+}
+
+fn mark_native_dropped(id: AiProviderId, model: &str) {
+    NO_NATIVE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert((id, model.to_string()));
+}
+
+/// The status line mv-ai sends when it retried a step without the tool definitions.
+fn says_tools_dropped(text: &str) -> bool {
+    text.contains("can't use app tools")
 }
 
 static STUDIO_CONTEXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -265,8 +270,11 @@ impl<T: ToolRunner> Turn<'_, T> {
     /// directly), the tool, its step row, then the (trimmed) result for the model. `None` when the
     /// turn was cancelled meanwhile.
     async fn call(&self, scope: &mut ToolScope, call: &AiToolCall) -> Option<Value> {
-        if call.name == tools::LOAD_TOOLS {
-            return Some(scope.load(&call.args).unwrap_or_else(|e| json!({ "error": e })));
+        match call.name.as_str() {
+            tools::LOAD_TOOLS => return Some(scope.load(&call.args).unwrap_or_else(|e| json!({ "error": e }))),
+            tools::FIND_TOOLS => return Some(scope.find(&call.args).unwrap_or_else(|e| json!({ "error": e }))),
+            tools::DESCRIBE_TOOL => return Some(scope.describe(&call.args).unwrap_or_else(|e| json!({ "error": e }))),
+            _ => {}
         }
         if call.name == tools::RUN_TOOL {
             let name = call.args.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -277,7 +285,7 @@ impl<T: ToolRunner> Turn<'_, T> {
             return Box::pin(self.call(scope, &AiToolCall { id: call.id.clone(), name, args })).await;
         }
         let Some(risk) = tools::risk_for(&call.name, &call.args) else {
-            return Some(json!({ "error": format!("Unknown tool {}", call.name) }));
+            return Some(json!({ "error": tools::unknown_tool_error(&call.name) }));
         };
         scope.add_for(&call.name);
         let step_id = new_id("s");
@@ -291,6 +299,7 @@ impl<T: ToolRunner> Turn<'_, T> {
             risk: risk.as_str().into(),
             state: if approval { StepState::AwaitingApproval } else { StepState::Running },
             result: None,
+            progress: None,
         }));
         let update = |state, result| {
             let _ = self.tx.unbounded_send(AgentEvent::StepUpdated { id: step_id.clone(), state, result });
@@ -315,7 +324,12 @@ impl<T: ToolRunner> Turn<'_, T> {
             return Some(json!({ "error": "The user declined this action. Do not retry it; ask what they want instead." }));
         }
         update(StepState::Running, None);
-        Some(match self.tools.run(call.name.clone(), call.args.clone()).await {
+        let (ptx, pid) = (self.tx.clone(), step_id.clone());
+        let progress: tools::ProgressFn = Arc::new(move |text| {
+            let _ = ptx.unbounded_send(AgentEvent::StepProgress { id: pid.clone(), text });
+        });
+        let ran = tools::with_progress(progress, self.tools.run(call.name.clone(), call.args.clone())).await;
+        Some(match ran {
             Ok(out) => {
                 let value = match out {
                     ToolOutput::Value(v) => v,
@@ -328,7 +342,7 @@ impl<T: ToolRunner> Turn<'_, T> {
                         v
                     }
                 };
-                let content = tools::trim_result(value, RESULT_MAX);
+                let content = tools::trim_result(value, self.p.result_max());
                 update(StepState::Done, Some(content.to_string().chars().take(600).collect()));
                 content
             }
@@ -354,15 +368,24 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
             return outcome;
         }
     }
-    let mut scope = ToolScope::new(p.page.as_ref(), history, false);
-    let text_tools = p.tools_enabled && !p.native_tools;
-    for round in 0..MAX_ROUNDS {
+    let mut text_tools = p.tools_enabled && (!p.native_tools || native_dropped(p.provider, &p.model));
+    let mut scope = if p.lean || (text_tools && p.native_tools) { ToolScope::lean(history, false) } else { ToolScope::new(p.page.as_ref(), history, false) };
+    let mut retries = 0;
+    let mut round = 0;
+    while round < MAX_ROUNDS {
         if cancel.is_cancelled() {
             return Outcome::Stopped;
         }
         let _ = tx.unbounded_send(AgentEvent::Round(round));
         let delta_tx = tx.clone();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = dropped.clone();
         let emit = emit_fn(move |ev| {
+            if let StreamEvent::Status { text } = &ev {
+                if says_tools_dropped(text) {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
             let _ = delta_tx.unbounded_send(AgentEvent::Delta(ev));
         });
         // The scope grows when the model loads groups, so the list is made per round.
@@ -375,7 +398,7 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
             provider_id: p.provider,
             model: p.model.clone(),
             messages,
-            tools: (p.tools_enabled && p.native_tools).then_some(specs),
+            tools: (p.tools_enabled && !text_tools).then_some(specs),
             effort: Some(p.effort),
             access: Some(*p.access.lock().unwrap_or_else(|e| e.into_inner())),
             images: if round == 0 { p.images.clone() } else { vec![] },
@@ -390,9 +413,30 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
         if let Some(e) = result.error {
             return Outcome::Error(e);
         }
+        // The provider dropped the tool definitions (the model has no tool template): this model
+        // uses the text protocol from now on, starting with this round again.
+        if !text_tools && p.tools_enabled && dropped.load(std::sync::atomic::Ordering::SeqCst) && result.tool_calls.is_empty() {
+            mark_native_dropped(p.provider, &p.model);
+            text_tools = true;
+            scope = ToolScope::lean(history, false);
+            let _ = tx.unbounded_send(AgentEvent::RoundRestart);
+            let _ = tx.unbounded_send(AgentEvent::Delta(StreamEvent::Status { text: "Describing the app's tools in the prompt instead".into() }));
+            continue;
+        }
         // The reply's text keeps its ```mangavox blocks: a CLI agent reads its own calls back
         // from the transcript next round.
-        let calls = if text_tools { parse_text_calls(&result.text) } else { result.tool_calls.clone() };
+        let parsed = if text_tools { crate::textcall::parse(&result.text) } else { Default::default() };
+        let calls = if text_tools { parsed.calls.clone() } else { result.tool_calls.clone() };
+        // Calls that could not be read: say why and ask again (a few times at most).
+        if text_tools && calls.is_empty() && !parsed.invalid.is_empty() && retries < MAX_TEXT_RETRIES {
+            retries += 1;
+            history.push(AiMessage::assistant(result.text.clone()));
+            history.push(AiMessage::user(crate::textcall::retry_message(&parsed.invalid)));
+            let _ = tx.unbounded_send(AgentEvent::RoundRestart);
+            let _ = tx.unbounded_send(AgentEvent::Delta(StreamEvent::Status { text: "The tool call was not valid JSON; asking the model again".into() }));
+            round += 1;
+            continue;
+        }
         let mut assistant = AiMessage::assistant(result.text.clone());
         if !calls.is_empty() && !text_tools {
             assistant.tool_calls = Some(calls.clone());
@@ -413,6 +457,7 @@ async fn run_loop<R: StepRunner, T: ToolRunner>(
         if calls.iter().all(|c| c.name == "suggest_replies") && history.last().is_some_and(|m| !m.content.contains("\"error\"")) {
             return Outcome::Done;
         }
+        round += 1;
     }
     // Hit the round cap while still calling tools.
     let _ = tx.unbounded_send(AgentEvent::Delta(StreamEvent::Text { delta: format!("\n\n_Stopped after {MAX_ROUNDS} rounds of actions._") }));
@@ -474,7 +519,7 @@ async fn run_mcp<R: StepRunner, T: ToolRunner>(runner: &R, turn: &Turn<'_, T>, h
                 let content = turn.call(&mut scope, &call).await.unwrap_or_else(|| json!({ "error": "The user stopped this reply." }));
                 let _ = c.reply.send(content.clone());
                 server.set_tools(scope.specs());
-                if call.name != tools::LOAD_TOOLS {
+                if !matches!(call.name.as_str(), tools::LOAD_TOOLS | tools::FIND_TOOLS | tools::DESCRIBE_TOOL) {
                     let call = if call.name == tools::RUN_TOOL { unwrap_run_tool(call) } else { call };
                     done.push((call, content));
                 }
@@ -503,6 +548,29 @@ async fn run_mcp<R: StepRunner, T: ToolRunner>(runner: &R, turn: &Turn<'_, T>, h
     }
     history.push(AiMessage::assistant(result.text));
     Some(Outcome::Done)
+}
+
+/// One plain model step with no tools (used by `/compact` to summarise older messages).
+pub async fn ask_once<R: StepRunner>(runner: &R, provider: AiProviderId, model: &str, prompt: String, cancel: CancellationToken) -> Result<String, String> {
+    let req = AiStepRequest {
+        request_id: new_id("step"),
+        provider_id: provider,
+        model: model.to_string(),
+        messages: vec![AiMessage::system("You summarise conversations precisely and briefly."), AiMessage::user(prompt)],
+        tools: None,
+        effort: Some(AiEffort::Low),
+        access: Some(AiAccessMode::Ask),
+        images: vec![],
+        workspace: None,
+        lean: true,
+        mcp: None,
+    };
+    let r = runner.step(req, emit_fn(|_| {}), cancel).await;
+    match (r.error, r.text.trim()) {
+        (Some(e), _) => Err(e),
+        (None, "") => Err("The model returned no text".into()),
+        (None, t) => Ok(visible_text(t).into_owned()),
+    }
 }
 
 /// `run_tool {name, args}` as the call it stands for, for the history.
@@ -569,6 +637,7 @@ mod tests {
             mcp: false,
             page: None,
             images: vec![],
+            lean: false,
         }
     }
 
@@ -866,7 +935,7 @@ not json
         assert!(reqs[0].messages[0].content.contains(MCP_PROMPT) && !reqs[0].messages[0].content.contains(TOOL_FENCE));
         let results = cli.results.lock().unwrap();
         let listed: Vec<&str> = results[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(listed.contains(&"navigate") && listed.contains(&tools::RUN_TOOL) && listed.contains(&tools::LOAD_TOOLS));
+        assert!(listed.contains(&"navigate") && listed.contains(&tools::RUN_TOOL) && listed.contains(&tools::LOAD_TOOLS) && listed.contains(&tools::FIND_TOOLS) && listed.contains(&tools::APP_GUIDE));
         assert_eq!(results[1]["result"]["isError"], false);
         assert!(results[1]["result"]["content"][0]["text"].as_str().unwrap().contains("\"title\":\"X\""));
         // The read ran directly; the action asked first (Ask mode), then navigated.
@@ -948,6 +1017,182 @@ not json
             used.push((navigated, after.0 - before.0));
         }
         assert!(used[0].0, "the MCP turn called the tool");
+    }
+
+    #[tokio::test]
+    async fn a_lean_model_gets_the_core_set_and_finds_the_rest() {
+        let mut find = call(tools::FIND_TOOLS);
+        find.args.insert("query".into(), json!("search anime by title"));
+        let fake = Fake::new(vec![AiStepResult { tool_calls: vec![find], ..Default::default() }, AiStepResult { text: "ok".into(), ..Default::default() }]);
+        let (tx, rx) = unbounded();
+        let mut p = params(AiAccessMode::Ask, true);
+        p.lean = true;
+        run_agent(&fake, &FakeTools, p, tx, CancellationToken::new()).await;
+        let evs = collect(rx, None).await;
+        // Finding tools is not an app action: no step row.
+        assert!(!evs.iter().any(|e| matches!(e, AgentEvent::StepAdded(_))));
+        let reqs = fake.1.lock().unwrap();
+        let names = |i: usize| reqs[i].tools.as_ref().unwrap().iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        let first = names(0);
+        assert!(first.contains(&"navigate".to_string()) && first.contains(&tools::FIND_TOOLS.to_string()) && first.contains(&tools::APP_GUIDE.to_string()));
+        assert!(!first.contains(&"list_library".to_string()) && !first.contains(&tools::LOAD_TOOLS.to_string()), "no whole groups: {first:?}");
+        assert!(first.len() <= 12, "a small set: {first:?}");
+        assert!(names(1).contains(&"search_anime".to_string()), "found tools are sent next round");
+        let result = reqs[1].messages.iter().find(|m| m.role == AiRole::Tool).unwrap();
+        assert!(result.content.contains("search_anime(query: string)"));
+    }
+
+    #[tokio::test]
+    async fn unreadable_text_calls_are_retried_a_few_times() {
+        let bad = AiStepResult { text: "```mangavox\nopen the library\n```".into(), ..Default::default() };
+        let good = AiStepResult { text: "```mangavox\n{tool: 'navigate', args: {page: 'library'}}\n```".into(), ..Default::default() };
+        let fake = Arc::new(Fake::new(vec![bad, good, AiStepResult { text: "Done.".into(), ..Default::default() }]));
+        let (tx, rx) = unbounded();
+        let mut p = params(AiAccessMode::Full, true);
+        p.native_tools = false;
+        let f2 = fake.clone();
+        let task = tokio::spawn(async move { run_agent(&*f2, &FakeTools, p, tx, CancellationToken::new()).await });
+        let evs = collect(rx, None).await;
+        task.await.unwrap();
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::RoundRestart)));
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::Navigate(Route::Library))), "the repaired call ran");
+        let reqs = fake.1.lock().unwrap();
+        assert!(reqs[1].messages.iter().any(|m| m.role == AiRole::User && m.content.contains("could not be read")));
+        // Never more than MAX_TEXT_RETRIES retries in a row.
+        let bad = || AiStepResult { text: "```mangavox\nnope\n```".into(), ..Default::default() };
+        let fake = Fake::new(vec![bad(), bad(), bad(), bad(), bad()]);
+        let (tx, rx) = unbounded();
+        let mut p = params(AiAccessMode::Full, true);
+        p.native_tools = false;
+        run_agent(&fake, &FakeTools, p, tx, CancellationToken::new()).await;
+        collect(rx, None).await;
+        assert_eq!(fake.1.lock().unwrap().len(), MAX_TEXT_RETRIES + 1);
+    }
+
+    /// A provider that drops the tools on the first step (as mv-ai does for models without a
+    /// tool template), then answers with a text call.
+    struct Dropper(Mutex<Vec<AiStepRequest>>);
+    impl StepRunner for Dropper {
+        fn step(&self, req: AiStepRequest, emit: Emit, _c: CancellationToken) -> BoxFuture<'static, AiStepResult> {
+            let n = {
+                let mut g = self.0.lock().unwrap();
+                g.push(req);
+                g.len()
+            };
+            async move {
+                match n {
+                    1 => {
+                        emit(StreamEvent::Status { text: "tiny can't use app tools — answering without them".into() });
+                        emit(StreamEvent::Text { delta: "I cannot do that.".into() });
+                        AiStepResult { text: "I cannot do that.".into(), ..Default::default() }
+                    }
+                    2 => AiStepResult { text: "```mangavox\n{\"tool\": \"navigate\", \"args\": {\"page\": \"library\"}}\n```".into(), ..Default::default() },
+                    _ => AiStepResult { text: "Opened.".into(), ..Default::default() },
+                }
+            }
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_without_tool_support_switches_to_the_text_protocol() {
+        let d = Arc::new(Dropper(Mutex::new(vec![])));
+        let (tx, rx) = unbounded();
+        let mut p = params(AiAccessMode::Full, true);
+        p.model = "tiny-no-tools".into();
+        let d2 = d.clone();
+        let task = tokio::spawn(async move { run_agent(&*d2, &FakeTools, p, tx, CancellationToken::new()).await });
+        let evs = collect(rx, None).await;
+        task.await.unwrap();
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::RoundRestart)));
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::Navigate(Route::Library))));
+        let reqs = d.0.lock().unwrap();
+        assert!(reqs[0].tools.is_some());
+        assert!(reqs[1].tools.is_none() && reqs[1].messages[0].content.contains(TOOL_FENCE), "the same round again, in text");
+        // The dropped answer is not in the history.
+        assert!(!reqs[1].messages.iter().any(|m| m.content == "I cannot do that."));
+        drop(reqs);
+        // The next turn of that model starts in text mode right away.
+        let (tx, rx) = unbounded();
+        let fake = Fake::new(vec![AiStepResult { text: "hi".into(), ..Default::default() }]);
+        let mut p = params(AiAccessMode::Full, true);
+        p.model = "tiny-no-tools".into();
+        run_agent(&fake, &FakeTools, p, tx, CancellationToken::new()).await;
+        collect(rx, None).await;
+        assert!(fake.1.lock().unwrap()[0].tools.is_none());
+    }
+
+    struct SlowTools;
+    impl ToolRunner for SlowTools {
+        fn run(&self, _n: String, _a: Map<String, Value>) -> BoxFuture<'static, tools::ToolResult> {
+            async move {
+                tools::report_progress("Rendering 50%");
+                Ok(ToolOutput::Value(json!({ "ok": true })))
+            }
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn long_tools_report_progress_on_their_step() {
+        let fake = Fake::new(vec![AiStepResult { tool_calls: vec![call("navigate")], ..Default::default() }, AiStepResult { text: "ok".into(), ..Default::default() }]);
+        let (tx, rx) = unbounded();
+        run_agent(&fake, &SlowTools, params(AiAccessMode::Full, true), tx, CancellationToken::new()).await;
+        let evs = collect(rx, None).await;
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::StepProgress { text, .. } if text == "Rendering 50%")));
+    }
+
+    /// Records which tools actually ran.
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+    impl ToolRunner for Recorder {
+        fn run(&self, name: String, _a: Map<String, Value>) -> BoxFuture<'static, tools::ToolResult> {
+            self.0.lock().unwrap().push(name);
+            async move { Ok(ToolOutput::Value(json!({ "ok": true }))) }.boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn destructive_tools_always_ask_and_a_no_stops_them() {
+        // Spending credits / overwriting: Destructive, so even Auto mode asks.
+        tools::register(vec![
+            tools::ToolDef::new("test_spend_credits", "Spends credits", json!({ "type": "object", "properties": {}, "required": [] }), tools::Risk::Destructive),
+            tools::ToolDef::new("test_overwrite", "Overwrites when asked", json!({ "type": "object", "properties": { "overwrite": { "type": "boolean" } }, "required": [] }), tools::Risk::Act)
+                .risk_for(|a| if tools::bool_arg(a, "overwrite") == Some(true) { tools::Risk::Destructive } else { tools::Risk::Act }),
+        ]);
+        let mut over = call("test_overwrite");
+        over.args.insert("overwrite".into(), json!(true));
+        for approve in [false, true] {
+            let ran = Arc::new(Mutex::new(vec![]));
+            let fake = Fake::new(vec![
+                AiStepResult { tool_calls: vec![call("test_spend_credits"), over.clone(), call("test_overwrite")], ..Default::default() },
+                AiStepResult { text: "ok".into(), ..Default::default() },
+            ]);
+            let (tx, rx) = unbounded();
+            let rec = Recorder(ran.clone());
+            let task = async { run_agent(&fake, &rec, params(AiAccessMode::Auto, true), tx, CancellationToken::new()).await };
+            let (_, evs) = futures::join!(task, collect(rx, Some(approve)));
+            let asked: Vec<&str> = evs.iter().filter_map(|e| if let AgentEvent::StepAdded(s) = e { (s.state == StepState::AwaitingApproval).then_some(s.name.as_str()) } else { None }).collect();
+            assert_eq!(asked, ["test_spend_credits", "test_overwrite"], "only the destructive calls ask in Auto mode");
+            let ran = ran.lock().unwrap().clone();
+            if approve {
+                assert_eq!(ran, ["test_spend_credits", "test_overwrite", "test_overwrite"]);
+            } else {
+                assert_eq!(ran, ["test_overwrite"], "declined calls never run; the safe one does");
+                let reqs = fake.1.lock().unwrap();
+                assert!(reqs[1].messages.iter().any(|m| m.role == AiRole::Tool && m.content.contains("declined")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_tools_suggest_close_names() {
+        let fake = Fake::new(vec![AiStepResult { tool_calls: vec![call("search_animes")], ..Default::default() }, AiStepResult { text: "ok".into(), ..Default::default() }]);
+        let (tx, rx) = unbounded();
+        run_agent(&fake, &FakeTools, params(AiAccessMode::Full, true), tx, CancellationToken::new()).await;
+        collect(rx, None).await;
+        let reqs = fake.1.lock().unwrap();
+        let r = reqs[1].messages.iter().find(|m| m.role == AiRole::Tool).unwrap();
+        assert!(r.content.contains("Did you mean") && r.content.contains("search_anime"), "{}", r.content);
     }
 
     #[test]

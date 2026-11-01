@@ -526,6 +526,7 @@ impl AnimeDetail {
         let quality = streams::quality_tags(&self.streams);
         let next = self.next();
         let panel = if self.inline { None } else { self.panel(cx) };
+        let has_panel = panel.is_some();
         let full = d.description.clone().unwrap_or_default();
         let long = !full.is_empty() && (full.len() > look::blurb(&full).len() + 40 || full.len() > 260);
         let open = self.synopsis_open && long;
@@ -618,6 +619,11 @@ impl AnimeDetail {
                         .when_some(d.cover_url.clone(), |x, u| x.child(look::pic(u))),
                 ),
             })
+            // A click on the artwork plays too (resumes where it stopped), like the Play button.
+            .child(look::hero_click_area("anime-hero-play", height, if has_panel { look::SIDE_PANEL + EDGE } else { 240. + EDGE }, next.label.clone()).on_click(cx.listener(move |this, _, w, cx| {
+                cx.stop_propagation();
+                this.play_at(ep, false, w, cx);
+            })))
     }
 
     /// Links for the selected episode (`None` when nothing is selected).
@@ -921,6 +927,7 @@ mod tests {
             cover_url: None,
             provider_id: None,
             episode_number: Some(ep),
+            season_number: None,
             position_secs: pos,
             duration_secs: dur,
             completed,

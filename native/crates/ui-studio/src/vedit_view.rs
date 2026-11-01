@@ -1757,7 +1757,27 @@ impl StudioPage {
                     .child(canvas(move |b, _, _| mon.set(b), |_, _, _, _| {}).absolute().inset_0());
             }
         }
-        self.frame(seq, placed, now, fw, fh, window, cx)
+        let live = self.frame(seq, placed, now, fw, fh, window, cx);
+        match crate::vedit_frame::layered_badge(crate::look::saved_layered()) {
+            Some(text) => live.child(
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .left(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(radius::MD))
+                    .bg(video::paint(hex("#000000"), 0.6))
+                    .text_size(px(size::XS))
+                    .text_color(video::paint(hex("#ffffff"), 0.9))
+                    .child(icon_ph(ph::STACK, hex("#ffffff"), icon_px::XS))
+                    .child(text),
+            ),
+            None => live,
+        }
     }
 
     /// The decoded rendered frame `file`, kept while it shows (the one before leaves the GPU).

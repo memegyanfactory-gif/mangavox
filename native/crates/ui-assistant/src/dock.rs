@@ -1,4 +1,6 @@
 //! The assistant dock: header, chat-history drawer, message list, approvals and composer.
+mod cmds;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -6,7 +8,7 @@ use std::time::Duration;
 
 use futures::channel::{mpsc, oneshot};
 use futures::StreamExt;
-use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Escape as InputEscape, Indent, IndentInline, InputEvent, InputState, MoveDown, MoveUp, Textarea, TextareaState};
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -27,7 +29,7 @@ use crate::suggest::{self, Suggestion};
 use crate::tools::{self, AppTools};
 use crate::ui::{ago_ms, date_group, field, fmt_secs, not_ready_title, provider_logo, search_prefix, set_value, text_state, value_of};
 
-const PLACEHOLDER: &str = "Ask about your library, find anime, or attach a panel…";
+const PLACEHOLDER: &str = "Ask anything · / for commands · @ to attach a manga, chapter or file";
 const DRAWER_W: f32 = 288.;
 const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 /// How often the app's own suggestions are looked at again.
@@ -40,6 +42,9 @@ struct Run {
     approvals: HashMap<String, oneshot::Sender<bool>>,
     /// When the first reasoning delta of this reply arrived (for "Thought for 12s").
     thinking_since: Option<u64>,
+    /// Length of the reply's text when the current model round began (a restarted round drops
+    /// what it wrote).
+    round_start: usize,
     _task: Task<()>,
 }
 
@@ -76,6 +81,15 @@ pub struct Dock {
     app_suggestions: Vec<Suggestion>,
     /// Cards closed this session, by id.
     dismissed: Vec<String>,
+    /// Items attached with `@` for the next message (chips above the text).
+    mentions: Vec<crate::commands::Mention>,
+    /// The composer popup (slash commands, `@` mentions): highlighted row, and the text it was
+    /// closed for with Esc (it opens again when the text changes).
+    popup_ix: usize,
+    popup_closed: Option<String>,
+    mention_cache: cmds::MentionCache,
+    /// A `/compact` summary is being written.
+    compacting: bool,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -93,9 +107,20 @@ impl Dock {
         let meter = crate::usage_meter::create(window, cx);
         let mut subs = vec![];
         subs.push(cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| match ev {
-            InputEvent::PressEnter { shift: false, .. } => this.send_from_composer(window, cx),
-            // Focus changes the composer border and the shortcut hints; typing enables Send.
-            InputEvent::Focus | InputEvent::Blur | InputEvent::Change => cx.notify(),
+            // Enter takes the popup's highlighted row while it is open, else sends.
+            InputEvent::PressEnter { shift: false, .. } => {
+                if this.popup_open(cx) {
+                    this.popup_accept(true, window, cx);
+                } else {
+                    this.send_from_composer(window, cx);
+                }
+            }
+            InputEvent::Change => {
+                this.composer_changed(cx);
+                cx.notify();
+            }
+            // Focus changes the composer border and the shortcut hints.
+            InputEvent::Focus | InputEvent::Blur => cx.notify(),
             _ => {}
         }));
         subs.push(cx.subscribe_in(&search, window, |_, _, ev: &InputEvent, _, cx| {
@@ -144,6 +169,11 @@ impl Dock {
             run: None,
             app_suggestions: vec![],
             dismissed: vec![],
+            mentions: vec![],
+            popup_ix: 0,
+            popup_closed: None,
+            mention_cache: Default::default(),
+            compacting: false,
             _subs: subs,
             _poll: poll,
         }
@@ -198,6 +228,10 @@ impl Dock {
 
     fn send_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
+        // A slash command runs here (some, like /stop and /help, also while a reply runs).
+        if self.try_command(&text, window, cx) {
+            return;
+        }
         if self.run.is_some() {
             if !self.running_here(cx) {
                 // One reply at a time: say why Enter did nothing instead of dropping it silently.
@@ -216,7 +250,7 @@ impl Dock {
             }
             return;
         }
-        if text.trim().is_empty() && self.attachments.is_empty() {
+        if text.trim().is_empty() && self.attachments.is_empty() && self.mentions.is_empty() {
             return;
         }
         if self.model_missing(cx) {
@@ -228,7 +262,13 @@ impl Dock {
             return;
         }
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
-        let text = if text.trim().is_empty() { "Look at the attached image(s).".to_string() } else { text };
+        let text = if !text.trim().is_empty() {
+            text
+        } else if self.attachments.is_empty() {
+            "Look at the attached items.".to_string()
+        } else {
+            "Look at the attached image(s).".to_string()
+        };
         self.send(text, window, cx);
     }
 
@@ -258,7 +298,16 @@ impl Dock {
             self.ask_for_model(window, cx);
             return;
         }
-        let images = std::mem::take(&mut self.attachments);
+        let mut images = std::mem::take(&mut self.attachments);
+        let mentions = std::mem::take(&mut self.mentions);
+        // Attached pages and image files also go to the model as images.
+        for m in &mentions {
+            if let Some(p) = m.path.as_ref().filter(|p| is_image(p) && p.is_file()) {
+                if !images.contains(p) {
+                    images.push(p.clone());
+                }
+            }
+        }
         let (thread_id, item_id, prefs, history) = self.shared.update(cx, |s, cx| {
             let id = match s.store.active.clone().filter(|id| s.store.thread(id).is_some()) {
                 Some(id) => id,
@@ -271,11 +320,13 @@ impl Dock {
             if t.items.is_empty() {
                 t.title = title_from(&prompt);
             }
-            t.items.push(ChatItem::user(prompt.clone()));
+            let mut asked = ChatItem::user(prompt.clone());
+            asked.mentions = mentions.clone();
+            t.items.push(asked);
             t.items.push(reply);
             t.updated_at = now_ms();
             let mut history = t.history.clone();
-            history.push(AiMessage::user(prompt.clone()));
+            history.push(AiMessage::user(crate::commands::with_context(&prompt, &mentions)));
             s.save();
             cx.notify();
             (id, reply_id, prefs, history)
@@ -306,6 +357,7 @@ impl Dock {
             mcp: mv_ai::providers::cli::supports_mcp(prefs.provider),
             page: tools::page_context(),
             images,
+            lean: agent::is_local(prefs.provider),
         };
         let token = cancel.clone();
         mv_ui::bg::runtime().spawn(async move {
@@ -335,7 +387,7 @@ impl Dock {
                 cx.background_executor().timer(Duration::from_millis(33)).await;
             }
         });
-        self.run = Some(Run { thread: thread_id, cancel, access, approvals: HashMap::new(), thinking_since: None, _task: task });
+        self.run = Some(Run { thread: thread_id, cancel, access, approvals: HashMap::new(), thinking_since: None, round_start: 0, _task: task });
         cx.notify();
     }
 
@@ -367,6 +419,7 @@ impl Dock {
         let mut navigations = vec![];
         let mut approvals = vec![];
         let mut since = self.run.as_ref().and_then(|r| r.thinking_since);
+        let mut round_start = self.run.as_ref().map_or(0, |r| r.round_start);
         let (tid, iid) = (thread_id.to_string(), item_id.to_string());
         self.shared.update(cx, |s, cx| {
             let Some(item) = s.store.thread_mut(&tid).and_then(|t| t.items.iter_mut().find(|i| i.id == iid)) else { return };
@@ -388,6 +441,17 @@ impl Dock {
                     AgentEvent::Round(n) => {
                         if n > 0 && !item.text.is_empty() && !item.text.ends_with('\n') {
                             item.text.push_str("\n\n");
+                        }
+                        round_start = item.text.len();
+                    }
+                    AgentEvent::RoundRestart => {
+                        if round_start <= item.text.len() && item.text.is_char_boundary(round_start) {
+                            item.text.truncate(round_start);
+                        }
+                    }
+                    AgentEvent::StepProgress { id, text } => {
+                        if let Some(st) = item.steps.iter_mut().find(|s| s.id == id) {
+                            st.progress = Some(text);
                         }
                     }
                     AgentEvent::StepAdded(step) => item.steps.push(step),
@@ -415,6 +479,7 @@ impl Dock {
         let asked = !approvals.is_empty();
         if let Some(run) = self.run.as_mut() {
             run.thinking_since = since;
+            run.round_start = round_start;
             for (id, reply) in approvals {
                 run.approvals.insert(id, reply);
             }
@@ -508,14 +573,16 @@ impl Dock {
             let t = s.store.thread_mut(&id)?;
             let cut = t.items.iter().rposition(|i| i.role == ItemRole::User)?;
             let text = t.items[cut].text.clone();
+            let mentions = t.items[cut].mentions.clone();
             t.items.truncate(cut);
             if let Some(h) = t.history.iter().rposition(|m| m.role == AiRole::User) {
                 t.history.truncate(h);
             }
             cx.notify();
-            Some(text)
+            Some((text, mentions))
         });
-        if let Some(text) = text {
+        if let Some((text, mentions)) = text {
+            self.mentions = mentions;
             self.send(text, window, cx);
         }
     }
@@ -539,8 +606,10 @@ impl Dock {
             Some((id, cut, text, items, history))
         });
         let Some((tid, cut, text, items, history)) = removed else { return };
+        self.mentions = items.first().map(|i| i.mentions.clone()).unwrap_or_default();
         self.input.update(cx, |s, cx| {
-            s.set_value(text, window, cx);
+            s.set_value("", window, cx);
+            s.insert(text, window, cx);
             s.focus(window, cx);
         });
         let weak = cx.weak_entity();
@@ -557,7 +626,10 @@ impl Dock {
                     Some(())
                 });
                 if restored.is_some() {
-                    let _ = weak.update(cx, |this, cx| this.input.update(cx, |s, cx| s.set_value("", w, cx)));
+                    let _ = weak.update(cx, |this, cx| {
+                        this.mentions.clear();
+                        this.input.update(cx, |s, cx| s.set_value("", w, cx));
+                    });
                 }
             }),
         );
@@ -713,7 +785,9 @@ impl Dock {
             // The topmost surface first: a rename, then the drawer over the chat, then the
             // approval on screen, then the running reply.
             "escape" if plain => {
-                if self.rename.is_some() {
+                if self.popup_open(cx) {
+                    self.close_popup(cx);
+                } else if self.rename.is_some() {
                     self.rename = None;
                     // Keep the keyboard in the drawer so a second Esc closes it.
                     window.focus(&self.focus, cx);
@@ -742,6 +816,43 @@ impl Dock {
             }
             _ => {}
         }
+    }
+
+    // ── Composer keys ──
+
+    /// ↑: moves the popup highlight; in an empty composer, edits the last message.
+    fn key_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.popup_open(cx) {
+            self.popup_move(-1, cx);
+            cx.stop_propagation();
+        } else if self.can_edit_last(cx) {
+            self.edit_last(window, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    fn key_down(&mut self, cx: &mut Context<Self>) {
+        if self.popup_open(cx) {
+            self.popup_move(1, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// Tab completes the highlighted command or mention without running it.
+    fn key_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.popup_open(cx) {
+            self.popup_accept(false, window, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// The composer is empty and the chat on screen has a message of yours to edit.
+    fn can_edit_last(&self, cx: &App) -> bool {
+        self.run.is_none()
+            && self.attachments.is_empty()
+            && self.mentions.is_empty()
+            && self.input.read(cx).value().is_empty()
+            && self.shared.read(cx).store.active_thread().is_some_and(|t| t.items.iter().any(|i| i.role == ItemRole::User))
     }
 
     // ── Header and drawer ──
@@ -958,6 +1069,7 @@ impl Dock {
                             .text_color(Tokens::text_1())
                             .child(item.text.clone()),
                     )
+                    .children(cmds::sent_chips(item))
                     .child(
                         div()
                             .flex()
@@ -1430,7 +1542,7 @@ impl Dock {
         let attach = icon_button("dock-attach", ph::PAPERCLIP, "Attach images").small().on_click(cx.listener(|this, _, _, cx| this.attach(cx)));
 
         let blocked = if busy_elsewhere { Some(self.busy_reason(cx)) } else { self.send_blocked(cx) };
-        let can_send = (!empty || !self.attachments.is_empty()) && blocked.is_none();
+        let can_send = (!empty || !self.attachments.is_empty() || !self.mentions.is_empty()) && blocked.is_none();
         let send = div()
             .id("dock-send")
             .flex()
@@ -1464,6 +1576,8 @@ impl Dock {
             }
         });
 
+        let popup = self.popup_view(cx);
+        let chips = self.mention_chips(cx);
         let thumbs = self.attachments.iter().enumerate().map(|(i, p)| {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("image").to_string();
             div()
@@ -1542,6 +1656,7 @@ impl Dock {
             .child(
                 div()
                     .id("composer")
+                    .relative()
                     .flex()
                     .flex_col()
                     .rounded(px(radius::XL))
@@ -1556,7 +1671,34 @@ impl Dock {
                             this.input.update(cx, |s, cx| s.focus(window, cx));
                         }
                     }))
+                    // The popup's keys run before the text box's own (↑ ↓ move the highlight, Tab
+                    // completes, Esc closes); ↑ in an empty box edits the last message.
+                    .capture_action(cx.listener(|this, _: &MoveUp, w, cx| this.key_up(w, cx)))
+                    .capture_action(cx.listener(|this, _: &MoveDown, _, cx| this.key_down(cx)))
+                    .capture_action(cx.listener(|this, _: &IndentInline, w, cx| this.key_tab(w, cx)))
+                    .capture_action(cx.listener(|this, _: &Indent, w, cx| this.key_tab(w, cx)))
+                    .capture_action(cx.listener(|this, _: &InputEscape, _, cx| {
+                        if this.popup_open(cx) {
+                            this.close_popup(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    // The same keys when the text box binds no action to them.
+                    .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                        let m = &ev.keystroke.modifiers;
+                        if m.control || m.alt || m.shift || m.platform {
+                            return;
+                        }
+                        match ev.keystroke.key.as_str() {
+                            "up" => this.key_up(w, cx),
+                            "down" => this.key_down(cx),
+                            "tab" => this.key_tab(w, cx),
+                            _ => {}
+                        }
+                    }))
+                    .children(popup)
                     .when(!self.attachments.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(8.)).px(px(10.)).pt(px(10.)).children(thumbs)))
+                    .children(chips)
                     .child(div().px(px(8.)).pt(px(8.)).child(textarea))
                     .child(
                         div()
@@ -1689,7 +1831,10 @@ fn step_row(st: &ToolStep, key: String, open: bool, cx: &mut Context<Dock>) -> S
     let args = st.args.as_object().cloned().unwrap_or_default();
     let p = tools::phrases(&st.name, &args);
     let label = match st.state {
-        StepState::Running => format!("{}…", p.doing),
+        StepState::Running => match st.progress.as_deref().filter(|t| !t.trim().is_empty()) {
+            Some(now) => format!("{}… · {}", p.doing, now),
+            None => format!("{}…", p.doing),
+        },
         StepState::AwaitingApproval => format!("{} · waiting for your OK", p.ask),
         StepState::Done => p.done,
         StepState::Denied => p.ask,

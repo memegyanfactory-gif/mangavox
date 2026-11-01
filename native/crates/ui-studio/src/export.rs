@@ -15,12 +15,15 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{radius, space};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, glyphs, icon_button, muted, ph, segmented, size, switch, ButtonKind, RampExt as _, Tokens};
+use mv_ui::{btn, glyphs, icon_button, ph, size, ButtonKind, RampExt as _, Tokens};
 use serde_json::{json, Value};
 
 use crate::data::{fresh, MangaGroup};
 use crate::page::{plural, StudioPage};
 use crate::restyle::safe_file_name;
+
+pub(crate) mod style;
+pub(crate) mod style_view;
 
 /// The name generated videos give their music-free audio track.
 pub(crate) const NARRATION_ONLY: &str = "Narration only";
@@ -144,7 +147,7 @@ pub(crate) fn scale_filter(w: u32, h: u32) -> String {
 }
 
 /// The section's choices.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ExportPrefs {
     /// 0 whole, 1 parts, 2 reels.
     pub kind: usize,
@@ -1661,20 +1664,12 @@ impl StudioPage {
         self.made_videos(g).into_iter().map(|(c, _)| c).collect()
     }
 
-    /// Plays every made chapter of `g` as one video, after asking about chapters that changed
-    /// since they were rendered (`data::fresh`).
+    /// Plays every made chapter of `g` as one video. With the Video style locked, the chapters
+    /// that do not match it are re-edited first, then it plays; else it asks about chapters that
+    /// changed since they were rendered (`data::fresh`). See `style_view::style_gate`.
     pub(crate) fn play_full(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
-        let (page, group) = (cx.entity().downgrade(), g.clone());
-        fresh::guard(
-            self.made_chapters_of(g),
-            "playing",
-            fresh::After::Offer("Play"),
-            move |window, cx| {
-                let _ = page.update(cx, |this, cx| this.play_full_now(&group, window, cx));
-            },
-            window,
-            cx,
-        );
+        let group = g.clone();
+        self.style_gate(g, style::Goal::Play, Box::new(move |this, window, cx| this.play_full_now(&group, window, cx)), window, cx);
     }
 
     fn play_full_now(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
@@ -1696,18 +1691,9 @@ impl StudioPage {
     /// the hook plays first, and Play (the hook, when one was made for these videos, then the
     /// joined video). Asks about changed chapters first, like Play and Export.
     pub(crate) fn preview_export(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
-        let (page, group) = (cx.entity().downgrade(), g.clone());
+        let group = g.clone();
         let font = mark_font(self.setup.read(cx).env.as_ref());
-        fresh::guard(
-            self.made_chapters_of(g),
-            "previewing the export",
-            fresh::After::Auto,
-            move |window, cx| {
-                let _ = page.update(cx, |this, cx| this.preview_export_now(group, font, window, cx));
-            },
-            window,
-            cx,
-        );
+        self.style_gate(g, style::Goal::PreviewExport, Box::new(move |this, window, cx| this.preview_export_now(group, font, window, cx)), window, cx);
     }
 
     fn preview_export_now(&mut self, g: MangaGroup, font: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1779,23 +1765,14 @@ impl StudioPage {
             None
         };
         let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Export here".into()) });
-        let chapters: Vec<crate::data::ChapterItem> = videos.iter().map(|(c, _)| c.clone()).collect();
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else { return };
             let Some(dir) = paths.into_iter().next() else { return };
-            let page = this.clone();
-            let _ = this.update_in(cx, |_, window, cx| {
-                // Chapters changed since they were rendered: render them first, or not.
-                fresh::guard(
-                    chapters,
-                    "exporting",
-                    fresh::After::Auto,
-                    move |window, cx| {
-                        let _ = page.update(cx, |this, cx| this.export_now(group, prefs, dir, name, font, hook, window, cx));
-                    },
-                    window,
-                    cx,
-                );
+            let _ = this.update_in(cx, |this, window, cx| {
+                // Chapters that do not match the style: re-edited first when it is locked, else
+                // asked about.
+                let g = group.clone();
+                this.style_gate(&g, style::Goal::Export, Box::new(move |this, window, cx| this.export_now(group, prefs, dir, name, font, hook, window, cx)), window, cx);
             });
         })
         .detach();
@@ -1958,7 +1935,11 @@ impl StudioPage {
                 .icon(ph::PLAY)
                 .tooltip("Play every made chapter as one video")
                 .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.play_full(&group, window, cx)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    if !this.style_first_open(cx) {
+                        this.play_full(&group, window, cx);
+                    }
+                }))
         };
         let preview = {
             let group = g.clone();
@@ -1967,23 +1948,27 @@ impl StudioPage {
                 .icon(ph::EYE)
                 .tooltip("See what the export holds with these choices: a frame drawn exactly as it will be saved (size, reel crop, watermark), and the hook")
                 .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.preview_export(&group, window, cx)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    if !this.style_first_open(cx) {
+                        this.preview_export(&group, window, cx);
+                    }
+                }))
         };
         let small = |t: String| div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(t);
+        // The hook's switch lives in the Video style panel: collapsed, the row still says it is on.
+        let hook_chip = (!self.style.prefs.open && mode == Mode::Whole && prefs.hook).then(|| {
+            btn("vid-hook", format!("Hook {} s", prefs.hook_secs), ButtonKind::Ghost)
+                .small()
+                .icon(ph::LIGHTNING)
+                .tooltip("A teaser of the most gripping moments plays before chapter 1. Open the Video style panel to change or turn it off")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.style.prefs.open = true;
+                    this.style.prefs.seen = true;
+                    this.style.prefs.save();
+                    cx.notify();
+                }))
+        });
 
-        let kinds = [(ph::FILM_STRIP, "One video"), (ph::SQUARES_FOUR, "Parts"), (ph::DEVICE_MOBILE, "Reels · 1 min")];
-        let kind_seg = segmented("vid-kind", kinds.iter().map(|&(i, l)| (Some(i), l)), prefs.kind).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
-            this.export_prefs.kind = *ix;
-            cx.notify();
-        }));
-        let parts_seg = segmented("vid-parts", PART_COUNTS.iter().map(|p| (None, p.to_string())), PART_COUNTS.iter().position(|p| *p == prefs.parts).unwrap_or(3)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
-            this.export_prefs.parts = PART_COUNTS[*ix];
-            cx.notify();
-        }));
-        let quality_seg = segmented("vid-quality", Quality::ALL.iter().map(|q| (None, q.label())), Quality::ALL.iter().position(|q| *q == prefs.quality).unwrap_or(0)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
-            this.export_prefs.quality = Quality::ALL[*ix];
-            cx.notify();
-        }));
         let note = match mode {
             Mode::Whole => "Saves everything as one video file.".to_string(),
             Mode::Parts(p) => format!("{p} videos of about {} each, cut between sentences.", if total > 0. { fmt_duration(total / p as f64) } else { "equal length".into() }),
@@ -1992,22 +1977,6 @@ impl StudioPage {
                 if total > 0. { format!(" (about {})", (total / REEL_SECONDS).ceil() as usize) } else { String::new() }
             ),
         };
-        let hook_row = (mode == Mode::Whole).then(|| {
-            let secs_seg = segmented("vid-hook-secs", HOOK_SECONDS.iter().map(|s| (None, format!("{s}s"))), HOOK_SECONDS.iter().position(|s| *s == prefs.hook_secs).unwrap_or(2)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
-                this.export_prefs.hook_secs = HOOK_SECONDS[*ix];
-                cx.notify();
-            }));
-            div()
-                .flex()
-                .items_center()
-                .gap(px(space::XS))
-                .child(switch("vid-hook", prefs.hook).on_click(cx.listener(|this, on: &bool, _, cx| {
-                    this.export_prefs.hook = *on;
-                    cx.notify();
-                })))
-                .child(div().id("vid-hook-label").tooltip(mv_ui::tip("AI picks the most gripping moments, writes and voices a teaser, and puts it before chapter 1.")).child(muted("Hook")))
-                .when(prefs.hook, |d| d.child(secs_seg))
-        });
         let group = g.clone();
         let options = div()
             .flex()
@@ -2019,22 +1988,14 @@ impl StudioPage {
                     .flex_wrap()
                     .items_center()
                     .gap(px(space::SM))
-                    .child(kind_seg)
-                    .when(matches!(mode, Mode::Parts(_)), |d| d.child(parts_seg))
-                    .child(quality_seg)
-                    .children(hook_row)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(space::XS))
-                            .child(switch("vid-music", prefs.music).on_click(cx.listener(|this, on: &bool, _, cx| {
-                                this.export_prefs.music = *on;
-                                cx.notify();
-                            })))
-                            .child(muted(if prefs.music { "Music" } else { "No music · narration only" })),
-                    )
-                    .child(div().flex_1())
+                    .child(div().flex_1().min_w(px(160.)).child(small(if n == 0 {
+                        "Every made chapter joins here, in order, as one video.".to_string()
+                    } else if prefs.quality == Quality::Source {
+                        note
+                    } else {
+                        format!("{note} Scaled to {} (re-encoded, so it takes longer{}).", prefs.quality.label(), if prefs.quality == Quality::K4 { "; 4K is the slowest" } else { "" })
+                    })))
+                    .children(hook_chip)
                     .child(preview)
                     .child(play)
                     .child(
@@ -2042,16 +2003,14 @@ impl StudioPage {
                             .small()
                             .icon(glyphs::DOWNLOADS)
                             .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_export(&group, window, cx))),
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                if !this.style_first_open(cx) {
+                                    this.start_export(&group, window, cx);
+                                }
+                            })),
                     ),
-            )
-            .child(small(if n == 0 {
-                "Every made chapter joins here, in order, as one video.".to_string()
-            } else if prefs.quality == Quality::Source {
-                note
-            } else {
-                format!("{note} Scaled to {} (re-encoded, so it takes longer{}).", prefs.quality.label(), if prefs.quality == Quality::K4 { "; 4K is the slowest" } else { "" })
-            }));
+            );
+        let style = self.style_panel(g, cx);
 
         let progress = job.map(|(here, (p, label))| {
             div()
@@ -2079,6 +2038,7 @@ impl StudioPage {
             .bg(Tokens::surface())
             .child(options)
             .children(progress)
+            .child(style)
             .into_any_element()
     }
 }

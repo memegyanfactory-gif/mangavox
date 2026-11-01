@@ -40,6 +40,9 @@ pub struct ToolStep {
     pub state: StepState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// What a long job is doing now ("Rendering 40%"), while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +84,9 @@ pub struct ChatItem {
     /// Next-step buttons the model offered under this reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggestions: Vec<crate::suggest::Suggestion>,
+    /// Items the user attached with `@` (shown as chips; sent as context).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<crate::commands::Mention>,
     pub created_at: u64,
 }
 
@@ -90,7 +96,7 @@ fn done_status() -> ItemStatus {
 
 impl ChatItem {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { id: new_id("u"), role: ItemRole::User, text: text.into(), reasoning: None, activity: vec![], steps: vec![], status: ItemStatus::Done, error: None, model: None, reasoning_ms: None, suggestions: vec![], created_at: now_ms() }
+        Self { id: new_id("u"), role: ItemRole::User, text: text.into(), reasoning: None, activity: vec![], steps: vec![], status: ItemStatus::Done, error: None, model: None, reasoning_ms: None, suggestions: vec![], mentions: vec![], created_at: now_ms() }
     }
     pub fn assistant(model: &str) -> Self {
         Self {
@@ -105,6 +111,7 @@ impl ChatItem {
             model: Some(model.to_string()),
             reasoning_ms: None,
             suggestions: vec![],
+            mentions: vec![],
             created_at: now_ms(),
         }
     }

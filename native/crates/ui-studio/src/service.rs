@@ -199,6 +199,11 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
     });
     // The Studio-wide look (preset and effects; see `look`).
     job.video_config["look"] = crate::look::video_config();
+    // The layered motion pack's own Python, when it is installed: the renderer runs the layer
+    // prep and animation in it (python/layered_motion.py) and skips layered motion without it.
+    if let Some(py) = mv_studio::vfx_pack::python() {
+        job.video_config["vfx_python"] = json!(py.to_string_lossy());
+    }
     // The chapter's own score (Music step), when it is on and matches the narration.
     let r = crate::page::chref(ch);
     let music = mv_score::load_settings(&r);

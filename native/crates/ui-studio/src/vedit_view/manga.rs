@@ -1073,7 +1073,7 @@ impl StudioPage {
     pub(super) fn look_backdrop(&self, seq: &Seq, placed: &[Placed], now: u64, fw: f32, fh: f32) -> Vec<AnyElement> {
         let mut out = vec![];
         let studio = self.studio_look();
-        let look = vf::LookParams::of(&seq.edit, (studio.preset, studio.effects()));
+        let look = vf::LookParams::of(&seq.edit, &studio);
         let shots = vf::plan(&seq.beats, placed, &look, seq.edit.cuts, seq.reels, &aspect);
         let t = now as f64 / 1000.;
         let Some(at) = vf::at(&shots, t) else { return out };
@@ -1178,7 +1178,7 @@ impl StudioPage {
         }
         let (rw, rh) = vf::render_size(seq.reels);
         let s = fw as f64 / rw;
-        let (bx, by, bw, bh) = vf::panel_box(aspect(&image).map(f64::from).unwrap_or(1.), rw, rh, look.fx.letterbox);
+        let (bx, by, bw, bh) = vf::panel_box(aspect(&image).map(f64::from).unwrap_or(1.), rw, rh, look.fx.letterbox, look.margin());
         let (bx, by, bw, bh) = (bx * s, by * s, bw * s, bh * s);
         let v = vf::camera(&shot.cam, shot.frames, on);
         let (iw, ih) = (bw * v.zoom, bh * v.zoom);

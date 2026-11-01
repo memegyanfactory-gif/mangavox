@@ -474,6 +474,7 @@ mod tests {
             cover_url: None,
             provider_id: None,
             episode_number: Some(1),
+            season_number: None,
             position_secs: pos,
             duration_secs: dur,
             completed,

@@ -83,10 +83,14 @@ pub fn kind_of(r: &AnimeSearchResult) -> &'static str {
     }
 }
 
-/// Season and episode to resume a series at: the history row has only the episode number, so
-/// it is matched against the season last started from these pages.
-pub fn series_point(imdb: &str, episode: Option<i64>) -> Option<(u32, u32)> {
-    let ep = u32::try_from(episode?).ok()?;
+/// Season and episode to resume a series at: the history row's own season and episode. Rows
+/// saved before seasons were kept have only the episode, matched against the season last
+/// started from these pages.
+pub fn series_point(imdb: &str, h: &PlaybackState) -> Option<(u32, u32)> {
+    let ep = u32::try_from(h.episode_number?).ok()?;
+    if let Some(s) = h.season_number.and_then(|s| u32::try_from(s).ok()) {
+        return Some((s, ep));
+    }
     let (s, last) = streams::last_played(imdb)?;
     // The player may have moved on to later episodes of the same season by itself.
     (ep >= last).then_some((s, ep))
@@ -610,7 +614,7 @@ impl MoviesHome {
     /// Hero Play: resumes where the user left off when that is known, otherwise starts at the top.
     fn play(&mut self, r: &AnimeSearchResult, window: &mut Window, cx: &mut Context<Self>) {
         let movie = kind_of(r) == "movie";
-        let point = if movie { None } else { r.imdb_id.as_deref().and_then(|id| series_point(id, self.resume_of(r).and_then(|h| h.episode_number))) };
+        let point = if movie { None } else { r.imdb_id.as_deref().and_then(|id| self.resume_of(r).and_then(|h| series_point(id, h))) };
         let (s, e) = point.unwrap_or((1, 1));
         let label = if movie { r.title.clone() } else { format!("{} S{s:02}E{e:02}", r.title) };
         let base = PlayBase { title: label.clone(), imdb_id: r.imdb_id.clone(), mal_id: None, season: (!movie).then_some(s), episode: (!movie).then_some(e) };
@@ -623,7 +627,7 @@ impl MoviesHome {
         if h.kind == "movie" {
             return Some((PlayBase { title: h.title.clone(), imdb_id: Some(imdb), mal_id: None, season: None, episode: None }, h.title.clone(), true));
         }
-        let (s, e) = series_point(&imdb, h.episode_number)?;
+        let (s, e) = series_point(&imdb, h)?;
         let label = format!("{} S{s:02}E{e:02}", h.title);
         Some((PlayBase { title: label.clone(), imdb_id: Some(imdb), mal_id: None, season: Some(s), episode: Some(e) }, label, false))
     }
@@ -685,7 +689,7 @@ impl MoviesHome {
         let meta = nfx::dot_line(parts, 16.).children(look::score(r.score, isz::SM, None));
         // "Resume" only when Play really resumes: a series needs its season (see `play`), or it
         // starts at S1 E1 and the label would be wrong.
-        let resume = self.resume_of(&r).is_some_and(|h| movie || r.imdb_id.as_deref().and_then(|id| series_point(id, h.episode_number)).is_some());
+        let resume = self.resume_of(&r).is_some_and(|h| movie || r.imdb_id.as_deref().and_then(|id| series_point(id, h)).is_some());
         let (play_r, info_r) = (r.clone(), r.clone());
         let paused = self.hero_paused;
         let pause = (!reduced()).then(|| {
@@ -1263,7 +1267,29 @@ impl Render for MoviesHome {
 
 #[cfg(test)]
 mod tests {
-    use super::{catalog_key, kind_of};
+    use super::{catalog_key, kind_of, series_point};
+    use mv_core::repo::media::PlaybackState;
+
+    #[test]
+    fn a_series_resumes_at_its_saved_season() {
+        let h = |s: Option<i64>, e: i64| PlaybackState {
+            media_id: "series:imdb:tt0000001".into(),
+            kind: "series".into(),
+            title: "Show".into(),
+            cover_url: None,
+            provider_id: None,
+            episode_number: Some(e),
+            season_number: s,
+            position_secs: 300.,
+            duration_secs: 2400.,
+            completed: false,
+            updated_at: 0,
+        };
+        // The history row's own season wins (no cached "last played" needed).
+        assert_eq!(series_point("tt0000001", &h(Some(2), 3)), Some((2, 3)));
+        // An old row without a season and nothing cached: unknown (the page asks no further).
+        assert_eq!(series_point("tt0000001", &h(None, 3)), None);
+    }
     use mv_media::cinemeta::CinemetaCatalog;
     use mv_media::types::AnimeSearchResult;
 

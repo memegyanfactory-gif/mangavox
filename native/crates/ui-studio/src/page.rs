@@ -327,6 +327,8 @@ pub struct StudioPage {
     pub(crate) export_job: Option<crate::export::Job>,
     /// Exports asked for while one runs, started in order as each ends.
     pub(crate) export_queue: Vec<crate::export::QueuedExport>,
+    /// The Video section's "Video style" panel (and the export choices it keeps).
+    pub(crate) style: crate::export::style_view::StyleUi,
     pub(crate) queue: crate::pipeline::Queue,
     seen_queue: u64,
     /// Every issue, worked out once per frame; and the ones the user dismissed.
@@ -390,6 +392,7 @@ impl StudioPage {
         // take focus on a click, so nothing else would hand it to the page.
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        let style = crate::export::style_view::StyleUi::load();
         let mut page = Self {
             setup,
             library: Load::Loading,
@@ -453,9 +456,10 @@ impl StudioPage {
             sheet: None,
             gen_answers: None,
             restyle: None,
-            export_prefs: Default::default(),
+            export_prefs: style.prefs.export,
             export_job: None,
             export_queue: vec![],
+            style,
             queue: crate::pipeline::snapshot(),
             seen_queue: crate::pipeline::version(),
             issues: vec![],

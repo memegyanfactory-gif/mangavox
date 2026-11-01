@@ -44,6 +44,9 @@ pub struct MediaEvent {
     pub query: Option<String>,
     pub provider_id: Option<String>,
     pub episode_number: Option<i64>,
+    /// A series' season (`None` for movies, anime and rows saved before seasons were kept).
+    #[serde(default)]
+    pub season_number: Option<i64>,
     pub position_secs: Option<f64>,
     pub duration_secs: Option<f64>,
     pub created_at: Option<i64>,
@@ -58,6 +61,9 @@ pub struct PlaybackState {
     pub cover_url: Option<String>,
     pub provider_id: Option<String>,
     pub episode_number: Option<i64>,
+    /// A series' season (`None` for movies, anime and rows saved before seasons were kept).
+    #[serde(default)]
+    pub season_number: Option<i64>,
     pub position_secs: f64,
     pub duration_secs: f64,
     pub completed: bool,
@@ -130,8 +136,8 @@ pub fn record_event(conn: &Connection, e: &MediaEvent) -> Result<String> {
     let media_id = e.media_id.clone().or_else(|| e.title.as_ref().map(|t| t.id.clone()));
     conn.execute(
         "INSERT INTO media_event
-           (id,media_id,kind,event_type,query,provider_id,episode_number,position_secs,duration_secs,created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+           (id,media_id,kind,event_type,query,provider_id,episode_number,position_secs,duration_secs,created_at,season_number)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
             id,
             media_id,
@@ -142,17 +148,18 @@ pub fn record_event(conn: &Connection, e: &MediaEvent) -> Result<String> {
             e.episode_number,
             e.position_secs,
             e.duration_secs,
-            e.created_at.unwrap_or_else(now_ms)
+            e.created_at.unwrap_or_else(now_ms),
+            e.season_number
         ],
     )?;
     if let Some(mid) = media_id {
         if ["play", "progress", "complete"].contains(&e.event_type.as_str()) {
             conn.execute(
                 "INSERT INTO media_playback
-                   (media_id,kind,provider_id,episode_number,position_secs,duration_secs,completed,updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                   (media_id,kind,provider_id,episode_number,position_secs,duration_secs,completed,updated_at,season_number)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
                  ON CONFLICT(media_id) DO UPDATE SET provider_id=excluded.provider_id,
-                   episode_number=excluded.episode_number,position_secs=excluded.position_secs,
+                   episode_number=excluded.episode_number,season_number=excluded.season_number,position_secs=excluded.position_secs,
                    duration_secs=excluded.duration_secs,completed=excluded.completed,updated_at=excluded.updated_at",
                 params![
                     mid,
@@ -162,7 +169,8 @@ pub fn record_event(conn: &Connection, e: &MediaEvent) -> Result<String> {
                     e.position_secs.unwrap_or(0.0),
                     e.duration_secs.unwrap_or(0.0),
                     (e.event_type == "complete") as i64,
-                    now_ms()
+                    now_ms(),
+                    e.season_number
                 ],
             )?;
         }
@@ -173,7 +181,7 @@ pub fn record_event(conn: &Connection, e: &MediaEvent) -> Result<String> {
 pub fn list_history(conn: &Connection, kind: Option<&str>, provider_id: Option<&str>, limit: usize) -> Result<Vec<PlaybackState>> {
     let mut stmt = conn.prepare(
         "SELECT p.media_id,p.kind,t.title,t.cover_url,p.provider_id,p.episode_number,p.position_secs,
-                p.duration_secs,p.completed,p.updated_at
+                p.duration_secs,p.completed,p.updated_at,p.season_number
          FROM media_playback p JOIN media_title t ON t.id = p.media_id
          WHERE (?1 IS NULL OR p.kind = ?1) AND (?2 IS NULL OR p.provider_id = ?2)
          ORDER BY p.updated_at DESC LIMIT ?3",
@@ -191,6 +199,7 @@ pub fn list_history(conn: &Connection, kind: Option<&str>, provider_id: Option<&
                 duration_secs: r.get(7)?,
                 completed: r.get::<_, i64>(8)? != 0,
                 updated_at: r.get(9)?,
+                season_number: r.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -295,6 +304,17 @@ mod tests {
         record_event(&conn, &MediaEvent { episode_number: Some(3), position_secs: Some(1300.0), ..ev("a", "progress") }).unwrap();
         let w = watched_episodes(&conn, "a").unwrap();
         assert_eq!(w, HashSet::from([2, 3]));
+    }
+
+    #[test]
+    fn the_resume_point_keeps_the_season() {
+        let (_d, conn) = temp_db();
+        upsert_title(&conn, &MediaTitle { id: "series:imdb:tt1".into(), kind: "series".into(), title: "Show".into(), ..Default::default() }).unwrap();
+        let at = |s: i64, e: i64| MediaEvent { media_id: Some("series:imdb:tt1".into()), kind: "series".into(), event_type: "progress".into(), episode_number: Some(e), season_number: Some(s), position_secs: Some(300.0), duration_secs: Some(2400.0), ..Default::default() };
+        record_event(&conn, &at(1, 9)).unwrap();
+        record_event(&conn, &at(2, 3)).unwrap();
+        let h = &list_history(&conn, Some("series"), None, 10).unwrap()[0];
+        assert_eq!((h.season_number, h.episode_number), (Some(2), Some(3)), "S2 E3, not an episode 3 of no season");
     }
 
     #[test]

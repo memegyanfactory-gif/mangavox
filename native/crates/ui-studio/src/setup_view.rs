@@ -1,7 +1,8 @@
 //! Setup sheet: Python, the pipeline scripts, the voices (the packs on disk and the engine that
 //! speaks them) and FFmpeg. Voices are set up in one click through `mv_studio::voice_setup`, the
 //! same job Settings → Audio runs, with its live progress here too; everything else names the
-//! exact command that fixes it, one click away under "Manual install".
+//! exact command that fixes it, one click away under "Manual install". The optional layered
+//! motion pack (`mv_studio::vfx_pack`) installs and goes from here too.
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -39,6 +40,8 @@ pub enum Level {
 #[derive(Clone, Copy, PartialEq)]
 enum Fix {
     SetUpVoices(Target),
+    /// Install / remove the optional layered motion pack.
+    LayeredPack,
 }
 
 pub struct SetupRow {
@@ -89,7 +92,7 @@ impl SetupView {
 
     fn follow_checks(&mut self, cx: &mut Context<Self>) {
         // A setup job's progress moves on its own: keep its bar and step live.
-        if voice_setup::any_running() {
+        if voice_setup::any_running() || mv_studio::vfx_pack::busy() {
             cx.notify();
         }
         if !self.sync.pending() {
@@ -224,7 +227,10 @@ impl SetupView {
 
     /// "Set up voices" and the live state of the job that runs it.
     fn fix_view(&self, fix: Fix, cx: &mut Context<Self>) -> AnyElement {
-        let Fix::SetUpVoices(target) = fix;
+        let target = match fix {
+            Fix::SetUpVoices(t) => t,
+            Fix::LayeredPack => return self.pack_view(cx),
+        };
         // Any voice setup that runs (started here or in Settings → Audio) shows here.
         let running = PACKS.iter().map(|p| p.id).chain(ENGINE_KEYS).find_map(|k| match voice_setup::state(k) {
             Some(SetupState::Running(p)) => Some((k, p)),
@@ -275,6 +281,81 @@ impl SetupView {
             }))
             .child(div().w_full().child(muted(what)))
             .into_any_element()
+    }
+}
+
+impl SetupView {
+    /// The layered motion pack: Install (size, one click) with live progress and Stop, the
+    /// error with Try again, or what is installed with Remove.
+    fn pack_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        use mv_studio::vfx_pack::{self, PackState};
+        let well = || div().flex().flex_col().gap(px(6.)).p(px(space::MD)).rounded(px(radius::MD)).bg(Tokens::well()).border_1().border_color(Tokens::border());
+        match vfx_pack::state() {
+            Some(PackState::Running(p)) => well()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(space::SM))
+                        .child(spinner("setup-vfx-spin", Tokens::accent(), icon_px::SM))
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child("Installing the layered motion pack"))
+                        .child(btn("setup-vfx-stop", "Stop", ButtonKind::Ghost).small().icon(ph::STOP_CIRCLE).on_click(|_, _, _| vfx_pack::cancel())),
+                )
+                .child(progress_bar("setup-vfx-bar", p.fraction(), true))
+                .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(p.summary()))
+                .into_any_element(),
+            Some(PackState::Removing) => well().child(div().flex().items_center().gap(px(space::SM)).child(spinner("setup-vfx-rm", Tokens::text_2(), icon_px::SM)).child(muted("Removing the layered motion pack…"))).into_any_element(),
+            Some(PackState::Failed(msg)) => inline_alert(AlertKind::Error, "The layered motion pack did not install", msg)
+                .action("Try again", cx.listener(|this, _: &ClickEvent, _, cx| this.pack_action(true, cx)))
+                .into_any_element(),
+            Some(PackState::RemoveFailed(msg)) => inline_alert(AlertKind::Error, "The layered motion pack could not be removed", msg)
+                .action("Try again", cx.listener(|this, _: &ClickEvent, _, cx| this.pack_action(false, cx)))
+                .into_any_element(),
+            None if vfx_pack::installed_cached() => {
+                let size = vfx_pack::size_on_disk().map(fmt_bytes).unwrap_or_else(|| "measuring…".into());
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(space::SM))
+                    .child(icon_tag(ph::CHECK_CIRCLE, format!("Installed · {size}{}", vfx_pack::cached().1.map(|g| format!(" · {g}")).unwrap_or_default()), Tone::Success))
+                    .child(btn("setup-vfx-remove", "Remove", ButtonKind::Ghost).small().icon(ph::TRASH).tooltip("Deletes the pack's Python and models (layered motion turns off)").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pack_action(false, cx))))
+                    .into_any_element()
+            }
+            None => div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(space::SM))
+                .child(btn("setup-vfx-install", "Install", ButtonKind::Secondary).icon(glyphs::DOWNLOAD).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pack_action(true, cx))))
+                .child(muted(format!("About {} to download, {} on disk. Needs an NVIDIA graphics card.", fmt_bytes(vfx_pack::DOWNLOAD_BYTES), fmt_bytes(vfx_pack::DISK_BYTES))))
+                .into_any_element(),
+        }
+    }
+
+    /// Installs (`true`) or removes the layered motion pack and says how it ended.
+    fn pack_action(&mut self, install: bool, cx: &mut Context<Self>) {
+        use mv_studio::vfx_pack;
+        if vfx_pack::busy() {
+            return;
+        }
+        vfx_pack::clear_error();
+        cx.spawn(async move |this, cx| {
+            let res = if install { mv_ui::bg::run(vfx_pack::install()).await } else { mv_ui::bg::run(vfx_pack::remove()).await };
+            let _ = this.update(cx, |_, cx| {
+                match (install, res) {
+                    (true, Ok(Ok(()))) => toast::show(cx, Toast::success("Layered motion pack installed: pick it in Look & branding")),
+                    (false, Ok(Ok(()))) => toast::show(cx, Toast::info("Layered motion pack removed")),
+                    (_, Ok(Err(StudioError::Cancelled))) => toast::show(cx, Toast::info("Pack install stopped. Downloads resume next time.")),
+                    (true, Ok(Err(_))) => toast::show(cx, Toast::error("The layered motion pack did not install")),
+                    (false, Ok(Err(e))) => toast::show(cx, Toast::error(format!("Could not remove the pack: {e}"))),
+                    (_, Err(e)) => toast::show(cx, Toast::error(format!("Layered motion pack: {e:#}"))),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 }
 
@@ -401,6 +482,16 @@ fn setup_rows(env: &Env, packs: &[&'static VoicePack]) -> Vec<SetupRow> {
             rows.push(SetupRow { detail: Some(detail), packs, fix: Some(Fix::SetUpVoices(Target::Pack(voice_setup::suggested_pack()))), commands, ..row("voices", Level::Error, glyphs::VOICE, title) });
         }
     }
+    // Optional, so never an issue: the 2.5D layered motion of the Look (Studio → Video).
+    rows.push(SetupRow {
+        detail: Some(if mv_studio::vfx_pack::installed_cached() {
+            "Animates panels in 2.5D (characters on their own layers, parallax, sway, hits) when Look & branding → Layered motion is on.".into()
+        } else {
+            "Optional. Animates panels in 2.5D: SAM2 cuts the characters out, LaMa fills behind them, Depth Anything V2 adds depth. Runs on the graphics card.".into()
+        }),
+        fix: Some(Fix::LayeredPack),
+        ..row("layered", Level::Ok, ph::STACK, "Layered motion pack".into())
+    });
     rows.push(if env.ffmpeg {
         row("ffmpeg", Level::Ok, glyphs::VIDEO, "FFmpeg".into())
     } else {

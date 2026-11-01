@@ -158,6 +158,32 @@ pub fn paged(items: Vec<Value>, offset: usize, total: usize) -> Value {
     v
 }
 
+// ── Progress of a long tool (shown on its step row while it runs) ──────────────────
+
+pub type ProgressFn = Arc<dyn Fn(String) + Send + Sync>;
+
+tokio::task_local! {
+    static PROGRESS: ProgressFn;
+}
+
+/// The running tool's progress reporter. Take it at the start of a handler (it lives in the
+/// handler's task) and move it into blocking work or threads.
+pub fn progress_handle() -> Option<ProgressFn> {
+    PROGRESS.try_with(|p| p.clone()).ok()
+}
+
+/// Says what the running tool is doing now ("Rendering 40%"); does nothing outside a tool call.
+pub fn report_progress(text: impl Into<String>) {
+    if let Some(p) = progress_handle() {
+        p(text.into());
+    }
+}
+
+/// Runs a tool future with `p` as its progress reporter.
+pub async fn with_progress<F: std::future::Future>(p: ProgressFn, f: F) -> F::Output {
+    PROGRESS.scope(p, f).await
+}
+
 // ── Page context (the shell may call `set_page_context` on every navigation) ────
 
 static PAGE: Mutex<Option<Route>> = Mutex::new(None);
@@ -280,7 +306,12 @@ fn builtin_tools() -> Vec<AppTool> {
             obj(json!({ "imdbId": s("IMDB id from search_movies"), "title": s("Title"), "kind": s_enum("Kind", &["movie", "series"]) }), &["imdbId", "title"]),
             Risk::Act,
         ),
-        t("open_manga", "Open a manga that is already in the user's library, by title.".into(), obj(json!({ "title": s("Manga title") }), &["title"]), Risk::Act),
+        t(
+            "open_manga",
+            "Open a manga's detail page: one in the library by title, or any loaded manga by its id (the mangaId from manga_chapters).".into(),
+            obj(json!({ "title": s("Manga title (library)"), "id": s("Manga id (from manga_chapters / list_library)") }), &[]),
+            Risk::Act,
+        ),
         t(
             "play_title",
             "Open the page of an anime, movie or series so it can be played (searches by title).".into(),
@@ -321,7 +352,142 @@ fn builtin_tools() -> Vec<AppTool> {
             Risk::Read,
         ),
         t("app_suggestions", "What the app suggests right now: failed Studio chapters to retry, new downloads without recaps, recaps ready to export, YouTube titles to write. Use when the user asks what to do next.".into(), obj(json!({}), &[]), Risk::Read),
+        t(
+            APP_GUIDE,
+            format!("How MangaVox is organised and the right order of steps (find a manga → library → download → Studio steps → export), with the tools for each. Call it first when unsure how to do something. Topics: {}.", crate::guide::TOPICS.join(", ")),
+            obj(json!({ "topic": s_enum("Optional topic (default: overview)", crate::guide::TOPICS) }), &[]),
+            Risk::Read,
+        ),
     ]
+}
+
+/// Explains the app (see [`crate::guide`]).
+pub const APP_GUIDE: &str = "app_guide";
+/// Searches every tool by what it does and makes the matches available (handled by the agent loop).
+pub const FIND_TOOLS: &str = "find_tools";
+/// One tool's full schema (handled by the agent loop).
+pub const DESCRIBE_TOOL: &str = "describe_tool";
+
+/// Core tools a small model always gets (with [`FIND_TOOLS`] / [`DESCRIBE_TOOL`] for the rest).
+pub const LEAN_CORE: &[&str] = &[APP_GUIDE, "get_app_state", "navigate", "go_back", "open_settings", "app_suggestions", "suggest_replies"];
+
+/// Words that carry no meaning for tool search.
+const STOP: &[&str] = &["a", "an", "the", "to", "of", "for", "and", "or", "in", "on", "my", "me", "i", "it", "is", "be", "with", "from", "this", "that", "please", "can", "you", "how", "do", "what", "want", "some", "all", "into", "by", "at", "as", "tool", "tools", "app"];
+
+/// What users say → words the tools use.
+const SYNONYMS: &[(&str, &[&str])] = &[
+    ("recap", &["studio", "generate", "video"]),
+    ("make", &["generate", "compose", "create"]),
+    ("create", &["generate", "compose"]),
+    ("subtitle", &["captions"]),
+    ("caption", &["captions"]),
+    ("narration", &["voice", "audio"]),
+    ("narrator", &["voice", "voices"]),
+    ("tts", &["voice", "audio"]),
+    ("favourite", &["library", "favorites"]),
+    ("favorite", &["library", "favorites"]),
+    ("save", &["library", "export"]),
+    ("queue", &["queue", "status"]),
+    ("progress", &["status", "downloads"]),
+    ("animation", &["motion", "compose"]),
+    ("animate", &["motion", "compose"]),
+    ("graphic", &["motion", "compose"]),
+    ("intro", &["motion", "hook"]),
+    ("trailer", &["motion", "hook"]),
+    ("thumbnail", &["thumbnails", "thumbnail"]),
+    ("watch", &["play", "media"]),
+    ("stream", &["play", "media", "sources"]),
+    ("movie", &["movies", "media"]),
+    ("series", &["movies", "media"]),
+    ("show", &["media", "movies", "anime"]),
+    ("read", &["reader", "chapters"]),
+    ("chapter", &["chapters"]),
+    ("page", &["pages", "reader"]),
+    ("panel", &["pages", "motion"]),
+    ("render", &["video", "render"]),
+    ("look", &["look", "effects", "preset"]),
+    ("effect", &["effects", "look"]),
+    ("watermark", &["look"]),
+    ("music", &["music"]),
+    ("sound", &["sfx", "music"]),
+    ("pause", &["queue", "pause"]),
+    ("cancel", &["queue", "cancel"]),
+    ("retry", &["queue", "retry"]),
+    ("delete", &["delete", "remove"]),
+    ("remove", &["delete", "remove"]),
+    ("search", &["search", "find"]),
+    ("find", &["search"]),
+    ("youtube", &["youtube"]),
+    ("upload", &["youtube", "schedule"]),
+    ("seo", &["youtube"]),
+];
+
+fn stem(w: &str) -> String {
+    let w = w.trim();
+    for suf in ["ing", "ed", "es", "s"] {
+        if w.len() > suf.len() + 3 {
+            if let Some(r) = w.strip_suffix(suf) {
+                return r.to_string();
+            }
+        }
+    }
+    w.to_string()
+}
+
+fn words(s: &str) -> Vec<String> {
+    s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty() && !STOP.contains(w)).map(stem).collect()
+}
+
+/// Tools ranked by how well they match `query` (what the user wants to do, or a tool name),
+/// best first; only matches. A tool's name counts most, then its group, then its description.
+pub fn rank_tools(query: &str, specs: &[AiToolSpec]) -> Vec<(String, f32)> {
+    let q = query.trim().to_lowercase();
+    let mut terms = words(&q);
+    for (from, to) in SYNONYMS {
+        // "animated", "animation" and "animate" all hit "animat".
+        let key: String = stem(from).chars().take(6).collect();
+        if terms.iter().any(|t| t.starts_with(&key)) {
+            terms.extend(to.iter().map(|w| stem(w)));
+        }
+    }
+    terms.sort();
+    terms.dedup();
+    let mut out: Vec<(String, f32)> = specs
+        .iter()
+        .filter(|t| !matches!(t.name.as_str(), FIND_TOOLS | DESCRIBE_TOOL | LOAD_TOOLS | RUN_TOOL))
+        .filter_map(|t| {
+            let name = t.name.to_lowercase();
+            let name_words = words(&name.replace('_', " "));
+            let desc_words = words(&t.description);
+            let group = group_of(&t.name).key();
+            let mut score = if name == q || name == q.replace(' ', "_") { 20.0 } else { 0.0 };
+            for term in &terms {
+                if name_words.iter().any(|w| w == term) {
+                    score += 4.0;
+                } else if name_words.iter().any(|w| w.starts_with(term.as_str()) || term.starts_with(w.as_str())) && term.len() >= 3 {
+                    score += 2.0;
+                }
+                if group == term {
+                    score += 1.5;
+                }
+                let hits = desc_words.iter().filter(|w| *w == term).count();
+                score += (hits.min(3) as f32) * 0.75;
+            }
+            (score > 0.0).then_some((t.name.clone(), score))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// "Did you mean …" for a tool name the model made up.
+pub fn unknown_tool_error(name: &str) -> String {
+    let near: Vec<String> = rank_tools(&name.replace('_', " "), &tool_specs()).into_iter().take(3).map(|(n, _)| n).collect();
+    if near.is_empty() {
+        format!("Unknown tool {name}. Use {FIND_TOOLS} to search the app's tools by what they do.")
+    } else {
+        format!("Unknown tool {name}. Did you mean {}? Or use {FIND_TOOLS} to search the app's tools.", near.join(", "))
+    }
 }
 
 pub fn tool_specs() -> Vec<AiToolSpec> {
@@ -362,7 +528,7 @@ impl Group {
             Group::Core => "pages, settings, suggestions",
             Group::Manga => "the library, manga sources, chapters, downloads, the reader",
             Group::Media => "anime, movies and series: search, open, play, stream sources, downloads, watch history",
-            Group::Studio => "recap videos: the Studio library, the generate queue, voices, look, captions, export, YouTube package",
+            Group::Studio => "recap videos: the Studio library, the generate queue and single steps, voices, look, captions, export, thumbnails, playing videos, custom motion-graphic videos (motion_compose)",
             Group::Video => "the Video editor: a chapter video's timeline, clips, layers, captions, music, look, render",
             Group::Youtube => "the YouTube channel: stats, videos, SEO, upload schedule",
         }
@@ -377,7 +543,7 @@ impl Group {
 pub fn group_of(name: &str) -> Group {
     match name {
         n if n.starts_with("video_") => Group::Video,
-        n if n.starts_with("studio_") => Group::Studio,
+        n if n.starts_with("studio_") || n.starts_with("motion_") => Group::Studio,
         n if n.starts_with("youtube_") => Group::Youtube,
         n if n.starts_with("manga_") || matches!(n, "list_library" | "open_manga" | "open_reader") => Group::Manga,
         n if n.starts_with("media_") || matches!(n, "get_watch_history" | "search_anime" | "open_anime" | "search_movies" | "open_movie" | "play_title") => Group::Media,
@@ -408,8 +574,12 @@ pub const RUN_TOOL: &str = "run_tool";
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolScope {
     groups: std::collections::BTreeSet<Group>,
+    /// Single tools added by [`FIND_TOOLS`] / [`DESCRIBE_TOOL`] or called directly in lean mode.
+    extra: std::collections::BTreeSet<String>,
     /// Tools reach the model over MCP: it lists them once, so later groups go through [`RUN_TOOL`].
     mcp: bool,
+    /// A small model: only [`LEAN_CORE`] plus the tools it finds, never whole groups.
+    lean: bool,
 }
 
 /// How many recent messages decide which groups the conversation is using.
@@ -422,23 +592,93 @@ impl ToolScope {
             groups.extend(m.tool_calls.iter().flatten().map(|c| group_of(&c.name)));
             groups.extend(m.tool_name.as_deref().map(group_of));
         }
-        ToolScope { groups, mcp }
+        ToolScope { groups, extra: Default::default(), mcp, lean: false }
+    }
+
+    /// For small models (local ones, the text protocol): the core set, the tools the recent
+    /// conversation used, and [`FIND_TOOLS`] for everything else.
+    pub fn lean(history: &[mv_ai::AiMessage], mcp: bool) -> Self {
+        let mut extra: std::collections::BTreeSet<String> = LEAN_CORE.iter().map(|s| s.to_string()).collect();
+        let known: Vec<String> = app_tools().into_iter().map(|t| t.name.to_string()).collect();
+        for m in history.iter().rev().take(RECENT) {
+            extra.extend(m.tool_calls.iter().flatten().map(|c| c.name.clone()).filter(|n| known.contains(n)));
+            extra.extend(m.tool_name.clone().filter(|n| known.contains(n)));
+        }
+        ToolScope { groups: Default::default(), extra, mcp, lean: true }
+    }
+
+    pub fn is_lean(&self) -> bool {
+        self.lean
     }
 
     pub fn groups(&self) -> Vec<Group> {
         self.groups.iter().copied().collect()
     }
 
-    /// Adds the group of a tool the model called directly.
+    /// Adds the group of a tool the model called directly (just the tool in lean mode).
     pub fn add_for(&mut self, name: &str) {
-        self.groups.insert(group_of(name));
+        if self.lean {
+            self.extra.insert(name.to_string());
+        } else {
+            self.groups.insert(group_of(name));
+        }
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.groups.contains(&group_of(name)) || self.extra.contains(name)
+    }
+
+    /// Runs [`FIND_TOOLS`]: the best matches for `query`, made available from the next round.
+    pub fn find(&mut self, args: &Map<String, Value>) -> Result<Value, String> {
+        let q = arg(args, "query");
+        if q.is_empty() {
+            return Err("Say what you want to do, e.g. {\"query\": \"download chapters\"}".into());
+        }
+        let limit = num_arg(args, "limit").map_or(6, |n| (n.max(1.) as usize).min(12));
+        let all = tool_specs();
+        let hits: Vec<AiToolSpec> = rank_tools(q, &all).into_iter().take(limit).filter_map(|(n, _)| all.iter().find(|t| t.name == n).cloned()).collect();
+        if hits.is_empty() {
+            return Ok(json!({ "tools": [], "note": format!("Nothing matched \"{q}\". Try other words, or {APP_GUIDE} for how the app is organised.") }));
+        }
+        for h in &hits {
+            self.extra.insert(h.name.clone());
+        }
+        let mut v = json!({ "tools": hits.iter().map(signature).collect::<Vec<_>>(), "note": format!("These tools are available now. {DESCRIBE_TOOL} gives one tool's full schema.") });
+        if self.mcp {
+            v["howToCall"] = json!(format!("If your tool list does not show them, call them with {RUN_TOOL} {{\"name\": ..., \"args\": {{...}}}}."));
+        }
+        Ok(v)
+    }
+
+    /// Runs [`DESCRIBE_TOOL`]: one tool's description and JSON schema, and makes it available.
+    pub fn describe(&mut self, args: &Map<String, Value>) -> Result<Value, String> {
+        let name = crate::textcall::clean_name(arg(args, "name"));
+        let Some(t) = tool_specs().into_iter().find(|t| t.name == name) else {
+            return Err(unknown_tool_error(&name));
+        };
+        self.extra.insert(t.name.clone());
+        let mut v = json!({ "name": t.name, "description": t.description, "parameters": t.parameters, "risk": risk_of(&t.name).map(|r| r.as_str()) });
+        if self.mcp {
+            v["howToCall"] = json!(format!("Call it directly, or with {RUN_TOOL} if your tool list does not show it."));
+        }
+        Ok(v)
     }
 
     /// The specs to send: the scope's tools plus [`LOAD_TOOLS`] (and [`RUN_TOOL`] over MCP).
     pub fn specs(&self) -> Vec<AiToolSpec> {
-        let mut out: Vec<AiToolSpec> = tool_specs().into_iter().filter(|t| self.groups.contains(&group_of(&t.name))).collect();
+        let mut out: Vec<AiToolSpec> = tool_specs().into_iter().filter(|t| self.has(&t.name)).collect();
+        out.push(AiToolSpec {
+            name: FIND_TOOLS.into(),
+            description: "Searches all of the app's tools by what you want to do (\"download chapters\", \"export reels\", \"animated intro\") and makes the best matches available. Use it whenever the tool you need is not in your list.".into(),
+            parameters: obj(json!({ "query": s("What you want to do, in a few words"), "limit": { "type": "number", "description": "Max tools (default 6)" } }), &["query"]),
+        });
+        out.push(AiToolSpec {
+            name: DESCRIBE_TOOL.into(),
+            description: "One tool's full description and argument schema (use before calling a tool you are unsure about).".into(),
+            parameters: obj(json!({ "name": s("Tool name") }), &["name"]),
+        });
         let others: Vec<String> = Group::ALL.iter().filter(|g| !self.groups.contains(g)).map(|g| format!("{} ({})", g.key(), g.about())).collect();
-        if !others.is_empty() {
+        if !others.is_empty() && !self.lean {
             out.push(AiToolSpec {
                 name: LOAD_TOOLS.into(),
                 description: format!("Loads more of the app's tools when the request needs them. Not loaded yet: {}.", others.join("; ")),
@@ -600,6 +840,9 @@ pub fn phrases(name: &str, args: &Map<String, Value>) -> Phrases {
         "youtube_schedule" => p("Schedule the video for", "Scheduling the video for", "Scheduled the video for", a("at")),
         "suggest_replies" => p("Suggest", "Suggesting", "Suggested", "next steps"),
         "app_suggestions" => p("Check", "Checking", "Checked", "what to do next"),
+        APP_GUIDE => p("Read", "Reading", "Read", "the app guide"),
+        FIND_TOOLS => p("Look for", "Looking for", "Looked for", &format!("tools to {}", a("query"))),
+        DESCRIBE_TOOL => p("Read", "Reading", "Read", &format!("how {} works", a("name"))),
         other => match registered(other).and_then(|d| d.phrases) {
             Some(f) => f(args),
             None => crate::ext::phrases(other, args).unwrap_or_else(|| p("Run", "Running", "Ran", &other.replace('_', " "))),
@@ -827,8 +1070,20 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
         }
         "open_manga" => {
             let q = a("title").to_lowercase();
-            if q.is_empty() {
-                return Err("title is required".into());
+            let id = a("id").to_string();
+            if q.is_empty() && id.is_empty() {
+                return Err("Give the manga's title or its id".into());
+            }
+            if !id.is_empty() {
+                let found = blocking({
+                    let id = id.clone();
+                    move || mv_core::library::open_readonly().ok().and_then(|c| mv_core::repo::manga::get(&c, &id).ok().flatten()).map(|m| m.title)
+                })
+                .await?;
+                return match found {
+                    Some(title) => nav(Route::MangaDetail { manga_id: id, source_id: None }, json!({ "ok": true, "opened": title })),
+                    None => Err(format!("No manga with id \"{id}\". Load it with manga_chapters (source + id) first.")),
+                };
             }
             let rows = blocking(|| mv_core::library::open_readonly().and_then(|c| mv_core::library::list_manga(&c)).map_err(|e| e.to_string())).await??;
             let hit = rows
@@ -878,6 +1133,7 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
             let n = list.len();
             Ok(ToolOutput::Suggest(list, json!({ "ok": true, "shown": n })))
         }
+        APP_GUIDE => Ok(ToolOutput::Value(crate::guide::guide(a("topic")))),
         "app_suggestions" => {
             let list = blocking(crate::suggest::collect).await?;
             Ok(ToolOutput::Value(Value::Array(list.iter().map(|s| json!({ "title": s.title, "detail": s.detail, "prompt": s.prompt })).collect())))
@@ -887,7 +1143,7 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
             // Provider-style tools (Studio's Video editor registers through `ext`).
             None => match crate::ext::run(other, args) {
                 Some(f) => f.await,
-                None => Err(format!("Unknown tool {other}")),
+                None => Err(unknown_tool_error(other)),
             },
         },
     }
@@ -1072,6 +1328,77 @@ mod tests {
         all.insert("groups".into(), json!(Group::ALL.map(|g| g.key())));
         mcp.load(&all).unwrap();
         assert!(!names(&mcp).contains(&LOAD_TOOLS.into()));
+    }
+
+    fn spec(name: &str, description: &str) -> AiToolSpec {
+        AiToolSpec { name: name.into(), description: description.into(), parameters: obj(json!({}), &[]) }
+    }
+
+    #[test]
+    fn find_tools_ranks_by_name_then_description() {
+        let specs = vec![
+            spec("manga_download", "Download chapters of a manga through the app's queue."),
+            spec("manga_downloads", "The download queue: progress and failed chapters."),
+            spec("studio_export", "Export the full recap of a manga as one video, parts or reels."),
+            spec("motion_compose", "Render a custom motion graphic video from a JSON spec."),
+            spec("navigate", "Open a page of the app."),
+            spec(FIND_TOOLS, "Searches tools."),
+        ];
+        let names = |q: &str| rank_tools(q, &specs).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert_eq!(names("download chapters")[0], "manga_download");
+        assert_eq!(names("export reels")[0], "studio_export");
+        // Synonyms: what users say.
+        assert_eq!(names("animated intro")[0], "motion_compose");
+        assert_eq!(names("make a recap")[0], "studio_export");
+        // An exact name wins outright; the meta tools never show.
+        assert_eq!(names("navigate")[0], "navigate");
+        assert!(!names("search tools").contains(&FIND_TOOLS.to_string()));
+        assert!(names("zzzz qqqq").is_empty());
+    }
+
+    #[test]
+    fn a_lean_scope_starts_small_and_grows_by_single_tools() {
+        let mut scope = ToolScope::lean(&[], false);
+        let names = |s: &ToolScope| s.specs().into_iter().map(|t| t.name).collect::<Vec<_>>();
+        let n = names(&scope);
+        for core in LEAN_CORE {
+            assert!(n.contains(&core.to_string()), "{core}");
+        }
+        assert!(n.contains(&FIND_TOOLS.into()) && n.contains(&DESCRIBE_TOOL.into()));
+        assert!(!n.contains(&LOAD_TOOLS.into()) && !n.contains(&"list_library".into()) && !n.contains(&"set_theme".into()));
+        let mut a = Map::new();
+        a.insert("query".into(), json!("search movies"));
+        let r = scope.find(&a).unwrap();
+        assert!(r["tools"][0].as_str().unwrap().starts_with("search_movies("), "{r}");
+        assert!(names(&scope).contains(&"search_movies".into()));
+        assert!(!names(&scope).contains(&"search_anime".into()) || r["tools"].to_string().contains("search_anime"), "only what was found");
+        // Calling a tool directly adds just that tool.
+        scope.add_for("list_library");
+        assert!(names(&scope).contains(&"list_library".into()) && !names(&scope).contains(&"open_manga".into()));
+        // describe_tool gives the schema; a made-up name gets suggestions.
+        let mut d = Map::new();
+        d.insert("name".into(), json!("mangavox.open_settings"));
+        let r = scope.describe(&d).unwrap();
+        assert_eq!(r["parameters"]["required"], json!(["tab"]));
+        d.insert("name".into(), json!("open_setting"));
+        assert!(scope.describe(&d).unwrap_err().contains("open_settings"));
+        assert!(scope.find(&Map::new()).is_err());
+        // The conversation's recent tools stay available.
+        let mut m = mv_ai::AiMessage::new(mv_ai::AiRole::Tool, "{}");
+        m.tool_name = Some("get_watch_history".into());
+        assert!(names(&ToolScope::lean(&[m], false)).contains(&"get_watch_history".into()));
+        // Over MCP the result says how to call tools the client does not list.
+        let mut mcp = ToolScope::lean(&[], true);
+        assert!(mcp.find(&a).unwrap()["howToCall"].as_str().unwrap().contains(RUN_TOOL));
+    }
+
+    #[tokio::test]
+    async fn app_guide_explains_the_flow() {
+        let mut a = Map::new();
+        a.insert("topic".into(), json!("studio"));
+        let ToolOutput::Value(v) = execute(APP_GUIDE, &a).await.unwrap() else { panic!() };
+        assert!(v["steps"].to_string().contains("studio_run_steps"));
+        assert_eq!(risk_of(APP_GUIDE), Some(Risk::Read));
     }
 
     #[test]

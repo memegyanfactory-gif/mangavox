@@ -134,6 +134,8 @@ pub struct Ident {
     pub imdb_id: Option<String>,
     pub mal_id: Option<i64>,
     pub episode: Option<i64>,
+    /// A series' season.
+    pub season: Option<i64>,
     /// A catalog title (IMDb or MAL id). A local file such as a Studio recap video has neither,
     /// so it is kept out of watch history and Continue Watching.
     pub tracked: bool,
@@ -157,6 +159,7 @@ pub fn ident(req: &PlayRequest) -> Ident {
         imdb_id: if kind == "anime" { None } else { imdb },
         mal_id: if kind == "anime" { mal } else { None },
         episode: req.episode.map(|e| e as i64),
+        season: if kind == "series" { req.season.map(|s| s as i64) } else { None },
         tracked,
     }
 }
@@ -169,7 +172,7 @@ pub fn load_resume(ident: &Ident) -> Option<f64> {
     let conn = mv_core::db::open_default().ok()?;
     let rows = media::list_history(&conn, Some(ident.kind), None, 1000).ok()?;
     let row = rows.into_iter().find(|r| r.media_id == ident.id)?;
-    if row.episode_number != ident.episode {
+    if row.episode_number != ident.episode || (row.season_number.is_some() && ident.season.is_some() && row.season_number != ident.season) {
         return None;
     }
     logic::resume_position(row.position_secs, row.duration_secs, row.completed)
@@ -207,6 +210,7 @@ pub fn save_event(ident: &Ident, kind: &str, pos: f64, duration: f64) -> Result<
             event_type: kind.to_string(),
             title,
             episode_number: ident.episode,
+            season_number: ident.season,
             position_secs: Some(pos),
             duration_secs: Some(duration),
             ..Default::default()

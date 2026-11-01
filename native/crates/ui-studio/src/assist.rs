@@ -23,8 +23,11 @@ use crate::look::{ColorPreset, Effect, Look, Preset, POSITIONS};
 use crate::pipeline::{self, ItemState, QueueItem, StepState};
 use crate::setup::{self, Env};
 
+mod extra;
+mod motion;
+
 pub fn register() {
-    at::register(tools());
+    at::register(tools().into_iter().chain(extra::tools()).chain(motion::tools()).collect());
     suggest::register("studio", suggestions);
     crate::ytpack::register_tools();
 }

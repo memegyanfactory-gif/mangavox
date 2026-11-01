@@ -130,8 +130,10 @@ class LookTests(unittest.TestCase):
         mixed = resolve_look({"preset": "dynamic", "glow": False, "grain": True, "duo": False})
         self.assertFalse(mixed["glow"])
         self.assertTrue(mixed["grain"])
-        # Only the effect switches can be overridden, not the layout.
-        self.assertTrue(mixed["duo"])
+        # Side by side is the Studio's framing choice (the dashboard's Video style): a bool turns it
+        # off or on over the look's own; anything else leaves the look's layout.
+        self.assertFalse(mixed["duo"])
+        self.assertTrue(resolve_look({"preset": "dynamic", "duo": "no"})["duo"])
 
     def test_action_beats(self):
         from python.video_generator import is_impact

@@ -65,6 +65,20 @@ fn tools() -> Vec<ToolDef> {
             .phrases(|_| Phrases::new("Add", "Adding", "Added", "the manga to your Library"))
             .run(|a| async move { add_to_library(a).await }.boxed()),
         ToolDef::new(
+            "manga_favorite",
+            "Mark or unmark a manga as a favourite (a Library title or a manga id from manga_chapters). Favouriting a title that is not in the Library adds it there, as the detail page does.",
+            obj(json!({ "manga": s("Manga id or Library title"), "favorite": { "type": "boolean", "description": "true to favourite (default), false to remove" } }), &["manga"]),
+            Risk::Act,
+        )
+        .phrases(|a| {
+            if bool_arg(a, "favorite") == Some(false) {
+                Phrases::new("Remove", "Removing", "Removed", &format!("{} from Favorites", name_of(a)))
+            } else {
+                Phrases::new("Add", "Adding", "Added", &format!("{} to Favorites", name_of(a)))
+            }
+        })
+        .run(|a| async move { favorite(a).await }.boxed()),
+        ToolDef::new(
             "manga_download",
             "Download chapters of a manga for offline reading and Studio, through the app's download queue (progress shows on the Downloads page). `manga` is a manga id from manga_chapters or a Library title. Big downloads ask the user first.",
             obj(json!({ "manga": s("Manga id or Library title"), "chapters": chapters_schema() }), &["manga", "chapters"]),
@@ -303,6 +317,25 @@ async fn add_to_library(a: Map<String, Value>) -> ToolResult {
     backend::set_in_library(&m.id, true);
     backend::bump_data();
     Ok(ToolOutput::Value(json!({ "ok": true, "title": m.title })))
+}
+
+async fn favorite(a: Map<String, Value>) -> ToolResult {
+    let q = str_arg(&a, "manga").to_string();
+    let want = bool_arg(&a, "favorite").unwrap_or(true);
+    let m = blocking(move || backend::with_db(|c| find_manga(c, &q))).await?;
+    let (id, title) = (m.id.clone(), m.title.clone());
+    let now = if m.is_favorite != want {
+        let id2 = id.clone();
+        blocking(move || backend::with_db(|c| manga::toggle_favorite(c, &id2))).await?
+    } else {
+        want
+    };
+    if now {
+        // A favourite lives in the Library.
+        backend::set_in_library(&id, true);
+    }
+    backend::bump_data();
+    Ok(ToolOutput::Value(json!({ "ok": true, "title": title, "favorite": now })))
 }
 
 async fn download(a: Map<String, Value>) -> ToolResult {

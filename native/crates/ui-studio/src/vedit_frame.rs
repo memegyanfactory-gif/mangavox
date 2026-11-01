@@ -4,7 +4,8 @@
 //! where the panel sits (`panel_margins`), which transition joins two shots and how far it is
 //! (`plan_transitions`, `clip_frames`), the action punch (`_flash`, `_shake`, the IMPACT_GAP
 //! rule, and with the story mood on the renderer's time spacing `punch_ok`) and the side-by-side
-//! duo panels. `tests/fixtures/frame_transforms.json` pins the camera of both sides to the same
+//! duo panels. `tests/fixtures/frame_transforms.json` pins the camera of both sides, and what the
+//! Video style look gives it (side by side, the "fill" margin, the motion amount), to the same
 //! numbers. The look's own moves keep the panel whole (the renderer's framing: zoom capped to
 //! its must-see region, here the panel less `PANEL_TRIM`); faces and the mood reading are the
 //! renderer's alone, so with them the preview is close rather than exact.
@@ -13,13 +14,15 @@
 use std::f64::consts::PI;
 use std::path::Path;
 
-use crate::look::{Effects, Preset};
+use crate::look::{Effects, Layered, Preset};
 use crate::vedit::{Beat, ChapterEdit, Clip, Motion, Placed, TransKind};
 
 pub const FPS: f64 = 30.;
 const FG_PUSH: f64 = 0.05;
 const FG_PAN_ZOOM: f64 = 1.04;
 const FG_MARGIN: f64 = 0.05;
+/// The thinner margin of the "fill" framing (`FILL_MARGIN`).
+const FILL_MARGIN: f64 = 0.015;
 pub const IMPACT_SEC: f64 = 0.4;
 const IMPACT_GAP: i64 = 4;
 const PUNCH_SEC: f64 = 0.25;
@@ -35,6 +38,12 @@ const IMPACT_EARLY_WINDOW: f64 = 30.;
 const IMPACT_EARLY_SEC: f64 = 10.;
 /// The look's own page-change transition length (`transition_duration` of every render).
 const BASE_TRANSITION: f64 = 0.5;
+
+/// The note the live preview carries while layered motion is on: the animated layers are made
+/// by the render (the layered motion pack), so the preview shows the panels as they are.
+pub fn layered_badge(mode: Layered) -> Option<&'static str> {
+    (mode != Layered::Off).then_some("Layered motion renders in the final video")
+}
 
 /// Python's `round()` (halves to even).
 fn round_py(x: f64) -> f64 {
@@ -54,19 +63,35 @@ fn sent(v: f32) -> f64 {
 
 // ------------------------------------------------------------------------------------ the look
 
-/// What a look does to the picture (the renderer's `LOOKS` and `apply_intensity`).
+/// What a look does to the picture (the renderer's `LOOKS`, `resolve_look` and
+/// `apply_intensity`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LookParams {
     pub preset: Preset,
     pub fx: Effects,
     /// The edit's intensities (key -> multiplier 0..2).
     pub intensity: std::collections::BTreeMap<String, f32>,
+    /// The Video style's framing choices as the render's `look` carries them: side by side
+    /// (`None` = the preset's own), "fill" (the thinner `FILL_MARGIN`) and the camera motion
+    /// amount (a multiplier under the editor's motion intensity).
+    pub duo_override: Option<bool>,
+    pub fill: bool,
+    pub motion_amount: f64,
+}
+
+impl Default for LookParams {
+    fn default() -> Self {
+        LookParams { preset: Preset::default(), fx: Preset::default().effects(), intensity: Default::default(), duo_override: None, fill: false, motion_amount: 1. }
+    }
 }
 
 impl LookParams {
-    /// The chapter's look: its own pick over the Studio-wide `studio` one.
-    pub fn of(e: &ChapterEdit, studio: (Preset, Effects)) -> LookParams {
-        let (preset, fx) = match &e.look {
+    /// The chapter's look: its own pick over the Studio-wide `studio` one. A chapter's own look
+    /// replaces the render's whole `look` (`vedit::render_extra`), so the Studio framing choices
+    /// only count without one, as in the render.
+    pub fn of(e: &ChapterEdit, studio: &crate::look::Look) -> LookParams {
+        let intensity = e.intensity.clone();
+        match &e.look {
             Some(l) => {
                 let p = Preset::parse(&l.preset).unwrap_or_default();
                 let mut fx = p.effects();
@@ -75,11 +100,18 @@ impl LookParams {
                         set(&mut fx, eff, *on);
                     }
                 }
-                (p, fx)
+                LookParams { preset: p, fx, intensity, ..Default::default() }
             }
-            None => studio,
-        };
-        LookParams { preset, fx, intensity: e.intensity.clone() }
+            None => LookParams {
+                preset: studio.preset,
+                fx: studio.effects(),
+                intensity,
+                duo_override: studio.duo,
+                fill: studio.framing == crate::look::Framing::Fill,
+                // `render_config` sends it at 3 decimals; the renderer clamps it to 0..2.
+                motion_amount: studio.motion.map(|m| round_to(m as f64, 3).clamp(0., 2.)).unwrap_or(1.),
+            },
+        }
     }
 
     /// An intensity multiplier (1 = the look's own).
@@ -87,14 +119,20 @@ impl LookParams {
         self.intensity.get(key).map(|v| sent(v.clamp(0., 2.))).unwrap_or(1.)
     }
 
-    /// The look's push, scaled by the motion intensity.
+    /// The auto moves' multiplier: the motion intensity times the Video style's motion amount
+    /// (`apply_intensity`'s `motion_k`).
+    pub fn motion_k(&self) -> f64 {
+        round_to(self.k("motion") * self.motion_amount, 4)
+    }
+
+    /// The look's push, scaled by [`motion_k`](Self::motion_k).
     pub fn push(&self) -> f64 {
         let base = match self.preset {
             Preset::Cinematic => 0.06,
             Preset::Dynamic => 0.08,
             _ => FG_PUSH,
         };
-        round_to(base * self.k("motion"), 4)
+        round_to(base * self.motion_k(), 4)
     }
 
     /// Moves timed to the beat (a snap on a short beat).
@@ -103,7 +141,16 @@ impl LookParams {
     }
 
     pub fn duo(&self) -> bool {
-        matches!(self.preset, Preset::Recap | Preset::Dynamic)
+        self.duo_override.unwrap_or(matches!(self.preset, Preset::Recap | Preset::Dynamic))
+    }
+
+    /// The margin around a single panel (`FILL_MARGIN` with "fill", else `FG_MARGIN`).
+    pub fn margin(&self) -> f64 {
+        if self.fill {
+            FILL_MARGIN
+        } else {
+            FG_MARGIN
+        }
     }
 
     /// The page-change transitions the look rotates through.
@@ -343,9 +390,9 @@ pub fn letterbox_bar(w: f64, h: f64) -> f64 {
     (round_py((h - w / LETTERBOX_ASPECT) / 4.) * 2.).max(0.)
 }
 
-/// The space around a single panel on the blurred fill (`panel_margins`).
-fn margins(w: f64, h: f64, inset: f64) -> (f64, f64) {
-    let (mx, mut my) = (round_py(w * FG_MARGIN), round_py(h * FG_MARGIN));
+/// The space around a single panel on the blurred fill (`panel_margins`), `margin` of the frame.
+fn margins(w: f64, h: f64, inset: f64, margin: f64) -> (f64, f64) {
+    let (mx, mut my) = (round_py(w * margin), round_py(h * margin));
     if inset > 0. {
         my = my.max(inset + round_py(h * 0.025));
     }
@@ -353,10 +400,10 @@ fn margins(w: f64, h: f64, inset: f64) -> (f64, f64) {
 }
 
 /// Where a panel of `aspect` (w / h) sits in a `w` x `h` frame: (x, y, width, height)
-/// (`_prepare_clip_images`, the blurred fill).
-pub fn panel_box(aspect: f64, w: f64, h: f64, letterbox: bool) -> (f64, f64, f64, f64) {
+/// (`_prepare_clip_images`, the blurred fill) with `margin` ([`LookParams::margin`]).
+pub fn panel_box(aspect: f64, w: f64, h: f64, letterbox: bool, margin: f64) -> (f64, f64, f64, f64) {
     let inset = if letterbox { letterbox_bar(w, h) } else { 0. };
-    let (mx, my) = margins(w, h, inset);
+    let (mx, my) = margins(w, h, inset, margin);
     let (bw, bh) = (w - 2. * mx, h - 2. * my);
     let a = aspect.max(0.01);
     let scale = (bw / a).min(bh);
@@ -366,9 +413,9 @@ pub fn panel_box(aspect: f64, w: f64, h: f64, letterbox: bool) -> (f64, f64, f64
 }
 
 /// The panel box's aspect (`box_aspect`).
-fn box_aspect(w: f64, h: f64, letterbox: bool) -> f64 {
+fn box_aspect(w: f64, h: f64, letterbox: bool, margin: f64) -> f64 {
     let inset = if letterbox { letterbox_bar(w, h) } else { 0. };
-    let (mx, my) = margins(w, h, inset);
+    let (mx, my) = margins(w, h, inset, margin);
     (w - 2. * mx) / (h - 2. * my)
 }
 
@@ -445,7 +492,7 @@ pub fn edit_cam(c: &Clip) -> Option<Cam> {
 /// an image's width / height; `cuts`: the edit's hard cuts between every clip.
 pub fn plan(beats: &[Beat], placed: &[Placed], look: &LookParams, cuts: bool, reels: bool, aspect: &dyn Fn(&Path) -> Option<f32>) -> Vec<Shot> {
     let (w, h) = render_size(reels);
-    let box_a = box_aspect(w, h, look.fx.letterbox);
+    let box_a = box_aspect(w, h, look.fx.letterbox, look.margin());
     let duo_on = look.duo() && !reels;
     let (mut turn, mut prev) = (0usize, None);
     let mut last_impact = -IMPACT_GAP;
@@ -494,7 +541,7 @@ pub fn plan(beats: &[Beat], placed: &[Placed], look: &LookParams, cuts: bool, re
             index: p.index,
             start: p.start_ms as f64 / 1000.,
             frames: 0,
-            cam: ClipCam { cam, impact, ramp: look.ramp(), push: look.push(), motion_k: look.k("motion"), punch, framed: true },
+            cam: ClipCam { cam, impact, ramp: look.ramp(), push: look.push(), motion_k: look.motion_k(), punch, framed: true },
             duo,
             impact,
             trans: None,
@@ -613,6 +660,13 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../../../../tests/fixtures/frame_transforms.json");
 
+    #[test]
+    fn the_preview_says_when_layered_motion_is_left_to_the_render() {
+        assert_eq!(layered_badge(Layered::Off), None);
+        assert_eq!(layered_badge(Layered::Key), Some("Layered motion renders in the final video"));
+        assert!(layered_badge(Layered::All).is_some());
+    }
+
     fn cam_of(c: &Value) -> ClipCam {
         let f = |k: &str, d: f64| c.get(k).and_then(Value::as_f64).unwrap_or(d);
         let pt = |v: &Value| v.as_array().map(|a| (a[0].as_f64().unwrap(), a[1].as_f64().unwrap()));
@@ -647,13 +701,48 @@ mod tests {
         }
     }
 
+    /// The Video style's side by side, "fill" margin and motion amount reach the preview as the
+    /// renderer applies them (`resolve_look`, `apply_intensity`, `panel_margins`: the fixture's
+    /// `looks`, checked against the renderer by `tests/test_frame_transforms.py`).
+    #[test]
+    fn the_preview_look_matches_the_renderer() {
+        let v: Value = serde_json::from_str(FIXTURE).unwrap();
+        let looks = v["looks"].as_array().unwrap();
+        assert!(looks.len() >= 5);
+        for case in looks {
+            let name = case["name"].as_str().unwrap();
+            let studio = crate::look::Look::from_json(&case["look"]);
+            let mut e = ChapterEdit::default();
+            for (k, x) in case["intensity"].as_object().unwrap() {
+                e.intensity.insert(k.clone(), x.as_f64().unwrap() as f32);
+            }
+            let look = LookParams::of(&e, &studio);
+            let want = &case["expect"];
+            assert!((look.push() - want["push"].as_f64().unwrap()).abs() < 1e-9, "{name}: push {}", look.push());
+            assert!((look.motion_k() - want["motion_k"].as_f64().unwrap()).abs() < 1e-9, "{name}: motion_k {}", look.motion_k());
+            assert_eq!(look.duo(), want["duo"].as_bool().unwrap(), "{name}: duo");
+            let m = margins(1920., 1080., 0., look.margin());
+            assert_eq!(vec![m.0, m.1], want["margins"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect::<Vec<_>>(), "{name}: margins");
+        }
+        // A chapter with a look of its own replaces the render's whole look: the Studio framing
+        // choices do not apply to it (as `vedit::render_extra` sends it).
+        let studio = crate::look::Look::from_json(&serde_json::json!({ "preset": "clean", "framing": "fill", "duo": true, "motion": 1.5 }));
+        let e = ChapterEdit { look: Some(crate::vedit::LookEdit { preset: "clean".into(), effects: Default::default() }), ..Default::default() };
+        let own = LookParams::of(&e, &studio);
+        assert_eq!((own.duo(), own.margin(), own.motion_k()), (false, FG_MARGIN, 1.));
+        // The fill framing puts a bigger panel in the plan's box.
+        let fit = panel_box(1., 1920., 1080., false, FG_MARGIN);
+        let fill = panel_box(1., 1920., 1080., false, FILL_MARGIN);
+        assert!(fill.3 > fit.3);
+    }
+
     fn beats() -> Vec<Beat> {
         let b = |page: usize, text: &str, dur_ms: u64| Beat { page, image: Some(PathBuf::from(format!("p{page}.jpg"))), text: text.into(), audio: PathBuf::from("a.wav"), offset_ms: 0, dur_ms };
         vec![b(0, "Calm.", 3000), b(0, "Still calm.", 2000), b(1, "He strikes!", 2400), b(2, "After.", 3000)]
     }
 
     fn clean() -> LookParams {
-        LookParams { preset: Preset::Clean, fx: Preset::Clean.effects(), intensity: Default::default() }
+        LookParams { preset: Preset::Clean, fx: Preset::Clean.effects(), ..Default::default() }
     }
 
     #[test]
@@ -695,7 +784,7 @@ mod tests {
         assert!((a.trans.unwrap().1 - 0.4).abs() < 1e-6);
         assert!(at(&shots, 7.4 + 0.3).unwrap().from.is_none());
         // A duo look pairs the tall panels (no camera), but not the editor's own move.
-        let duo = LookParams { preset: Preset::Recap, fx: Preset::Recap.effects(), intensity: Default::default() };
+        let duo = LookParams { preset: Preset::Recap, fx: Preset::Recap.effects(), ..Default::default() };
         let shots = plan(&b, &placed, &duo, false, false, &|_| Some(0.7));
         assert_eq!(shots.iter().map(|s| s.duo).collect::<Vec<_>>(), vec![true, false, true, true]);
         assert_eq!(shots[3].trans, Some(("fadewhite".into(), 0.25)), "the editor's transition wins over the duo cut");
@@ -704,10 +793,10 @@ mod tests {
     #[test]
     fn panels_sit_where_the_renderer_puts_them() {
         // A square panel in 1080p: 5% margins, centred, even sizes.
-        assert_eq!(panel_box(1., 1920., 1080., false), (474., 54., 972., 972.));
+        assert_eq!(panel_box(1., 1920., 1080., false, FG_MARGIN), (474., 54., 972., 972.));
         // The cinematic letterbox keeps it between the bars.
         assert_eq!(letterbox_bar(1920., 1080.), 138.);
-        let (_, y, _, h) = panel_box(1., 1920., 1080., true);
+        let (_, y, _, h) = panel_box(1., 1920., 1080., true, FG_MARGIN);
         assert!(y >= 138. && y + h <= 1080. - 138.);
         assert!((flash(0.) - 0.35).abs() < 1e-9 && flash(0.4) == 0.);
         // The look's own moves keep the panel whole: no frame shows less than all but PANEL_TRIM a side.

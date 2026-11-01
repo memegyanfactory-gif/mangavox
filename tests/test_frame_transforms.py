@@ -14,6 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "python"))
 sys.path.insert(0, ROOT)
 
+from python import video_generator as vg  # noqa: E402
 from python.video_generator import clip_camera  # noqa: E402
 
 FIXTURE = os.path.join(ROOT, "tests", "fixtures", "frame_transforms.json")
@@ -35,6 +36,23 @@ CASES = [
     ("shake 20% over a pan", {"motion": "pan_left", "push": 0.08, "impact": True, "punch": 0.2}, 50),
     ("auto action punch", {"motion": "push", "push": 0.05, "impact": True}, 70),
 ]
+# (name, the render's `look` as the Studio sends it, the editor's intensities): the look's push,
+# motion multiplier, side by side and single-panel margins (1080p), which the preview mirrors.
+LOOKS = [
+    ("clean, defaults", {"preset": "clean"}, {}),
+    ("recap, side by side off", {"preset": "recap", "duo": False}, {}),
+    ("clean, side by side on, fill", {"preset": "clean", "duo": True, "framing": "fill"}, {}),
+    ("dynamic, motion 1.5, editor motion 0.5", {"preset": "dynamic", "motion": 1.5}, {"motion": 0.5}),
+    ("cinematic, still", {"preset": "cinematic", "motion": 0}, {"motion": 1.3}),
+    ("recap, fill, lively", {"preset": "recap", "framing": "fill", "motion": 1.5}, {}),
+]
+
+
+def look_numbers(look_cfg, intensity):
+    """What generate_video takes from the look: push, motion_k, duo and panel_margins."""
+    look = vg.apply_intensity(vg.resolve_look(look_cfg), intensity)
+    margin = vg.FILL_MARGIN if look.get("framing") == "fill" else vg.FG_MARGIN
+    return {"push": look["push"], "motion_k": look["motion_k"], "duo": bool(look["duo"]), "margins": list(vg.panel_margins(1920, 1080, "blur", 0, margin))}
 
 
 def camera_at(clip, frames, on):
@@ -57,7 +75,8 @@ def build():
             "name": name, "clip": clip, "frames": frames,
             "expect": [[f, *camera_at(clip, frames, f)] for f in samples(frames)],
         })
-    return {"about": "Panel camera (frame, zoom, x, y) per case: python/video_generator.clip_camera and ui-studio vedit_frame::camera must both give these.", "cases": out}
+    return {"about": "Panel camera (frame, zoom, x, y) per case: python/video_generator.clip_camera and ui-studio vedit_frame::camera must both give these. looks: what a Video style look gives the camera and panel layout (resolve_look + apply_intensity + panel_margins vs vedit_frame::LookParams).", "cases": out,
+            "looks": [{"name": name, "look": cfg, "intensity": k, "expect": look_numbers(cfg, k)} for name, cfg, k in LOOKS]}
 
 
 class FrameTransformTests(unittest.TestCase):
@@ -70,6 +89,13 @@ class FrameTransformTests(unittest.TestCase):
                 got = camera_at(case["clip"], case["frames"], frame)
                 for g, w in zip(got, want):
                     self.assertAlmostEqual(g, w, places=4, msg=f"{case['name']} at frame {frame}")
+
+    def test_the_looks_match_the_shared_fixture(self):
+        with open(FIXTURE, encoding="utf-8") as f:
+            fixture = json.load(f)
+        self.assertEqual([c["name"] for c in fixture["looks"]], [c[0] for c in LOOKS])
+        for case in fixture["looks"]:
+            self.assertEqual(look_numbers(case["look"], case["intensity"]), case["expect"], case["name"])
 
     def test_moves_go_where_they_say(self):
         # Pushing into the top-left aims the window there and ends 12% in.
@@ -90,6 +116,8 @@ if __name__ == "__main__":
         with open(FIXTURE, "w", encoding="utf-8") as f:
             f.write('{\n "about": ' + json.dumps(data["about"]) + ',\n "cases": [\n  ')
             f.write(",\n  ".join(json.dumps(c) for c in data["cases"]))
+            f.write('\n ],\n "looks": [\n  ')
+            f.write(",\n  ".join(json.dumps(c) for c in data["looks"]))
             f.write("\n ]\n}\n")
         print(f"wrote {FIXTURE}")
     else:

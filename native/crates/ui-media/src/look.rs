@@ -122,6 +122,41 @@ pub fn billboard(id: impl Into<ElementId>, height: f32, image: Option<String>, u
         .child(div().absolute().left_0().right_0().bottom_0().h(px(height * 0.42)).bg(linear_gradient(180., linear_color_stop(ink(0.), 0.), linear_color_stop(ink(1.), 1.))))
 }
 
+/// The clickable top of a detail hero's artwork: a click plays (or resumes), like the Play button,
+/// and a play disc shows while hovered. It covers only the art above the title and buttons (and
+/// left of a docked panel, `right` px wide), so it never takes their clicks.
+pub fn hero_click_area(id: impl Into<ElementId>, height: f32, right: f32, tip_label: impl Into<SharedString>) -> Stateful<Div> {
+    let id: ElementId = id.into();
+    let group: SharedString = format!("{id:?}").into();
+    div()
+        .id(id)
+        .group(group.clone())
+        .absolute()
+        .top_0()
+        .left_0()
+        .right(px(right))
+        .h(px(height * 0.45))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(mv_ui::tip(tip_label))
+        .child(
+            div()
+                .size(px(64.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(ink(0.55))
+                .border_1()
+                .border_color(Tokens::border_strong())
+                .opacity(0.)
+                .group_hover(group, |s| s.opacity(1.))
+                .child(ph_icon(ph::PLAY, Weight::Fill, Tokens::text_1(), isz::LG)),
+        )
+}
+
 /// Width of the sources panel docked on the right of a detail hero.
 pub const SIDE_PANEL: f32 = 430.;
 

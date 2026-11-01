@@ -19,10 +19,17 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:
+    import layered_plan
+except ImportError:  # imported as python.video_generator (the tests)
+    from . import layered_plan
+
 FPS = 30
 AUDIO_RATE = 48000
 # Panel inset from the frame edge (fraction of the frame) when the blurred fill is used.
 FG_MARGIN = 0.05
+# The thinner margin of the "fill" framing (single panels drawn larger, still whole).
+FILL_MARGIN = 0.015
 # Ken Burns: push-in / pull-out amount and the fixed zoom used while panning.
 FG_PUSH = 0.05
 FG_PAN_ZOOM = 1.04
@@ -167,6 +174,15 @@ def resolve_look(value):
             look[k] = value[k]
     if value.get("color") in COLOR_PRESETS:
         look["color"] = value["color"]
+    # Layered motion (the optional pack, see layered_motion.py): "off", "key" moments or "all".
+    look["layered"] = value.get("layered") if value.get("layered") in layered_plan.MODES else layered_plan.DEFAULT_MODE
+    # The Studio's framing choices (absent: the look's own): tall panels side by side or not,
+    # "fill" draws single panels larger (a thinner margin, still whole: never cut), and the
+    # camera motion amount (a multiplier on the look's moves, under the editor's own).
+    if isinstance(value.get("duo"), bool):
+        look["duo"] = value["duo"]
+    look["framing"] = "fill" if value.get("framing") == "fill" else "fit"
+    look["motion_amount"] = _num(value.get("motion"), 1.0, 0.0, 2.0)
     return look
 
 
@@ -181,6 +197,7 @@ def apply_intensity(look, intensity):
         for k in INTENSITIES:
             if k in intensity:
                 look[f"{k}_k"] = _num(intensity.get(k), 1.0, 0.0, 2.0)
+    look["motion_k"] = round(look["motion_k"] * look.get("motion_amount", 1.0), 4)
     look["push"] = round(look.get("push", FG_PUSH) * look["motion_k"], 4)
     return look
 
@@ -1070,18 +1087,20 @@ def move_dirs(move):
     return PARALLAX_DIRS.get({"zoom": "push", "zoom_out": "pull", "punch": "push"}.get(kind, kind), (0.6, 0))
 
 
-def _warp(window, zoom, frames, interp, ease=None):
+def _warp(window, zoom, frames, interp, ease=None, held=True):
     """One still held for `frames` frames with an eased move: each frame shows the
     sub-rectangle 1/zoom the size of the image, placed by the `window` fractions, stretched
     over the whole frame. perspective resamples with subpixel precision, so slow moves glide
-    (zoompan rounds its crop to whole, chroma-aligned pixels and visibly steps)."""
+    (zoompan rounds its crop to whole, chroma-aligned pixels and visibly steps). With `held`
+    False the input is already a moving picture of `frames` frames (a layered panel)."""
     e = ease or _ease("on", frames)
     z = "(" + zoom.format(e=e) + ")"
     px, py = (v.format(e=e) for v in window)
     cw, ch = f"W/{z}", f"H/{z}"
     x, y = f"(W-{cw})*{px}", f"(H-{ch})*{py}"
+    clock = _hold(frames) if held else f"settb=1/{FPS},setpts=N"
     return (
-        f"{_hold(frames)},"
+        f"{clock},"
         f"perspective=x0='{x}':y0='{y}':x1='{x}+{cw}':y1='{y}':"
         f"x2='{x}':y2='{y}+{ch}':x3='{x}+{cw}':y3='{y}+{ch}':"
         f"interpolation={interp}:eval=frame"
@@ -1413,16 +1432,16 @@ def duo_slot(src_size, w, h, slot, inset=0):
     return geo
 
 
-def panel_margins(w, h, fill, inset=0):
-    """Space (x, y pixels) left around a single panel: a margin on the blurred fill, and room
-    for letterbox bars `inset` pixels high so the panel sits whole between them."""
-    mx, my = (round(w * FG_MARGIN), round(h * FG_MARGIN)) if fill == "blur" else (0, 0)
+def panel_margins(w, h, fill, inset=0, margin=FG_MARGIN):
+    """Space (x, y pixels) left around a single panel: a margin (`margin` of the frame) on the
+    blurred fill, and room for letterbox bars `inset` pixels high so the panel sits whole between them."""
+    mx, my = (round(w * margin), round(h * margin)) if fill == "blur" else (0, 0)
     if inset:
         my = max(my, inset + (round(h * 0.025) if fill == "blur" else 0))
     return mx, my
 
 
-def _prepare_clip_images(src, idx, w, h, fill, work_dir, glow=False, inset=0, drift=0, grade=None):
+def _prepare_clip_images(src, idx, w, h, fill, work_dir, glow=False, inset=0, drift=0, grade=None, margin=FG_MARGIN):
     """Write this clip's stills: the upscaled panel and the frame-sized background it sits on.
     For the blurred fill the background is the panel zoomed in past "cover", blurred, darkened
     and desaturated, with the panel's soft drop shadow baked in; otherwise black. The
@@ -1437,7 +1456,7 @@ def _prepare_clip_images(src, idx, w, h, fill, work_dir, glow=False, inset=0, dr
     iw, ih = img.size
     blur = fill == "blur"
     drift = drift if blur else 0
-    mx, my = panel_margins(w, h, fill, inset)
+    mx, my = panel_margins(w, h, fill, inset, margin)
     bw, bh = w - 2 * mx, h - 2 * my
     scale = min(bw / iw, bh / ih)
     fw = max(2, int(iw * scale) // 2 * 2)
@@ -1463,7 +1482,7 @@ def _prepare_clip_images(src, idx, w, h, fill, work_dir, glow=False, inset=0, dr
     bg.save(bg_path, "JPEG", quality=92)
 
     return {
-        "fg": fg_path, "fg_pos": (fx, fy), "bg": bg_path, "drift": drift,
+        "fg": fg_path, "fg_pos": (fx, fy), "fg_size": (fw, fh), "bg": bg_path, "drift": drift,
         "aspect": iw / ih, "box_aspect": bw / bh,
     }
 
@@ -2004,10 +2023,12 @@ def _render_clip(clip, frames, w, h, out_path):
         dx, dy = move_dirs(move) if move else PARALLAX_DIRS.get(motion, (0.6, 0))
         e = f"(2*{ramp_ease('n', frames, ramp)}-1)"
         bg += f",crop={w}:{h}:x='{drift}+{round(dx * drift * k, 2)}*{e}':y='{drift}+{round(dy * drift * k, 2)}*{e}'"
-    inputs = ["-i", imgs["bg"], "-i", imgs["fg"]]
+    # A layered clip's panel is a moving picture (layered_motion.py); otherwise the still.
+    anim = imgs.get("fg_anim")
+    inputs = ["-i", imgs["bg"], "-i", anim or imgs["fg"]]
     graph = [
         f"{bg}[bg]",
-        f"[1:v]{TV}format=yuv420p,{_warp(window, fg_zoom, frames, 'cubic', ease)},setsar=1[fg]",
+        f"[1:v]{TV}format=yuv420p,{_warp(window, fg_zoom, frames, 'cubic', ease, held=not anim)},setsar=1[fg]",
         f"[bg][fg]overlay=x='{fx}+{_shake(jolt, 'x')}':y='{fy}+{_shake(jolt, 'y')}':eval=frame{_flash(impact)},format=yuv420p[base]",
     ]
     _finish_clip(clip, frames, w, h, inputs, graph, "base")
@@ -2408,6 +2429,143 @@ def overlay_graph(overlays, w, h, total, src, out, first_input, work_dir, t0=0.0
     return inputs, ";".join(parts)
 
 
+# ── Layered motion (optional pack): animated 2.5D panels on key moments or every panel ──
+
+_LAYERED_NOTES = set()
+
+
+def _layered_note(msg):
+    """One log line per reason per process (a missing pack is not news on every render)."""
+    if msg not in _LAYERED_NOTES:
+        _LAYERED_NOTES.add(msg)
+        print(f"[video] Layered motion: {msg}", file=sys.stderr)
+
+
+def layered_eligible(c):
+    """A clip whose panel can be layered: a single studio panel crop (not side by side)."""
+    return bool(c.get("images")) and not c.get("duo") and PANEL_FILE.search(str(c.get("source") or "")) is not None
+
+
+def select_layered_clips(look, config, clips, items, panels):
+    """{clip index} that get layered motion: none when the look has it off or the pack is not
+    installed (said once in the log), else layered_plan.select_layered over the clips."""
+    mode = (look or {}).get("layered", "off")
+    if mode not in ("key", "all") or not clips:
+        return set()
+    py, why = layered_plan.pack_python(config)
+    if not py:
+        _layered_note(f"skipped ({why}); rendering as usual")
+        return set()
+    eligible = [layered_eligible(c) and beat_panel(items[c["idx"]], panels) is not None for c in clips]
+    scores = [layered_plan.key_candidate(c.get("mood")) for c in clips]
+    picked = set(layered_plan.select_layered(mode, eligible, scores))
+    print(f"[video] Layered motion ({mode}): {len(picked)} of {len(clips)} clips", file=sys.stderr)
+    return picked
+
+
+def clip_ease(clip, frames):
+    """The camera's eased progress (0..1) at every frame of a clip, from the very expression
+    the render uses (so the panel's own parallax moves with the camera)."""
+    _, _, ease = clip_camera(clip, frames)
+    env = {"__builtins__": {}, "min": min, "max": max, "pow": pow, "cos": math.cos, "sin": math.sin, "exp": math.exp, "PI": math.pi}
+    out = []
+    for on in range(frames):
+        env["on"] = on
+        try:
+            out.append(round(float(eval(ease, env)), 5))
+        except Exception:
+            out.append(round(0.5 - 0.5 * math.cos(math.pi * on / max(1, frames - 1)), 5))
+    return out
+
+
+def layered_job(c, frames, seg, panels, reads, look, output_dir, video_dir):
+    """The pack's job for one clip (see layered_motion.run), or None when it has no panel."""
+    panel = beat_panel(seg, panels)
+    imgs = c.get("images") or {}
+    if panel is None or not imgs.get("fg_size"):
+        return None
+    src = c["source"]
+    page = reads.get(c["page"]) or {}
+    raw = page.get("scene") if isinstance(page.get("scene"), dict) else {}
+    scene = dict(raw, summary=str(page.get("summary") or ""))
+    if c.get("mood"):
+        scene.update(kind=c["mood"]["kind"], tags=c["mood"]["tags"])
+    intensity = c["mood"]["intensity"] if c.get("mood") else raw.get("intensity")
+    prep = layered_plan.panel_key(src, panel)
+    move = c.get("move")
+    drift = move_dirs(move) if move else PARALLAX_DIRS.get(c["motion"], (0.6, 0))
+    ease = clip_ease(c, frames)
+    plan_in = [list(imgs["fg_size"]), frames, ease, list(drift), c.get("grade"), look.get("glow"), scene, intensity]
+    akey = layered_plan.anim_key(prep, plan_in)
+    return {
+        "id": f"clip_{c['idx']:04d}", "src": src, "panel": panel, "scene": scene, "intensity": intensity,
+        "cache": os.path.join(layered_plan.layers_root(output_dir), prep), "size": list(imgs["fg_size"]), "frames": frames,
+        "ease": ease, "drift": list(drift), "grade": list(c["grade"]) if c.get("grade") else None, "glow": bool(look.get("glow")),
+        "faces": [list(f) for _, f in layered_plan.panel_faces(panel)],
+        "out": os.path.join(video_dir, f"fga_{c['idx']:04d}_{akey}.mp4"), "anim_key": akey,
+    }
+
+
+def run_layered(jobs, config, work_dir):
+    """Runs the pack (its own Python, below normal priority) on the jobs {clip: job}; returns
+    {job id: result}. Any failure leaves those clips to render as usual."""
+    py, why = layered_plan.pack_python(config)
+    if not py:
+        _layered_note(f"skipped ({why})")
+        return {}
+    path = os.path.join(work_dir, "layered_jobs.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"threads": cpus(), "jobs": list(jobs.values())}, f)
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layered_motion.py")
+    env = os.environ.copy()
+    env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"})
+    env.pop("VIRTUAL_ENV", None)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+    result = {}
+    try:
+        proc = subprocess.Popen([py, "-I", script, "run", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace", env=env, creationflags=flags)
+        timer = threading.Timer(900 + 60 * len(jobs), proc.kill)
+        timer.start()
+        errs = []
+        pump = threading.Thread(target=lambda: errs.append(proc.stderr.read()), daemon=True)
+        pump.start()
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("type") == "info":
+                    print(f"[video] Layered: {msg.get('message')}", file=sys.stderr)
+                elif msg.get("type") == "done":
+                    result = msg.get("results") or {}
+                    ok = sum(1 for r in result.values() if r.get("ok"))
+                    print(f"[video] Layered: {ok} of {len(jobs)} clips animated in {msg.get('seconds')} s "
+                          f"(layers {msg.get('prep_seconds')} s, GPU memory peak {msg.get('vram_peak_mb')} MB)", file=sys.stderr)
+                elif msg.get("type") == "error":
+                    _layered_note(f"the pack failed ({msg.get('message')}); rendering as usual")
+            proc.wait()
+            pump.join(timeout=5)
+        finally:
+            timer.cancel()
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        if proc.returncode != 0 and not result:
+            lines = [l for l in "".join(errs).strip().splitlines() if l.strip()]
+            tail = lines[-1][-300:] if lines else ""
+            _layered_note(f"the pack stopped ({tail or proc.returncode}); rendering as usual")
+    except Exception as e:
+        _layered_note(f"could not run the pack ({e}); rendering as usual")
+    return result
+
+
 def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=None):
     """
     Generate a narrated manga video.
@@ -2466,6 +2624,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     look = apply_intensity(resolve_look(config.get("look")), edit.get("intensity"))
     # Side-by-side panels need the wide frame and the blurred fill.
     duo_on = look["duo"] and fmt == "landscape" and fill == "blur" and effect != "none"
+    margin = FILL_MARGIN if look.get("framing") == "fill" else FG_MARGIN
     # Letterbox bars (landscape only): panels are laid out between them. Parallax needs the
     # blurred fill to drift.
     inset = letterbox_bar(w, h) if look.get("letterbox") else 0
@@ -2524,7 +2683,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     caption_segments = []
     timeline = 0.0
     total = len(render_items)
-    mx, my = panel_margins(w, h, fill, inset)
+    mx, my = panel_margins(w, h, fill, inset, margin)
     box_aspect = (w - 2 * mx) / (h - 2 * my)
     turn = 0
     prev_motion = None
@@ -2597,7 +2756,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                 # Placed in its half below (the stills are the same for either half).
                 duo, images = _prepare_duo_images(page_image, idx, w, h, 0, video_dir, look["glow"], inset, drift, grade), None
             else:
-                duo, images = None, _prepare_clip_images(page_image, idx, w, h, fill, video_dir, look["glow"], inset, drift, grade)
+                duo, images = None, _prepare_clip_images(page_image, idx, w, h, fill, video_dir, look["glow"], inset, drift, grade, margin)
         except Exception as e:
             print(f"[video] Skipping unreadable image for page {page_num}: {e}", file=sys.stderr)
             return None
@@ -2762,6 +2921,10 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     clip_paths = []
     todo = []
     framing = []
+    # Layered motion: which clips get animated panels (the pack changes nothing about timing).
+    layered = select_layered_clips(look, config, clips, render_items, panels)
+    reads = layered_plan.load_read(output_dir) if layered else {}
+    layer_jobs = {}
     for k, c in enumerate(clips):
         frames = frame_counts[k]
         c["fx"], c["assets"] = clip_fx[k], assets
@@ -2781,12 +2944,21 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             d = c["duo"]
             spec += [d["slot"], d.get("hold", False), d["move_frames"], d.get("bg_prev"), (d.get("partner") or {}).get("fg"),
                      d.get("bg_dir"), d.get("bg_prev_dir")]
+        if margin != FG_MARGIN:
+            spec = spec + [("margin", margin)]
+        c["spec"] = spec
+        if k in layered:
+            job = layered_job(c, frames, render_items[c["idx"]], panels, reads, look, output_dir, video_dir)
+            if job:
+                layer_jobs[k] = job
+                spec = spec + [("layered", job["anim_key"])]
         key = clip_key(c["source"], c["focus"], spec, frames, w, h, fill)
         path = os.path.join(video_dir, f"clip_{c['idx']:04d}_{key}.mp4")
         clip_paths.append(path)
         # Reuse a clip an interrupted run already rendered.
         if os.path.exists(path) and os.path.getsize(path) > 100:
             rendered += frames
+            layer_jobs.pop(k, None)
         else:
             todo.append((c, frames, path))
     report("clips", rendered / all_frames)
@@ -2799,13 +2971,31 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     except OSError as e:
         print(f"[video] Could not save the framing report: {e}", file=sys.stderr)
 
+    # The layered clips' panels, made in one run of the pack (models one after another on the
+    # GPU); a clip whose panel could not be made renders as usual, under its plain key.
+    if layer_jobs:
+        made = run_layered(layer_jobs, config, video_dir)
+        for n, (c, frames, path) in enumerate(todo):
+            k = clips.index(c)
+            job = layer_jobs.get(k)
+            if not job:
+                continue
+            if made.get(job["id"], {}).get("ok") and os.path.isfile(job["out"]):
+                c["images"] = dict(c["images"], fg_anim=job["out"])
+            else:
+                plain = clip_key(c["source"], c["focus"], c["spec"], frames, w, h, fill)
+                clip_paths[k] = os.path.join(video_dir, f"clip_{c['idx']:04d}_{plain}.mp4")
+                todo[n] = (c, frames, clip_paths[k])
+
     def render_one(c, frames, path):
         try:
             _render_clip(c, frames, w, h, path)
         except Exception as e:
             print(f"[video] {e} (page {c['page']}); retrying as a still", file=sys.stderr)
+            if c.get("images"):
+                c["images"].pop("fg_anim", None)
             if c["duo"]:
-                c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift, c["grade"])
+                c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift, c["grade"], margin)
                 c["duo"] = None
             c["motion"] = "still"
             c["move"] = None

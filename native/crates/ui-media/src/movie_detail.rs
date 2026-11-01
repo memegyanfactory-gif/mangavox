@@ -356,7 +356,7 @@ impl MovieDetail {
     /// Where the history row points, with its season (remembered, or the only regular one:
     /// Specials, season 0, do not count, or a one-season show with specials never resumed).
     fn resume_at(&self, h: &PlaybackState) -> Option<(u32, u32)> {
-        series_point(&self.imdb_id, h.episode_number).or_else(|| {
+        series_point(&self.imdb_id, h).or_else(|| {
             let ep = u32::try_from(h.episode_number?).ok()?;
             let regular: Vec<u32> = self.seasons().into_iter().filter(|s| *s > 0).collect();
             (regular.len() == 1).then(|| (regular[0], ep))
@@ -575,6 +575,11 @@ impl MovieDetail {
                     .when_some(next.progress, |c, (p, left)| c.child(look::resume_note("resume-bar", p, left))),
             ),
         )
+        // A click on the artwork plays too (resumes where it stopped), like the Play button.
+        .child(look::hero_click_area("movie-hero-play", height, if docked { look::SIDE_PANEL + EDGE } else { 0. }, next.label.clone()).on_click(cx.listener(move |this, _, w, cx| {
+            cx.stop_propagation();
+            this.play_at(ps, pe, false, w, cx);
+        })))
     }
 
     /// Two columns under the art: the meta line ("2022  4 Seasons  [HD]") and the synopsis on

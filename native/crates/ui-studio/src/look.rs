@@ -5,8 +5,9 @@
 //! File: `<data>/studio/video_look.json`. The export reads the same file on its own, so the keys
 //! are a fixed contract:
 //! `{"preset", "grade"?, "vignette"?, "grain"?, "glow"?, "impact"?, "leaks"?, "chroma"?,
-//! "parallax"?, "particles"?, "letterbox"?, "mood"?, "edge_glow"?, "color"?: "none|warm|cool|noir|vivid", "logo": {on,
-//! path, pos, size, opacity}, "text": {on, text, pos, size, opacity}}`. A missing effect or colour
+//! "parallax"?, "particles"?, "letterbox"?, "mood"?, "edge_glow"?, "color"?: "none|warm|cool|noir|vivid",
+//! "layered"?: "off|key|all", "framing"?: "fill", "duo"?: bool, "motion"?: 0..2,
+//! "logo": {on, path, pos, size, opacity}, "text": {on, text, pos, size, opacity}}`. A missing effect or colour
 //! key means "the preset's own default" (so files written before a switch existed keep working). A picked logo is copied into `<data>/studio/brand/logo.<ext>`: it is the user's
 //! own data and lives with the app data, never in the repo.
 use std::path::{Path, PathBuf};
@@ -80,6 +81,11 @@ impl Preset {
         }
     }
 
+    /// Whether this look puts tall panels side by side by itself (the renderer's `duo`).
+    pub fn duo(self) -> bool {
+        matches!(self, Preset::Recap | Preset::Dynamic)
+    }
+
     /// The colour preset this look uses by itself.
     pub fn color(self) -> ColorPreset {
         match self {
@@ -87,6 +93,65 @@ impl Preset {
             _ => ColorPreset::None,
         }
     }
+}
+
+/// Layered motion (the optional pack, `mv_studio::vfx_pack`): which clips get animated 2.5D
+/// panels (characters on their own layers over a clean plate, parallax, breathing, sway, a
+/// shockwave on big hits). The renderer skips it when the pack is not installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Layered {
+    #[default]
+    Off,
+    /// Only the strongest beats (intense, a hit or a reveal), at most about one clip in four.
+    Key,
+    /// Every single panel.
+    All,
+}
+
+impl Layered {
+    pub const ALL: [Layered; 3] = [Layered::Off, Layered::Key, Layered::All];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Layered::Off => "off",
+            Layered::Key => "key",
+            Layered::All => "all",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Layered> {
+        Self::ALL.into_iter().find(|l| l.key() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Layered::Off => "Off",
+            Layered::Key => "Key moments",
+            Layered::All => "Every panel",
+        }
+    }
+
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Layered::Off => "Panels move as a whole (the look's own camera).",
+            Layered::Key => "The strongest beats come alive: characters lift off the page, hits shake the panel. About one clip in four.",
+            Layered::All => "Every panel is cut into layers and animated. Slower to render the first time.",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// How a single panel sits in the frame. Either way it is drawn whole: never cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Framing {
+    /// The whole panel with a margin around it (the renderer's default).
+    #[default]
+    Fit,
+    /// The panel drawn larger, with a thin margin.
+    Fill,
 }
 
 /// A colour treatment over the grade (one lookup table in the renderer, so it costs nothing).
@@ -404,6 +469,14 @@ pub struct Look {
     pub overrides: [Option<bool>; EFFECT_COUNT],
     /// `None` = the preset's own colour.
     pub color: Option<ColorPreset>,
+    /// Layered motion (kept when the preset changes: it is not part of a look).
+    pub layered: Layered,
+    /// Framing (kept when the preset changes, like the two below).
+    pub framing: Framing,
+    /// Tall panels side by side; `None` = the preset's own.
+    pub duo: Option<bool>,
+    /// Camera motion amount (multiplier 0..2 on the look's moves); `None` = 1.
+    pub motion: Option<f32>,
     pub logo: Logo,
     pub text: Watermark,
 }
@@ -440,6 +513,44 @@ impl Look {
         self.preset = p;
         self.overrides = [None; EFFECT_COUNT];
         self.color = None;
+        if self.duo == Some(p.duo()) {
+            self.duo = None;
+        }
+    }
+
+    /// Whether a render puts tall panels side by side.
+    pub fn duo(&self) -> bool {
+        self.duo.unwrap_or(self.preset.duo())
+    }
+
+    /// Side by side on or off (an override only when it differs from the preset).
+    pub fn set_duo(&mut self, on: bool) {
+        self.duo = (self.preset.duo() != on).then_some(on);
+    }
+
+    /// The camera motion amount (1 = the look's own).
+    pub fn motion(&self) -> f32 {
+        self.motion.unwrap_or(1.)
+    }
+
+    /// Sets the motion amount (kept only when it is not 1).
+    pub fn set_motion(&mut self, m: f32) {
+        let m = (m.clamp(0., 2.) * 100.).round() / 100.;
+        self.motion = ((m - 1.).abs() > 0.001).then_some(m);
+    }
+
+    /// The framing keys the file and the renderer carry, only where they are not the defaults
+    /// (so a look saved before they existed keeps its render key).
+    fn framing_keys(&self, m: &mut Map<String, Value>) {
+        if self.framing == Framing::Fill {
+            m.insert("framing".into(), json!("fill"));
+        }
+        if let Some(d) = self.duo {
+            m.insert("duo".into(), json!(d));
+        }
+        if let Some(k) = self.motion {
+            m.insert("motion".into(), json!(round3(k)));
+        }
     }
 
     pub fn to_json(&self) -> Value {
@@ -453,6 +564,10 @@ impl Look {
         if let Some(c) = self.color {
             m.insert("color".into(), json!(c.key()));
         }
+        if self.layered != Layered::Off {
+            m.insert("layered".into(), json!(self.layered.key()));
+        }
+        self.framing_keys(&mut m);
         m.insert("logo".into(), self.logo.to_json());
         m.insert("text".into(), self.text.to_json());
         Value::Object(m)
@@ -467,6 +582,10 @@ impl Look {
             preset: v.get("preset").and_then(Value::as_str).and_then(Preset::parse).unwrap_or_default(),
             overrides,
             color: v.get("color").and_then(Value::as_str).and_then(ColorPreset::parse),
+            layered: v.get("layered").and_then(Value::as_str).and_then(Layered::parse).unwrap_or_default(),
+            framing: if v.get("framing").and_then(Value::as_str) == Some("fill") { Framing::Fill } else { Framing::Fit },
+            duo: v.get("duo").and_then(Value::as_bool),
+            motion: v.get("motion").and_then(Value::as_f64).map(|k| (k as f32).clamp(0., 2.)).filter(|k| (k - 1.).abs() > 0.001),
             logo: v.get("logo").map(Logo::from_json).unwrap_or_default(),
             text: v.get("text").map(Watermark::from_json).unwrap_or_default(),
         }
@@ -481,7 +600,23 @@ impl Look {
             m.insert(e.key().into(), json!(fx.get(e)));
         }
         m.insert("color".into(), json!(self.color().key()));
+        // Only when on (the renderer defaults to off), so the render key of every existing
+        // video stays what it was.
+        if self.layered != Layered::Off {
+            m.insert("layered".into(), json!(self.layered.key()));
+        }
+        self.framing_keys(&mut m);
         Value::Object(m)
+    }
+
+    /// [`render_config`](Self::render_config) for a render: layered motion counts only with the
+    /// pack installed (`pack`), so a video is not stale just because the setting is on
+    /// without the pack (the renderer skips it then anyway).
+    pub fn render_config_for(&self, pack: bool) -> Value {
+        if pack || self.layered == Layered::Off {
+            return self.render_config();
+        }
+        Look { layered: Layered::Off, ..self.clone() }.render_config()
     }
 
     pub fn load_from(file: &Path) -> Self {
@@ -521,9 +656,24 @@ pub fn brand_dir() -> PathBuf {
     mv_core::paths::studio().join("brand")
 }
 
+/// The saved Layered motion mode, re-read only after a save (the editor asks every frame).
+pub fn saved_layered() -> Layered {
+    static CACHE: std::sync::Mutex<Option<(u64, Layered)>> = std::sync::Mutex::new(None);
+    let now = SAVES.load(std::sync::atomic::Ordering::SeqCst);
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    match *g {
+        Some((seen, mode)) if seen == now => mode,
+        _ => {
+            let mode = Look::load().layered;
+            *g = Some((now, mode));
+            mode
+        }
+    }
+}
+
 /// `video_config["look"]` for a render, from the saved setting.
 pub fn video_config() -> Value {
-    Look::load().render_config()
+    Look::load().render_config_for(mv_studio::vfx_pack::installed_cached())
 }
 
 /// Image types a logo can be.
@@ -623,9 +773,17 @@ impl LookPanel {
         let logo = look.logo.path.as_deref().and_then(load_logo_image);
         let watch = cx.spawn_in(window, async move |this, cx| {
             let mut seen = SAVES.load(std::sync::atomic::Ordering::SeqCst);
+            let mut pack_seen = mv_studio::vfx_pack::changes();
             loop {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
                 let now = SAVES.load(std::sync::atomic::Ordering::SeqCst);
+                let pack_now = mv_studio::vfx_pack::changes();
+                if pack_now != pack_seen || mv_studio::vfx_pack::busy() {
+                    pack_seen = pack_now;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
                 if now == seen {
                     continue;
                 }
@@ -773,7 +931,102 @@ impl LookPanel {
                             .on_change(cx.listener(|this, ix: &usize, _, cx| this.edit(|l| l.set_color(ColorPreset::ALL[(*ix).min(4)]), cx))),
                     ),
             )
+            .child(self.layered_controls(cx))
             .child(muted("A dot marks a setting changed from the look's own. Picking a look resets them."))
+    }
+
+    /// "Layered motion: Off / Key moments / Every panel", with the pack's install state: the
+    /// switch needs the pack for Key moments / Every panel (Off always works, so a setting left
+    /// on after Remove can be turned off), with Install (and its progress) right here.
+    fn layered_controls(&self, cx: &mut Context<Self>) -> Div {
+        use mv_studio::vfx_pack::{self, PackState};
+        let (installed, gpu) = vfx_pack::cached();
+        let mode = self.look.layered;
+        let pick = segmented("look-layered", Layered::ALL.map(Layered::label), mode.index()).small();
+        let control = if installed || mode != Layered::Off {
+            let pick = pick.on_change(cx.listener(move |this, ix: &usize, _, cx| {
+                let m = Layered::ALL[(*ix).min(2)];
+                if installed || m == Layered::Off {
+                    this.edit(|l| l.layered = m, cx)
+                }
+            }));
+            if installed { pick.into_any_element() } else { div().opacity(0.6).child(pick).into_any_element() }
+        } else {
+            div().opacity(0.45).child(pick).into_any_element()
+        };
+        let pack: AnyElement = match vfx_pack::state() {
+            _ if installed => muted(format!("Layered motion pack installed{}.", gpu.map(|g| format!(" · {g}")).unwrap_or_default())).into_any_element(),
+            Some(PackState::Running(p)) => div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().flex().items_center().justify_between().gap(px(space::SM)).child(div().flex_1().min_w_0().truncate().text_size(px(size::XS)).text_color(Tokens::text_2()).child(p.summary())).child(
+                    btn("look-layered-stop", "Stop", ButtonKind::Ghost).small().on_click(|_, _, _| vfx_pack::cancel()),
+                ))
+                .child(mv_ui::progress_bar("look-layered-bar", p.fraction(), true))
+                .into_any_element(),
+            Some(PackState::Removing) => muted("Removing the layered motion pack…").into_any_element(),
+            Some(PackState::RemoveFailed(msg)) => div().text_size(px(size::XS)).text_color(Tokens::danger()).child(format!("The pack could not be removed: {msg}")).into_any_element(),
+            Some(PackState::Failed(msg)) => div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().text_size(px(size::XS)).text_color(Tokens::danger()).child(format!("The pack did not install: {msg}")))
+                .child(btn("look-layered-retry", "Try again", ButtonKind::Secondary).small().icon(ph::ARROW_CLOCKWISE).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.install_pack(cx))))
+                .into_any_element(),
+            None => div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    btn("look-layered-install", "Install the layered motion pack", ButtonKind::Secondary)
+                        .small()
+                        .icon(ph::DOWNLOAD_SIMPLE)
+                        .tooltip("PyTorch with CUDA and three open models (SAM2, Depth Anything V2, LaMa), from their official sources")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.install_pack(cx))),
+                )
+                .child(muted(format!("Needs an NVIDIA graphics card. About {} to download, {} on disk.", mv_ui::fmt_bytes(vfx_pack::DOWNLOAD_BYTES), mv_ui::fmt_bytes(vfx_pack::DISK_BYTES))))
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .id("look-layered-label")
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(size::SM))
+                    .text_color(Tokens::text_2())
+                    .tooltip(tip("Cuts panels into layers (characters, background, lettering) and animates them in 2.5D. Lettering never moves and faces are never warped."))
+                    .child(icon_ph(ph::STACK, Tokens::text_3(), icon_px::SM))
+                    .child("Layered motion")
+                    .when(mode != Layered::Off, |d| d.child(div().size(px(6.)).rounded_full().bg(Tokens::accent()))),
+            )
+            .child(control)
+            .child(muted(mode.blurb()))
+            .child(pack)
+    }
+
+    fn install_pack(&mut self, cx: &mut Context<Self>) {
+        use mv_studio::vfx_pack;
+        vfx_pack::clear_error();
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::run(vfx_pack::install()).await;
+            let _ = this.update(cx, |_, cx| {
+                match res {
+                    Ok(Ok(())) => toast::show(cx, Toast::success("Layered motion pack installed")),
+                    Ok(Err(mv_studio::StudioError::Cancelled)) => toast::show(cx, Toast::info("Pack install stopped. Downloads resume next time.")),
+                    Ok(Err(_)) => toast::show(cx, Toast::error("The layered motion pack did not install")),
+                    Err(e) => toast::show(cx, Toast::error(format!("The layered motion pack did not install: {e:#}"))),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn logo_controls(&self, cx: &mut Context<Self>) -> Div {
@@ -1052,6 +1305,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn layered_motion_round_trips_and_reaches_the_renderer() {
+        use super::Layered;
+        let mut l = Look::default();
+        assert!(l.render_config().get("layered").is_none(), "off is the renderer's default and not sent");
+        assert!(l.to_json().get("layered").is_none(), "off is the default and not written");
+        l.layered = Layered::Key;
+        assert_eq!(Look::from_json(&l.to_json()).layered, Layered::Key);
+        assert_eq!(l.render_config()["layered"], "key");
+        assert_eq!(l.render_config_for(true)["layered"], "key");
+        assert!(l.render_config_for(false).get("layered").is_none(), "without the pack it does not change the render key");
+        assert_eq!(l.render_config_for(false), Look { layered: Layered::Off, ..l.clone() }.render_config());
+        l.set_preset(Preset::Clean);
+        assert_eq!(l.layered, Layered::Key, "kept when the look changes");
+        assert_eq!(Look::from_json(&json!({"layered": "all"})).layered, Layered::All);
+        assert_eq!(Look::from_json(&json!({"layered": "bogus"})).layered, Layered::Off);
+    }
+
+    #[test]
     fn defaults_match_the_contract() {
         let l = Look::default();
         assert_eq!(l.preset, Preset::Dynamic);
@@ -1082,6 +1353,19 @@ mod tests {
         }
         assert_eq!(Preset::Cinematic.color(), ColorPreset::Warm);
         assert_eq!(Preset::Dynamic.color(), ColorPreset::None);
+    }
+
+    #[test]
+    fn a_default_look_sends_no_new_keys() {
+        // The render key of existing videos hangs on this: preset, the effects and the colour only.
+        let cfg = Look::default().render_config();
+        let mut keys: Vec<String> = cfg.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        let mut want: Vec<String> = Effect::ALL.iter().map(|e| e.key().to_string()).chain(["preset".into(), "color".into()]).collect();
+        want.sort();
+        assert_eq!(keys, want);
+        assert_eq!(Look::default().render_config_for(false), cfg);
+        assert_eq!(Look::default().render_config_for(true), cfg);
     }
 
     #[test]
@@ -1191,6 +1475,26 @@ mod tests {
         assert_eq!(import_logo_into(&brand.join("logo.jpg"), &brand).unwrap(), brand.join("logo.jpg"));
         assert_eq!(std::fs::read(brand.join("logo.jpg")).unwrap(), b"jpg-bytes");
         assert!(import_logo_into(&dir.path().join("notes.txt"), &brand).is_err());
+    }
+
+    #[test]
+    fn framing_choices_round_trip_and_are_only_written_when_chosen() {
+        use super::Framing;
+        let mut l = Look::default();
+        let before = l.render_config();
+        l.set_duo(true);
+        l.set_motion(1.0);
+        assert_eq!(l.render_config(), before, "the look's own values change nothing (no video turns stale)");
+        l.framing = Framing::Fill;
+        l.set_duo(false);
+        l.set_motion(0.5);
+        let cfg = l.render_config();
+        assert_eq!((cfg["framing"].as_str(), cfg["duo"].as_bool(), cfg["motion"].as_f64()), (Some("fill"), Some(false), Some(0.5)));
+        assert_eq!(Look::from_json(&l.to_json()), l);
+        // A new preset keeps them, and drops a side-by-side choice that is now its own.
+        l.set_preset(Preset::Clean);
+        assert_eq!((l.framing, l.duo, l.motion()), (Framing::Fill, None, 0.5));
+        assert!(!l.duo());
     }
 
     #[test]

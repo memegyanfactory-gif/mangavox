@@ -288,7 +288,33 @@ pub fn stamp(output_dir: &Path) -> Option<u64> {
 /// Only in an existing chapter folder; a failure only means the video shows as old.
 pub fn stamp_pending(ch: &ChapterItem) {
     if ch.output_dir.is_dir() {
-        let _ = std::fs::write(ch.output_dir.join(PENDING_FILE), json!({ "key": current_key(ch) }).to_string());
+        let music = music_mark(&mv_score::load_settings(&crate::page::chref(ch)));
+        let _ = std::fs::write(ch.output_dir.join(PENDING_FILE), json!({ "key": current_key(ch), "music": music }).to_string());
+    }
+}
+
+/// What the music settings add to a video beyond [`look_key`] (which only knows whether music is
+/// on): its loudness under the voice and the sound effects. Kept in the stamp as `"music"`, so a
+/// video made at another level is told apart without changing the key of every video made so far.
+pub fn music_mark(m: &mv_score::MusicSettings) -> Value {
+    json!({ "level": m.level, "sfx": m.sfx })
+}
+
+/// The [`music_mark`] a chapter's video was made with, when its stamp has one.
+pub fn stamp_music(output_dir: &Path) -> Option<Value> {
+    let v: Value = serde_json::from_slice(&std::fs::read(output_dir.join(STAMP_FILE)).ok()?).ok()?;
+    v.get("music").filter(|m| m.is_object()).cloned()
+}
+
+/// The music settings of a chapter whose video exists are about to change from `old`: its stamp
+/// learns what the video was made with (when it does not know yet), so the video reads as not
+/// matching the new settings until it is rendered again.
+pub fn mark_old_music(output_dir: &Path, old: &mv_score::MusicSettings) {
+    let file = output_dir.join(STAMP_FILE);
+    let Some(mut v) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(Value::is_object) else { return };
+    if v.get("music").is_none() {
+        v["music"] = music_mark(old);
+        let _ = std::fs::write(&file, v.to_string());
     }
 }
 

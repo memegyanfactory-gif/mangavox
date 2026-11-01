@@ -2,9 +2,9 @@
 //! dashboard's YouTube package card, saved to the same file, and the open card refreshed.
 use futures::FutureExt as _;
 use serde_json::{json, Map, Value};
-use ui_assistant::tools::{self as at, bool_arg, str_arg, Phrases, Risk, ToolDef, ToolOutput, ToolResult};
+use ui_assistant::tools::{self as at, bool_arg, num_arg, str_arg, Phrases, Risk, ToolDef, ToolOutput, ToolResult};
 
-use super::{ask, logic, research, Panels, Saved, CAST_FOR_MATCH, CAST_FOR_PROMPT};
+use super::{ask, logic, magnific, research, Panels, Saved, CAST_FOR_MATCH, CAST_FOR_PROMPT};
 
 pub(crate) fn register_tools() {
     // Not a tool, but registered at the same startup call: the reader asks Studio for a manga's
@@ -22,6 +22,177 @@ pub(crate) fn register_tools() {
     )
     .phrases(|a| Phrases::new("Make the YouTube package for", "Making the YouTube package for", "Made the YouTube package for", str_arg(a, "manga")))
     .run(|a| async move { package(a).await }.boxed())]);
+    at::register(thumbnail_tools());
+}
+
+// ---------------------------------------------------------------- thumbnails
+
+fn thumbnail_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef::new(
+            "studio_thumbnails",
+            "A manga's YouTube thumbnails (Thumbnails page): the ones made (id, label, prompt, file), the AI's thumbnail ideas, the image model, size and the credits one image costs, whether a Magnific key is set and the credits spent this month.",
+            json!({ "type": "object", "properties": { "manga": { "type": "string", "description": "Manga title or id" } }, "required": ["manga"] }),
+            Risk::Read,
+        )
+        .phrases(|a| Phrases::new("Read", "Reading", "Read", &format!("the thumbnails of {}", str_arg(a, "manga"))))
+        .run(|a| async move { thumbnails(a).await }.boxed()),
+        ToolDef::new(
+            "studio_thumbnail_make",
+            "Make a YouTube thumbnail with Magnific's image AI. Spends Magnific API credits (studio_thumbnails says how many; always asks the user). `prompt` describes the image (use @Name for a character to attach their face card); without it, idea number `concept` from studio_thumbnails, else the YouTube package's thumbnail prompt.",
+            json!({ "type": "object", "properties": {
+                "manga": { "type": "string", "description": "Manga title or id" },
+                "prompt": { "type": "string", "description": "What the thumbnail shows" },
+                "concept": { "type": "number", "description": "Use the AI idea with this number (1-based)" },
+                "aspect": { "type": "string", "enum": ["16:9", "9:16", "1:1", "4:3"], "description": "Default: the Thumbnails page's choice" },
+            }, "required": ["manga"] }),
+            Risk::Destructive,
+        )
+        .phrases(|a| {
+            // The same choice the run makes: a prompt naming characters (@Name) may switch model.
+            let prompt = str_arg(a, "prompt");
+            let refs: &[bool] = if !prompt.is_empty() {
+                if prompt.contains('@') { &[true] } else { &[false] }
+            } else if num_arg(a, "concept").is_some() {
+                // The idea's prompt is only read when it runs: either way.
+                &[false, true]
+            } else {
+                // The package prompt names no @characters.
+                &[false]
+            };
+            let costs: Vec<f64> = refs.iter().map(|r| {
+                let (model, res, _) = final_model(str_arg(a, "aspect"), *r);
+                model.cost_at(&res)
+            }).collect();
+            let what = format!("a thumbnail for {}{}", str_arg(a, "manga"), credits_note(&costs));
+            Phrases::new("Spend credits on", "Making", "Made", &what)
+        })
+        .run(|a| async move { make_thumbnail(a).await }.boxed()),
+    ]
+}
+
+fn model_and_res() -> (&'static magnific::ImageModel, String, String) {
+    let prefs = magnific::Prefs::load();
+    let model = magnific::CATALOG.iter().find(|m| m.id == prefs.model).unwrap_or(&magnific::CATALOG[0]);
+    let res = if model.resolutions.contains(&prefs.resolution.as_str()) { prefs.resolution.clone() } else { model.resolutions.first().copied().unwrap_or("Auto").to_string() };
+    let aspect = if prefs.aspect.is_empty() { "16:9".to_string() } else { prefs.aspect.clone() };
+    (model, res, aspect)
+}
+
+/// The model, size and aspect a thumbnail is really made with (the approval text and the run
+/// both use this): the Thumbnails page's choice, with `aspect` given by the call over it.
+fn final_model(aspect: &str, uses_refs: bool) -> (&'static magnific::ImageModel, String, String) {
+    let (model, res, aspect_pref) = model_and_res();
+    pick_model(model, res, if aspect.is_empty() { aspect_pref } else { aspect.to_string() }, uses_refs)
+}
+
+/// `model` unless it cannot do the job: character references (a prompt with @Name) need a model
+/// that takes them, and a model without aspect control only makes squares; then the first of
+/// the catalogue (Nano Banana 2.1 does both). The size falls back to the model's first.
+fn pick_model(mut model: &'static magnific::ImageModel, res: String, aspect: String, uses_refs: bool) -> (&'static magnific::ImageModel, String, String) {
+    if uses_refs && model.refs == 0 {
+        model = &magnific::CATALOG[0];
+    }
+    if !model.takes_aspect() && aspect != "1:1" {
+        model = &magnific::CATALOG[0];
+    }
+    let res = if model.resolutions.contains(&res.as_str()) { res } else { model.resolutions.first().copied().unwrap_or("Auto").to_string() };
+    (model, res, aspect)
+}
+
+/// " (about N Magnific credits)" for the approval, "up to N" when the cost depends on what the
+/// run reads; empty when the model's price is unknown.
+fn credits_note(costs: &[f64]) -> String {
+    let (lo, hi) = costs.iter().fold((f64::MAX, 0f64), |(lo, hi), c| (lo.min(*c), hi.max(*c)));
+    if hi <= 0. {
+        String::new()
+    } else if (hi - lo).abs() < 0.5 {
+        format!(" (about {hi:.0} Magnific credits)")
+    } else {
+        format!(" (up to {hi:.0} Magnific credits)")
+    }
+}
+
+async fn thumbnails(a: Map<String, Value>) -> ToolResult {
+    let groups = mv_ui::bg::blocking(crate::data::load).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let g = crate::assist::find_manga(&groups, str_arg(&a, "manga"))?;
+    let gallery = super::thumbs::Gallery::load(&g.id);
+    let (model, res, aspect) = model_and_res();
+    let usage = magnific::Usage::load();
+    Ok(ToolOutput::Value(json!({
+        "manga": g.title,
+        "made": gallery.thumbs.iter().take(20).map(|t| json!({ "id": t.id, "label": t.label, "prompt": t.prompt, "model": t.model, "file": super::thumbs::Gallery::image(&g.id, &t.id).display().to_string() })).collect::<Vec<_>>(),
+        "ideas": gallery.concepts.iter().enumerate().map(|(i, c)| json!({ "concept": i + 1, "name": c.name, "why": c.why, "prompt": c.prompt, "text": c.text })).collect::<Vec<_>>(),
+        "model": model.name,
+        "resolution": res,
+        "aspect": aspect,
+        "creditsPerImage": model.cost_at(&res),
+        "magnificKey": magnific::key().is_some(),
+        "spentThisMonth": usage.month_spent(),
+    })))
+}
+
+async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
+    let Some(key) = magnific::key() else {
+        return Err("No Magnific API key yet. The user adds it in Settings → Magnific (or on the Thumbnails page).".into());
+    };
+    let groups = mv_ui::bg::blocking(crate::data::load).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let g = crate::assist::find_manga(&groups, str_arg(&a, "manga"))?.clone();
+    let gallery = super::thumbs::Gallery::load(&g.id);
+    let (id, title) = (g.id.clone(), g.title.clone());
+    let brain = mv_ui::bg::blocking(move || crate::run::brain_snapshot(&id, &title)).await.map_err(|e| e.to_string())?;
+    let cast: Vec<(logic::Cast, std::path::PathBuf)> = logic::lead_cast(&brain, super::thumb_view::CAST_FOR_REFS).into_iter().filter_map(|(c, f)| Some((c, f?))).collect();
+    let just_cast: Vec<logic::Cast> = cast.iter().map(|(c, _)| c.clone()).collect();
+    let (prompt, label) = match (str_arg(&a, "prompt"), num_arg(&a, "concept")) {
+        (p, _) if !p.is_empty() => (p.to_string(), "Custom".to_string()),
+        (_, Some(n)) => {
+            let c = gallery.concepts.get((n.max(1.) as usize) - 1).ok_or_else(|| format!("There are {} ideas; pick one of 1-{}", gallery.concepts.len(), gallery.concepts.len().max(1)))?;
+            (c.prompt.clone(), c.name.clone())
+        }
+        _ => {
+            let saved = Saved::load(&g.id);
+            let hook = saved.suggestion.as_ref().map(|s| s.thumbnail_text.clone()).unwrap_or_default();
+            let story = logic::story_so_far(&brain.notes, 4);
+            let refs: Vec<bool> = cast.iter().map(|_| true).collect();
+            (logic::thumbnail_prompt(&g.title, &just_cast, &refs, &story, &hook), "Package idea".to_string())
+        }
+    };
+    let (resolved, order) = super::thumbs::resolve(&prompt, &just_cast, 0);
+    // `resolve` only finds references at an @Name, so this is what the approval assumed.
+    let (model, res, aspect) = final_model(str_arg(&a, "aspect"), !order.is_empty() || prompt.contains('@'));
+    let mut refs: Vec<magnific::Reference> = vec![];
+    let mut looks = vec![];
+    for i in order.iter().take(model.refs) {
+        let (c, f) = &cast[*i];
+        refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}: {}", refs.len() + 1, c.name) });
+        looks.push((c.name.clone(), super::thumbs::look_of(c)));
+    }
+    let full = super::thumbs::image_prompt(&g.title, &resolved, &looks, 0);
+    let tid = format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+    let out = super::thumbs::Gallery::image(&g.id, &tid);
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let progress = ui_assistant::tools::progress_handle();
+    let (o2, k2, f2, a2, r2) = (out.clone(), key.clone(), full.clone(), aspect.clone(), res.clone());
+    let job = async move {
+        magnific::generate(model, &k2, &f2, &refs, &a2, &r2, &o2, move |s| {
+            if let Some(p) = &progress {
+                p(s.to_string());
+            }
+        })
+        .await
+    };
+    mv_ui::bg::run(job).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))?;
+    let cost = model.cost_at(&res);
+    let mut usage = magnific::Usage::load();
+    usage.add(cost);
+    usage.save();
+    let mut gallery = super::thumbs::Gallery::load(&g.id);
+    gallery.thumbs.insert(0, super::thumbs::Thumb { id: tid.clone(), prompt, label, parent: None, model: model.name.to_string(), resolution: res.clone(), cost, created: super::now() });
+    gallery.save(&g.id);
+    ui_assistant::on_ui(|_, cx| super::thumb_page::notify_changed(cx)).await.ok();
+    Ok(ToolOutput::Value(json!({ "manga": g.title, "file": out.display().to_string(), "model": model.name, "resolution": res, "aspect": aspect, "credits": cost, "note": "Saved on the Thumbnails page (reopen it to see the new image)." })))
 }
 
 /// The manga has an AI title saved (so no "suggest a title" card for it).
@@ -104,4 +275,38 @@ async fn package(a: Map<String, Value>) -> ToolResult {
         "thumbnailPrompt": thumb_prompt,
         "notes": notes,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(id: &str) -> &'static magnific::ImageModel {
+        magnific::CATALOG.iter().find(|m| m.id == id).unwrap()
+    }
+
+    #[test]
+    fn the_model_switches_only_when_it_cannot_do_the_job() {
+        let first = &magnific::CATALOG[0];
+        // A model without references, asked for @characters: the first model, at a size it has.
+        let (m, res, _) = pick_model(model("nano-banana-pro"), "4K".into(), "16:9".into(), true);
+        assert_eq!(m.id, first.id);
+        assert!(first.resolutions.contains(&res.as_str()));
+        // Without references it stays.
+        assert_eq!(pick_model(model("nano-banana-pro"), "2K".into(), "16:9".into(), false).0.id, "nano-banana-pro");
+        // No aspect control: only squares stay.
+        assert_eq!(pick_model(model("nano-banana"), "".into(), "16:9".into(), false).0.id, first.id);
+        assert_eq!(pick_model(model("nano-banana"), "".into(), "1:1".into(), false).0.id, "nano-banana");
+        // The approval quotes the model the run uses.
+        let (m, res, _) = pick_model(model("nano-banana-pro"), "4K".into(), "16:9".into(), true);
+        assert_eq!(credits_note(&[m.cost_at(&res)]), format!(" (about {:.0} Magnific credits)", first.cost_at(&res)));
+    }
+
+    #[test]
+    fn the_credit_note_says_about_or_up_to() {
+        assert_eq!(credits_note(&[50.]), " (about 50 Magnific credits)");
+        assert_eq!(credits_note(&[50., 75.]), " (up to 75 Magnific credits)");
+        assert_eq!(credits_note(&[0.]), "");
+        assert_eq!(credits_note(&[]), "");
+    }
 }

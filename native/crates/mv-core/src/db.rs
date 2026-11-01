@@ -310,6 +310,12 @@ const MIGRATIONS: &[Migration] = &[
       DELETE FROM media_playback WHERE (media_id LIKE 'movie:imdb:%' OR media_id LIKE 'series:imdb:%') AND media_id NOT LIKE '%:imdb:tt%';
       DELETE FROM media_title WHERE (id LIKE 'movie:imdb:%' OR id LIKE 'series:imdb:%') AND id NOT LIKE '%:imdb:tt%';
     "#)] },
+    // A series' season next to its episode: the history kept only the episode, so a show's page
+    // could not tell S2 E3 from S1 E3 and started over at S1 E1.
+    Migration { id: 17, name: "017_playback_season", steps: &[Sql(r#"
+      ALTER TABLE media_playback ADD COLUMN season_number INTEGER;
+      ALTER TABLE media_event ADD COLUMN season_number INTEGER;
+    "#)] },
 ];
 
 /// Tables the TS services create with `registerSchema` (run on every start; all idempotent).

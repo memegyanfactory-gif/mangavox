@@ -90,9 +90,20 @@ pub fn stale_of(chapters: &[ChapterItem]) -> Vec<Stale> {
         .filter(|c| c.output_dir.join(super::VIDEO_FILE).metadata().is_ok_and(|m| m.len() > 0))
         .filter_map(|c| {
             let f = facts(c, &look);
-            why_stale(&f).map(|why| Stale { item: c.clone(), why, key: f.key })
+            if let Some(why) = why_stale(&f) {
+                return Some(Stale { item: c.clone(), why, key: f.key });
+            }
+            // The key only knows whether music is on: the level and sound effects are in the stamp.
+            let now = vm::music_mark(&mv_score::load_settings(&crate::page::chref(c)));
+            music_stale(vm::stamp_music(&c.output_dir).as_ref(), &now).then(|| Stale { item: c.clone(), why: Why::Look, key: f.key ^ crate::vedit::render_key(&now) })
         })
         .collect()
+}
+
+/// Whether a video stamped with the music mark `stamped` differs from the music settings `now`
+/// (`vedit_manga::music_mark`). A stamp from before marks were kept is taken as matching.
+pub fn music_stale(stamped: Option<&serde_json::Value>, now: &serde_json::Value) -> bool {
+    stamped.is_some_and(|s| s != now)
 }
 
 // ------------------------------------------------------------------------------------ asking
@@ -392,6 +403,17 @@ mod tests {
         assert!(b.contains("1 has Video editor changes") && b.contains("since 1 of them was rendered") && b.contains("1 was made before"), "{b}");
         let (_, b) = question(&[stale("a", Why::Edit, 1), stale("b", Why::Edit, 2)], "playing");
         assert!(b.starts_with("They have Video editor changes"), "{b}");
+    }
+
+    #[test]
+    fn a_video_made_at_another_music_level_is_stale() {
+        let quiet = vm::music_mark(&mv_score::MusicSettings { level: mv_score::Level::Quiet, ..Default::default() });
+        let normal = vm::music_mark(&mv_score::MusicSettings::default());
+        assert!(!music_stale(None, &normal), "a stamp from before music marks matches");
+        assert!(!music_stale(Some(&normal), &normal));
+        assert!(music_stale(Some(&quiet), &normal));
+        let punchy = vm::music_mark(&mv_score::MusicSettings { sfx: mv_score::SfxAmount::Punchy, ..Default::default() });
+        assert!(music_stale(Some(&normal), &punchy), "and with other sound effects");
     }
 
     #[test]
