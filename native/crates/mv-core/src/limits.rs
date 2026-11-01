@@ -62,6 +62,15 @@ pub fn apply_percent(p: u8) -> u8 {
     p
 }
 
+/// Holds heavy work to `p` percent for a while (`None` goes back to the saved cap), without
+/// changing the saved percentage: something the user waits on (an export) gets the PC first.
+pub fn throttle(p: Option<u8>) {
+    #[cfg(windows)]
+    win::apply(p.map(|p| clamp(p as i64)).unwrap_or_else(percent));
+    #[cfg(not(windows))]
+    let _ = p;
+}
+
 /// Logical CPUs on this PC.
 pub fn cores() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)

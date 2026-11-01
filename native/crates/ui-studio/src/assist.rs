@@ -132,7 +132,7 @@ fn tools() -> Vec<ToolDef> {
                     "kind": { "type": "string", "enum": ["whole", "parts", "reels"] },
                     "parts": { "type": "number", "description": "Number of parts (2, 3, 4, 6, 8 or 10)" },
                     "hook": { "type": "boolean", "description": "AI teaser before chapter 1 (whole only)" },
-                    "hook_seconds": { "type": "number", "description": "15, 20 or 30" },
+                    "hook_seconds": { "type": "number", "description": "15, 20, 30, 45 or 60" },
                     "music": { "type": "boolean", "description": "Keep the background music (default true)" },
                     "folder": s("Output folder (optional)"),
                     "overwrite": { "type": "boolean", "description": "Replace existing files of the same name" },
@@ -570,7 +570,7 @@ pub(crate) fn export_prefs(a: &Map<String, Value>) -> Result<ExportPrefs, String
     }
     p.hook = bool_arg(a, "hook").unwrap_or(false) && p.kind == 0;
     if let Some(s) = num_arg(a, "hook_seconds") {
-        p.hook_secs = *export::HOOK_SECONDS.iter().min_by_key(|c| c.abs_diff(s.round() as u32)).unwrap_or(&20);
+        p.hook_secs = *export::HOOK_SECONDS.iter().min_by_key(|c| c.abs_diff(s.round() as u32)).unwrap_or(&30);
     }
     p.music = bool_arg(a, "music").unwrap_or(true);
     Ok(p)

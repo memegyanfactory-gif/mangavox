@@ -43,7 +43,7 @@ pub(crate) enum Mode {
 }
 
 /// Hook lengths offered, in seconds.
-pub(crate) const HOOK_SECONDS: [u32; 3] = [15, 20, 30];
+pub(crate) const HOOK_SECONDS: [u32; 5] = [15, 20, 30, 45, 60];
 /// The font a text watermark is drawn in (from the scripts' `fonts/`).
 const MARK_FONT: &str = "Inter-ExtraBold.ttf";
 
@@ -101,10 +101,29 @@ impl Quality {
         }
     }
 
-    /// The x264 video arguments (no audio).
+    /// The video arguments (no audio): the GPU's H.264 encoder when one works here (many times
+    /// faster than x264 on a long recap, and the CPU stays free), else x264.
     pub(crate) fn video_args(self) -> Vec<String> {
+        self.video_args_for(crate::encode::detect_encoders())
+    }
+
+    /// [`Quality::video_args`] with the encoders `enc`, each at about x264's quality for this size.
+    pub(crate) fn video_args_for(self, enc: &crate::encode::Encoders) -> Vec<String> {
+        use crate::encode::Encoder;
         let (preset, crf) = self.encode();
-        ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p"].map(String::from).to_vec()
+        let crf_n = crf.parse::<u32>().unwrap_or(20);
+        let q = (crf_n + 1).to_string();
+        // NVENC's CQ 25 matched x264's CRF 20 in picture (SSIM 0.993 vs 0.994) and file size on a
+        // 1440p recap, encoded faster with the CPU left free.
+        let cq = (crf_n + 5).to_string();
+        let mut a: Vec<String> = match enc.pick(false) {
+            Encoder::H264Nvenc => ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", &cq, "-b:v", "0", "-spatial-aq", "1"].map(String::from).to_vec(),
+            Encoder::H264Qsv => ["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", &q].map(String::from).to_vec(),
+            Encoder::H264Amf => ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", &q, "-qp_p", &q, "-qp_b", &q].map(String::from).to_vec(),
+            _ => ["-c:v", "libx264", "-preset", preset, "-crf", crf].map(String::from).to_vec(),
+        };
+        a.extend(["-pix_fmt".into(), "yuv420p".into()]);
+        a
     }
 }
 
@@ -138,7 +157,7 @@ pub(crate) struct ExportPrefs {
 
 impl Default for ExportPrefs {
     fn default() -> Self {
-        ExportPrefs { kind: 0, parts: 6, music: true, hook: false, hook_secs: 20, quality: Quality::Source }
+        ExportPrefs { kind: 0, parts: 6, music: true, hook: false, hook_secs: 30, quality: Quality::Source }
     }
 }
 
@@ -152,6 +171,29 @@ impl ExportPrefs {
     }
 }
 
+/// Whether an export holds the turn (see [`Turn`]).
+static TURN: AtomicBool = AtomicBool::new(false);
+
+/// Exports take turns (the dashboard's, the Video mode's and the assistant's), and the one
+/// running has the PC first: heavy background work (Studio's voicing and rendering) is held to
+/// the lowest cap and the Generate queue starts no new media step until it is done.
+pub(crate) struct Turn;
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        mv_core::limits::throttle(None);
+        TURN.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether an export is running (the Generate queue waits for it before voicing or rendering).
+pub(crate) fn exporting() -> bool {
+    TURN.load(Ordering::SeqCst)
+}
+
+/// An export asked for while another runs: started when it ends.
+pub(crate) type QueuedExport = Box<dyn FnOnce(&mut StudioPage, &mut Window, &mut Context<StudioPage>)>;
+
 /// A join or export in flight.
 pub(crate) struct Job {
     pub manga_id: String,
@@ -160,11 +202,13 @@ pub(crate) struct Job {
     pub cancel: Arc<AtomicBool>,
     /// The step being timed (its label) and when it began, for the time left.
     phase: Mutex<(String, Instant)>,
+    /// The export turn, once taken (given back when the job and its workers are gone).
+    turn: Arc<Mutex<Option<Turn>>>,
 }
 
 impl Job {
     pub(crate) fn new(manga_id: &str, label: &str) -> Job {
-        Job { manga_id: manga_id.to_string(), state: Arc::new(Mutex::new((0., label.to_string()))), cancel: Arc::new(AtomicBool::new(false)), phase: Mutex::new((label.to_string(), Instant::now())) }
+        Job { manga_id: manga_id.to_string(), state: Arc::new(Mutex::new((0., label.to_string()))), cancel: Arc::new(AtomicBool::new(false)), phase: Mutex::new((label.to_string(), Instant::now())), turn: Arc::new(Mutex::new(None)) }
     }
 
     /// Seconds left of the current step, once there is enough progress to tell (each step, e.g.
@@ -180,7 +224,7 @@ impl Job {
     }
 
     pub(crate) fn reporter(&self) -> Reporter {
-        Reporter { state: self.state.clone(), cancel: self.cancel.clone() }
+        Reporter { state: self.state.clone(), cancel: self.cancel.clone(), turn: self.turn.clone() }
     }
 
     pub fn snapshot(&self) -> (f32, String) {
@@ -193,6 +237,7 @@ impl Job {
 pub(crate) struct Reporter {
     state: Arc<Mutex<(f32, String)>>,
     cancel: Arc<AtomicBool>,
+    turn: Arc<Mutex<Option<Turn>>>,
 }
 
 impl Reporter {
@@ -204,6 +249,29 @@ impl Reporter {
 
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Waits (on this worker thread) until no other export runs, then holds the [`Turn`] for
+    /// this job. Does nothing when it holds it already. Errors when cancelled while waiting.
+    pub(crate) fn take_turn(&self) -> Result<()> {
+        let mut slot = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return Ok(());
+        }
+        let mut waited = false;
+        while TURN.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            if !waited {
+                waited = true;
+                self.set(0., "Queued: waiting for the other export to finish");
+            }
+            if self.cancelled() {
+                bail!(CANCELLED);
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        mv_core::limits::throttle(Some(mv_core::limits::MIN_PERCENT));
+        *slot = Some(Turn);
+        Ok(())
     }
 }
 
@@ -444,7 +512,7 @@ pub(crate) fn joined_path(manga_id: &str) -> PathBuf {
 /// Export do, for callers outside the page (the phone companion). Blocking; `progress` gets
 /// (0..1, label) and setting `cancel` stops it.
 pub fn join_full_recap(manga_id: &str, files: &[PathBuf], progress: Arc<Mutex<(f32, String)>>, cancel: Arc<AtomicBool>) -> Result<PathBuf> {
-    join(files, &joined_path(manga_id), &Reporter { state: progress, cancel }).map(|j| j.path)
+    join(files, &joined_path(manga_id), &Reporter { state: progress, cancel, turn: Default::default() }).map(|j| j.path)
 }
 
 /// What the joined video was made from (path, size, modified) - a match means it is current.
@@ -547,6 +615,7 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
             });
         }
     }
+    r.take_turn()?;
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -936,6 +1005,7 @@ pub(crate) fn hook_concat_graph(hook_track: usize, track: usize, w: u32, h: u32,
 /// Writes the export of `j` into `out_dir`: one file, or (for parts and reels) a folder of them,
 /// with the hook before it (one video) and the watermark over it as `extras` say.
 pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: &str, extras: &Extras, r: &Reporter) -> Result<Vec<PathBuf>> {
+    r.take_turn()?;
     let track = if !music && j.solo { 1 } else { 0 };
     let src = j.path.to_string_lossy().to_string();
     let mark = Mark::prepare(extras.watermark.clone(), extras.font.as_deref())?;
@@ -1107,6 +1177,10 @@ pub(crate) fn resolution_for(h: u32) -> &'static str {
     }
 }
 
+/// Panels a hook line may cut to after its own, and how far after it they may be.
+const HOOK_CUT_INS: usize = 2;
+const HOOK_CUT_REACH: usize = 4;
+
 /// What making a hook needs, gathered on the UI thread.
 pub(crate) struct HookJob {
     pub manga_id: String,
@@ -1149,8 +1223,29 @@ async fn wait_for<T: Send + 'static>(task: tokio::task::JoinHandle<T>, r: &Repor
 /// no line has a picture.
 pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Vec<Beat>)], script: &mv_recap::hook::HookScript, resolution: &str, work: &Path) -> Option<Value> {
     let flat: Vec<(usize, &Beat)> = chapters.iter().enumerate().flat_map(|(c, (_, beats))| beats.iter().map(move |b| (c, b))).collect();
-    let lines: Vec<(usize, &Beat, &String)> = script.lines.iter().filter_map(|(id, text)| flat.get(*id).filter(|(_, b)| b.image.is_some()).map(|(c, b)| (*c, *b, text))).collect();
-    let (first_chapter, first_beat, _) = lines.first()?;
+    let lines: Vec<(usize, usize, &Beat, &String)> = script.lines.iter().filter_map(|(id, text)| flat.get(*id).filter(|(_, b)| b.image.is_some()).map(|(c, b)| (*id, *c, *b, text))).collect();
+    lines.first()?;
+    // Fast cuts like a trailer: each line may cut to the next panels of the same moment.
+    let mut used: Vec<&str> = lines.iter().filter_map(|(_, _, b, _)| b.image.as_deref()).collect();
+    let cut_ins: Vec<Vec<Value>> = lines
+        .iter()
+        .map(|(id, c, _, _)| {
+            let mut more = vec![];
+            for (c2, b) in flat.iter().skip(id + 1).take(HOOK_CUT_REACH) {
+                let Some(img) = b.image.as_deref() else { continue };
+                if c2 != c || more.len() == HOOK_CUT_INS {
+                    break;
+                }
+                if !used.contains(&img) {
+                    used.push(img);
+                    more.push(json!({"image": img, "focus": b.focus}));
+                }
+            }
+            more
+        })
+        .collect();
+    // The music of the most gripping line's moment.
+    let (_, loud_chapter, loud_beat, _) = lines.iter().max_by(|a, b| mv_recap::hook::beat_score(a.3).total_cmp(&mv_recap::hook::beat_score(b.3)))?;
     let (last, _) = chapters.last()?;
     // The manga's cover, else its first page or panel.
     let opening = job.cover.as_ref().map(|p| p.to_string_lossy().into_owned()).or_else(|| chapters.iter().find_map(|(_, beats)| beats.iter().find_map(|b| b.image.clone())).or_else(|| {
@@ -1161,10 +1256,10 @@ pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Ve
     }))?;
     let voice = mv_studio::voices::voice_for_chapter(&last.id);
     let engine = mv_studio::tts::engine_hint(&voice);
-    let score = mv_score::score_wav(&crate::page::chref(&chapters[*first_chapter].0));
-    let score = score.is_file().then(|| json!({"wav": score.to_string_lossy(), "start": first_beat.start, "seconds": job.seconds}));
+    let score = mv_score::score_wav(&crate::page::chref(&chapters[*loud_chapter].0));
+    let score = score.is_file().then(|| json!({"wav": score.to_string_lossy(), "start": loud_beat.start, "seconds": job.seconds}));
     Some(json!({
-        "lines": lines.iter().map(|(_, b, text)| json!({"text": text, "image": b.image, "focus": b.focus})).collect::<Vec<_>>(),
+        "lines": lines.iter().zip(cut_ins).map(|((_, _, b, text), more)| json!({"text": text, "image": b.image, "focus": b.focus, "more": more})).collect::<Vec<_>>(),
         "outro": {"text": script.outro, "image": opening},
         "voice": voice,
         "engine": engine,
@@ -1180,7 +1275,7 @@ pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Ve
 /// Writes, voices and renders the hook of `job` for the joined video `j`. Returns the hook video,
 /// and why the model's script was not used when it failed (the narration's own lines were).
 pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &BackgroundExecutor) -> Result<(PathBuf, Option<String>)> {
-    use mv_recap::hook::{fallback_hook, pick_candidates, write_hook, MAX_CANDIDATES};
+    use mv_recap::hook::{fallback_hook, pick_candidates, story_context, write_hook, MAX_CANDIDATES};
     r.set(0.01, "Writing the hook");
     let work = job.work_dir();
     let (chapters, height) = {
@@ -1206,7 +1301,11 @@ pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &Backg
         Some(model) => {
             let token = mv_ai::CancellationToken::new();
             let (reg, title, cands, secs, t) = (job.reg.clone(), job.manga_title.clone(), candidates.clone(), job.seconds, token.clone());
-            let task = mv_ui::bg::runtime().spawn(async move { write_hook(reg, model, &title, &cands, secs, t).await });
+            let (id, last) = (job.manga_id.clone(), chapters.last().map(|(c, _)| c.label()).unwrap_or_default());
+            let task = mv_ui::bg::runtime().spawn(async move {
+                let story = story_context(&mv_recap::Brain::load(&id, &title), &last);
+                write_hook(reg, model, &title, &story, &cands, secs, t).await
+            });
             let res = wait_for(task, r, ex, || {}).await;
             if r.cancelled() {
                 token.cancel();
@@ -1229,18 +1328,21 @@ pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &Backg
     let script_path = job.layout.script("hook_maker.py").map_err(|e| anyhow!("{e}"))?;
     let (py, dir) = (job.python.clone(), job.layout.dir.clone());
     let arg = args_file.to_string_lossy().into_owned();
+    // The hook renders under the heavy-work cap the export holds low: lift it meanwhile.
+    mv_core::limits::throttle(None);
     let task = mv_ui::bg::runtime().spawn(async move { mv_studio::bridge::run_capture(&py, &script_path, &[arg], &dir).await });
     // The script writes its sync map once every line is voiced: rendering starts then.
     let voiced = work.join("render").join("sync_map.json");
     let mut rendering = false;
-    let (code, stdout, stderr) = wait_for(task, r, ex, || {
+    let res = wait_for(task, r, ex, || {
         if !rendering && voiced.is_file() {
             rendering = true;
             r.set(0.25, "Rendering the hook");
         }
     })
-    .await?
-    .map_err(|e| anyhow!("{e}"))?;
+    .await;
+    mv_core::limits::throttle(Some(mv_core::limits::MIN_PERCENT));
+    let (code, stdout, stderr) = res?.map_err(|e| anyhow!("{e}"))?;
     let last = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
     let v: Value = serde_json::from_str(last).unwrap_or(Value::Null);
     if v["ok"].as_bool() == Some(true) {
@@ -1261,6 +1363,12 @@ pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &Backg
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: ExportPrefs, dir: PathBuf, name: String, font: Option<PathBuf>, r: Reporter, ex: BackgroundExecutor) -> (Result<Vec<PathBuf>>, String) {
     let hook_dir = hook.as_ref().map(HookJob::work_dir);
+    if hook.is_some() {
+        let rr = r.clone();
+        if let Err(e) = mv_ui::bg::blocking(move || rr.take_turn()).await.and_then(|x| x) {
+            return (Err(e), String::new());
+        }
+    }
     // A hook that could not be made leaves the video without it (said in the result).
     let mut hook_note = String::new();
     let mut hook_path = None;
@@ -1334,6 +1442,16 @@ impl StudioPage {
         self.export_job.is_some()
     }
 
+    /// The export (or join) in flight ended: the next queued one starts.
+    fn export_ended(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.export_job = None;
+        if !self.export_queue.is_empty() {
+            let next = self.export_queue.remove(0);
+            next(self, window, cx);
+        }
+        cx.notify();
+    }
+
     /// Repaints while a job runs, until it ends.
     fn follow_export(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
@@ -1352,6 +1470,9 @@ impl StudioPage {
     /// The made videos of `g` joined (made now if missing or stale), then `then`.
     fn with_joined(&mut self, g: &MangaGroup, label: &str, then: impl FnOnce(&mut StudioPage, Joined, &Reporter, &mut Window, &mut Context<Self>) + 'static, window: &mut Window, cx: &mut Context<Self>) {
         if self.export_busy() {
+            let (g, label) = (g.clone(), label.to_string());
+            self.export_queue.push(Box::new(move |this, window, cx| this.with_joined(&g, &label, then, window, cx)));
+            toast::show(cx, Toast::info("Export queued: it starts when the current one is done"));
             return;
         }
         let files: Vec<PathBuf> = self.made_videos(g).into_iter().map(|(_, p)| p).collect();
@@ -1371,11 +1492,10 @@ impl StudioPage {
             let _ = this.update_in(cx, |this, window, cx| match res {
                 Ok(j) => then(this, j, &r, window, cx),
                 Err(e) => {
-                    this.export_job = None;
                     if e.to_string() != CANCELLED {
                         toast::show(cx, Toast::error(format!("Could not join the chapter videos: {e:#}")));
                     }
-                    cx.notify();
+                    this.export_ended(window, cx);
                 }
             });
         })
@@ -1389,8 +1509,7 @@ impl StudioPage {
             g,
             "Preparing the full video",
             move |this, j, _, window, cx| {
-                this.export_job = None;
-                cx.notify();
+                this.export_ended(window, cx);
                 crate::phases::play_video(&title, &j.path, window, cx);
             },
             window,
@@ -1443,8 +1562,8 @@ impl StudioPage {
                         let ex = cx.background_executor().clone();
                         cx.spawn_in(window, async move |this, cx| {
                             let (res, hook_note) = export_joined(j, hook, prefs, dir, name, font, r, ex).await;
-                            let _ = this.update(cx, |this, cx| {
-                                this.export_job = None;
+                            let _ = this.update_in(cx, |this, window, cx| {
+                                this.export_ended(window, cx);
                                 match res {
                                     Ok(files) => {
                                         let n = files.len();
@@ -1482,7 +1601,7 @@ impl StudioPage {
     /// watermark like every export. Progress, time left and Cancel are `export_job`.
     pub(crate) fn start_preset_export(&mut self, g: &MangaGroup, p: PresetExport, window: &mut Window, cx: &mut Context<Self>) {
         let videos = self.made_videos(g);
-        if videos.is_empty() || self.export_busy() {
+        if videos.is_empty() {
             return;
         }
         let name = format!("{} ({})", export_name(&g.title, &videos.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>()), p.tag());
@@ -1507,8 +1626,8 @@ impl StudioPage {
                             })
                             .await
                             .and_then(|r| r);
-                            let _ = this.update(cx, |this, cx| {
-                                this.export_job = None;
+                            let _ = this.update_in(cx, |this, window, cx| {
+                                this.export_ended(window, cx);
                                 match res {
                                     Ok((files, codec)) => {
                                         let n = files.len();
@@ -1598,7 +1717,7 @@ impl StudioPage {
             ),
         };
         let hook_row = (mode == Mode::Whole).then(|| {
-            let secs_seg = segmented("vid-hook-secs", HOOK_SECONDS.iter().map(|s| (None, format!("{s}s"))), HOOK_SECONDS.iter().position(|s| *s == prefs.hook_secs).unwrap_or(1)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+            let secs_seg = segmented("vid-hook-secs", HOOK_SECONDS.iter().map(|s| (None, format!("{s}s"))), HOOK_SECONDS.iter().position(|s| *s == prefs.hook_secs).unwrap_or(2)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
                 this.export_prefs.hook_secs = HOOK_SECONDS[*ix];
                 cx.notify();
             }));
@@ -1848,8 +1967,35 @@ mod tests {
         assert_eq!((Quality::K4.reel_size(), Quality::P1440.reel_size()), ((2160, 3840), (1440, 2560)));
         assert_eq!(Quality::K4.encode(), ("medium", "18"));
         assert_eq!(Quality::P1080.encode(), ("veryfast", "20"));
-        let a = Quality::K4.video_args();
-        assert_eq!(&a[2..6], ["-preset", "medium", "-crf", "18"]);
+        use crate::encode::{Encoder, Encoders};
+        let a = Quality::K4.video_args_for(&Encoders::software());
+        assert_eq!(&a[..6], ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]);
+        // The GPU's encoder when there is one, at about the same quality.
+        let a = Quality::P1080.video_args_for(&Encoders { available: vec![Encoder::H264Nvenc, Encoder::Libx264] });
+        assert_eq!(&a[..2], ["-c:v", "h264_nvenc"]);
+        assert!(a.windows(2).any(|w| w == ["-cq", "25"]) && a.ends_with(&["-pix_fmt".to_string(), "yuv420p".to_string()]), "{a:?}");
+        let a = Quality::P1080.video_args_for(&Encoders { available: vec![Encoder::H264Amf, Encoder::Libx264] });
+        assert!(a.windows(2).any(|w| w == ["-qp_p", "21"]), "{a:?}");
+    }
+
+    #[test]
+    fn exports_take_turns() {
+        use std::sync::atomic::Ordering;
+        // Other tests join too (and take the turn): only what holds whatever they do is checked.
+        let (a, b) = (Job::new("a", "Joining"), Job::new("b", "Joining"));
+        let (ra, rb) = (a.reporter(), b.reporter());
+        ra.take_turn().unwrap();
+        assert!(super::exporting());
+        ra.take_turn().unwrap();
+        // The second waits its turn; cancelled, it gives up.
+        b.cancel.store(true, Ordering::SeqCst);
+        assert_eq!(rb.take_turn().unwrap_err().to_string(), super::CANCELLED);
+        assert!(b.snapshot().1.starts_with("Queued"));
+        // The first job and its workers gone, the second gets the turn.
+        drop((a, ra));
+        b.cancel.store(false, Ordering::SeqCst);
+        rb.take_turn().unwrap();
+        assert!(super::exporting());
     }
 
     #[test]

@@ -699,6 +699,8 @@ pub fn dismiss(id: u64) {
 /// Read, Transcript and Story (the AI steps) run in one lane; Audio, Music and Video in another,
 /// so the AI reads and writes the next chapter while this one is voiced and rendered.
 const AI_STEPS: usize = 3;
+/// How often a media step waiting for an export looks again.
+const EXPORT_WAIT: Duration = Duration::from_secs(2);
 
 async fn runner() {
     // The AI lane reads every waiting chapter ahead; the media lane voices and renders them in
@@ -777,6 +779,13 @@ async fn run_steps(id: u64, steps: std::ops::Range<usize>, mut dirty: bool) -> O
         if plan(step, &facts, &item.format, forced).is_err() {
             edit(|q| q.set_step(id, step, StepState::Skipped));
             continue;
+        }
+        // A running export has the PC first: voicing and rendering start once it is done.
+        while step.index() >= AI_STEPS && crate::export::exporting() {
+            if !still_running(id) {
+                return None;
+            }
+            tokio::time::sleep(EXPORT_WAIT).await;
         }
         edit(|q| q.set_step(id, step, StepState::Running));
         let out = run_step(id, &item, step, &facts, dirty, item.force == Some(step.index())).await;

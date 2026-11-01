@@ -18,6 +18,51 @@ use crate::pipeline::{self, ItemState, QueueItem, StepState};
 use crate::run::RunKind;
 use crate::widgets::{card, phase_icon};
 
+/// The chapter number a card shows: the chapter's own, else the first number in its title or
+/// label ("Ch. 12.5 - The Duel" -> "12.5", after "ch" when there is one). `None` without one.
+pub(crate) fn chapter_no(number: Option<f64>, title: Option<&str>) -> Option<String> {
+    if let Some(n) = number {
+        return Some(if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n}") });
+    }
+    let t = title?.to_lowercase();
+    let from = t.find("ch").unwrap_or(0);
+    let digits: String = t[from..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let digits = digits.trim_end_matches('.');
+    (!digits.is_empty()).then(|| digits.to_string())
+}
+
+/// What a card says next to its number badge: the chapter's own title, or "Chapter 12" when it
+/// has none (or its title only repeats the number).
+pub(crate) fn chapter_heading(number: Option<f64>, title: Option<&str>) -> String {
+    let title = title.map(str::trim).filter(|t| !t.is_empty());
+    match title {
+        Some(t) if !t.to_lowercase().starts_with("chapter") && !t.to_lowercase().starts_with("ch.") => t.to_string(),
+        _ => crate::data::chapter_label(number, title),
+    }
+}
+
+/// The square "CH 12" badge that leads a chapter's card, so the number reads at a glance,
+/// tinted by the chapter's state (`tint`: background and text).
+pub(crate) fn chapter_badge(no: Option<String>, (bg, fg): (Rgba, Rgba)) -> Div {
+    let base = div().flex().flex_none().flex_col().items_center().justify_center().size(px(40.)).rounded(px(radius::MD)).bg(bg);
+    match no {
+        Some(n) => base
+            .child(div().text_size(px(9.)).font_weight(FontWeight::SEMIBOLD).text_color(fg).opacity(0.8).child("CH"))
+            .child(div().text_size(px(if n.len() > 3 { size::XS } else { size::MD })).font_weight(FontWeight::BOLD).text_color(fg).line_height(px(18.)).child(n)),
+        None => base.child(ph_icon(ph::BOOK_OPEN, Weight::Duotone, fg, icon_px::MD)),
+    }
+}
+
+/// The badge colours for a chapter in `state`.
+fn badge_tint(state: ItemState) -> (Rgba, Rgba) {
+    match state {
+        ItemState::Running => (Tokens::accent_soft(), Tokens::accent()),
+        ItemState::Done => (Tokens::success_soft(), Tokens::success()),
+        ItemState::Failed => (Tokens::danger_soft(), Tokens::danger()),
+        ItemState::Queued | ItemState::Paused => (Tokens::surface_3(), Tokens::text_2()),
+    }
+}
+
 impl StudioPage {
     /// The library's chapters with these ids.
     pub(crate) fn chapter_items(&self, ids: &[String]) -> Vec<ChapterItem> {
@@ -355,17 +400,18 @@ impl StudioPage {
                     .flex()
                     .items_center()
                     .gap(px(space::SM))
+                    .child(chapter_badge(chapter_no(it.chapter.number, it.chapter.title.as_deref()), badge_tint(it.state)))
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .child(div().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(it.chapter.label()))
+                            .gap(px(2.))
+                            .child(div().truncate().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(chapter_heading(it.chapter.number, it.chapter.title.as_deref())))
                             .child(div().truncate().text_size(px(size::XS)).text_color(Tokens::text_3()).child(it.chapter.manga_title.clone())),
                     )
-                    .child(status_tag(kind).label(label))
-                    .child(controls),
+                    .child(div().flex().flex_none().flex_col().items_end().gap(px(4.)).child(status_tag(kind).label(label)).child(controls)),
             )
             .child(step_trail(it))
             .when(it.until < Step::Video.index() && it.state.active(), |d| {
@@ -634,4 +680,27 @@ fn step_trail(it: &QueueItem) -> Div {
             .tooltip(tip(format!("{}: {word}", s.label())))
             .child(ph_icon(if st == StepState::Failed { ph::X_CIRCLE } else { phase_icon(Phase::of(*s)) }, weight, color, icon_px::SM))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chapter_heading, chapter_no};
+
+    #[test]
+    fn cards_always_find_the_chapter_number() {
+        assert_eq!(chapter_no(Some(12.), None).as_deref(), Some("12"));
+        assert_eq!(chapter_no(Some(12.5), Some("x")).as_deref(), Some("12.5"));
+        assert_eq!(chapter_no(None, Some("Vol. 2 Ch. 7.5 - The Duel")).as_deref(), Some("7.5"));
+        assert_eq!(chapter_no(None, Some("Episode 3.")).as_deref(), Some("3"));
+        assert_eq!(chapter_no(None, Some("Prologue")), None);
+        assert_eq!(chapter_no(None, None), None);
+    }
+
+    #[test]
+    fn the_heading_is_the_title_or_the_chapter() {
+        assert_eq!(chapter_heading(Some(3.), Some("The Duel")), "The Duel");
+        assert_eq!(chapter_heading(Some(3.), Some("Chapter 3")), "Chapter 3");
+        assert_eq!(chapter_heading(Some(3.), None), "Chapter 3");
+        assert_eq!(chapter_heading(None, Some("Prologue")), "Prologue");
+    }
 }

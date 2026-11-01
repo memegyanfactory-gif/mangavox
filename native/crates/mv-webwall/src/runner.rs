@@ -247,12 +247,19 @@ impl Runner {
         }
     }
 
+    /// Shows the page's window so a challenge that waits for a shown page can finish, silently:
+    /// behind every other window, without focus or a taskbar button (the user is never
+    /// interrupted by it).
     fn show(&mut self, pid: u64) {
         if let Some(p) = self.pages.get_mut(&pid) {
             p.visible = true;
-            p.window.set_visible(true);
-            p.window.set_focus();
+            show_behind(&p.window);
         }
+    }
+
+    /// Whether another page's window is shown for a challenge (only one is, at a time).
+    fn other_shown(&self, pid: u64) -> bool {
+        self.pages.iter().any(|(i, p)| *i != pid && p.job.as_ref().is_some_and(|j| j.shown_for_user))
     }
 
     fn hide(&mut self, pid: u64) {
@@ -409,7 +416,13 @@ impl Runner {
         if v.wall {
             job.streak = 0;
             if now > job.hidden_deadline && !job.shown_for_user {
-                if interactive_ok {
+                let busy = self.other_shown(pid);
+                let Some(job) = self.pages.get_mut(&pid).and_then(|p| p.job.as_mut()) else { return };
+                if interactive_ok && busy {
+                    // Another page's window is up: this one waits its turn, hidden.
+                    job.hidden_deadline = now + Duration::from_secs(5);
+                    job.deadline = job.deadline.max(now + interactive_timeout);
+                } else if interactive_ok {
                     job.shown_for_user = true;
                     job.deadline = now + interactive_timeout;
                     self.show(pid);
@@ -522,4 +535,23 @@ fn wrap_async(jid: u64, expr: &str) -> String {
         "(async () => {{ try {{ const v = await ({expr}); window.ipc.postMessage(JSON.stringify({{ job: {jid}, ok: true, v }})); }} \
          catch (e) {{ window.ipc.postMessage(JSON.stringify({{ job: {jid}, ok: false, e: String((e && e.message) || e) }})); }} }})();"
     )
+}
+
+/// Shows `window` at the bottom of the z-order without activating it, with no taskbar button.
+#[cfg(windows)]
+fn show_behind(window: &Window) {
+    use tao::platform::windows::WindowExtWindows;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, ShowWindow, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE};
+    let _ = window.set_skip_taskbar(true);
+    let hwnd = window.hwnd() as windows_sys::Win32::Foundation::HWND;
+    // SAFETY: `hwnd` is this live window's handle, used on the thread that owns it.
+    unsafe {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_behind(window: &Window) {
+    window.set_visible(true);
 }

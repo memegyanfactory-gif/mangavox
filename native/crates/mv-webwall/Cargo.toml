@@ -14,5 +14,8 @@ serde_json = { workspace = true }
 dirs = { workspace = true }
 tokio = { version = "1", features = ["sync", "time"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

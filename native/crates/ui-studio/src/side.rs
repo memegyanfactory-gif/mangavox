@@ -194,8 +194,32 @@ impl StudioPage {
                     .flex()
                     .items_center()
                     .gap(px(space::SM))
-                    .child(icon_ph(if r.kind == RunKind::Read { glyphs::READ } else { glyphs::STORY }, Tokens::text_2(), icon_px::MD))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(what))
+                    .child(crate::queue_view::chapter_badge(
+                        r.chapter.as_deref().and_then(|c| crate::queue_view::chapter_no(None, Some(c))),
+                        if r.running() { (Tokens::accent_soft(), Tokens::accent()) } else { (Tokens::surface_3(), Tokens::text_2()) },
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .min_w_0()
+                                    .child(icon_ph(if r.kind == RunKind::Read { glyphs::READ } else { glyphs::STORY }, Tokens::text_2(), icon_px::SM))
+                                    .child(div().truncate().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(what)),
+                            )
+                            .when_some(r.chapter.clone(), |d, c| {
+                                let (i, n) = r.chapter_pos;
+                                let of = if n > 1 { format!(" · {} of {n}", i.max(1)) } else { String::new() };
+                                d.child(div().truncate().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{c}{of}")))
+                            }),
+                    )
                     .child(status_tag(kind).label(label))
                     .when(r.running(), |d| {
                         d.child(icon_button("act-stop", ph::STOP_CIRCLE, "Stop the run (finished pages are kept)").small().on_click(cx.listener(|_, _: &ClickEvent, _, cx| {

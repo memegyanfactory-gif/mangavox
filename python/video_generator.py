@@ -825,7 +825,7 @@ def make_flare_frames(kind, w, h, work_dir):
             _paint(img, _glow_sprite((sh * 1.4 * grow, sh * 1.2 * grow), (255, 120, 30), 0.7 * env), sw * 0.95, sh * 0.2)
         img.save(os.path.join(tmp, f"f_{i:03d}.png"), compress_level=1)
 
-    with ThreadPoolExecutor(max_workers=max(2, min(16, os.cpu_count() or 4))) as pool:
+    with ThreadPoolExecutor(max_workers=max(2, min(16, cpus()))) as pool:
         list(pool.map(draw, range(count)))
     try:
         os.replace(tmp, folder)
@@ -1336,16 +1336,22 @@ def _env_int(name):
         return None
 
 
+def cpus():
+    """Cores heavy work may use: the app's resource limit share (MANGAVOX_THREADS, Settings ->
+    System), else all of them, so the app stays usable while a video renders."""
+    return _env_int("MANGAVOX_THREADS") or os.cpu_count() or 4
+
+
 def render_jobs():
     """ffmpeg runs at once while rendering clips: about one per three cores, 2 to 6
     (MANGAVOX_RENDER_JOBS overrides)."""
-    return _env_int("MANGAVOX_RENDER_JOBS") or max(2, min(6, (os.cpu_count() or 4) // 3))
+    return _env_int("MANGAVOX_RENDER_JOBS") or max(2, min(6, cpus() // 3))
 
 
 def ffmpeg_threads(jobs):
     """Threads each of `jobs` ffmpeg runs side by side may use (MANGAVOX_FFMPEG_THREADS
     overrides), so together they fill the cores without swamping them and the PC stays usable."""
-    return _env_int("MANGAVOX_FFMPEG_THREADS") or max(2, (os.cpu_count() or 4) // max(1, jobs))
+    return _env_int("MANGAVOX_FFMPEG_THREADS") or max(2, cpus() // max(1, jobs))
 
 
 # Video encoders. NVENC (an NVIDIA GPU) when this ffmpeg has it and it works here, checked once
@@ -1790,7 +1796,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         return {"audio_path": audio_path, "source": source_image, "focus": focus_point, "duo": duo, "images": images}
 
     prepared = [None] * total
-    with ThreadPoolExecutor(max_workers=max(2, min(16, os.cpu_count() or 4))) as pool:
+    with ThreadPoolExecutor(max_workers=max(2, min(16, cpus()))) as pool:
         futures = {pool.submit(prepare, idx, seg): idx for idx, seg in enumerate(render_items)}
         for n, done in enumerate(as_completed(futures)):
             prepared[futures[done]] = done.result()
@@ -2122,7 +2128,7 @@ def segment_jobs():
     captions, encode) moving whole 1440p frames through memory, so more than about four at
     once only fight over memory bandwidth (measured on a 16-core desktop): one per four cores, 2 to 4
     (MANGAVOX_RENDER_JOBS overrides)."""
-    return _env_int("MANGAVOX_RENDER_JOBS") or max(2, min(4, (os.cpu_count() or 4) // 4))
+    return _env_int("MANGAVOX_RENDER_JOBS") or max(2, min(4, cpus() // 4))
 
 
 def _concat_list(paths, list_path):

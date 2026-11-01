@@ -30,9 +30,10 @@ pub struct WallConfig {
     pub user_agent: Option<String>,
     /// How long a challenge may take while hidden before escalating (default 25 s).
     pub hidden_timeout: Duration,
-    /// Show a visible window when the hidden attempt fails so the user can solve it (default true).
+    /// When the hidden attempt fails, try again in a shown window kept silently behind every
+    /// other window (never focused, no taskbar button, one at a time) (default true).
     pub interactive: bool,
-    /// How long the user gets to solve it (default 180 s).
+    /// How long that attempt may take (default 60 s).
     pub interactive_timeout: Duration,
     /// Max time for the script / HTML read after the page is clear (default 30 s).
     pub action_timeout: Duration,
@@ -53,7 +54,7 @@ impl Default for WallConfig {
             user_agent: None,
             hidden_timeout: Duration::from_secs(25),
             interactive: true,
-            interactive_timeout: Duration::from_secs(180),
+            interactive_timeout: Duration::from_secs(60),
             action_timeout: Duration::from_secs(30),
             selector_timeout: Duration::from_secs(15),
             max_pages: 4,

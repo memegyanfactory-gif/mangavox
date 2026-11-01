@@ -52,7 +52,9 @@ pub fn start_cli(bin: &str, args: &[String], workspace: &Path) -> Result<Command
     let mut cmd = {
         let mut c = Command::new("cmd");
         c.raw_arg(format!("/d /s /c \"{} {}\"", bin, args.join(" ")));
-        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS: several agents read pages at once, and
+        // the app (and the video playing in it) must stay smooth meanwhile; their children inherit it.
+        c.creation_flags(0x0800_0000 | 0x0000_4000);
         c
     };
     #[cfg(not(windows))]

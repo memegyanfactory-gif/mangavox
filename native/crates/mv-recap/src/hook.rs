@@ -18,7 +18,7 @@ pub const MAX_CANDIDATES: usize = 120;
 /// Spoken words per second of hook (an anime-recap narrator's pace).
 const WORDS_PER_SECOND: f64 = 2.6;
 /// Lines a hook has, at most and at least.
-const MAX_LINES: usize = 7;
+const MAX_LINES: usize = 10;
 const MIN_LINES: usize = 2;
 const FALLBACK_OUTRO: &str = "Let's see how this story begins.";
 
@@ -138,22 +138,28 @@ fn trim_words(text: &str, words: usize) -> String {
     s
 }
 
-/// The hook without a model: the strongest beats' own words (from the later two thirds of the
-/// story when there is enough there, so it does not start with the setup), trimmed to fit
-/// `seconds`, in story order, and a generic outro.
+/// The hook without a model, shaped like a recap channel's: the strongest beat of the first
+/// third as the premise, then the strongest beats of the rest (when there are enough there),
+/// their own words trimmed to fit `seconds`, in story order, and a generic outro.
 pub fn fallback_hook(candidates: &[HookCandidate], seconds: u32) -> HookScript {
     let outro = FALLBACK_OUTRO.to_string();
     let budget = target_words(seconds).saturating_sub(outro.split_whitespace().count()).max(6);
     let lines_wanted = (budget / 9).clamp(MIN_LINES, MAX_LINES - 2);
     let per_line = (budget / lines_wanted).max(5);
+    let by_score = |v: &mut Vec<&HookCandidate>| v.sort_by(|a, b| beat_score(&b.text).total_cmp(&beat_score(&a.text)).then(a.id.cmp(&b.id)));
     let mut ranked: Vec<&HookCandidate> = candidates.iter().filter(|c| !c.text.trim().is_empty()).collect();
     let skip = ranked.len() / 3;
-    let later: Vec<&HookCandidate> = ranked.iter().skip(skip).copied().collect();
+    let mut later: Vec<&HookCandidate> = ranked.iter().skip(skip).copied().collect();
+    let mut picked = vec![];
     if later.len() >= lines_wanted {
-        ranked = later;
+        let mut early: Vec<&HookCandidate> = ranked[..skip].to_vec();
+        by_score(&mut early);
+        picked.extend(early.into_iter().take(1));
+        ranked = std::mem::take(&mut later);
     }
-    ranked.sort_by(|a, b| beat_score(&b.text).total_cmp(&beat_score(&a.text)).then(a.id.cmp(&b.id)));
-    let mut picked: Vec<&HookCandidate> = ranked.into_iter().take(lines_wanted).collect();
+    by_score(&mut ranked);
+    let rest = lines_wanted - picked.len();
+    picked.extend(ranked.into_iter().take(rest));
     picked.sort_by_key(|c| c.id);
     let mut left = budget;
     let mut lines = vec![];
@@ -168,35 +174,67 @@ pub fn fallback_hook(candidates: &[HookCandidate], seconds: u32) -> HookScript {
     HookScript { lines, outro }
 }
 
+/// Lines a hook of `seconds` asks the model for, at least and at most.
+fn line_range(seconds: u32) -> (usize, usize) {
+    let hi = (seconds as usize / 5 + 2).clamp(4, MAX_LINES);
+    ((hi - 2).max(3), hi)
+}
+
 fn hook_system(seconds: u32) -> String {
     let words = target_words(seconds);
+    let (lo, hi) = line_range(seconds);
     format!(
-        r##"You write the cold-open HOOK of an anime-style recap video of a manga: the first {seconds} seconds, before chapter 1 starts, that make a viewer stay for the whole video.
+        r##"You write the cold-open HOOK of a YouTube manga recap: the first {seconds} seconds, before chapter 1 starts, that decide whether a viewer stays for the whole video. Write it the way the big recap channels do: a trailer narrator selling the whole story in a few breaths.
 
-You receive CANDIDATE narration beats from the whole recap, each with an id. Each line of the hook is spoken over the picture of the beat whose id it names.
+You receive the STORY so far (context only) and CANDIDATE narration beats, each with an id. Each line of the hook is spoken over the picture of the beat whose id it names, so pick the beat that shows what the line says.
 
-RULES
-1. Write 4-7 short, punchy lines in the present tense, in story order or in the order that builds the most tension. Tease the biggest moments: the stakes, power, betrayals, reveals, fights. Rewrite them as a trailer narrator would; do not copy the beats word for word.
-2. Never spoil the ending or the answer to the story's biggest question: tease, do not resolve.
-3. About {words} words in total, the outro included. Plain spoken text only: no markdown, emojis, brackets, stage directions or chapter numbers.
-4. End with "outro": ONE short line that invites the viewer in, matched to the manga's feel, e.g. "Let's see how this epic journey begins." Never say "in this video", never ask to like or subscribe.
-5. Only use ids from the candidates.
-6. Tell the story's stakes, never the artwork: no colours, light, darkness, clothes or "the screen". Name the characters; never call them by their looks.
+THE SHAPE THAT WORKS
+1. PREMISE (line 1): who the hero is and the twist that starts everything, in one breath, e.g. "Ruko is the weakest swordsman in the academy, until a dying god chooses him as heir." This line may come from the start of the story.
+2. ESCALATION (the middle lines): the biggest moments from later in the story, each one raising the stakes: the power gained, the enemies, betrayals, reveals, fights, how far the hero rises. One moment per line, concrete, with names.
+3. CLIFFHANGER (the last line): the biggest threat or question, left open, e.g. "But the man who killed his family is still out there, and he is watching."
+4. OUTRO: one short line that pulls the viewer in, matched to the manga's feel, e.g. "Let's dive in." or "This is how it all began."
+
+STYLE
+- {lo}-{hi} lines, about {words} words in total, the outro included. Short spoken sentences: most lines 6-14 words, and one 2-4 word punch line ("He was wrong.") hits hard. Vary the rhythm.
+- Present tense, plain spoken text: no markdown, emojis, brackets, stage directions or chapter numbers. Never say "in this video", never ask to like or subscribe.
+- Rewrite, never copy the beats word for word. Concrete beats vague: "He cuts down the Sword Saint in one strike" beats "an epic battle begins".
+- Tease, never resolve: no ending, no answer to the story's biggest question, no "and he wins".
+- Tell the story's stakes, never the artwork: no colours, light, darkness, clothes, "the panel" or "the screen". Name the characters; never call them by their looks.
+- Only use ids from the candidates, each at most once.
 
 OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
 {{"lines": [{{"id": 42, "text": "One boy stands between the city and the end of the world."}}],
-  "outro": "Let's see how it all begins."}}"##
+  "outro": "Let's dive in."}}"##
     )
 }
 
-/// Reads the model's answer: lines whose id is a candidate (at most 7), and the outro. Errors
+/// What the hook writer is told about the story: the story so far at the end of chapter
+/// `last_label` (else the latest one known) and the most seen characters' names.
+pub fn story_context(brain: &crate::Brain, last_label: &str) -> String {
+    let recap = brain.recaps.iter().find(|r| r.label == last_label).or_else(|| brain.recaps.iter().max_by(|a, b| crate::brain::chapter_number(&a.label).unwrap_or(0.).total_cmp(&crate::brain::chapter_number(&b.label).unwrap_or(0.))));
+    let mut cast: Vec<&crate::types::Character> = brain.characters.iter().filter(|c| !c.name.trim().is_empty()).collect();
+    cast.sort_by(|a, b| b.appearances.cmp(&a.appearances));
+    let names: Vec<&str> = cast.iter().take(8).map(|c| c.name.trim()).collect();
+    let mut s = String::new();
+    if let Some(r) = recap.filter(|r| !r.summary.trim().is_empty()) {
+        s += &format!("STORY SO FAR: {}
+", truncate(r.summary.trim(), 2500));
+    }
+    if !names.is_empty() {
+        s += &format!("MAIN CHARACTERS: {}
+", names.join(", "));
+    }
+    s
+}
+
+/// Reads the model's answer: lines whose id is a candidate (each once, at most 10), and the outro. Errors
 /// when fewer than two usable lines came back.
 pub(crate) fn parse_hook(v: &Value, candidates: &[HookCandidate]) -> Result<HookScript> {
     let mut lines = vec![];
     for l in v.get("lines").and_then(Value::as_array).into_iter().flatten() {
         let text = clean_line(&str_of(l, "text"));
         let Some(id) = num_of(l, "id").filter(|n| *n >= 0.).map(|n| n as usize) else { continue };
-        if text.is_empty() || !candidates.iter().any(|c| c.id == id) {
+        if text.is_empty() || !candidates.iter().any(|c| c.id == id) || lines.iter().any(|(i, _)| *i == id) {
             continue;
         }
         lines.push((id, text));
@@ -229,15 +267,16 @@ fn clean_line(s: &str) -> String {
 
 /// Asks `model` for a hook of about `seconds` teasing `candidates` (see [`pick_candidates`]).
 /// Errors when the call fails or no usable script came back; [`fallback_hook`] is the way out.
-pub async fn write_hook(reg: Arc<Registry>, model: ModelChoice, manga_title: &str, candidates: &[HookCandidate], seconds: u32, cancel: CancellationToken) -> Result<HookScript> {
-    write_hook_with(&reg, &model, manga_title, candidates, seconds, &cancel).await
+/// `story` is [`story_context`] (may be empty).
+pub async fn write_hook(reg: Arc<Registry>, model: ModelChoice, manga_title: &str, story: &str, candidates: &[HookCandidate], seconds: u32, cancel: CancellationToken) -> Result<HookScript> {
+    write_hook_with(&reg, &model, manga_title, story, candidates, seconds, &cancel).await
 }
 
-pub(crate) async fn write_hook_with(llm: &dyn Llm, model: &ModelChoice, manga_title: &str, candidates: &[HookCandidate], seconds: u32, cancel: &CancellationToken) -> Result<HookScript> {
+pub(crate) async fn write_hook_with(llm: &dyn Llm, model: &ModelChoice, manga_title: &str, story: &str, candidates: &[HookCandidate], seconds: u32, cancel: &CancellationToken) -> Result<HookScript> {
     if candidates.len() < MIN_LINES {
         bail!("not enough narration to make a hook from");
     }
-    let mut prompt = format!("MANGA: {manga_title}\nHOOK LENGTH: {seconds} seconds (about {} words in total)\n\nCANDIDATES (id, chapter, narration):\n", target_words(seconds));
+    let mut prompt = format!("MANGA: {manga_title}\nHOOK LENGTH: {seconds} seconds (about {} words in total)\n{story}\nCANDIDATES (id, chapter, narration):\n", target_words(seconds));
     for c in candidates {
         prompt += &format!("[{}] ({}) {}\n", c.id, c.chapter, truncate(&c.text, 240));
     }
@@ -329,6 +368,45 @@ mod tests {
         // No outro: a generic one.
         let h = parse_hook(&json!({"lines": [{"id": 3, "text": "x"}, {"id": 9, "text": "y"}]}), &cands).unwrap();
         assert_eq!(h.outro, FALLBACK_OUTRO);
+    }
+
+    #[test]
+    fn a_repeated_id_is_used_once() {
+        let cands = vec![HookCandidate { id: 3, chapter: "C1".into(), text: "a".into() }, HookCandidate { id: 9, chapter: "C2".into(), text: "b".into() }];
+        let v = json!({"lines": [{"id": 3, "text": "One."}, {"id": 3, "text": "Again."}, {"id": 9, "text": "Two."}]});
+        assert_eq!(parse_hook(&v, &cands).unwrap().lines, vec![(3, "One.".to_string()), (9, "Two.".to_string())]);
+    }
+
+    #[test]
+    fn the_fallback_opens_on_the_premise() {
+        let chapters = vec![beats("Chapter 1", 30, &[2]), beats("Chapter 2", 30, &[5, 20]), beats("Chapter 3", 30, &[8])];
+        let cands = pick_candidates(&chapters, 120);
+        let h = fallback_hook(&cands, 30);
+        assert_eq!(h.lines[0].0, 2, "the first line is the strongest early beat");
+        assert!(h.lines.iter().any(|(id, _)| *id == 68), "{:?}", h.lines);
+    }
+
+    #[test]
+    fn longer_hooks_ask_for_more_lines() {
+        assert_eq!(line_range(15), (3, 5));
+        assert_eq!(line_range(30), (6, 8));
+        assert_eq!(line_range(60), (8, MAX_LINES));
+    }
+
+    #[test]
+    fn the_story_context_has_the_latest_recap_and_the_main_cast() {
+        let mut b = crate::Brain::default();
+        b.set_recap("Chapter 1", "Ruko joins the academy.");
+        b.set_recap("Chapter 3", "Ruko defeats Kaito.");
+        b.characters = vec![
+            crate::types::Character { name: "Kaito".into(), appearances: 4, ..Default::default() },
+            crate::types::Character { name: "Ruko".into(), appearances: 9, ..Default::default() },
+        ];
+        let s = story_context(&b, "Chapter 9");
+        assert!(s.contains("STORY SO FAR: Ruko defeats Kaito."), "{s}");
+        assert!(s.contains("MAIN CHARACTERS: Ruko, Kaito"), "{s}");
+        assert!(story_context(&b, "Chapter 1").contains("Ruko joins the academy."));
+        assert_eq!(story_context(&crate::Brain::default(), "Chapter 1"), "");
     }
 
     #[test]

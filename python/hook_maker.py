@@ -3,13 +3,16 @@
 
   python hook_maker.py <args.json>
 
-args: {lines: [{text, image, focus?}], outro: {text, image}, voice, engine, speed, resolution,
-       subtitles, score: {wav, start, seconds} | null, out, work_dir}
+args: {lines: [{text, image, focus?, more?: [{image, focus?}]}], outro: {text, image}, voice,
+       engine, speed, resolution, subtitles, score: {wav, start, seconds} | null, out, work_dir}
 
-Each line is voiced (tts_bridge.run_tts, one "page" per line, the outro last), shown over its
-image (cropped to `focus` when given), and rendered like a chapter video (video_generator,
-dynamic look, the chapter's caption style). With `score`, a slice of that chapter's score.wav
-from `start` plays under it, fading out over the last 1.5 s. The video is copied to `out`.
+Each line is voiced (tts_bridge.run_tts, one "page" per line, the outro last) and edited like a
+recap channel's cold open (see `edit_line`): a long line cuts between its image and the `more`
+panels of the same moment, lines whip or flash into each other, gripping lines punch in with a
+shake, and the outro fades through black onto the cover. It renders like a chapter video
+(video_generator, dynamic look, the chapter's caption style). With `score`, a slice of that
+chapter's score.wav from `start` plays under it, fading out over the last 1.5 s. The video is
+copied to `out`.
 
 Prints one JSON line: {"ok": true, "path": out, "seconds": ...} or {"ok": false, "message": ...}.
 """
@@ -21,6 +24,64 @@ import sys
 import traceback
 
 FADE_SEC = 1.5
+# Seconds of narration per picture in a line (a long line cuts to its next panels), and the
+# shortest a picture is shown.
+CUT_EVERY = 1.8
+MIN_CUT = 0.9
+# Transitions between lines (video_generator's names and seconds): a flash into a gripping
+# line, a whip into the others, and a fade through black onto the closing cover.
+FLASH = ("fadewhite", 0.2)
+WHIPS = (("whipleft", 0.22), ("whipright", 0.22))
+TO_OUTRO = ("fadeblack", 0.6)
+PUNCH = 0.14
+
+
+def split_words(text, n):
+    """`text` in `n` runs of whole words with about the same number of letters each."""
+    words = text.split()
+    n = max(1, min(n, len(words)))
+    total = sum(len(w) + 1 for w in words)
+    runs, cur, size = [], [], 0
+    for i, w in enumerate(words):
+        cur.append(w)
+        size += len(w) + 1
+        # Runs still to start after this one; each needs a word.
+        need = n - 1 - len(runs)
+        if need and (size >= total * (len(runs) + 1) / n or len(words) - i - 1 == need):
+            runs.append(" ".join(cur))
+            cur = []
+    if cur:
+        runs.append(" ".join(cur))
+    return runs
+
+
+def edit_line(index, shot, secs, punch):
+    """The clips of line `index` (voiced in `secs`): its picture and, when the line is long,
+    cuts to its `more` panels, its words and time shared out between them. The first clip
+    punches in when `punch`, else whips in (flashes when gripping); the outro fades in through
+    black. Returns (the clips, each with its `offset` and `seconds` into the line's voice, and
+    whether it punched)."""
+    pictures = [{"image": shot["image"], "focus": shot.get("focus")}] + [m for m in shot.get("more") or [] if m.get("image") and os.path.isfile(m["image"])]
+    n = 1 if shot.get("layout") else max(1, min(len(pictures), round(secs / CUT_EVERY), int(secs / MIN_CUT)))
+    runs = split_words(shot["text"], n)
+    letters = sum(len(r) for r in runs) or 1
+    clips, at = [], 0.0
+    for k, (run, pic) in enumerate(zip(runs, pictures)):
+        dur = secs - at if k == len(runs) - 1 else secs * len(run) / letters
+        clip = {"text": run, "image": pic["image"], "focus": pic.get("focus"), "offset": at, "seconds": dur, "layout": "single"}
+        if k:
+            clip["cut"] = True
+        elif shot.get("layout"):
+            clip["transition"] = TO_OUTRO
+        else:
+            if punch:
+                clip["motion"] = "shake"
+                clip["amount"] = PUNCH
+            if index:
+                clip["transition"] = FLASH if punch else WHIPS[index % 2]
+        clips.append(clip)
+        at += dur
+    return clips, punch
 
 
 def _score_slice(score, seconds, work_dir):
@@ -46,12 +107,12 @@ def _score_slice(score, seconds, work_dir):
 
 def make_hook(args):
     from tts_bridge import run_tts
-    from video_generator import generate_video, get_audio_duration_sec
+    from video_generator import generate_video, get_audio_duration_sec, is_impact
 
     work_dir = args["work_dir"]
     out = args["out"]
     os.makedirs(work_dir, exist_ok=True)
-    shots = [{"text": (l.get("text") or "").strip(), "image": l.get("image"), "focus": l.get("focus")} for l in args.get("lines") or []]
+    shots = [{"text": (l.get("text") or "").strip(), "image": l.get("image"), "focus": l.get("focus"), "more": l.get("more") or []} for l in args.get("lines") or []]
     outro = args.get("outro") or {}
     if (outro.get("text") or "").strip():
         # The closing line shows the cover whole, centred (never half of a side-by-side pair).
@@ -66,6 +127,8 @@ def make_hook(args):
 
     beats = []
     total = 0.0
+    punched = False
+    lines = sum(1 for s in shots if not s.get("layout"))
     for i, s in enumerate(shots):
         a = voiced.get(i) or {}
         path = a.get("path")
@@ -75,20 +138,29 @@ def make_hook(args):
         secs = get_audio_duration_sec(path)
         if secs < 0.1:
             continue
-        beat = {
-            "page": i,
-            "panel_image": s["image"],
-            "text": s["text"],
-            "audio_file": os.path.basename(path),
-            "audio_offset_ms": 0,
-            "duration_ms": int(round(secs * 1000)),
-            "start_ms": int(round(total * 1000)),
-        }
-        if s.get("layout"):
-            beat["layout"] = s["layout"]
-        if s["focus"] and len(s["focus"]) == 4:
-            beat["focus_point"] = s["focus"]
-        beats.append(beat)
+        # The opening line, the cliffhanger and the gripping lines between punch in (never two
+        # in a row, so each one lands).
+        gripping = i == 0 or i == lines - 1 or is_impact(s["text"])
+        clips, punched = edit_line(i, s, secs, gripping and not s.get("layout") and (i == lines - 1 or not punched))
+        for c in clips:
+            beat = {
+                "page": i,
+                "panel_image": c["image"],
+                "text": c["text"],
+                "audio_file": os.path.basename(path),
+                "audio_offset_ms": int(round(c["offset"] * 1000)),
+                "duration_ms": int(round(c["seconds"] * 1000)),
+                "start_ms": int(round((total + c["offset"]) * 1000)),
+                "layout": c["layout"],
+            }
+            for k in ("cut", "motion", "amount"):
+                if k in c:
+                    beat[k] = c[k]
+            if "transition" in c:
+                beat["transition"] = list(c["transition"])
+            if c.get("focus") and len(c["focus"]) == 4:
+                beat["focus_point"] = c["focus"]
+            beats.append(beat)
         total += secs
     if not beats:
         raise RuntimeError("No line of the hook could be voiced")
@@ -111,7 +183,7 @@ def make_hook(args):
         raise RuntimeError("The hook video was not made")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     shutil.copyfile(video, out)
-    return {"ok": True, "path": out, "seconds": round(total, 3), "lines": len(beats)}
+    return {"ok": True, "path": out, "seconds": round(total, 3), "lines": len({b["page"] for b in beats}), "clips": len(beats)}
 
 
 def main() -> int:

@@ -325,6 +325,8 @@ pub struct StudioPage {
     /// The dashboard Video section's export choices, and its join / export in flight.
     pub(crate) export_prefs: crate::export::ExportPrefs,
     pub(crate) export_job: Option<crate::export::Job>,
+    /// Exports asked for while one runs, started in order as each ends.
+    pub(crate) export_queue: Vec<crate::export::QueuedExport>,
     pub(crate) queue: crate::pipeline::Queue,
     seen_queue: u64,
     /// Every issue, worked out once per frame; and the ones the user dismissed.
@@ -453,6 +455,7 @@ impl StudioPage {
             restyle: None,
             export_prefs: Default::default(),
             export_job: None,
+            export_queue: vec![],
             queue: crate::pipeline::snapshot(),
             seen_queue: crate::pipeline::version(),
             issues: vec![],
