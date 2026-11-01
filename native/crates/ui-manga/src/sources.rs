@@ -13,8 +13,8 @@ use mv_sources::SourceInfo;
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    btn, checkbox, confirm_dialog, confirm_inline, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, muted, ph, section_header, section_label, size, skeleton, skeleton_line,
-    status_tag, switch, tag, ButtonKind, MenuItem, Ph, StatusKind, Tokens, Tone,
+    btn, checkbox, confirm_dialog, confirm_inline, empty_view, error_view, filter_chip, glyphs, icon_button, icon_ph, menu_button, muted, ph, settings_block, settings_group, settings_row, size, skeleton, skeleton_line,
+    status_tag, switch, tag, ButtonKind, MenuItem, StatusKind, Tokens, Tone,
 };
 
 use crate::backend;
@@ -266,8 +266,10 @@ impl SourcesPanel {
             .flex()
             .items_center()
             .gap(px(12.))
+            // Settings row padding; the group card draws the hairlines between rows.
+            .px(px(mv_ui::settings::SETTINGS_ROW_X))
             .py(px(12.))
-            .when(i > 0, |d| d.border_t_1().border_color(Tokens::border()))
+            .min_h(px(mv_ui::settings::SETTINGS_ROW_MIN_H))
             .child(source_avatar(&r.info, 32., false))
             .child(
                 div()
@@ -281,8 +283,9 @@ impl SourcesPanel {
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(r.info.name.clone()))
-                            .children(health),
+                            .min_w_0()
+                            .child(div().min_w_0().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(r.info.name.clone()))
+                            .children(health.map(|h| div().flex_none().child(h))),
                     )
                     .child(
                         div()
@@ -295,23 +298,30 @@ impl SourcesPanel {
                             .child(tag(if r.plugin { "Extension" } else { "Built in" }, if r.plugin { Tone::Accent } else { Tone::Neutral }))
                             .child(muted(format!("v{}", r.info.version))),
                     )
-                    .when_some(fail, |d, e| d.child(div().text_size(px(size::SM)).text_color(Tokens::danger()).child(e))),
+                    .when_some(fail, |d, e| d.child(div().text_size(px(size::SM)).line_height(px(18.)).text_color(Tokens::danger()).child(e))),
             )
             .child(
-                btn(("test", i), "Test", ButtonKind::Ghost)
-                    .small()
-                    .icon(ph::PULSE)
-                    .loading(matches!(r.health, Health::Testing))
-                    .tooltip("Load one page of titles to check that the source answers")
-                    .on_click(cx.listener(move |this, _, _, cx| this.test(tid.clone(), cx))),
-            )
-            .child(
-                btn(("rm", i), if removing { "Removing" } else { "Remove" }, ButtonKind::DangerGhost)
-                    .small()
-                    .icon(glyphs::DELETE)
-                    .loading(removing)
-                    .tooltip(if plugin { "Uninstall: delete it from this computer and Browse" } else { "Take it out of Browse" })
-                    .on_click(cx.listener(move |this, _, w, cx| this.confirm_remove(rid.clone(), name.clone(), plugin, w, cx))),
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        btn(("test", i), "Test", ButtonKind::Ghost)
+                            .small()
+                            .icon(ph::PULSE)
+                            .loading(matches!(r.health, Health::Testing))
+                            .tooltip("Load one page of titles to check that the source answers")
+                            .on_click(cx.listener(move |this, _, _, cx| this.test(tid.clone(), cx))),
+                    )
+                    .child(
+                        btn(("rm", i), if removing { "Removing" } else { "Remove" }, ButtonKind::DangerGhost)
+                            .small()
+                            .icon(glyphs::DELETE)
+                            .loading(removing)
+                            .tooltip(if plugin { "Uninstall: delete it from this computer and Browse" } else { "Take it out of Browse" })
+                            .on_click(cx.listener(move |this, _, w, cx| this.confirm_remove(rid.clone(), name.clone(), plugin, w, cx))),
+                    ),
             )
     }
 
@@ -332,11 +342,17 @@ impl SourcesPanel {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(div().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(info.name.clone()))
+                    .child(div().min_w_0().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(info.name.clone()))
                     .when(info.nsfw, |d| d.child(tag("18+", Tone::Danger))),
             )
-            .child(btn(("avail-add", i), "Add", ButtonKind::Secondary).small().icon(ph::PLUS).on_click(cx.listener(move |this, _, _, cx| this.add_builtin(add.clone(), cx))))
+            .child(div().flex_none().child(btn(("avail-add", i), "Add", ButtonKind::Secondary).small().icon(ph::PLUS).on_click(cx.listener(move |this, _, _, cx| this.add_builtin(add.clone(), cx)))))
     }
+}
+
+/// Wraps a child view (the repository browser, the plugin link box) so it takes the full width
+/// of a stacked settings row instead of shrinking to its content.
+fn full_width(el: impl IntoElement) -> Div {
+    div().w_full().min_w_0().child(el)
 }
 
 fn row_skeleton() -> Div {
@@ -349,35 +365,25 @@ fn row_skeleton() -> Div {
         .child(div().flex().flex_col().gap(px(8.)).flex_1().child(skeleton_line(px(160.))).child(skeleton_line(px(240.)).h(px(10.))))
 }
 
-fn section(title: &'static str, icon: Ph, hint: Option<&'static str>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .child(section_header(title, Some(icon)).mt(px(0.)).mb(px(0.)))
-        .when_some(hint, |d, h| d.child(muted(h)))
-}
-
 impl Render for SourcesPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if backend::sources_version() != self.seen_sources {
             self.reload(false, cx);
         }
-        let installed: AnyElement = match &self.lists {
-            None => div().flex().flex_col().children((0..3).map(|_| row_skeleton())).into_any_element(),
-            Some(Err(e)) => error_view(e.clone())
-                .title("Could not list sources")
-                .compact()
-                .retry(cx.listener(|this, _, _, cx| {
-                    this.lists = None;
-                    this.reload(true, cx);
-                    cx.notify();
-                }))
-                .into_any_element(),
+        // One card row per installed source (the group draws the hairlines); loading, error and
+        // empty states are one padded block.
+        let installed: Vec<AnyElement> = match &self.lists {
+            None => vec![settings_block(div().flex().flex_col().children((0..3).map(|_| row_skeleton()))).into_any_element()],
+            Some(Err(e)) => vec![settings_block(error_view(e.clone()).title("Could not list sources").compact().retry(cx.listener(|this, _, _, cx| {
+                this.lists = None;
+                this.reload(true, cx);
+                cx.notify();
+            })))
+            .into_any_element()],
             Some(Ok(l)) if l.installed.is_empty() => {
-                empty_view(glyphs::SOURCES, "Nothing installed", "Install an extension from a repository or a plugin link below. It shows up in Browse straight away.").compact().into_any_element()
+                vec![settings_block(empty_view(glyphs::SOURCES, "Nothing installed", "Install an extension from a repository or a plugin link below. It shows up in Browse straight away.").compact()).into_any_element()]
             }
-            Some(Ok(l)) => div().flex().flex_col().children(l.installed.iter().enumerate().map(|(i, r)| self.source_row(i, r, cx))).into_any_element(),
+            Some(Ok(l)) => l.installed.iter().enumerate().map(|(i, r)| self.source_row(i, r, cx).into_any_element()).collect(),
         };
         let count = match &self.lists {
             Some(Ok(l)) => Some(l.installed.len()),
@@ -389,88 +395,77 @@ impl Render for SourcesPanel {
         };
         let (adult, general): (Vec<SourceInfo>, Vec<SourceInfo>) = available.into_iter().partition(|s| s.nsfw);
         let adult_count = adult.len();
-        div()
-            .id("sources-panel")
-            .size_full()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(24.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(section_header("Installed", Some(glyphs::SOURCES)).when_some(count, |h, n| h.count(n)).mt(px(0.)).mb(px(4.)))
-                    .child(muted("Everything here is listed in Browse. Remove takes it out; an extension's files are deleted."))
-                    .child(installed),
-            )
-            .child(
-                section("Add a source", ph::PLUS, None)
-                    .child(section_label("From an extension repository").pt(px(4.)))
-                    .child(muted("Add a Mihon or Tachiyomi repository, then press Install on a site."))
-                    .child(self.repos.clone())
-                    .child(section_label("From a plugin link").pt(px(8.)))
-                    .child(self.plugin_box.clone())
-                    // Built-in sites stay folded away until asked for; adult ones need an explicit 18+ tick.
-                    .when(!general.is_empty() || adult_count > 0, |d| {
-                        d.child(section_label("Built-in sites").pt(px(8.))).child(if !self.show_builtins {
-                            btn("show-builtins", format!("Show built-in sites ({})", general.len()), ButtonKind::Ghost)
-                                .small()
-                                .icon(ph::CARET_DOWN)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_builtins = true;
-                                    cx.notify();
-                                }))
-                                .into_any_element()
-                        } else {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .children(general.iter().enumerate().map(|(i, s)| self.available_row(i, s, cx)))
-                                .when(adult_count > 0, |d| {
-                                    d.child(
-                                        div().pt(px(10.)).child(checkbox("sources-adult-ok", self.adult_ok).child(format!("I am 18 or older. Show the {adult_count} adult sites")).on_click(cx.listener(
-                                            |this, _, _, cx| {
-                                                this.adult_ok = !this.adult_ok;
-                                                cx.notify();
-                                            },
-                                        ))),
-                                    )
-                                    .when(self.adult_ok, |d| d.children(adult.iter().enumerate().map(|(i, s)| self.available_row(100 + i, s, cx))))
-                                })
-                                .into_any_element()
-                        })
-                    })
-                    .child(trust_note()),
-            )
-            .child(
-                section("Connection", ph::SHIELD_CHECK, None).child(
+        let has_builtins = !general.is_empty() || adult_count > 0;
+        // Built-in sites stay folded away until asked for; adult ones need an explicit 18+ tick.
+        let builtins = has_builtins.then(|| {
+            if !self.show_builtins {
+                settings_row(
+                    "Built-in sites",
+                    "Sites MangaVox can read without an extension.",
+                    btn("show-builtins", format!("Show built-in sites ({})", general.len()), ButtonKind::Ghost).small().icon(ph::CARET_DOWN).on_click(cx.listener(|this, _, _, cx| {
+                        this.show_builtins = true;
+                        cx.notify();
+                    })),
+                )
+            } else {
+                settings_row(
+                    "Built-in sites",
+                    "Sites MangaVox can read without an extension.",
                     div()
                         .flex()
-                        .items_start()
-                        .gap(px(12.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.))
-                                .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child("Smart bypass"))
-                                .child(muted(
-                                    "When a site shows an anti-bot check (Cloudflare and similar), MangaVox passes it in a hidden built-in browser and loads the page again. Turn off to see the block as an error instead.",
-                                )),
-                        )
-                        .child(
-                            switch("smart-bypass", self.smart_bypass)
-                                .tooltip(if self.smart_bypass { "On: anti-bot checks are passed automatically" } else { "Off" })
-                                .on_click(cx.listener(|this, on: &bool, _, cx| this.set_smart_bypass(*on, cx))),
-                        ),
-                ),
+                        .flex_col()
+                        .w_full()
+                        .min_w_0()
+                        .children(general.iter().enumerate().map(|(i, s)| self.available_row(i, s, cx)))
+                        .when(adult_count > 0, |d| {
+                            d.child(div().pt(px(10.)).child(checkbox("sources-adult-ok", self.adult_ok).child(format!("I am 18 or older. Show the {adult_count} adult sites")).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.adult_ok = !this.adult_ok;
+                                    cx.notify();
+                                },
+                            ))))
+                            .when(self.adult_ok, |d| d.children(adult.iter().enumerate().map(|(i, s)| self.available_row(100 + i, s, cx))))
+                        }),
+                )
+                .stacked()
+            }
+        });
+        div()
+            .id("sources-panel")
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(28.))
+            .child(
+                settings_group(
+                    match count {
+                        Some(n) => format!("Installed ({n})"),
+                        None => "Installed".to_string(),
+                    },
+                    Some("Everything here is listed in Browse. Remove takes it out; an extension's files are deleted.".into()),
+                )
+                .children(installed),
             )
             .child(
-                section("Chapter language", glyphs::LANGUAGE, Some("Manga pages list chapters in this language. Titles without any fall back to every language.")).child(
-                    div().flex().flex_wrap().gap(px(6.)).pt(px(4.)).children(LANGUAGES.map(|(code, name)| {
+                settings_group("Add a source", None)
+                    .child(settings_row("From an extension repository", "Add a Mihon or Tachiyomi repository, then press Install on a site.", full_width(self.repos.clone())).icon(ph::GIT_BRANCH).stacked())
+                    .child(settings_row("From a plugin link", "A GitHub repository or a manifest.json link.", full_width(self.plugin_box.clone())).icon(ph::LINK_SIMPLE).stacked())
+                    .children(builtins)
+                    .child(settings_block(trust_note())),
+            )
+            .child(
+                settings_group("Connection", None).child(settings_row(
+                    "Smart bypass",
+                    "When a site shows an anti-bot check (Cloudflare and similar), MangaVox passes it in a hidden built-in browser and loads the page again. Turn off to see the block as an error instead.",
+                    switch("smart-bypass", self.smart_bypass)
+                        .tooltip(if self.smart_bypass { "On: anti-bot checks are passed automatically" } else { "Off" })
+                        .on_click(cx.listener(|this, on: &bool, _, cx| this.set_smart_bypass(*on, cx))),
+                )),
+            )
+            .child(
+                settings_group("Chapter language", Some("Manga pages list chapters in this language. Titles without any fall back to every language.".into())).child(settings_block(
+                    div().flex().flex_wrap().gap(px(6.)).children(LANGUAGES.map(|(code, name)| {
                         let active = crate::logic::lang_matches(&self.lang, code) && (code == "all") == (self.lang == "all");
                         filter_chip(SharedString::from(format!("lang-{code}")), name, active).on_click(cx.listener(move |this, _, _, cx| {
                             this.lang = code.to_string();
@@ -480,7 +475,7 @@ impl Render for SourcesPanel {
                             cx.notify();
                         }))
                     })),
-                ),
+                )),
             )
     }
 }

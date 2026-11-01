@@ -101,5 +101,23 @@ jobs:
         shell: pwsh
         run: |
           $v = '${{ steps.ver.outputs.version }}'
-          gh release create "v$v" --title "MangaVox v$v" --generate-notes `
+          # The notes the app's "What's new" shows: one section per change since the last
+          # release, from the commit messages (merges and version bumps left out).
+          $prev = git describe --tags --abbrev=0 "v$v^" 2>$null
+          $range = if ($prev) { "$prev..v$v" } else { "v$v~20..v$v" }
+          $out = @("## What's new in MangaVox v$v", "")
+          foreach ($h in (git rev-list --no-merges $range)) {
+            $subject = git log -1 --format=%s $h
+            if ($subject -match '^chore\(release\)') { continue }
+            $out += "### " + ($subject -replace '^\w+(\([^)]*\))?!?:\s*', '')
+            foreach ($l in (git log -1 --format=%b $h)) {
+              if ($l -match '^Co-Authored-By' -or $l.Trim() -eq '') { continue }
+              $out += $l.TrimEnd()
+            }
+            $out += ""
+          }
+          if ($out.Count -le 2) { $out += "- Fixes and improvements." }
+          if ($prev) { $out += "", "**Full changelog**: https://github.com/${{ github.repository }}/compare/$prev...v$v" }
+          Set-Content -Path release-notes.md -Value ($out -join "`n") -Encoding utf8
+          gh release create "v$v" --title "MangaVox v$v" --notes-file release-notes.md `
             "dist/MangaVox-$v-win64.zip" "dist/MangaVox-Setup-$v.exe" "dist/SHA256SUMS.txt"

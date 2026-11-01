@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use gpui_kit::component::Theme;
+use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{linear_color_stop, linear_gradient, px, rgb, rgba, App, Background, Hsla, Rgba, Styled};
 
 pub struct Tokens;
@@ -96,14 +96,15 @@ impl Tokens {
         linear_gradient(angle, linear_color_stop(base.alpha(0.), 0.), linear_color_stop(base, 1.))
     }
 
-    /// A categorical colour (icon tiles, storage segments, chart series). Same in every preset.
+    /// A categorical colour (icon tiles, storage segments, chart series). The same hue in every
+    /// preset: the 400 tier on dark presets, a deeper tier on light ones so it still reads.
     pub fn hue(h: Hue) -> Rgba {
-        rgb(h.hex())
+        palette().hue(h)
     }
 
     /// 14% tint of a hue, for the tile behind a hue-coloured icon.
     pub fn hue_soft(h: Hue) -> Rgba {
-        a8(rgb(h.hex()), SOFT)
+        a8(palette().hue(h), SOFT)
     }
 }
 
@@ -139,9 +140,65 @@ impl Hue {
             Hue::Slate => 0x94a3b8,
         }
     }
+
+    /// The same hues for light presets: Tailwind 700/800, so each keeps 3:1 on light surfaces
+    /// and a light page colour reads on it as a filled tile's glyph.
+    fn hex_light(self) -> u32 {
+        match self {
+            Hue::Blue => 0x1d4ed8,
+            Hue::Violet => 0x6d28d9,
+            Hue::Cyan => 0x155e75,
+            Hue::Green => 0x166534,
+            Hue::Amber => 0x92400e,
+            Hue::Orange => 0x9a3412,
+            Hue::Rose => 0xbe123c,
+            Hue::Slate => 0x475569,
+        }
+    }
 }
 
-/// One Settings → Appearance preset: id, copy and the three swatch colours (base, accent, secondary).
+/// Where a preset is listed in Settings → Appearance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PresetGroup {
+    /// Quiet, neutral looks: light, paper, plain dark.
+    Clean,
+    /// Expressive or special-purpose looks: high contrast, OLED, community palettes, brand colours.
+    Advanced,
+}
+
+impl PresetGroup {
+    pub const ALL: [PresetGroup; 2] = [PresetGroup::Clean, PresetGroup::Advanced];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PresetGroup::Clean => "Clean",
+            PresetGroup::Advanced => "Advanced",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            PresetGroup::Clean => "Calm, neutral looks that keep the focus on covers and video.",
+            PresetGroup::Advanced => "High contrast, true black, community palettes and bolder colour.",
+        }
+    }
+}
+
+/// How a preset's surfaces, lines and text are built.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Light text on dark surfaces; lines and state layers are white at low opacity.
+    Dark,
+    /// Dark text on light surfaces; lines and state layers are black at low opacity.
+    Light,
+    /// Dark, with stronger lines, state layers and secondary text (Windows contrast themes:
+    /// <https://learn.microsoft.com/en-us/windows/apps/design/accessibility/high-contrast-themes>).
+    HighContrast,
+}
+
+/// One Settings → Appearance preset: id, copy, the three swatch colours (base, accent,
+/// secondary), its group and mode, and optional hand-tuned surfaces and text. Build with
+/// [`dark`] / [`light`] and the `const` modifiers below.
 #[derive(Clone, Copy, Debug)]
 pub struct Preset {
     pub id: &'static str,
@@ -150,26 +207,84 @@ pub struct Preset {
     pub base: u32,
     pub accent: u32,
     pub secondary: u32,
+    pub group: PresetGroup,
+    pub mode: Mode,
+    /// Sidebar, surface, surface_2 and surface_3; derived from `base` when `None`.
+    pub ramp: Option<[u32; 4]>,
+    /// text_1, text_2 and text_3; the mode's defaults when `None`.
+    pub text: Option<[u32; 3]>,
+}
+
+/// A dark preset in the Advanced group with derived surfaces and the default text.
+pub const fn dark(id: &'static str, name: &'static str, description: &'static str, base: u32, accent: u32, secondary: u32) -> Preset {
+    Preset { id, name, description, base, accent, secondary, group: PresetGroup::Advanced, mode: Mode::Dark, ramp: None, text: None }
+}
+
+/// A light preset (dark text on light surfaces) in the Advanced group.
+pub const fn light(id: &'static str, name: &'static str, description: &'static str, base: u32, accent: u32, secondary: u32) -> Preset {
+    Preset { mode: Mode::Light, ..dark(id, name, description, base, accent, secondary) }
+}
+
+impl Preset {
+    /// Lists the preset under Clean.
+    pub const fn clean(self) -> Self {
+        Preset { group: PresetGroup::Clean, ..self }
+    }
+
+    pub const fn high_contrast(self) -> Self {
+        Preset { mode: Mode::HighContrast, ..self }
+    }
+
+    /// Hand-tuned sidebar, surface, surface_2, surface_3.
+    pub const fn ramp(self, ramp: [u32; 4]) -> Self {
+        Preset { ramp: Some(ramp), ..self }
+    }
+
+    /// Hand-tuned text_1, text_2, text_3.
+    pub const fn text(self, text: [u32; 3]) -> Self {
+        Preset { text: Some(text), ..self }
+    }
+
+    pub fn is_light(&self) -> bool {
+        self.mode == Mode::Light
+    }
 }
 
 /// The original MangaVox look. Must stay first in [`PRESETS`].
 pub const DEFAULT_PRESET: &str = "mangavox-mint";
 
-/// Theme presets (ids shared with the Electron app's `src/shared/appearance.ts`, plus Mint).
+/// Theme presets (ids shared with the Electron app's `src/shared/appearance.ts`, plus Mint and
+/// the newer Clean / Advanced additions). Community palettes follow their published colours:
+/// Nord <https://www.nordtheme.com/docs/colors-and-palettes>, Solarized
+/// <https://ethanschoonover.com/solarized/>, nudged where a colour missed WCAG AA as text.
 pub const PRESETS: &[Preset] = &[
-    Preset { id: "mangavox-mint", name: "MangaVox Mint", description: "Signature mint and sky on cool graphite", base: 0x0b0d10, accent: 0x2bd49a, secondary: 0x7dd3fc },
-    Preset { id: "rust", name: "Rust", description: "Oxidized orange on warm charcoal — forged metal", base: 0x0e0907, accent: 0xc8501a, secondary: 0xf0b27a },
-    Preset { id: "watchfiwn", name: "Watchfiwn", description: "Cinematic red on true black — streaming-grade", base: 0x0b0b0c, accent: 0xe8392e, secondary: 0xff6b5f },
-    Preset { id: "mangavox-emerald", name: "MangaVox Emerald", description: "Emerald and cyan studio lighting", base: 0x07090d, accent: 0x10b981, secondary: 0x60a5fa },
-    Preset { id: "chatgpt-green", name: "ChatGPT Green", description: "Charcoal, mint, and connected signals", base: 0x080b0a, accent: 0x10a37f, secondary: 0x9ce6d1 },
-    Preset { id: "claude-warm", name: "Claude Warm", description: "Warm terracotta on deep charcoal", base: 0x0d0b0a, accent: 0xd97757, secondary: 0xe8c7a8 },
-    Preset { id: "gemini-prism", name: "Gemini Prism", description: "Blue, violet, and cyan refractions", base: 0x080a12, accent: 0x5b8def, secondary: 0xa78bfa },
-    Preset { id: "amber-terminal", name: "Amber Terminal", description: "Black glass and restrained amber data", base: 0x090806, accent: 0xf59e0b, secondary: 0xfde68a },
-    Preset { id: "cyberpunk", name: "Cyberpunk", description: "Cyan and magenta over graphite", base: 0x07090c, accent: 0x22d3ee, secondary: 0xf472b6 },
-    Preset { id: "sakura", name: "Sakura", description: "Rose highlights and drifting petals", base: 0x0d090c, accent: 0xfb7185, secondary: 0xf9a8d4 },
-    Preset { id: "ocean", name: "Ocean", description: "Deep neutral water and clear cyan", base: 0x060b0e, accent: 0x06b6d4, secondary: 0x38bdf8 },
-    Preset { id: "monochrome", name: "Monochrome", description: "Graphite, silver, and quiet motion", base: 0x090a0b, accent: 0xb8c0cc, secondary: 0x7f8ea3 },
-    Preset { id: "aurora", name: "Aurora", description: "Green, blue, and violet circular flow", base: 0x070a0c, accent: 0x2dd4bf, secondary: 0x818cf8 },
+    // ── Clean ──
+    dark("mangavox-mint", "MangaVox Mint", "Signature mint and sky on cool graphite", 0x0b0d10, 0x2bd49a, 0x7dd3fc).clean(),
+    light("light", "Light", "Crisp white cards on soft grey, classic blue", 0xf5f6f8, 0x2563eb, 0x0ea5e9).clean().ramp([0xeceef2, 0xffffff, 0xe9ecf0, 0xffffff]),
+    light("soft-light", "Soft Light", "Low-glare grey with a calm teal accent", 0xe9eaee, 0x0f766e, 0x6366f1).clean().ramp([0xe1e3e8, 0xf4f5f7, 0xdfe2e7, 0xf8f9fa]).text([0x1b1e24, 0x353b46, 0x4b5360]),
+    light("paper", "Paper", "Warm off-white like a printed page", 0xf7f3ea, 0xa8471f, 0x4d7c5a).clean().ramp([0xefe9dc, 0xfffdf8, 0xece5d6, 0xfffdf8]).text([0x24201a, 0x4a4337, 0x625a4c]),
+    dark("pure-dark", "Pure Dark", "Neutral greys with no tint, blue for actions", 0x0a0a0a, 0x3b82f6, 0xa3a3a3).clean().ramp([0x0f0f0f, 0x161616, 0x1e1e1e, 0x262626]),
+    dark("graphite", "Graphite", "Soft charcoal and a quiet periwinkle", 0x17181b, 0x8b93ff, 0x9ca3af).clean().text([0xf2f3f5, 0xc8cbd1, 0x9aa1ab]),
+    dark("monochrome", "Monochrome", "Graphite, silver, and quiet motion", 0x090a0b, 0xb8c0cc, 0x7f8ea3).clean(),
+    // ── Advanced ──
+    dark("high-contrast", "High Contrast", "Black, white and yellow with strong edges", 0x000000, 0xffd60a, 0x00e5ff).high_contrast().ramp([0x000000, 0x0a0a0a, 0x141414, 0x1c1c1c]).text([0xffffff, 0xf2f2f2, 0xd6d6d6]),
+    dark("oled-black", "OLED Black", "True black that switches OLED pixels off", 0x000000, 0xa78bfa, 0x22d3ee).ramp([0x000000, 0x0b0b0c, 0x141416, 0x1c1c1f]),
+    dark("nord", "Nord", "Arctic polar night with frost blue", 0x2e3440, 0x88c0d0, 0x81a1c1).ramp([0x2a2f3a, 0x343a47, 0x3b4252, 0x434c5e]).text([0xeceff4, 0xd8dee9, 0xb6bfcd]),
+    dark("solarized-dark", "Solarized Dark", "Ethan Schoonover's teal-blue night", 0x002b36, 0x2aa198, 0xb58900).ramp([0x00252f, 0x073642, 0x0b3d4a, 0x104552]).text([0xfdf6e3, 0xeee8d5, 0xa3b1b1]),
+    light("solarized-light", "Solarized Light", "Solarized's warm cream daylight", 0xfdf6e3, 0x1e6fa8, 0xb58900).ramp([0xf3ecd8, 0xfffbf0, 0xeee8d5, 0xfffcf4]).text([0x073642, 0x34525a, 0x52676d]),
+    dark("midnight-blue", "Midnight Blue", "Deep navy with a clear sky-blue accent", 0x0a1020, 0x6ea8fe, 0xa5b4fc),
+    light("sakura-light", "Sakura Light", "Blossom pink paper with a deep rose accent", 0xfbf3f5, 0xbe185d, 0xf9a8d4).ramp([0xf5e8ec, 0xfffafb, 0xf3e4e9, 0xfffbfc]).text([0x2a1a20, 0x4e3a42, 0x6b5560]),
+    dark("sakura", "Sakura", "Rose highlights and drifting petals", 0x0d090c, 0xfb7185, 0xf9a8d4),
+    dark("rust", "Rust", "Oxidized orange on warm charcoal — forged metal", 0x0e0907, 0xc8501a, 0xf0b27a),
+    dark("watchfiwn", "Watchfiwn", "Cinematic red on true black — streaming-grade", 0x0b0b0c, 0xe8392e, 0xff6b5f),
+    dark("mangavox-emerald", "MangaVox Emerald", "Emerald and cyan studio lighting", 0x07090d, 0x10b981, 0x60a5fa),
+    dark("chatgpt-green", "ChatGPT Green", "Charcoal, mint, and connected signals", 0x080b0a, 0x10a37f, 0x9ce6d1),
+    dark("claude-warm", "Claude Warm", "Warm terracotta on deep charcoal", 0x0d0b0a, 0xd97757, 0xe8c7a8),
+    dark("gemini-prism", "Gemini Prism", "Blue, violet, and cyan refractions", 0x080a12, 0x5b8def, 0xa78bfa),
+    dark("amber-terminal", "Amber Terminal", "Black glass and restrained amber data", 0x090806, 0xf59e0b, 0xfde68a),
+    dark("cyberpunk", "Cyberpunk", "Cyan and magenta over graphite", 0x07090c, 0x22d3ee, 0xf472b6),
+    dark("ocean", "Ocean", "Deep neutral water and clear cyan", 0x060b0e, 0x06b6d4, 0x38bdf8),
+    dark("aurora", "Aurora", "Green, blue, and violet circular flow", 0x070a0c, 0x2dd4bf, 0x818cf8),
 ];
 
 /// Every colour token, resolved for one preset. Read the live one with [`palette`].
@@ -217,6 +332,8 @@ pub struct Palette {
     pub glass_border: Rgba,
     pub overlay: Rgba,
     pub scrim: Rgba,
+    /// Dark text on light surfaces (picks the light hue tier and the light component theme).
+    pub light: bool,
 }
 
 /// Soft fills are 14% of their colour, borders 35% (the same steps as the original accent_soft).
@@ -227,35 +344,62 @@ impl Palette {
     /// Builds the palette from a preset's base and accent: surfaces lift the base in even steps
     /// (keeping its tint), accent states shift its lightness, status colours are shared.
     pub fn from_preset(p: &Preset) -> Self {
+        let light = p.mode == Mode::Light;
+        let hc = p.mode == Mode::HighContrast;
         let base = rgb(p.base);
         let accent = rgb(p.accent);
         let [sidebar, surface, surface_2, surface_3] = neutrals(p);
-        let text_1 = rgb(0xf2f4f7);
-        let text_3 = rgb(0x8b949e);
-        let (success, info, warning, danger) = (rgb(0x4ade80), rgb(0x60a5fa), rgb(0xfbbf24), rgb(0xf87171));
+        let [text_1, text_2, text_3] = p
+            .text
+            .unwrap_or(match p.mode {
+                Mode::Dark => [0xf2f4f7, 0xc3c9d1, 0x8b949e],
+                Mode::Light => [0x16181d, 0x3d4450, 0x5b6370],
+                Mode::HighContrast => [0xffffff, 0xf2f2f2, 0xd6d6d6],
+            })
+            .map(rgb);
+        // Lines and state layers are "ink" at low opacity: white on dark, black on light.
+        // Steps: border, border_strong, hover, active, active_hover, pressed, track, glass_border.
+        let steps: [u8; 8] = match p.mode {
+            Mode::Dark => [0x12, 0x26, 0x0d, 0x17, 0x1f, 0x24, 0x5c, 0x1a],
+            Mode::Light => [0x1a, 0x33, 0x0a, 0x12, 0x1a, 0x21, 0x80, 0x1f],
+            Mode::HighContrast => [0x59, 0x99, 0x1a, 0x2b, 0x38, 0x40, 0xa6, 0x66],
+        };
+        let ink = |a: u8| if light { a8(rgb(0x000000), a) } else { a8(rgb(0xffffff), a) };
+        // Tracks need 3:1 on every surface (WCAG 1.4.11); lighter bases (Nord) need more ink.
+        let track_bgs = [base, sidebar, surface, surface_2, surface_3, base.blend(ink(steps[3]))];
+        let track_a = (steps[6]..=0xff).find(|a| track_bgs.iter().all(|bg| contrast(ink(*a), *bg) >= 3.05)).unwrap_or(0xff);
+        // Status colours: the 400 tier reads on dark, the 700 tier on light.
+        let (success, info, warning, danger) = if light {
+            (rgb(0x15803d), rgb(0x1d4ed8), rgb(0xb45309), rgb(0xb91c1c))
+        } else if hc {
+            (rgb(0x4ade80), rgb(0x60a5fa), rgb(0xfacc15), rgb(0xff6b6b))
+        } else {
+            (rgb(0x4ade80), rgb(0x60a5fa), rgb(0xfbbf24), rgb(0xf87171))
+        };
         Self {
-            canvas: scale(base, 0.65),
+            canvas: if light { scale(base, 0.94) } else { scale(base, 0.65) },
             base,
             sidebar,
             surface,
             surface_2,
             surface_3,
-            well: rgba(0x00000038),
-            border: rgba(0xffffff12),
-            border_strong: rgba(0xffffff26),
-            hover: rgba(0xffffff0d),
-            active: rgba(0xffffff17),
-            active_hover: rgba(0xffffff1f),
-            pressed: rgba(0xffffff24),
+            well: if light { rgba(0x0000000d) } else if hc { rgba(0xffffff0f) } else { rgba(0x00000038) },
+            border: ink(steps[0]),
+            border_strong: ink(steps[1]),
+            hover: ink(steps[2]),
+            active: ink(steps[3]),
+            active_hover: ink(steps[4]),
+            pressed: ink(steps[5]),
             focus_ring: accent,
-            track: rgba(0xffffff5c),
+            track: ink(track_a),
             text_1,
-            text_2: rgb(0xc3c9d1),
+            text_2,
             text_3,
             text_disabled: a8(text_3, 0x66),
             accent,
-            accent_hover: shift_l(accent, 0.07),
-            accent_pressed: shift_l(accent, -0.06),
+            // Hover moves away from the page: lighter on dark, deeper on light.
+            accent_hover: shift_l(accent, if light { -0.06 } else { 0.07 }),
+            accent_pressed: shift_l(accent, if light { -0.12 } else { -0.06 }),
             accent_soft: a8(accent, SOFT),
             accent_border: a8(accent, EDGE),
             on_accent: readable_on(accent, [base, text_1, rgb(0x000000), rgb(0xffffff)]),
@@ -270,23 +414,44 @@ impl Palette {
             danger,
             danger_soft: a8(danger, SOFT),
             danger_border: a8(danger, EDGE),
-            favorite: rgb(0xfacc15),
-            glass: rgba(0x0000008c),
+            favorite: if light { rgb(0xa16207) } else { rgb(0xfacc15) },
+            // Text over glass and scrims is text_1, so on light presets they are light washes
+            // (the macOS light material) and dark text keeps reading over images.
+            glass: if light { rgba(0xffffffb8) } else { rgba(0x0000008c) },
             glass_strong: a8(surface, 0xf0),
-            glass_border: rgba(0xffffff1a),
-            overlay: rgba(0x0000004d),
-            scrim: rgba(0x000000b3),
+            glass_border: ink(steps[7]),
+            overlay: if light { rgba(0x0000002e) } else { rgba(0x0000004d) },
+            scrim: if light { rgba(0xffffffc7) } else { rgba(0x000000b3) },
+            light,
         }
+    }
+
+    /// A categorical hue in this palette's tier (see [`Tokens::hue`]).
+    pub fn hue(&self, h: Hue) -> Rgba {
+        rgb(if self.light { h.hex_light() } else { h.hex() })
     }
 }
 
-/// Sidebar, surface, surface_2 and surface_3. Mint keeps its original hand-tuned ramp.
+/// Sidebar, surface, surface_2 and surface_3: the preset's own ramp, else Mint's original
+/// hand-tuned one, else derived from the base (lifted for dark presets, whitened for light).
 fn neutrals(p: &Preset) -> [Rgba; 4] {
+    if let Some(r) = p.ramp {
+        return r.map(rgb);
+    }
     if p.id == DEFAULT_PRESET {
         return [rgb(0x0f1215), rgb(0x14181c), rgb(0x1a1f24), rgb(0x21272d)];
     }
     let base = rgb(p.base);
+    if p.mode == Mode::Light {
+        let white = rgb(0xffffff);
+        return [scale(base, 0.965), mix(base, white, 0.7), scale(base, 0.955), mix(base, white, 0.85)];
+    }
     [4.7, 10.7, 17.7, 25.7].map(|k| lift(base, k))
+}
+
+/// `a` moved `t` of the way to `b`.
+fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    Rgba { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: 1. }
 }
 
 /// Adds `k`/255 to each channel in proportion to the base's own tint, so warm bases stay warm.
@@ -383,7 +548,11 @@ pub fn apply_component_theme(cx: &mut App) {
     let c = Hsla::from;
     // Opaque mix of a state layer over a fill, for widgets that expect solid colours.
     let over = |bg: Rgba, layer: Rgba| Hsla::from(bg.blend(layer));
+    // Switch and slider thumbs: white on light presets (text_1 is dark there).
+    let thumb = if p.light { p.surface_3 } else { p.text_1 };
     Theme::update(cx, |t| {
+        // Widgets that shade by mode (buttons, shimmer, highlighted text) follow the preset.
+        t.mode = if p.light { ThemeMode::Light } else { ThemeMode::Dark };
         t.radius = px(radius::MD);
         t.radius_lg = px(radius::LG);
 
@@ -450,9 +619,9 @@ pub fn apply_component_theme(cx: &mut App) {
         t.link_active = c(p.accent_pressed);
 
         t.switch = c(p.track);
-        t.switch_thumb = c(p.text_1);
+        t.switch_thumb = c(thumb);
         t.slider_bar = c(p.accent);
-        t.slider_thumb = c(p.text_1);
+        t.slider_thumb = c(thumb);
 
         t.title_bar = c(p.base);
         t.title_bar_border = c(p.border);
@@ -686,7 +855,7 @@ mod tests {
     fn hues_read_on_every_surface() {
         for (id, p) in all() {
             for h in super::Hue::ALL {
-                let c = super::rgb(h.hex());
+                let c = p.hue(h);
                 for (name, bg) in surfaces(&p) {
                     let r = contrast(c, bg);
                     assert!(r >= 3., "{id}: {h:?} on {name} is {r:.2}:1");
@@ -694,6 +863,43 @@ mod tests {
                 let r = contrast(p.base, c);
                 assert!(r >= 4.5, "{id}: base text on {h:?} is {r:.2}:1");
             }
+        }
+    }
+
+    /// Body text (text_1, text_2) stays WCAG AA (4.5:1) on the surfaces Settings draws it on,
+    /// including a selected (accent-tinted) card and a hovered row, for every preset.
+    #[test]
+    fn body_text_reads_on_cards_and_selection() {
+        for (id, p) in all() {
+            let cards = [("surface", p.surface), ("surface+hover", p.surface.blend(p.hover)), ("surface+accent_soft", p.surface.blend(p.accent_soft)), ("glass_strong", p.base.blend(p.glass_strong))];
+            for (name, bg) in cards {
+                for (t, fg) in [("text_1", p.text_1), ("text_2", p.text_2)] {
+                    let r = contrast(fg, bg);
+                    assert!(r >= 4.5, "{id}: {t} on {name} is {r:.2}:1");
+                }
+            }
+            // Primary text gets more than the minimum everywhere.
+            assert!(contrast(p.text_1, p.surface) >= 7., "{id}: text_1 on surface is {:.2}:1 (want AAA 7:1)", contrast(p.text_1, p.surface));
+        }
+    }
+
+    /// Both Appearance groups are filled, light presets are actually light (and dark ones dark),
+    /// and text over glass stays readable whichever way round it is.
+    #[test]
+    fn groups_and_modes_are_coherent() {
+        use super::{Mode, PresetGroup};
+        for g in PresetGroup::ALL {
+            assert!(PRESETS.iter().filter(|p| p.group == g).count() >= 5, "{g:?} has too few presets");
+        }
+        for p in PRESETS {
+            let pal = Palette::from_preset(p);
+            let lum_base = contrast(pal.base, super::rgb(0x000000));
+            match p.mode {
+                Mode::Light => assert!(lum_base > 10., "{}: a light preset needs a light base", p.id),
+                Mode::Dark | Mode::HighContrast => assert!(lum_base < 3., "{}: a dark preset needs a dark base", p.id),
+            }
+            let over_glass = super::rgb(0x808080).blend(pal.glass);
+            assert!(contrast(pal.text_1, over_glass) >= 4.5, "{}: text_1 over glass on a mid-grey image is {:.2}:1", p.id, contrast(pal.text_1, over_glass));
         }
     }
 

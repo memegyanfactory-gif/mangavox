@@ -57,6 +57,9 @@ Known limits (design tradeoffs, not bugs):
 ## Static (web/, embedded with include_str!/include_bytes!)
 - `GET /` -> `web/index.html` (paired) ; `GET /locked` -> `web/locked.html`
 - `GET /app.js`, `GET /app.css`, `GET /manifest.webmanifest`
+- `GET /sw.js` (paired): the service worker, its cache version a hash of the shell. Browsers only run it
+  in a secure context (HTTPS / localhost), so not over the LAN `http://` address; it caches the shell only,
+  never `/api`.
 - `GET /icon.png` (192 px), `GET /icon-512.png`, `GET /logo.png` (96 px, app bar): from
   `mv-ui/assets/phone/`, public.
 
@@ -102,6 +105,33 @@ Known limits (design tradeoffs, not bugs):
    "url": "/api/media/<opaque>", "size", "modified" }]`  (narration audio, chapter videos, full recaps; newest first)
 - `GET /api/media/<opaque>` -> the file, with HTTP Range support (video/audio streaming + download).
   `<opaque>` maps to a path under `<root>/studio/projects` only (never a raw path from the client).
+
+### Chapter media (api_chapter_media.rs)
+- `GET /api/chapter/<id>/media` -> `{ "listen": bool, "narration": url|null, "video": url|null, "thumbnail": url|null,
+   "total_ms", "timeline": [{ "start_ms", "end_ms", "page", "focus": [x, y, w, h]|null }] }`. `page` is a reader page
+   index (Studio pages matched by file name); `focus` the part of the page narrated (0..1). `narration` is the joined
+   `narration.wav` (only when newer than the sync map); `listen` without it means per-page clips
+   (`/api/chapter/<id>/recap`). 404 when Studio made neither narration nor video.
+- `GET /api/chapter/<id>/media/video|narration|thumbnail` -> the file, with HTTP Range (`video?download=1` adds an
+   attachment name). The thumbnail falls back to the manga's shared one. Fixed file names in the chapter's Studio
+   folder only; any other `<kind>` is 404.
+- `GET /api/manga/<id>/videos` -> `{ "manga_id", "title", "thumbnail": url|null, "videos": [{ "chapter_id", "number",
+   "label", "url", "poster", "size" }] }` in chapter order (chapters with a made video only).
+- `GET /api/manga/<id>/thumbnail` -> the manga's one shared thumbnail (`full_recap_thumbnail.jpg`, else
+   `cover_thumb_16x9.jpg` / `cover_local_16x9.jpg` in its Studio folder).
+- Until `mv_recap::media::chapter_media` builds, the module reads these files itself with the same meaning.
+
+### Activity (activity.rs)
+- `GET /api/activity` -> `{ "now": unix ms (PC clock), "busy": n, "manga": [card], "events": [event] }`, read-only,
+  `no-store`. One card per manga: `{ "id", "title", "cover": url|null, "state", "tasks": [task] }`; a task is
+  `{ "key", "kind": "download"|"generate"|"voice"|"read"|"export", "label", "state":
+  "running"|"limit"|"waiting"|"paused"|"failed"|"done", "line", "progress": 0..1, "at", "total" (chapters; 0 =
+  not counted), "steps": [{ "name": "Read".."Video", "state": "pending"|"skipped"|"running"|"done"|"failed" }]
+  (Generate), "resume_at": unix s|null (AI limit), "error", "cancel": [job ids for /api/studio/jobs/<id>/cancel] }`.
+  Sources: the download queue (ui-manga), the Generate queue and Python jobs (ui-studio pipeline / service),
+  Studio's AI run, exports and joins. Finished tasks stay 30 min. `events` (last 40, oldest first):
+  `{ "id", "at", "manga_id", "title", "kind", "label", "state": "done"|"failed"|"limit", "text" }`, logged on
+  transitions by a background tick that runs until 30 min after the last request.
 
 ### Movies (api_media.rs)
 - `GET /api/movies?tab=home|movies|series` -> `{ "hero": Item|null, "rows": [{ "id","title","top10": bool,"items": [Item] }], "error": string|null }`

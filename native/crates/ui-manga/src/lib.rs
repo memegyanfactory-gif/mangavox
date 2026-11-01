@@ -25,6 +25,7 @@ mod suggest;
 pub mod tags;
 mod taste;
 mod ui;
+mod videos;
 
 pub use backend::set_source_ctx;
 pub use discover::request_search;

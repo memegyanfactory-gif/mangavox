@@ -2,10 +2,10 @@
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::radius;
-use mv_ui::{btn, disclosure, inline_alert, ph, setting_row, setting_section, size, skeleton_line, status_tag, switch, AlertKind, ButtonKind, StatusKind, Tokens};
+use mv_ui::settings::{SETTINGS_GROUP_GAP, SETTINGS_ROW_MIN_H, SETTINGS_ROW_X};
+use mv_ui::{btn, disclosure, inline_alert, ph, settings_group, settings_row, size, skeleton_line, status_tag, switch, AlertKind, ButtonKind, StatusKind, Tokens};
 
 use crate::cli_updates::{tail_lines, CLIS};
-use crate::ui::divided;
 use crate::{SettingsView, Tab};
 
 impl SettingsView {
@@ -14,8 +14,8 @@ impl SettingsView {
             let s = self.cli.read(cx);
             (s.checking, s.checked, s.auto_update, s.notify_updates)
         };
-        let mut list = setting_section("Agent CLIs", Some("Command-line agents the assistant can use. Updates run in the background.".into()));
-        for (n, s) in CLIS.iter().enumerate() {
+        let mut list = settings_group("Agent CLIs", Some("Command-line agents the assistant can use. Updates run in the background.".into()));
+        for s in CLIS.iter() {
             let info = self.cli.read(cx).info(s.id).cloned().unwrap_or_default();
             let hint: AnyElement = match (&info.installed, &info.latest) {
                 (None, _) if !checked => skeleton_line(px(160.)).mt(px(4.)).into_any_element(),
@@ -25,7 +25,7 @@ impl SettingsView {
                 (Some(i), None) => hint_text(format!("Installed {i}")),
             };
             let id = s.id;
-            let mut control = div().flex().items_center().gap(px(8.));
+            let mut control = div().flex().flex_wrap().justify_end().items_center().gap(px(8.));
             // The last run's outcome as an icon chip; the raw output sits behind "Show log".
             if let Some((ok, _)) = &info.result {
                 control = control.child(if *ok { status_tag(StatusKind::Done).label("Updated") } else { status_tag(StatusKind::Failed).label("Update failed") });
@@ -46,13 +46,16 @@ impl SettingsView {
             let row = div()
                 .flex()
                 .flex_col()
+                .px(px(SETTINGS_ROW_X))
                 .py(px(12.))
+                .min_h(px(SETTINGS_ROW_MIN_H))
+                .justify_center()
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap(px(24.))
+                        .gap(px(16.))
                         .child(
                             div()
                                 .flex()
@@ -72,7 +75,7 @@ impl SettingsView {
                                         .child(hint),
                                 ),
                         )
-                        .child(div().flex().flex_none().items_center().child(control)),
+                        .child(div().flex().flex_none().max_w(relative(0.5)).items_center().child(control)),
                 )
                 .when_some(log, |d, text| {
                     let summary = tail_lines(&text);
@@ -96,25 +99,25 @@ impl SettingsView {
                         ),
                     )
                 });
-            list = list.child(if n == 0 { row } else { divided(row) });
+            list = list.child(row);
         }
 
-        let settings = setting_section("Updates", Some("Checked at start and every 6 hours.".into()))
-            .child(setting_row(
+        let settings = settings_group("Updates", Some("Checked at start and every 6 hours.".into()))
+            .child(settings_row(
                 "Notify me when a CLI update is available",
                 "Shows a banner on the AI pages and a dot on this page",
                 switch("cli-notify", notify).on_click(cx.listener(|this, on: &bool, _, cx| {
                     this.cli.update(cx, |c, cx| c.set_notify_updates(*on, cx));
                 })),
             ))
-            .child(divided(setting_row(
+            .child(settings_row(
                 "Update CLIs automatically",
                 "Installs new versions silently when they are found",
                 switch("cli-auto", auto).on_click(cx.listener(|this, on: &bool, _, cx| {
                     this.cli.update(cx, |c, cx| c.set_auto_update(*on, cx));
                 })),
-            )))
-            .child(divided(setting_row(
+            ))
+            .child(settings_row(
                 "Check for updates",
                 "Looks up the newest versions now",
                 btn("cli-check", if checking { "Checking…" } else { "Check now" }, ButtonKind::Secondary)
@@ -123,16 +126,16 @@ impl SettingsView {
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.cli.update(cx, |c, cx| c.refresh(cx));
                     })),
-            )));
+            ));
 
-        div().flex().flex_col().gap(px(20.)).child(list).when_some(self.render_app_tools(cx), |d, s| d.child(s)).child(settings)
+        div().flex().flex_col().gap(px(SETTINGS_GROUP_GAP)).child(list).when_some(self.render_app_tools(cx), |d, s| d.child(s)).child(settings)
     }
 
     /// Opt-ins that let Grok and Antigravity load the app's tools (a `mangavox` entry in their own
     /// MCP settings). `None` while neither is installed.
-    fn render_app_tools(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_app_tools(&self, cx: &mut Context<Self>) -> Option<mv_ui::SettingsGroup> {
         let here = std::env::current_exe().ok();
-        let mut section = setting_section("App tools", Some("Claude Code, Codex, Gemini CLI and OpenCode load MangaVox's tools by themselves. These two need a one-time opt-in.".into()));
+        let mut section = settings_group("App tools", Some("Claude Code, Codex, Gemini CLI and OpenCode load MangaVox's tools by themselves. These two need a one-time opt-in.".into()));
         let mut rows = 0;
         for s in CLIS.iter().filter(|s| mv_ai::providers::cli_mcp::bridged(s.provider)) {
             let info = self.cli.read(cx).info(s.id).cloned().unwrap_or_default();
@@ -155,7 +158,7 @@ impl SettingsView {
                 hint = err.clone();
             }
             let id = s.id;
-            let row = setting_row(
+            let row = settings_row(
                 format!("Let {} use MangaVox's tools", s.name),
                 hint,
                 switch(SharedString::from(format!("cli-bridge-{id}")), on).on_click(cx.listener(move |this, on: &bool, _, cx| {
@@ -163,7 +166,7 @@ impl SettingsView {
                     this.cli.update(cx, |c, cx| c.set_bridge(id, on, cx));
                 })),
             );
-            section = section.child(if rows == 0 { row } else { divided(row) });
+            section = section.child(row);
             rows += 1;
         }
         (rows > 0).then_some(section)

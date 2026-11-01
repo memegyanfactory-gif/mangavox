@@ -111,6 +111,17 @@ pub async fn latest() -> Result<Release> {
     })
 }
 
+/// The release notes of `version` and its page: what "What's new" shows after an update.
+pub async fn notes_for(version: &str) -> Result<(String, String)> {
+    let url = format!("https://api.github.com/repos/{}/releases/tags/v{}", repo(), version.trim_start_matches(['v', 'V']));
+    let res = client()?.get(&url).header("Accept", "application/vnd.github+json").timeout(Duration::from_secs(20)).send().await.context("Could not reach GitHub")?;
+    if !res.status().is_success() {
+        bail!("GitHub answered {}", res.status());
+    }
+    let r: GhRelease = res.json().await.context("Unexpected answer from GitHub")?;
+    Ok((r.body.unwrap_or_default(), r.html_url))
+}
+
 /// The latest release when it is newer than this build.
 pub async fn check() -> Result<Option<Release>> {
     let r = latest().await?;

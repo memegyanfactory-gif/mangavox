@@ -83,6 +83,19 @@ pub fn back_target(cx: &App) -> Option<Route> {
     cx.try_global::<BackTarget>().and_then(|b| b.0.clone())
 }
 
+/// The shell's name for the back target ("Library", a manga title), so a page's own Back
+/// control can say where it leads exactly as the title bar would.
+struct BackLabel(Option<gpui_kit::SharedString>);
+impl Global for BackLabel {}
+
+pub fn set_back_label(cx: &mut App, label: Option<gpui_kit::SharedString>) {
+    cx.set_global(BackLabel(label));
+}
+
+pub fn back_label(cx: &App) -> Option<gpui_kit::SharedString> {
+    cx.try_global::<BackLabel>().and_then(|b| b.0.clone())
+}
+
 /// A page's own Back step (close its dialog, leave a sub-view), asked before the shell leaves
 /// the page. Returns true when it handled Back. Keyed by the page's view, so a kept-alive page
 /// that is not showing never takes Back.

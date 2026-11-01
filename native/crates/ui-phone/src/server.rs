@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::watch;
 
-use crate::{api_anime, api_img, api_manga, api_media, api_studio, api_watch, auth, screen, state, touchpad};
+use crate::{activity, api_anime, api_chapter_media, api_img, api_manga, api_media, api_studio, api_watch, auth, screen, state, touchpad};
 
 /// Ports tried after the configured one when it is busy.
 const PORT_TRIES: u16 = 20;
@@ -167,6 +167,7 @@ const LOCKED_JS: &str = include_str!("../web/locked.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
+const SW_JS: &str = include_str!("../web/sw.js");
 /// The home-screen icon lives with the app's other assets (images outside mv-ui/assets are
 /// kept out of the repository by the privacy guard).
 const ICON_PNG: &[u8] = include_bytes!("../../mv-ui/assets/phone/icon.png");
@@ -179,6 +180,18 @@ fn asset(body: impl Into<axum::body::Body>, mime: &'static str, no_cache: bool) 
     let cache = if no_cache { "no-cache" } else { "public, max-age=86400" };
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
     r
+}
+
+/// `/sw.js` with its cache version: a hash of the shell it caches, so every change to the app
+/// installs a new worker that drops the old cache.
+fn service_worker() -> &'static str {
+    static SW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SW.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest([INDEX_HTML, APP_JS, APP_CSS, MANIFEST, SW_JS].concat().as_bytes());
+        let v: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
+        SW_JS.replace("__MV_VERSION__", &v)
+    })
 }
 
 /// `/locked`: the locked page, or the app for a phone that is signed in after all (a tab left on
@@ -215,6 +228,8 @@ pub(crate) fn router() -> Router {
         .route("/app.js", get(|| async { asset(APP_JS, "text/javascript; charset=utf-8", true) }))
         .route("/app.css", get(|| async { asset(APP_CSS, "text/css; charset=utf-8", true) }))
         .route("/manifest.webmanifest", get(|| async { asset(MANIFEST, "application/manifest+json", true) }))
+        // Behind the guard like the app itself: only a paired phone installs the worker.
+        .route("/sw.js", get(|| async { asset(service_worker(), "text/javascript; charset=utf-8", true) }))
         .route("/icon.png", get(|| async { asset(ICON_PNG, "image/png", false) }))
         .route("/icon-512.png", get(|| async { asset(ICON_512_PNG, "image/png", false) }))
         .route("/logo.png", get(|| async { asset(LOGO_PNG, "image/png", false) }))
@@ -228,6 +243,8 @@ pub(crate) fn router() -> Router {
         .merge(api_studio::routes())
         .merge(screen::routes())
         .merge(touchpad::routes())
+        .merge(activity::routes())
+        .merge(api_chapter_media::routes())
         .fallback(not_found)
         // Request bodies are small JSON (an input gesture, a chapter list): cap them well below
         // axum's 2 MiB default.

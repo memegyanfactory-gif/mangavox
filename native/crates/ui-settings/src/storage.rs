@@ -14,10 +14,11 @@ use gpui_kit::*;
 use mv_core::paths::{self, Location, Part};
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, confirm_inline, glyphs, icon_button, inline_alert, ph, ph_icon, progress_bar, setting_row, setting_section, size, skeleton, skeleton_line, spinner, usage_bar, AlertKind, ButtonKind, Hue, Ph, Tokens, Weight};
+use mv_ui::settings::{SETTINGS_GROUP_GAP, SETTINGS_ROW_X};
+use mv_ui::{btn, confirm_inline, glyphs, icon_button, inline_alert, ph, ph_icon, progress_bar, settings_block, settings_group, settings_row, size, skeleton, skeleton_line, spinner, usage_bar, AlertKind, ButtonKind, Hue, Ph, SettingsGroup, SettingsRow, Tokens, Weight};
 
 use crate::data;
-use crate::ui::{danger_zone, divided, format_bytes, path_row};
+use crate::ui::{danger_zone, format_bytes, path_row};
 
 /// What can be deleted or reset, in the order shown: (part, title, what it removes).
 const PARTS: &[(Part, &str, &str)] = &[
@@ -358,8 +359,8 @@ impl StorageManager {
 
     // ── Render ──────────────────────────────────────────────────────────────────────────────
 
-    fn render_usage(&self) -> Div {
-        let section = setting_section("Space used", Some(format!("Everything MangaVox keeps lives in {}.", paths::root().display()).into()));
+    fn render_usage(&self) -> SettingsGroup {
+        let section = settings_group("Space used", Some(format!("Everything MangaVox keeps lives in {}.", paths::root().display()).into()));
         let Some(total) = self.size_of(Part::Everything).filter(|_| !self.sizes.is_empty()) else {
             // Shaped like the bar and legend that are coming. NN/g skeleton screens:
             // <https://www.nngroup.com/articles/skeleton-screens/>
@@ -368,7 +369,8 @@ impl StorageManager {
                     .flex()
                     .flex_col()
                     .gap(px(14.))
-                    .py(px(12.))
+                    .px(px(SETTINGS_ROW_X))
+                    .py(px(14.))
                     .child(skeleton_line(px(180.)))
                     .child(skeleton(relative(1.), px(8.), radius::PILL))
                     .child(div().grid().grid_cols(3).gap(px(10.)).children((0..6).map(|_| skeleton_line(relative(0.7))))),
@@ -402,7 +404,8 @@ impl StorageManager {
                 .flex()
                 .flex_col()
                 .gap(px(12.))
-                .py(px(12.))
+                .px(px(SETTINGS_ROW_X))
+                .py(px(14.))
                 .child(
                     div()
                         .flex()
@@ -419,8 +422,8 @@ impl StorageManager {
         )
     }
 
-    fn render_folders(&self, cx: &mut Context<Self>) -> Div {
-        let mut folders = setting_section("Download folders", Some("Where each kind of download is saved. Changes apply to new downloads; existing files stay where they are.".into()));
+    fn render_folders(&self, cx: &mut Context<Self>) -> SettingsGroup {
+        let mut folders = settings_group("Download folders", Some("Where each kind of download is saved. Changes apply to new downloads; existing files stay where they are.".into()));
         for (idx, (kind, label, hint)) in data::STORAGE_KINDS.iter().enumerate() {
             let custom = self.folders.get(idx).cloned().unwrap_or_default();
             let effective = if custom.is_empty() { data::storage_default(kind) } else { PathBuf::from(&custom) };
@@ -441,14 +444,14 @@ impl StorageManager {
                     d.child(icon_button(("storage-reset", idx), ph::ARROW_COUNTER_CLOCKWISE, "Use the default folder").on_click(cx.listener(move |m, _: &ClickEvent, _, cx| m.reset_storage(idx, cx))))
                 });
             let row = path_row(icon, *label, *hint, effective.display().to_string(), actions);
-            folders = folders.child(if idx == 0 { row } else { divided(row) });
+            folders = folders.child(row);
         }
         folders
     }
 
-    fn render_cache(&self, cx: &mut Context<Self>) -> Div {
+    fn render_cache(&self, cx: &mut Context<Self>) -> SettingsGroup {
         let size = self.size_of(Part::Cache);
-        setting_section("Cache", Some("Cover images and other data MangaVox can fetch again. Your library and downloads are not affected.".into())).child(setting_row(
+        settings_group("Cache", Some("Cover images and other data MangaVox can fetch again. Your library and downloads are not affected.".into())).child(settings_row(
             "Cache size",
             size.map(format_bytes).unwrap_or_else(|| "Measuring…".into()),
             div()
@@ -465,7 +468,7 @@ impl StorageManager {
         ))
     }
 
-    fn render_data_folder(&self, cx: &mut Context<Self>) -> Div {
+    fn render_data_folder(&self, cx: &mut Context<Self>) -> SettingsGroup {
         let root = paths::root();
         let env_set = std::env::var_os("MANGAVOX_HOME").is_some_and(|p| !p.is_empty());
         let custom = !env_set && root != paths::default_root();
@@ -493,12 +496,12 @@ impl StorageManager {
         } else {
             "The default folder"
         };
-        let mut c = setting_section("Data folder", Some("Library, downloads, Studio work, models, chats, settings and cache all live here. Pick another drive or folder to move it.".into()))
+        let mut c = settings_group("Data folder", Some("Library, downloads, Studio work, models, chats, settings and cache all live here. Pick another drive or folder to move it.".into()))
             .child(path_row(glyphs::FOLDER, "Location", hint, root.display().to_string(), actions));
         let weak = cx.entity().downgrade();
         if let Some(err) = self.pending.move_error.clone() {
             let w = weak.clone();
-            c = c.child(div().my(px(8.)).child(inline_alert(AlertKind::Error, "The data folder was not moved", err).dismissible(move |_, _, cx| {
+            c = c.child(settings_block(inline_alert(AlertKind::Error, "The data folder was not moved", err).dismissible(move |_, _, cx| {
                 let _ = w.update(cx, |m, cx| m.forget_move_result(cx));
             })));
         } else if let Some(done) = self.pending.moved.clone() {
@@ -507,26 +510,21 @@ impl StorageManager {
                 Some(old) => format!("{done}. The old folder {} is being removed.", old.display()),
                 None => format!("{done}."),
             };
-            c = c.child(div().my(px(8.)).child(inline_alert(AlertKind::Success, "Data folder moved", body).dismissible(move |_, _, cx| {
+            c = c.child(settings_block(inline_alert(AlertKind::Success, "Data folder moved", body).dismissible(move |_, _, cx| {
                 let _ = w.update(cx, |m, cx| m.forget_move_result(cx));
             })));
         } else if let Some(old) = self.pending.cleanup.clone() {
-            c = c.child(div().my(px(8.)).child(inline_alert(AlertKind::Info, "Removing the old data folder", format!("{} is deleted in the background; files still in use go at the next start.", old.display()))));
+            c = c.child(settings_block(inline_alert(AlertKind::Info, "Removing the old data folder", format!("{} is deleted in the background; files still in use go at the next start.", old.display()))));
         }
         match &self.moving {
             Some(Move::Choose { to, has_data }) => {
                 let (a, b, c2) = (to.clone(), to.clone(), to.clone());
+                // A row of the group (not a box inside the card), tinted so it reads as the
+                // pending choice.
                 c = c.child(
-                    div()
-                        .flex()
-                        .flex_col()
+                    div().flex().flex_col().min_w_0().px(px(SETTINGS_ROW_X)).py(px(12.))
                         .gap(px(10.))
-                        .my(px(8.))
-                        .p(px(14.))
-                        .rounded(px(radius::LG))
-                        .bg(Tokens::surface())
-                        .border_1()
-                        .border_color(Tokens::border_strong())
+                        .bg(Tokens::accent_soft())
                         .child(div().flex().items_center().gap(px(8.)).child(ph_icon(ph::FOLDER_OPEN, Weight::Fill, Tokens::accent(), icon_px::MD)).child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child("New data folder")))
                         .child(mv_ui::path_chip(to.display().to_string()))
                         .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(if *has_data {
@@ -558,11 +556,8 @@ impl StorageManager {
                 let (d, t) = (done.load(Ordering::Relaxed), total.load(Ordering::Relaxed));
                 let frac = if t == 0 { 0. } else { d as f32 / t as f32 };
                 c = c.child(
-                    div()
-                        .flex()
-                        .flex_col()
+                    div().flex().flex_col().min_w_0().px(px(SETTINGS_ROW_X)).py(px(12.))
                         .gap(px(8.))
-                        .my(px(8.))
                         .child(
                             div()
                                 .flex()
@@ -608,7 +603,7 @@ impl StorageManager {
         )
     }
 
-    fn part_row(&self, ix: usize, part: Part, title: &str, desc: &str, cx: &mut Context<Self>) -> Div {
+    fn part_row(&self, ix: usize, part: Part, title: &str, desc: &str, cx: &mut Context<Self>) -> SettingsRow {
         let queued = self.pending.reset.contains(&part);
         let settings = part == Part::Settings;
         let control: AnyElement = if queued {
@@ -641,15 +636,10 @@ impl StorageManager {
                 )
                 .into_any_element()
         };
-        let r = setting_row(title.to_string(), desc.to_string(), control);
-        if ix == 0 {
-            r
-        } else {
-            divided(r)
-        }
+        settings_row(title.to_string(), desc.to_string(), control)
     }
 
-    fn render_danger(&self, cx: &mut Context<Self>) -> Div {
+    fn render_danger(&self, cx: &mut Context<Self>) -> SettingsGroup {
         let mut zone = danger_zone("Danger zone", "Free space or start over, one part at a time. Deleted files cannot be recovered. Anything the app holds open is finished by a restart.");
         for (ix, (p, title, desc)) in PARTS.iter().enumerate() {
             zone = zone.child(self.part_row(ix, *p, title, desc, cx));
@@ -680,7 +670,7 @@ impl StorageManager {
                 }))
                 .into_any_element()
         };
-        zone.child(divided(setting_row("Factory reset", "Deletes everything in the data folder. MangaVox starts like a fresh install.", control)))
+        zone.child(settings_row("Factory reset", "Deletes everything in the data folder. MangaVox starts like a fresh install.", control))
     }
 }
 
@@ -689,7 +679,7 @@ impl Render for StorageManager {
         div()
             .flex()
             .flex_col()
-            .gap(px(20.))
+            .gap(px(SETTINGS_GROUP_GAP))
             .children(self.pending_alert(cx))
             .child(self.render_usage())
             .child(self.render_folders(cx))

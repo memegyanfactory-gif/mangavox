@@ -13,6 +13,11 @@ dirs = "6"
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# Narration WAVs (media::ensure_narration) and the thumbnail badge's text and shapes (thumb);
+# all three are already in the lockfile.
+hound = "3.5"
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -72,6 +72,13 @@ const API_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/screen/frame?w=900&q=60"),
     ("POST", "/api/screen/input"),
     ("POST", "/api/mouse"),
+    ("GET", "/api/activity"),
+    ("GET", "/api/chapter/c1/media"),
+    ("GET", "/api/chapter/c1/media/video"),
+    ("GET", "/api/chapter/c1/media/narration"),
+    ("GET", "/api/chapter/c1/media/thumbnail"),
+    ("GET", "/api/manga/m1/videos"),
+    ("GET", "/api/manga/m1/thumbnail"),
     // Unknown routes and methods.
     ("GET", "/api/nope"),
     ("GET", "/api"),
@@ -215,7 +222,7 @@ async fn unpaired_devices_get_nothing_from_any_route() {
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{cookie}");
     }
     // The app's pages and assets: the locked page instead, never the app.
-    for path in ["/", "/index.html", "/app.js", "/app.css", "/nope", "/pair/", "/locked/", "//api/me", "/API/me", "/%61pi/me", "/Pair?code=x"] {
+    for path in ["/", "/index.html", "/app.js", "/app.css", "/sw.js", "/nope", "/pair/", "/locked/", "//api/me", "/API/me", "/%61pi/me", "/Pair?code=x"] {
         let r = get(path, PEER).await;
         assert_eq!(r.status(), StatusCode::OK, "{path}");
         let body = text(r).await;
@@ -872,6 +879,117 @@ fn recap_fixture(tag: &str) -> (String, String, String) {
 
 fn json_of(s: &str) -> serde_json::Value {
     serde_json::from_str(s).unwrap_or_else(|e| panic!("{e}: {s}"))
+}
+
+#[tokio::test]
+async fn chapter_media_serves_only_studio_files_by_fixed_name() {
+    let _g = setup();
+    let cookie = pair().await;
+    let (mid, cid, other) = recap_fixture("media");
+    let dir = ui_manga::recap::chapter_dir(&mid, &cid);
+    // Narration and video, the manga's shared thumbnail, and a focus box on the first passage.
+    put(
+        &dir.join("sync_map.json"),
+        r#"{"total_duration_ms": 2000,
+            "segments": [{"page": 0, "audio_file": "page_0000.wav", "start_ms": 0, "end_ms": 2000}],
+            "beat_segments": [{"page": 0, "panel_image": "/lib/x/0001.jpg", "start_ms": 0, "end_ms": 1000, "focus_point": [100, 0, 400, 1000]},
+                              {"page": 1, "panel_image": "/lib/x/0002.jpg", "start_ms": 1000, "duration_ms": 1000}]}"#,
+    );
+    put(&dir.join("narration.wav"), "RIFF-NARRATION");
+    put(&dir.join("video_final.mp4"), "MP4-CHAPTER-VIDEO");
+    put(&ui_manga::recap::chapter_dir(&mid, &cid).parent().unwrap().join("full_recap_thumbnail.jpg"), "JPEG-SHARED");
+
+    let r = get_with(&format!("/api/chapter/{}/media", cid), &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = json_of(&text(r).await);
+    let base = format!("/api/chapter/{}/media", cid);
+    assert_eq!(v["listen"], true);
+    assert_eq!(v["narration"], format!("{base}/narration"));
+    assert_eq!(v["video"], format!("{base}/video"));
+    assert_eq!(v["thumbnail"], format!("{base}/thumbnail"), "the shared thumbnail stands in");
+    assert_eq!(v["total_ms"], 2000);
+    // Studio's page 0 is the reader's page 1 (the reader lists a cover first).
+    assert_eq!(v["timeline"][0]["page"], 1);
+    assert_eq!(v["timeline"][1]["page"], 2);
+    let f: Vec<f64> = v["timeline"][0]["focus"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    assert!((f[1] - 0.1).abs() < 1e-6 && (f[3] - 0.3).abs() < 1e-6, "{f:?}");
+    assert!(!v.to_string().contains(&root().display().to_string().replace('\\', "\\\\")), "no paths leak: {v}");
+
+    // Files, with Range.
+    assert_eq!(text(get_with(&format!("{base}/narration"), &cookie).await).await, "RIFF-NARRATION");
+    let r = send(req("GET", &format!("{base}/video"), PEER).header(header::COOKIE, &cookie).header(header::RANGE, "bytes=4-10").body(Body::empty()).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(r.headers()[header::CONTENT_TYPE], "video/mp4");
+    assert_eq!(text(r).await, "CHAPTER");
+    assert_eq!(text(get_with(&format!("{base}/thumbnail"), &cookie).await).await, "JPEG-SHARED");
+    let r = get_with(&format!("{base}/video?download=1"), &cookie).await;
+    assert!(r.headers()[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment"));
+
+    // Nothing else: other names, traversal, a chapter Studio made nothing for, unknown chapters.
+    for path in [
+        format!("{base}/sync_map.json"),
+        format!("{base}/..%2F..%2Fsecret.wav"),
+        format!("{base}/audio"),
+        format!("/api/chapter/{}/media/video", other),
+        format!("/api/chapter/{}/media", other),
+        "/api/chapter/nope/media".into(),
+        "/api/chapter/nope/media/video".into(),
+    ] {
+        let r = get_with(&path, &cookie).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+        assert!(!text(r).await.contains(SECRET), "{path}");
+    }
+
+    // The manga's videos, in chapter order, with the shared thumbnail.
+    let r = get_with(&format!("/api/manga/{}/videos", mid), &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = json_of(&text(r).await);
+    assert_eq!(v["thumbnail"], format!("/api/manga/{}/thumbnail", mid));
+    let vids = v["videos"].as_array().unwrap();
+    assert_eq!(vids.len(), 1, "only chapters with a video: {v}");
+    assert_eq!(vids[0]["chapter_id"], cid.as_str());
+    assert_eq!(vids[0]["url"], format!("{base}/video"));
+    assert_eq!(text(get_with(&format!("/api/manga/{}/thumbnail", mid), &cookie).await).await, "JPEG-SHARED");
+    assert_eq!(get_with("/api/manga/nope/videos", &cookie).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get_with("/api/manga/nope/thumbnail", &cookie).await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn activity_and_the_service_worker_are_for_paired_phones_only() {
+    let _g = setup();
+    let r = get("/api/activity", PEER).await;
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(text(r).await, r#"{"error":"not paired"}"#);
+    let r = get("/sw.js", PEER).await;
+    assert_eq!(text(r).await, LOCKED_HTML, "an unpaired browser never gets the worker");
+
+    let cookie = pair().await;
+    let r = get_with("/api/activity", &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store", "activity is never cached");
+    assert_no_cors(&r, "/api/activity");
+    let v = json_of(&text(r).await);
+    assert!(v["now"].as_u64().is_some_and(|n| n > 0), "{v}");
+    assert_eq!(v["busy"], 0, "{v}");
+    assert!(v["manga"].as_array().is_some_and(Vec::is_empty), "nothing runs in the test data folder: {v}");
+    assert!(v["events"].is_array(), "{v}");
+    // A quick second poll gets the same answer (served from the last build).
+    let again = json_of(&text(get_with("/api/activity", &cookie).await).await);
+    assert_eq!(again["manga"], v["manga"]);
+    // Read-only: other methods are refused (and need the CSRF header first).
+    let r = send(req("POST", "/api/activity", PEER).header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = send(post("/api/activity", PEER).header(header::COOKIE, &cookie).body(Body::from("{}")).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    // The worker: versioned, and it caches only the shell, never the API.
+    let r = get_with("/sw.js", &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(r.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/javascript"));
+    let sw = text(r).await;
+    assert!(!sw.contains("__MV_VERSION__") && sw.contains("mv-shell-"), "version filled in");
+    let shell = sw.lines().find(|l| l.starts_with("const SHELL")).expect("a SHELL list");
+    assert!(!shell.contains("/api"), "{shell}");
 }
 
 #[tokio::test]

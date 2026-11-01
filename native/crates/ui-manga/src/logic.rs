@@ -545,9 +545,28 @@ pub fn auto_nudge(secs: f32, dir: i32) -> f32 {
     }
 }
 
+/// Ease in and out over 0..1 (auto-scroll eases up to speed with it, so it never jerks).
+pub fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0., 1.);
+    t * t * (3. - 2. * t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_scroll_eases_up_to_speed() {
+        assert_eq!(smoothstep(0.), 0.);
+        assert_eq!(smoothstep(1.), 1.);
+        assert_eq!(smoothstep(0.5), 0.5);
+        assert_eq!(smoothstep(-3.), 0.);
+        assert_eq!(smoothstep(9.), 1.);
+        // Speed only ever grows while easing in, and starts gently.
+        let steps: Vec<f32> = (0..=10).map(|i| auto_step(800., 8., 1. / 60. * smoothstep(i as f32 / 10.))).collect();
+        assert!(steps.windows(2).all(|w| w[1] >= w[0]));
+        assert!(steps[1] < steps[10] * 0.05);
+    }
 
     #[test]
     fn auto_scroll_timer() {

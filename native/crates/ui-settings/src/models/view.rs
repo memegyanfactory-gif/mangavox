@@ -12,11 +12,11 @@ use gpui_kit::*;
 use mv_ai::HubSystemFit;
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, empty_view, filter_chip, glyphs, icon, icon_button, icon_tag, ph, ph_icon, segmented, size, skeleton, skeleton_line, skeleton_row, tag, ButtonKind, Hue, Ph, Tokens, Tone, Weight};
+use mv_ui::{btn, empty_view, filter_chip, glyphs, icon, icon_button, icon_tag, ph, ph_icon, segmented, settings_note, size, skeleton, skeleton_line, skeleton_row, tag, AlertKind, ButtonKind, Hue, Ph, Tokens, Tone, Weight};
 
 use super::jobs::{self, Choice, Job, Selections, Status};
 use super::scan::{self, Category, Engine, EngineId, EngineState, Inventory, LocalModel, Source};
-use crate::ui::{format_bytes, hero_tile, page_head, state_pill, surface};
+use crate::ui::{format_bytes, hero_tile, state_pill, surface};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -106,6 +106,11 @@ impl ModelLibrary {
         })
         .detach();
         this
+    }
+
+    /// Whether the page wants the wide Settings column (the model hub's two panes).
+    pub fn wide(&self) -> bool {
+        self.page == Page::Downloads
     }
 
     pub fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
@@ -371,18 +376,8 @@ impl ModelLibrary {
             )
             .when_some(hw_text, |d, t| d.child(div().flex().items_center().gap(px(6.)).child(ph_icon(ph::CPU, Weight::Bold, Tokens::text_3(), icon_px::XS)).child(t)));
 
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .px(px(32.))
-            .pt(px(24.))
-            .pb(px(12.))
-            .border_b_1()
-            .border_color(Tokens::border())
-            .child(top)
-            .children(categories)
-            .child(strip)
+        // Under the Settings page heading, inside the same column as every other page.
+        div().flex().flex_col().gap(px(10.)).pb(px(14.)).border_b_1().border_color(Tokens::border()).child(top).children(categories).child(strip)
     }
 
     // ── Pages ───────────────────────────────────────────────────────────────
@@ -561,7 +556,7 @@ impl ModelLibrary {
             .flex()
             .flex_col()
             .gap(px(16.))
-            .child(page_head(glyphs::MODEL, Hue::Green, "Model Library", "Choose which model MangaVox uses for each job. Everything listed here runs on this PC."));
+            .child(sub_head("In use", "Choose which model MangaVox uses for each job. Everything listed here runs on this PC."));
         if self.inv.is_none() {
             return col.children((0..3).map(|_| skeleton_job()));
         }
@@ -682,7 +677,7 @@ impl ModelLibrary {
     }
 
     fn render_downloaded(&self, cx: &mut Context<Self>) -> Div {
-        let head = |desc: String| page_head(glyphs::STORAGE, Hue::Blue, "On this PC", desc);
+        let head = |desc: String| sub_head("On this PC", desc);
         let Some(inv) = self.inv.as_ref() else {
             return div().flex().flex_col().gap(px(16.)).child(head("Looking for models on this PC…".into())).child(skeleton_list());
         };
@@ -713,7 +708,7 @@ impl ModelLibrary {
     }
 
     fn render_category(&self, c: Category, cx: &mut Context<Self>) -> Div {
-        let mut col = div().flex().flex_col().gap(px(20.)).child(page_head(c.icon(), c.hue(), c.label(), c.description()));
+        let mut col = div().flex().flex_col().gap(px(20.)).child(sub_head(c.label(), c.description()));
         let Some(inv) = self.inv.as_ref() else { return col.child(skeleton_list()) };
         let group: Vec<&LocalModel> = inv.models.iter().filter(|m| m.category == c).collect();
         if group.is_empty() {
@@ -739,7 +734,7 @@ impl ModelLibrary {
     }
 
     fn render_engines(&self, cx: &mut Context<Self>) -> Div {
-        let mut col = div().flex().flex_col().gap(px(16.)).child(page_head(ph::HARD_DRIVES, Hue::Slate, "Engines", "The programs that run models. MangaVox finds them on this PC and can start the ones that are stopped."));
+        let mut col = div().flex().flex_col().gap(px(16.)).child(sub_head("Engines", "The programs that run models. MangaVox finds them on this PC and can start the ones that are stopped."));
         let Some(inv) = self.inv.as_ref() else { return col.children((0..3).map(|_| skeleton_job())) };
         for e in &inv.engines {
             let busy = self.busy.contains(&e.id);
@@ -802,30 +797,35 @@ impl ModelLibrary {
 
     fn render_downloads(&self, cx: &mut Context<Self>) -> Div {
         div()
-            .flex_1()
-            .min_h_0()
             .flex()
             .flex_col()
             .gap(px(16.))
-            .child(page_head(glyphs::DOWNLOAD, Hue::Green, "Get models", "Chat models from Hugging Face as GGUF files. Downloads resume if interrupted and land in the models folder."))
+            .child(sub_head("Get models", "Chat models from Hugging Face as GGUF files. Downloads resume if interrupted and land in the models folder."))
             .child(
-                surface()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(12.))
-                    .px(px(16.))
-                    .py(px(12.))
-                    .child(hero_tile(ph::WAVEFORM, Hue::Cyan, 32.))
-                    .child(div().flex_1().min_w_0().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Narration voices (Kokoro, Chatterbox, Piper) are set up in Settings → Audio."))
-                    .child(btn("ml-dl-audio", "Manage voices", ButtonKind::Secondary).small().icon(ph::WAVEFORM).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_audio(cx)))),
+                settings_note(AlertKind::Info, "Narration voices (Kokoro, Chatterbox, Piper) are set up in Settings → Audio.")
+                    .icon(ph::WAVEFORM)
+                    .action(btn("ml-dl-audio", "Manage voices", ButtonKind::Secondary).small().icon(ph::WAVEFORM).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_audio(cx)))),
             )
-            .child(div().flex_1().min_h(px(420.)).when_some(self.hub.clone(), |d, h| d.child(h)))
+            // The Settings page scrolls, so the hub (a list and a detail pane that scroll on their
+            // own) gets a fixed, generous height instead of the rest of the window.
+            .child(div().h(px(640.)).min_w_0().when_some(self.hub.clone(), |d, h| d.child(h)))
     }
+}
+
+/// Sub-page heading under the segmented control: the group-title style, so "In use" or
+/// "Engines" reads as a section of Model Library, not as a second page title.
+fn sub_head(title: impl Into<SharedString>, desc: impl Into<SharedString>) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .px(px(4.))
+        .child(div().text_size(px(size::MD)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title.into()))
+        .child(div().text_size(px(size::SM)).line_height(px(18.)).text_color(Tokens::text_3()).child(desc.into()))
 }
 
 impl Render for ModelLibrary {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let downloads = self.page == Page::Downloads;
         let body = match self.page {
             Page::InUse => self.render_in_use(cx),
             Page::Downloaded => self.render_downloaded(cx),
@@ -833,13 +833,8 @@ impl Render for ModelLibrary {
             Page::Engines => self.render_engines(cx),
             Page::Category(c) => self.render_category(c, cx),
         };
-        let inner = div().w_full().max_w(px(780.)).when(downloads, |d| d.max_w(px(1200.)).h_full()).px(px(32.)).py(px(28.)).flex().flex_col().gap(px(14.)).child(body);
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(self.render_subnav(cx))
-            .child(div().id("ml-content").flex_1().min_w_0().h_full().when(!downloads, |d| d.overflow_y_scroll()).child(inner))
+        // The Settings page draws the heading and scrolls; this is the body under it.
+        div().flex().flex_col().gap(px(20.)).min_w_0().child(self.render_subnav(cx)).child(body)
     }
 }
 

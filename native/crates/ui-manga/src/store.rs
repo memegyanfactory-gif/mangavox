@@ -255,7 +255,15 @@ pub fn restore_read(conn: &mut Connection, prev: &[(String, bool, i64)]) -> Resu
 }
 
 /// Persist reading progress: page, history entry, last-read, and "read" at the last page.
+/// Nothing is written in private mode (no history, Continue Reading or last read).
 pub fn save_progress(conn: &Connection, manga_id: &str, chapter_id: &str, page: usize, total: usize) -> Result<()> {
+    save_progress_unless_private(conn, mv_core::privacy::active(), manga_id, chapter_id, page, total)
+}
+
+fn save_progress_unless_private(conn: &Connection, private: bool, manga_id: &str, chapter_id: &str, page: usize, total: usize) -> Result<()> {
+    if private {
+        return Ok(());
+    }
     chapter::update_read_progress(conn, chapter_id, page as i64)?;
     history::add(conn, manga_id, chapter_id, page as i64)?;
     manga::update_last_read(conn, manga_id)?;
@@ -278,6 +286,22 @@ mod tests {
 
     fn info(id: &str, n: f64) -> ChapterInfo {
         ChapterInfo { source_id: id.into(), number: Some(n), language: "en".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn private_reading_records_nothing() {
+        let (_d, mut conn) = db();
+        let r = MangaSearchResult { source_id: "p1".into(), title: "P".into(), ..Default::default() };
+        let m = ensure_manga(&conn, "src", &r, None).unwrap();
+        let cs = apply_chapters(&mut conn, &m.id, "src", &[info("c1", 1.0)], "en").unwrap();
+        save_progress_unless_private(&conn, true, &m.id, &cs[0].id, 3, 4).unwrap();
+        let ch = chapter::get(&conn, &cs[0].id).unwrap().unwrap();
+        assert!(!ch.is_read && ch.read_progress == 0, "no progress or read mark");
+        assert!(history::list(&conn, 10).unwrap().is_empty(), "no history / Continue Reading");
+        assert!(manga::get(&conn, &m.id).unwrap().unwrap().last_read_at.is_none(), "no last read");
+        // The same call outside private mode records it.
+        save_progress_unless_private(&conn, false, &m.id, &cs[0].id, 3, 4).unwrap();
+        assert_eq!(history::list(&conn, 10).unwrap().len(), 1);
     }
 
     #[test]

@@ -983,6 +983,87 @@ async fn music_step(ch: ChapterRef, reg_model: Option<(Arc<Registry>, Option<Mod
     }
 }
 
+// ---------------------------------------------------------------- activity (read-only)
+
+/// Studio's AI run (Read, Story, a page rewrite: `run`, private to this crate) as plain data,
+/// for activity views outside the Studio page (the phone companion's Activity).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiActivity {
+    /// "read" or "story".
+    pub kind: &'static str,
+    pub chapter_id: Option<String>,
+    /// 1-based position of the chapter in the batch, and the batch size.
+    pub chapter_pos: (usize, usize),
+    pub pages_done: usize,
+    pub pages_total: usize,
+    /// 0..=1 across the batch.
+    pub progress: f32,
+    /// "Chapter 1 · reading pages 5–7 · 4/38 done".
+    pub status: String,
+    /// Waiting for an AI usage limit: why, and when it carries on (unix seconds).
+    pub waiting: Option<(String, i64)>,
+    /// "running", "done", "failed" or "cancelled".
+    pub state: &'static str,
+    pub error: Option<String>,
+}
+
+/// The current (or last) AI run, if any ran this session.
+pub fn ai_activity() -> Option<AiActivity> {
+    run::snapshot().map(|r| {
+        let (state, error) = match &r.state {
+            run::RunState::Running => ("running", None),
+            run::RunState::Done => ("done", None),
+            run::RunState::Failed(e) => ("failed", Some(e.clone())),
+            run::RunState::Cancelled => ("cancelled", None),
+        };
+        AiActivity {
+            kind: if r.kind == run::RunKind::Story { "story" } else { "read" },
+            chapter_id: r.chapter_id.clone(),
+            chapter_pos: r.chapter_pos,
+            pages_done: r.done,
+            pages_total: r.total,
+            progress: r.progress(),
+            status: r.status_line(),
+            waiting: r.waiting.clone(),
+            state,
+            error,
+        }
+    })
+}
+
+/// A Studio export or join in flight (the Studio page's or the assistant's): its manga, 0..=1
+/// and what it is doing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportActivity {
+    pub manga_id: String,
+    pub progress: f32,
+    pub label: String,
+}
+
+type ExportState = std::sync::Weak<Mutex<(f32, String)>>;
+
+/// Exports in flight; an entry goes when its job and workers are gone.
+static EXPORTS: Mutex<Vec<(String, ExportState)>> = Mutex::new(Vec::new());
+
+/// Called by `export::Job::new`.
+pub(crate) fn track_export(manga_id: &str, state: &Arc<Mutex<(f32, String)>>) {
+    let mut g = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(_, w)| w.strong_count() > 0);
+    g.push((manga_id.to_string(), Arc::downgrade(state)));
+}
+
+/// Exports and joins running now.
+pub fn exports() -> Vec<ExportActivity> {
+    let mut g = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(_, w)| w.strong_count() > 0);
+    g.iter()
+        .filter_map(|(m, w)| {
+            let (progress, label) = w.upgrade()?.lock().ok()?.clone();
+            Some(ExportActivity { manga_id: m.clone(), progress: progress.clamp(0., 1.), label })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{plan, Added, Facts, ItemState, QChapter, Queue, StepState};

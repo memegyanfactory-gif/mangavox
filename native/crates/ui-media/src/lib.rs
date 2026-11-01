@@ -18,6 +18,7 @@ mod nfx;
 pub mod remote;
 mod streams;
 
+pub use common::list_changed;
 pub use mv_media::addons::AddonRegistry;
 
 /// Gives the assistant the movie / series / anime tools (sources, play, download). Called once at startup.

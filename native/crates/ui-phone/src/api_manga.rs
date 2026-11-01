@@ -287,6 +287,11 @@ async fn pages_of(ch: &Chapter, source: &str) -> ApiResult<Arc<Vec<Page>>> {
     Ok(pages)
 }
 
+/// The file names of the reader's pages (`/page/<n>`), to match Studio's pages by name.
+pub(crate) async fn reader_files(m: &Manga, ch: &Chapter) -> ApiResult<Vec<String>> {
+    Ok(pages_of(ch, &source_of(m, ch)).await?.iter().map(page_file).collect())
+}
+
 pub(crate) async fn load_chapter(id: String) -> ApiResult<(Manga, Chapter)> {
     let found = blocking(move || {
         backend::with_db(|c| {

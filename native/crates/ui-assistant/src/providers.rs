@@ -8,7 +8,8 @@ use gpui_kit::*;
 use mv_ai::{AiProviderId, AiProviderKind, AiProviderSettings, AiProviderState, AiProviderStatus};
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, copy_button, empty_view, external_link, glyphs, icon_tag, ph, ph_icon, size, skeleton_block, tip, ButtonKind, Interactive as _, Ph, Tokens, Tone, Weight, MONO_FONT};
+use mv_ui::settings::SETTINGS_ROW_X;
+use mv_ui::{btn, copy_button, empty_view, external_link, glyphs, icon_tag, ph, ph_icon, settings_group, size, skeleton_block, tip, ButtonKind, Interactive as _, Tokens, Tone, Weight, MONO_FONT};
 
 use crate::shared::{shared, Shared};
 use crate::ui::{field, muted, password_state, provider_logo, set_value, status_pill, text_state, value_of};
@@ -255,9 +256,9 @@ impl ProvidersPanel {
             .items_center()
             .gap(px(12.))
             .min_h(px(56.))
-            .px(px(14.))
+            .px(px(SETTINGS_ROW_X))
             .py(px(10.))
-            .map(|d| if open { d.rounded_t(px(radius::LG)) } else { d.rounded(px(radius::LG)) })
+            .min_w_0()
             .role(Role::Button)
             .aria_expanded(open)
             .hover(|s| s.bg(Tokens::hover()))
@@ -281,9 +282,10 @@ impl ProvidersPanel {
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(label.clone()))
-                            .when(current, |d| d.child(icon_tag(ph::CHECK, "In use", Tone::Accent)))
-                            .when_some(st.version.clone(), |d, v| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(v))),
+                            .min_w_0()
+                            .child(div().min_w_0().truncate().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(label.clone()))
+                            .when(current, |d| d.child(div().flex_none().child(icon_tag(ph::CHECK, "In use", Tone::Accent))))
+                            .when_some(st.version.clone(), |d, v| d.child(div().flex_none().text_size(px(size::XS)).text_color(Tokens::text_3()).child(v))),
                     )
                     .child(div().truncate().text_size(px(size::XS)).text_color(Tokens::text_3()).child(st.description.clone())),
             )
@@ -295,7 +297,7 @@ impl ProvidersPanel {
                     cx.open_url(u);
                 }))
             })
-            .child(status_pill(st.state))
+            .child(div().flex_none().child(status_pill(st.state)))
             // The switch acts on its own; keep its click from also opening the card.
             .child(
                 div().id(SharedString::from(format!("en-wrap-{sid}"))).flex_none().on_click(|_, _, cx| cx.stop_propagation()).child(
@@ -317,9 +319,10 @@ impl ProvidersPanel {
                 .flex()
                 .flex_col()
                 .gap(px(12.))
-                .px(px(14.))
+                .px(px(SETTINGS_ROW_X))
                 .pt(px(12.))
                 .pb(px(14.))
+                .min_w_0()
                 .border_t_1()
                 .border_color(Tokens::border())
                 .when_some(st.detail.clone().filter(|_| !ready && !show_hint), |d, t| d.child(muted(t)))
@@ -386,15 +389,9 @@ impl ProvidersPanel {
                 )
         });
 
-        div()
-            .flex()
-            .flex_col()
-            .rounded(px(radius::LG))
-            .border_1()
-            .border_color(if current { Tokens::accent_border() } else { Tokens::border() })
-            .bg(Tokens::surface())
-            .child(header)
-            .children(body)
+        // A row of its group's card (the group draws the hairlines), expanding in place like a
+        // Windows SettingsExpander. The provider in use is marked by its "In use" tag.
+        div().flex().flex_col().min_w_0().child(header).children(body)
     }
 }
 
@@ -488,19 +485,6 @@ fn install_block(id: AiProviderId, label: &str, hint: &str) -> Div {
         .when_some(download_url(id), |d, u| d.child(external_link(format!("Download {label}"), u)))
 }
 
-/// Uppercase group header with its icon and how many providers in it are ready.
-fn group_header(icon: Ph, title: &str, ready: usize, total: usize) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .mt(px(16.))
-        .mb(px(2.))
-        .px(px(2.))
-        .child(ph_icon(icon, Weight::Bold, Tokens::text_3(), icon_px::SM))
-        .child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(title.to_uppercase()))
-        .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(if ready > 0 { format!("{ready} of {total} ready") } else { format!("{total}") }))
-}
 
 impl Render for ProvidersPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -515,13 +499,15 @@ impl Render for ProvidersPanel {
             }
         }
         // Embedded in Settings, which draws the page title; keep only the refresh control.
-        let mut root = div().flex().flex_col().gap(px(10.)).w_full().child(
+        let mut root = div().flex().flex_col().gap(px(28.)).w_full().min_w_0().child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(10.))
-                .child(div().flex_1().text_size(px(size::SM)).text_color(Tokens::text_3()).child(if loading { "Checking which providers are available…" } else { "Turn a provider on, add its key if it needs one, then test it." }))
-                .child(btn("prov-refresh", "Refresh", ButtonKind::Ghost).small().icon(glyphs::REFRESH).loading(loading).tooltip("Detect providers again").on_click(cx.listener(|this, _, _, cx| this.shared.update(cx, |s, cx| s.refresh_providers(true, cx))))),
+                .gap(px(12.))
+                .px(px(4.))
+                .min_w_0()
+                .child(div().flex_1().min_w_0().text_size(px(size::SM)).line_height(px(18.)).text_color(Tokens::text_3()).child(if loading { "Checking which providers are available…" } else { "Turn a provider on, add its key if it needs one, then test it." }))
+                .child(div().flex_none().child(btn("prov-refresh", "Refresh", ButtonKind::Ghost).small().icon(glyphs::REFRESH).loading(loading).tooltip("Detect providers again").on_click(cx.listener(|this, _, _, cx| this.shared.update(cx, |s, cx| s.refresh_providers(true, cx)))))),
         );
         if providers.is_empty() {
             root = root.child(if loading {
@@ -530,19 +516,23 @@ impl Render for ProvidersPanel {
                 empty_view(ph::PLUGS, "No providers found", "Refresh to detect local apps, coding agents and API keys again.").into_any_element()
             });
         }
-        for (title, kind, icon) in [("On this PC", AiProviderKind::Local, ph::DESKTOP), ("Coding agents", AiProviderKind::Cli, ph::TERMINAL_WINDOW), ("Cloud APIs", AiProviderKind::Api, ph::CLOUD)] {
+        // One settings group per place a provider runs; each provider is an expandable row.
+        for (title, kind) in [("On this PC", AiProviderKind::Local), ("Coding agents", AiProviderKind::Cli), ("Cloud APIs", AiProviderKind::Api)] {
             let group: Vec<&AiProviderStatus> = providers.iter().filter(|p| p.kind == kind).collect();
             if group.is_empty() {
                 continue;
             }
             let ready = group.iter().filter(|p| p.state == AiProviderState::Ready).count();
-            root = root.child(group_header(icon, title, ready, group.len()));
+            let total = group.len();
+            let desc = if ready > 0 { format!("{ready} of {total} ready") } else { format!("{total} available, none ready yet") };
+            let mut section = settings_group(title, Some(desc.into()));
             for st in group {
                 let current = in_use_model && st.id == prefs_provider;
-                root = root.child(self.card(st, current, window, cx));
+                section = section.child(self.card(st, current, window, cx));
             }
+            root = root.child(section);
         }
-        div().id("providers-panel").w_full().child(root)
+        div().id("providers-panel").w_full().min_w_0().child(root)
     }
 }
 

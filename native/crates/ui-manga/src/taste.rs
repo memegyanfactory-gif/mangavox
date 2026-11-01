@@ -436,8 +436,12 @@ pub fn update(f: impl FnOnce(&mut TasteFile)) {
     VERSION.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Keep the built profile's snapshot (changes no signal).
+/// Keep the built profile's snapshot (changes no signal). Not while private: titles added
+/// in the session would shape it.
 pub fn save_snapshot(snapshot: Vec<FeatureStat>, now: i64) {
+    if !mv_core::privacy::records_history() {
+        return;
+    }
     write(|f| {
         f.snapshot = snapshot;
         f.built_at = now;
@@ -462,11 +466,19 @@ pub fn verdict(title: &str) -> Option<FeedbackKind> {
     file().verdict(title)
 }
 
+/// A like / "not interested". Private mode gives no taste signals.
 pub fn set_verdict(title: TitleRef, kind: Option<FeedbackKind>) {
+    if !mv_core::privacy::records_history() {
+        return;
+    }
     update(|f| f.set_verdict(title, kind, now_secs()));
 }
 
+/// Library membership as a signal. Not recorded while private.
 pub fn set_in_library(title: TitleRef, on: bool) {
+    if !mv_core::privacy::records_history() {
+        return;
+    }
     if on {
         update(|f| f.back_in_library(&title.title));
     } else {

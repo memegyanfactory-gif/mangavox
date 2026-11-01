@@ -1,12 +1,17 @@
-//! Layout pieces shared by every Settings page that the mv-ui kit does not have yet: the rail
-//! item and page heading with a category-coloured icon tile, a setting row with a leading icon,
-//! the danger zone, the "Default" star tag and small fact chips. Everything else comes straight
-//! from the kit (`setting_section`, `setting_row`, `btn`, `switch`, `status_tag`, ...).
+//! Layout pieces shared by every Settings page that the mv-ui kit does not have: the rail item
+//! and page heading with a category-coloured icon tile, rows that name a thing (icon, path), the
+//! danger zone, the "Default" star tag and small fact chips. Groups and rows come from the kit's
+//! settings layout (`settings_group`, `settings_row`, `settings_note`), so every page and every
+//! embedded panel shares one column, one card style and one row rhythm.
 //! Candidates for promotion to mv-ui are marked `Promote:`.
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius};
-use mv_ui::{ph, ph_icon, size, Hue, Interactive as _, Ph, Tokens, Weight};
+use mv_ui::{ph, ph_icon, settings_group, settings_row, size, Hue, Interactive as _, Ph, SettingsGroup, SettingsRow, Tokens, Weight};
+
+/// Height of a rail destination: the same as the shell sidebar's `nav_item`, so the rail and the
+/// sidebar it replaces line up row for row (the rail's Back sits where Settings was clicked).
+pub const RAIL_ITEM_H: f32 = 32.;
 
 /// Icon on a category-coloured tile. Soft tint with a hue glyph at rest; `filled` (the selected
 /// rail item) is a solid hue with a dark fill-weight glyph, so selection changes shape and fill,
@@ -50,8 +55,8 @@ pub fn rail_item(id: impl Into<ElementId>, icon: Ph, hue: Hue, label: impl Into<
         .items_center()
         .gap(px(10.))
         .w_full()
-        .h(px(34.))
-        .px(px(8.))
+        .h(px(RAIL_ITEM_H))
+        .px(px(10.))
         .rounded(px(radius::MD))
         .text_size(px(size::MD))
         .text_color(if active { Tokens::text_1() } else { Tokens::text_2() })
@@ -66,8 +71,8 @@ pub fn rail_item(id: impl Into<ElementId>, icon: Ph, hue: Hue, label: impl Into<
             }
         })
         .pressable()
-        .when(active, |d| d.child(div().absolute().left(px(0.)).top(px(10.)).w(px(3.)).h(px(14.)).rounded_full().bg(Tokens::accent())))
-        .child(hue_tile(icon, hue, 22., active))
+        .when(active, |d| d.child(div().absolute().left(px(0.)).top(px(9.)).w(px(3.)).h(px(14.)).rounded_full().bg(Tokens::accent())))
+        .child(hue_tile(icon, hue, 20., active))
         .child(div().flex_1().min_w_0().truncate().child(label))
 }
 
@@ -91,105 +96,26 @@ pub fn page_head(icon: Ph, hue: Hue, title: impl Into<SharedString>, desc: impl 
         )
 }
 
-/// `setting_row` with a leading 16px icon, for rows that name a thing (CPU, a folder, a link).
-/// Promote: `setting_row(..).icon(Ph)`.
-pub fn icon_row(icon: Ph, label: impl Into<SharedString>, hint: impl Into<SharedString>, control: impl IntoElement) -> Div {
-    let hint: SharedString = hint.into();
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(24.))
-        .py(px(12.))
-        .child(
-            div()
-                .flex()
-                .items_start()
-                .gap(px(12.))
-                .flex_1()
-                .min_w_0()
-                .child(div().pt(px(2.)).child(ph_icon(icon, Weight::Regular, Tokens::text_2(), icon_px::MD)))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .flex_1()
-                        .min_w_0()
-                        .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(label.into()))
-                        .when(!hint.is_empty(), |d| d.child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(hint))),
-                ),
-        )
-        .child(div().flex().flex_none().items_center().gap(px(6.)).child(control))
+/// A settings row with a leading 16px icon, for rows that name a thing (CPU, a folder, a link).
+pub fn icon_row(icon: Ph, label: impl Into<SharedString>, hint: impl Into<SharedString>, control: impl IntoElement) -> SettingsRow {
+    settings_row(label, hint, control).icon(icon)
 }
 
 /// Row for a folder or file: icon, label, optional hint and the path as a middle-truncated
 /// monospace chip with a copy button (both ends of a path carry meaning), actions on the right.
-pub fn path_row(icon: Ph, label: impl Into<SharedString>, hint: impl Into<SharedString>, path: impl Into<SharedString>, control: impl IntoElement) -> Div {
-    let hint: SharedString = hint.into();
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(16.))
-        .py(px(12.))
-        .child(
-            div()
-                .flex()
-                .items_start()
-                .gap(px(12.))
-                .flex_1()
-                .min_w_0()
-                .child(div().pt(px(2.)).child(ph_icon(icon, Weight::Regular, Tokens::text_2(), icon_px::MD)))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .flex_1()
-                        .min_w_0()
-                        .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(label.into()))
-                        .when(!hint.is_empty(), |d| d.child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(hint)))
-                        .child(div().max_w(px(460.)).child(mv_ui::path_chip(path))),
-                ),
-        )
-        .child(div().flex().flex_none().items_center().gap(px(2.)).child(control))
-}
-
-/// Hairline above a row, so rows inside a section read as one list.
-pub fn divided(row: Div) -> Div {
-    row.border_t_1().border_color(Tokens::border())
+pub fn path_row(icon: Ph, label: impl Into<SharedString>, hint: impl Into<SharedString>, path: impl Into<SharedString>, control: impl IntoElement) -> SettingsRow {
+    settings_row(label, hint, control).icon(icon).below(div().flex().min_w_0().max_w(px(460.)).child(mv_ui::path_chip(path)))
 }
 
 /// Bordered surface for cards inside a section (job cards, engine cards).
 pub fn surface() -> Div {
-    div().flex().flex_col().rounded(px(radius::LG)).bg(Tokens::surface()).border_1().border_color(Tokens::border())
+    div().flex().flex_col().min_w_0().rounded(px(radius::LG)).bg(Tokens::surface()).border_1().border_color(Tokens::border())
 }
 
 /// GitHub-style danger zone: irreversible actions grouped at the bottom of the page in one
-/// danger-edged surface. <https://docs.github.com/en/repositories/creating-and-managing-repositories/deleting-a-repository>.
-/// Promote: `mv_ui::danger_zone`.
-pub fn danger_zone(title: impl Into<SharedString>, desc: impl Into<SharedString>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .mt(px(8.))
-        .px(px(16.))
-        .pt(px(14.))
-        .pb(px(4.))
-        .rounded(px(radius::LG))
-        .border_1()
-        .border_color(Tokens::danger_border())
-        .bg(Tokens::danger().alpha(0.04))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(ph_icon(ph::WARNING, Weight::Fill, Tokens::danger(), icon_px::MD))
-                .child(div().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title.into())),
-        )
-        .child(div().pt(px(2.)).pb(px(6.)).text_size(px(size::SM)).text_color(Tokens::text_3()).child(desc.into()))
+/// danger-edged card. <https://docs.github.com/en/repositories/creating-and-managing-repositories/deleting-a-repository>.
+pub fn danger_zone(title: impl Into<SharedString>, desc: impl Into<SharedString>) -> SettingsGroup {
+    settings_group(title, Some(desc.into())).danger()
 }
 
 /// "★ Default" in the favourite gold with a FILLED star: the default narrator mark.

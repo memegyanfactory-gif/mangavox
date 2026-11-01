@@ -4,6 +4,7 @@ mod keys;
 mod palette;
 mod perf;
 mod prefs;
+mod privacy;
 mod routes;
 mod shell;
 #[cfg(windows)]
@@ -132,7 +133,13 @@ fn main() {
                 ..TitleBar::window_options()
             },
             cx,
-            |window, cx| cx.new(|cx| shell::Shell::new(window, cx)),
+            |window, cx| {
+                // After an update: what changed, once.
+                mv_ui::whats_new::check_on_start(window, cx);
+                // The app was closed while private mode was on: offer to clear that session.
+                privacy::check_on_start(window, cx);
+                cx.new(|cx| shell::Shell::new(window, cx))
+            },
         )
         .expect("open window");
         // Phone companion: the UI bridge for its server, and the server when Phone access is on.

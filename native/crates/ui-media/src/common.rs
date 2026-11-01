@@ -125,7 +125,14 @@ pub fn local_image(url: &str) -> Option<PathBuf> {
         }
         None if c.claim(url) => {
             let (c, u) = (c.clone(), url.to_string());
-            bg::runtime().spawn(async move { c.download(u).await });
+            bg::runtime().spawn(async move {
+                let file = c.download(u).await;
+                // Private mode: artwork cached for a title opened in the session can be cleared.
+                if let Some(p) = &file {
+                    mv_core::privacy::record_file(p);
+                }
+                file
+            });
         }
         _ => {}
     }
@@ -230,8 +237,13 @@ pub fn media_title(kind: &str, id: &str, r: &AnimeSearchResult, fallback_title: 
 }
 
 /// Record an `open` event (keeps the title row fresh so history/continue-watching can join it).
+/// Nothing is recorded in private mode.
 pub fn record_open(title: MediaTitle) -> impl Future<Output = Result<(), String>> + Send {
+    let private = mv_core::privacy::active();
     db(move |c| {
+        if private {
+            return Ok(());
+        }
         let e = MediaEvent { media_id: Some(title.id.clone()), kind: title.kind.clone(), event_type: "open".into(), title: Some(title), ..Default::default() };
         media::record_event(c, &e).map(|_| ())
     })
@@ -278,6 +290,8 @@ pub fn set_watchlist(title: MediaTitle, add: bool) -> impl Future<Output = Resul
             media::upsert_title(c, &title)?;
             if before.is_none() {
                 watchlist::set_status(c, &title.id, &title.kind, "planned")?;
+                // Private mode: offered for clearing when the session ends.
+                mv_core::privacy::record_list_add(&title.id);
             }
         } else {
             watchlist::remove_status(c, &title.id)?;
@@ -332,14 +346,20 @@ fn promote(c: &rusqlite::Connection, media_id: &str, from: &[&str], to: &str) ->
 /// A listed title the user starts playing moves from Planned to Watching, so My List's status
 /// filters fill themselves in.
 pub fn mark_watching(media_id: String) -> impl Future<Output = Result<(), String>> + Send {
-    db(move |c| promote(c, &media_id, &["planned"], "watching").map(|_| ()))
+    // Private mode: watching is not recorded anywhere, My List statuses included.
+    let private = mv_core::privacy::active();
+    db(move |c| if private { Ok(()) } else { promote(c, &media_id, &["planned"], "watching").map(|_| ()) })
 }
 
 /// A listed title the user has finished moves to Completed. Done once per title: after that the
 /// user's own choice wins (a rewatch set back to Watching is not flipped again). Returns the entry
 /// as it was, for Undo.
 pub fn mark_completed(media_id: String) -> impl Future<Output = Result<Option<WatchlistEntry>, String>> + Send {
+    let private = mv_core::privacy::active();
     db(move |c| {
+        if private {
+            return Ok(None);
+        }
         let key = format!("media:auto-completed:{media_id}");
         if DataCache::shared().age(&key).is_some() {
             // Touch the marker so the cache's 30-day pruning does not forget it.

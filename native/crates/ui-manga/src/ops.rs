@@ -28,6 +28,8 @@ pub async fn prepare_from_source(source_id: String, r: MangaSearchResult) -> Res
             backend::store_extras(&m.id, &chapters);
             if !existed {
                 backend::set_in_library(&m.id, false);
+                // Private mode: a title first opened in the session can be cleared when it ends.
+                mv_core::privacy::record_title(&m.id);
             }
             Ok(manga::get(c, &m.id)?.unwrap_or(m))
         })

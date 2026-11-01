@@ -31,6 +31,7 @@ use crate::recap::{self, RecapOutputs};
 use crate::store;
 use crate::tags::MAX_RECS;
 use crate::ui::{action_tile, cover_src, fill_menu, icon_trigger, skeleton_cover, spawn_cover_downloads, Entry, Grid, Load};
+use crate::videos::{self, Thumbs};
 
 /// Fixed list rows before the chapters: the header and the chapter toolbar.
 const LEAD: usize = 2;
@@ -59,6 +60,11 @@ pub struct DetailPage {
     extras: HashMap<String, ChapterExtra>,
     /// Chapters Studio made a recap of (video and / or narration), by chapter id.
     recaps: HashMap<String, RecapOutputs>,
+    /// The chapter videos Studio made, in reading order, and their thumbnails (one shared image).
+    videos: Vec<mv_recap::media::ChapterVideo>,
+    video_thumbs: Thumbs,
+    /// The manga's AI thumbnail is being painted.
+    painting: bool,
     lang: String,
     expanded: bool,
     refreshing: bool,
@@ -126,6 +132,9 @@ impl DetailPage {
             in_library: !backend::browse_only().contains(&manga_id),
             extras: backend::extras(&manga_id).unwrap_or_default(),
             recaps: HashMap::new(),
+            videos: vec![],
+            video_thumbs: Thumbs::default(),
+            painting: false,
             manga_id,
             state: Load::Loading,
             cover: None,
@@ -184,6 +193,7 @@ impl DetailPage {
                         this.member = l.member;
                         this.recaps = l.recaps;
                         this.set_data(l.manga, l.chapters);
+                        this.sync_videos(cx);
                         this.maybe_load_recs(cx);
                         // A title without chapters has never been synced: fetch them once.
                         if empty && !this.auto_refreshed {
@@ -465,6 +475,152 @@ impl DetailPage {
         let x = (o.x - px(step * dir)).min(px(0.)).max(-max);
         self.recs_scroll.set_offset(point(x, o.y));
         cx.notify();
+    }
+
+    // ------------------------------------------------------------ Studio videos
+
+    /// The chapter videos from the loaded recaps, then their thumbnails drawn in the background
+    /// (local only; reused when nothing changed).
+    fn sync_videos(&mut self, cx: &mut Context<Self>) {
+        let Load::Ready((m, cs)) = &self.state else { return };
+        let list = videos::chapter_videos(cs, &self.recaps);
+        let changed = list != self.videos;
+        self.videos = list;
+        if changed {
+            self.list.remeasure_items(0..LEAD.min(self.list.item_count()));
+        }
+        if self.videos.is_empty() {
+            return;
+        }
+        let (mid, title, cover_url, cs, list) = (m.id.clone(), m.title.clone(), m.cover_path.clone(), cs.clone(), self.videos.clone());
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::blocking(move || videos::make_thumbs(&mid, &title, videos::cover_file(cover_url.as_deref(), &cs).as_deref(), &list)).await.and_then(|r| r);
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(t) => {
+                    this.set_thumbs(t, cx);
+                }
+                Err(e) => eprintln!("[manga] video thumbnails: {e:#}"),
+            });
+        })
+        .detach();
+    }
+
+    fn set_thumbs(&mut self, t: Thumbs, cx: &mut Context<Self>) {
+        // A file drawn again (new label or base) keeps its name: the old picture must leave the
+        // image cache. Only the shared picture is shown here; the chapter files are the reader's.
+        videos::forget_images(t.full.iter().chain(self.videos.first().and_then(|v| t.chapters.get(&v.chapter_id))), cx);
+        self.video_thumbs = t;
+        self.list.remeasure_items(0..LEAD.min(self.list.item_count()));
+        cx.notify();
+    }
+
+    /// Paints the manga's one AI image from its cover (Magnific credits) and redraws every video's
+    /// badge on it. `force` is Regenerate.
+    fn paint_thumb(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Load::Ready((m, cs)) = &self.state else { return };
+        if self.painting || self.videos.is_empty() {
+            return;
+        }
+        let Some(cover) = videos::cover_file(m.cover_path.as_deref(), cs) else {
+            toast::show(cx, Toast::warning("This manga has no cover to make a thumbnail from"));
+            return;
+        };
+        self.painting = true;
+        cx.notify();
+        let (mid, title, list) = (m.id.clone(), m.title.clone(), self.videos.clone());
+        cx.spawn(async move |this, cx| {
+            let res = videos::paint(mid.clone(), title.clone(), cover.clone(), force).await;
+            let thumbs = match &res {
+                Ok(_) => mv_ui::bg::blocking(move || videos::make_thumbs(&mid, &title, Some(&cover), &list)).await.and_then(|r| r).ok(),
+                Err(_) => None,
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.painting = false;
+                match res {
+                    Ok(_) => {
+                        if let Some(t) = thumbs {
+                            // Regenerate keeps every file name: always drop the old pictures.
+                            videos::forget_images(t.chapters.values().chain(t.full.iter()), cx);
+                            this.video_thumbs = t;
+                            this.list.remeasure_items(0..LEAD.min(this.list.item_count()));
+                        }
+                        toast::show(cx, Toast::success("Made the video thumbnail from the cover").icon(ph::IMAGE));
+                    }
+                    Err(e) => toast::show(cx, Toast::error(format!("Could not make the AI thumbnail: {e:#}"))),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Videos": the chapter videos Studio made of this manga under one shared thumbnail, each
+    /// playable on its own, and Play all (every chapter video in order, back to back).
+    fn videos_section(&self, m: &Manga, cx: &mut Context<Self>) -> Option<Div> {
+        if self.videos.is_empty() {
+            return None;
+        }
+        let n = self.videos.len();
+        let numbers: Vec<Option<f64>> = self.videos.iter().map(|v| v.number).collect();
+        let range = mv_recap::thumb::badge_label(&numbers);
+        let shared = self.video_thumbs.shared(&self.videos);
+        let ai = self.video_thumbs.ai;
+        let play_all = {
+            let (mid, title, list) = (m.id.clone(), m.title.clone(), self.videos.clone());
+            move |_: &ClickEvent, w: &mut Window, cx: &mut App| {
+                if let [one] = &list[..] {
+                    watch_recap(format!("{title} · {}", one.label), &one.video, w, cx);
+                } else {
+                    videos::play_all(&mid, &title, &list, w, cx);
+                }
+            }
+        };
+        let heading = section_header("Videos", Some(ph::MONITOR_PLAY))
+            .mb(px(10.))
+            .trailing(muted(if n == 1 { "1 chapter video made in Studio".to_string() } else { format!("{n} chapter videos made in Studio") }).mr(px(8.)))
+            .when(mv_recap::thumb::can_paint(), |h| {
+                h.trailing(
+                    btn("videos-ai", if ai { "Regenerate thumbnail" } else { "Make AI thumbnail" }, ButtonKind::Ghost)
+                        .small()
+                        .icon(ph::SPARKLE)
+                        .loading(self.painting)
+                        .tooltip(format!("One image for all of this manga's videos, made from its cover with Magnific{}. Each video gets its own chapter badge.", videos::cost_hint()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.paint_thumb(ai, cx))),
+                )
+            });
+        let chips = div().flex().flex_wrap().gap(px(6.)).children(self.videos.iter().map(|v| {
+            let (title, video) = (format!("{} · {}", m.title, v.label), v.video.clone());
+            let short = v.number.map(|x| format!("Ch. {}", logic::fmt_number(x))).unwrap_or_else(|| v.label.clone());
+            btn(SharedString::from(format!("video-{}", v.chapter_id)), short, ButtonKind::Secondary)
+                .small()
+                .icon(ph::PLAY)
+                .tooltip(format!("Play {}", v.label))
+                .on_click(move |_, w, cx| watch_recap(title.clone(), &video, w, cx))
+        }));
+        let body = div()
+            .flex()
+            .flex_wrap()
+            .items_start()
+            .gap(px(16.))
+            .child(div().id("videos-thumb").rounded(px(radius::MD)).cursor_pointer().hover(|s| s.opacity(0.9)).child(videos::thumb_card(shared, 288., true)).on_click(play_all.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .flex_1()
+                    .min_w(px(260.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(btn("videos-all", if n > 1 { "Play all" } else { "Play" }, ButtonKind::Primary).icon(ph::PLAY).tooltip(if n > 1 { "Watch every chapter video in order, one after another" } else { "Watch the chapter video" }).on_click(play_all))
+                            .child(muted(if n > 1 { format!("{range}, back to back") } else { range })),
+                    )
+                    .child(chips),
+            );
+        Some(div().flex().flex_col().px(px(size::PAGE_X)).pb(px(18.)).child(heading).child(body))
     }
 
     /// "You may also like": the same author / artist, the rest of the series, the series on other
@@ -931,7 +1087,7 @@ impl DetailPage {
                 })))
             });
 
-        div().flex().flex_col().child(top).child(actions).child(about).children(self.recs_section(m, cx))
+        div().flex().flex_col().child(top).child(actions).child(about).children(self.videos_section(m, cx)).children(self.recs_section(m, cx))
     }
 
     /// Chapter section header: counts, the download button, then filters / order / mark all.

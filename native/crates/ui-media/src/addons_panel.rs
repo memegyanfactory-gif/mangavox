@@ -7,7 +7,7 @@ use mv_media::addons::InstalledAddon;
 use mv_ui::theme::{icon as isz, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    bg, btn, confirm_inline, empty_view, glyphs, icon, icon_button, icon_tag, inline_alert, ph, setting_section, size, skeleton_row, switch, tag, tip, AlertKind, ButtonKind,
+    bg, btn, confirm_inline, empty_view, glyphs, icon, icon_button, icon_tag, inline_alert, ph, settings_block, settings_group, size, skeleton_row, switch, tag, tip, AlertKind, ButtonKind,
     Tokens, Tone,
 };
 
@@ -154,8 +154,10 @@ impl AddonsPanel {
             .flex()
             .items_start()
             .gap(px(12.))
+            // Row padding of the settings kit; the group card draws the hairlines between rows.
+            .px(px(mv_ui::settings::SETTINGS_ROW_X))
             .py(px(14.))
-            .when(i > 0, |d| d.border_t_1().border_color(Tokens::border()))
+            .min_w_0()
             .child(logo)
             .child(
                 div()
@@ -198,38 +200,48 @@ impl Render for AddonsPanel {
         let install = btn("addon-install", if self.busy { "Installing…" } else { "Install" }, ButtonKind::Primary).icon(ph::DOWNLOAD_SIMPLE).loading(self.busy);
         let install = if empty_url && !self.busy { install.disabled("Paste a manifest URL first") } else { install.on_click(cx.listener(|this, _, w, cx| this.install(w, cx))) };
         let n = self.addons.len();
-        let list = if !self.loaded {
-            div().flex().flex_col().child(skeleton_row()).child(skeleton_row()).into_any_element()
+        // One card row per addon, so the group draws the hairlines; loading and empty states sit
+        // in a single padded block.
+        let list: Vec<AnyElement> = if !self.loaded {
+            vec![settings_block(div().flex().flex_col().child(skeleton_row()).child(skeleton_row())).into_any_element()]
         } else if n == 0 {
-            empty_view(glyphs::SOURCES, "No addons yet", "Addons find the streams for movies, series and anime. Paste an addon's manifest URL above to install one.")
-                .compact()
-                .action(btn("addon-paste", "Paste a manifest URL", ButtonKind::Secondary).icon(ph::LINK_SIMPLE).on_click(cx.listener(|this, _, w, cx| this.focus_url(w, cx))))
-                .into_any_element()
+            vec![settings_block(
+                empty_view(glyphs::SOURCES, "No addons yet", "Addons find the streams for movies, series and anime. Paste an addon's manifest URL above to install one.")
+                    .compact()
+                    .action(btn("addon-paste", "Paste a manifest URL", ButtonKind::Secondary).icon(ph::LINK_SIMPLE).on_click(cx.listener(|this, _, w, cx| this.focus_url(w, cx)))),
+            )
+            .into_any_element()]
         } else {
-            div().flex().flex_col().children(self.addons.iter().enumerate().map(|(i, a)| self.row(i, a, cx))).into_any_element()
+            self.addons.iter().enumerate().map(|(i, a)| self.row(i, a, cx).into_any_element()).collect()
         };
+        let field = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .min_w_0()
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.url).cleanable(true).prefix(icon(ph::LINK_SIMPLE.bold(), Tokens::text_3(), isz::SM))))
+                    .child(div().flex_none().child(install)),
+            )
+            .when_some(self.error.clone(), |d, e| {
+                d.child(inline_alert(AlertKind::Error, "Could not install this addon", e).dismissible(cx.listener(|this, _, _, cx| {
+                    this.error = None;
+                    cx.notify();
+                })))
+            });
         div()
             .id("addons-panel")
             .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(8.))
-            .child(
-                setting_section("Install an addon", Some("Paste the manifest URL from the addon's website. It usually ends in manifest.json.".into()))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .pt(px(6.))
-                            .child(div().flex_1().child(Input::new(&self.url).cleanable(true).prefix(icon(ph::LINK_SIMPLE.bold(), Tokens::text_3(), isz::SM))))
-                            .child(install),
-                    )
-                    .when_some(self.error.clone(), |d, e| d.child(div().pt(px(10.)).child(inline_alert(AlertKind::Error, "Could not install this addon", e).dismissible(cx.listener(|this, _, _, cx| {
-                        this.error = None;
-                        cx.notify();
-                    }))))),
-            )
-            .child(setting_section(if self.loaded { format!("Installed ({n})") } else { "Installed".to_string() }, None).child(list))
+            .gap(px(28.))
+            .child(settings_group("Install an addon", Some("Paste the manifest URL from the addon's website. It usually ends in manifest.json.".into())).child(settings_block(field)))
+            .child(settings_group(if self.loaded { format!("Installed ({n})") } else { "Installed".to_string() }, None).children(list))
     }
 }

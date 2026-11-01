@@ -379,6 +379,7 @@ enum RecapState {
 
 struct Recap {
     id: u64,
+    manga_id: String,
     manga_title: String,
     state: RecapState,
     error: Option<String>,
@@ -416,7 +417,7 @@ fn start_recap(manga_id: String, manga_title: String, chapter_ids: Vec<String>) 
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut list = recaps();
-        list.push(Recap { id, manga_title, state: RecapState::Waiting, error: None, progress: progress.clone(), cancel: cancel.clone() });
+        list.push(Recap { id, manga_id: manga_id.clone(), manga_title, state: RecapState::Waiting, error: None, progress: progress.clone(), cancel: cancel.clone() });
         while list.len() > KEEP_RECAPS {
             match list.iter().position(|r| matches!(r.state, RecapState::Done | RecapState::Failed | RecapState::Cancelled)) {
                 Some(i) => drop(list.remove(i)),
@@ -558,6 +559,20 @@ fn all_jobs() -> Vec<JobRow> {
     rows.extend(jobs.iter().filter(|j| !q.items.iter().any(|it| it.chapter.id == j.chapter_id)).map(service_row));
     rows.extend(recaps().iter().rev().map(recap_row));
     rows
+}
+
+/// The newest full-recap join of each manga started from the phone (cancelled ones left out), for
+/// Activity.
+pub(crate) fn recap_activity() -> Vec<crate::activity::Join> {
+    let mut out: Vec<crate::activity::Join> = vec![];
+    for r in recaps().iter().rev().filter(|r| r.state != RecapState::Cancelled) {
+        if out.iter().any(|o| o.manga_id == r.manga_id) {
+            continue;
+        }
+        let row = recap_row(r);
+        out.push(crate::activity::Join { id: row.id, manga_id: r.manga_id.clone(), title: r.manga_title.clone(), state: row.state, progress: row.progress as f32, line: row.stage, error: row.error });
+    }
+    out
 }
 
 async fn jobs() -> ApiResult<Json<Vec<JobRow>>> {

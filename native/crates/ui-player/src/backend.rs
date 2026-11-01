@@ -135,9 +135,15 @@ pub fn load_resume(ident: &Ident) -> Option<f64> {
     logic::resume_position(row.position_secs, row.duration_secs, row.completed)
 }
 
+/// Whether playback of `ident` goes into watch history, Continue Watching and resume points:
+/// catalog titles only, and never in private mode.
+pub fn records_watch(ident: &Ident, private: bool) -> bool {
+    ident.tracked && !private
+}
+
 /// `kind` is `play`, `progress` or `complete`.
 pub fn save_event(ident: &Ident, kind: &str, pos: f64, duration: f64) -> Result<()> {
-    if !ident.tracked {
+    if !records_watch(ident, mv_core::privacy::active()) {
         return Ok(());
     }
     let conn = mv_core::db::open_default()?;
@@ -278,8 +284,16 @@ pub async fn next_episode(req: PlayRequest) -> Result<PlayRequest> {
 
 #[cfg(test)]
 mod tests {
-    use super::ident;
+    use super::{ident, records_watch};
     use mv_ui::nav::PlayRequest;
+
+    #[test]
+    fn private_playback_is_not_recorded() {
+        let req = PlayRequest { title: "Frieren".into(), source: "magnet:?xt=1".into(), file_idx: None, imdb_id: None, mal_id: Some("52991".into()), season: None, episode: Some(3) };
+        let id = ident(&req);
+        assert!(records_watch(&id, false));
+        assert!(!records_watch(&id, true), "no history, resume point or Continue Watching while private");
+    }
 
     #[test]
     fn only_catalog_titles_go_into_watch_history() {

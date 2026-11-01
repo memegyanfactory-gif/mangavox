@@ -277,6 +277,11 @@ pub fn prompt(cx: &mut App) -> Option<AnyElement> {
     let el = match st {
         Status::Available(release) => card("Update available".into(), "icons/circle-arrow-up.svg", Tokens::accent())
             .child(text(format!("MangaVox v{} is out (you have v{}). Download it now? The app restarts by itself when it's done.", release.version, version())))
+            .children({
+                // What is in it: the notes' first few headlines.
+                let heads: Vec<String> = crate::whats_new::parse_notes(&release.notes).into_iter().filter(|s| !s.title.is_empty()).map(|s| s.title).take(3).collect();
+                (!heads.is_empty()).then(|| div().flex().flex_col().gap(px(3.)).children(heads.into_iter().map(|h| div().text_size(px(size::XS)).text_color(Tokens::text_1()).child(format!("• {h}")))))
+            })
             .child(
                 div()
                     .flex()
@@ -319,6 +324,7 @@ pub fn about(cx: &mut App) -> AnyElement {
     let busy = matches!(st, Status::Checking | Status::Downloading(_) | Status::Installing(_));
     div()
         .flex()
+        .flex_wrap()
         .items_center()
         .gap(px(12.))
         .child(
@@ -326,6 +332,7 @@ pub fn about(cx: &mut App) -> AnyElement {
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_w(px(200.))
                 .gap(px(3.))
                 .child(div().text_size(px(size::MD)).text_color(Tokens::text_1()).child(format!("MangaVox v{}", version())))
                 .child(div().text_size(px(size::SM)).text_color(color).child(line))
@@ -333,6 +340,7 @@ pub fn about(cx: &mut App) -> AnyElement {
                     d.child(div().mt(px(4.)).w_full().h(px(3.)).rounded_full().bg(Tokens::active()).child(div().h_full().rounded_full().bg(Tokens::accent()).w(relative(pct))))
                 }),
         )
+        .child(small_btn("about-whats-new", "What's new", false).on_click(|_, window, cx| crate::whats_new::show(window, cx, false)))
         .when(!busy, |d| {
             d.child(small_btn("about-check", "Check for updates", false).on_click(move |_, _, cx| a.update(cx, |u, cx| u.check(true, false, cx))))
                 .when(available, |d| d.child(small_btn("about-update", "Download and restart", true).on_click(move |_, _, cx| b.update(cx, |u, cx| u.install(cx)))))

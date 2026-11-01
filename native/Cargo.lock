@@ -5751,13 +5751,16 @@ dependencies = [
  "anyhow",
  "dirs 6.0.0",
  "futures",
+ "hound",
  "image",
  "mv-ai",
  "mv-core",
  "serde",
  "serde_json",
  "tempfile",
+ "tiny-skia",
  "tokio",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -5833,6 +5836,7 @@ dependencies = [
  "gpui-kit",
  "mv-core",
  "mv-update",
+ "serde_json",
  "tokio",
  "windows-sys 0.60.2",
 ]
@@ -9834,6 +9838,7 @@ dependencies = [
  "mv-core",
  "mv-net",
  "mv-plugins",
+ "mv-recap",
  "mv-sources",
  "mv-ui",
  "rodio",

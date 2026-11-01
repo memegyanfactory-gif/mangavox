@@ -61,6 +61,27 @@ struct Group {
     serial: u64,
 }
 
+/// One title's downloads as [`Downloads::activity`] reports them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DownloadActivity {
+    pub manga_id: String,
+    pub title: String,
+    /// Chapters in this count, saved, and failed.
+    pub total: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub last_error: Option<String>,
+    /// Paused from its card or the whole queue is (the chapter in progress still finishes).
+    pub paused: bool,
+    /// Nothing of the title is queued or downloading any more.
+    pub finished: bool,
+    /// The chapter downloading now ("Ch. 12") and its (saved, total) pages (total 0 = preparing).
+    pub chapter: Option<String>,
+    pub pages: Option<(usize, usize)>,
+    /// Unique per count: a new count of the same title gets a new one.
+    pub serial: u64,
+}
+
 /// Every title's [`Group`]. Pure bookkeeping, so it is tested without a window.
 #[derive(Default)]
 struct Groups {
@@ -249,6 +270,31 @@ impl Downloads {
         self.paused
     }
 
+    /// Every title's download count as plain data (what its card shows), for activity views
+    /// outside the shell (the phone companion's Activity).
+    pub fn activity(&self) -> Vec<DownloadActivity> {
+        self.groups
+            .list
+            .iter()
+            .map(|g| {
+                let active = self.active.as_ref().filter(|a| a.job.manga_id == g.manga_id);
+                DownloadActivity {
+                    manga_id: g.manga_id.clone(),
+                    title: g.title.clone(),
+                    total: g.total,
+                    done: g.done,
+                    failed: g.failed.len(),
+                    last_error: g.last_error.clone(),
+                    paused: !g.finished && (self.paused || g.held),
+                    finished: g.finished,
+                    chapter: active.map(|a| a.job.label.clone()),
+                    pages: active.map(|a| (a.pages_done, a.pages_total)),
+                    serial: g.serial,
+                }
+            })
+            .collect()
+    }
+
     /// Pause: the chapter in progress finishes, the rest waits. Resume picks the queue up again.
     pub fn set_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
         self.paused = paused;
@@ -298,6 +344,8 @@ impl Downloads {
         }
         for j in &jobs {
             self.errors.remove(&j.chapter_id);
+            // Private mode: offered for clearing when the session ends.
+            mv_core::privacy::record_download(&j.manga_id, &j.chapter_id);
         }
         // Asking for a download is a clear intent to run the queue.
         self.paused = false;

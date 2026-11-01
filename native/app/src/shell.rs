@@ -12,7 +12,7 @@ use gpui_kit::component::command::CommandState;
 use gpui_kit::component::{FocusTrapElement as _, TitleBar, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ui::nav::{set_back_target, set_current_route, set_navigator};
+use mv_ui::nav::{set_back_label, set_back_target, set_current_route, set_navigator};
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::update::{version, Status, Updater};
@@ -456,7 +456,9 @@ impl Shell {
     /// Keeps the back target current (pages label their own back control with it). The sidebar
     /// stays as the user left it: no page collapses it on its own.
     fn sync_back(&mut self, cx: &mut App) {
-        set_back_target(cx, self.back_route());
+        let back = self.back_route();
+        set_back_label(cx, back.as_ref().map(|r| self.label(r)));
+        set_back_target(cx, back);
         set_current_route(cx, self.route.clone());
     }
 
@@ -959,23 +961,14 @@ impl Shell {
                 .on_click(cx.listener(|this, _, w, cx| this.toggle_sidebar(w, cx)))
         });
 
-        // Settings has no sidebar, so its way out is spelled out.
-        let back_el = if in_settings {
-            btn("nav-back", format!("Back to {}", back_label.clone().unwrap_or_else(|| self.section.label().into())), ButtonKind::Ghost)
-                .small()
-                .icon(glyphs::BACK)
-                .kbd("escape")
-                .occlude()
-                .on_click(cx.listener(|this, _, w, cx| this.back(w, cx)))
-                .into_any_element()
-        } else {
-            icon_button("nav-back", glyphs::BACK, back_label.as_ref().map(|l| format!("Back to {l}")).unwrap_or_else(|| "Back".into()))
-                .kbd(Shortcut::Back.keys())
-                .when(back.is_none(), |b| b.disabled("Nothing to go back to"))
-                .occlude()
-                .on_click(cx.listener(|this, _, w, cx| this.back(w, cx)))
-                .into_any_element()
-        };
+        // The same Back icon in the same place on every page. Settings spells its way out at the
+        // bottom of its own rail, where the Settings entry was clicked (see ui-settings).
+        let back_el = icon_button("nav-back", glyphs::BACK, back_label.as_ref().map(|l| format!("Back to {l}")).unwrap_or_else(|| "Back".into()))
+            .kbd(if in_settings { "escape" } else { Shortcut::Back.keys() })
+            // Settings always has a way out (the section home when history is empty).
+            .when(back.is_none() && !in_settings, |b| b.disabled("Nothing to go back to"))
+            .occlude()
+            .on_click(cx.listener(|this, _, w, cx| this.back(w, cx)));
         let forward_el = (!in_settings).then(|| {
             let next = self.forward.last().map(|e| self.label(&e.route));
             icon_button("nav-forward", ph::ARROW_RIGHT, next.as_ref().map(|l| format!("Forward to {l}")).unwrap_or_else(|| "Forward".into()))
@@ -1046,7 +1039,8 @@ impl Shell {
                 // The welcome setup shows only its name: it has its own Back and Skip.
                 .child(div().flex().flex_1().min_w_0().items_center().gap(px(2.)).children(toggle).when(!welcome, |d| d.child(back_el).children(forward_el)).child(self.crumbs_el(cx)))
                 .child(search)
-                .child(div().flex().flex_1().min_w_0().justify_end().items_center().gap(px(4.)).children(assistant)),
+                // Private mode: only on Manga, Anime and Movies pages (see privacy.rs).
+                .child(div().flex().flex_1().min_w_0().justify_end().items_center().gap(px(4.)).children(crate::privacy::title_controls(&self.route)).children(assistant)),
         )
     }
 
@@ -1480,7 +1474,7 @@ impl Render for Shell {
             }
             mv_ui::activity::corner(cards, Some(toast::view(cx)), cx)
         };
-        let page = div().id("page").relative().flex_1().min_w_0().h_full().overflow_hidden().child(self.page.clone()).child(corner);
+        let page = div().id("page").relative().flex_1().min_w_0().h_full().overflow_hidden().child(self.page.clone()).children(crate::privacy::page_tint(&self.route)).child(corner);
 
         let mut body = div().relative().flex().flex_1().min_h_0().when(show_sidebar, |d| d.child(self.sidebar(rail, false, cx))).child(page);
         match dock {

@@ -27,6 +27,7 @@ use crate::narrator::Narrator;
 use crate::recap::{self, Narration, RecapOutputs};
 use crate::store;
 use crate::ui::{fill_menu, icon_trigger, menu_trigger, Entry, Load};
+use crate::videos;
 
 const MAX_INFLIGHT: usize = 3;
 const STRIP_WIDTH: f32 = 860.0;
@@ -46,6 +47,10 @@ const AUTO_FRAME: Duration = Duration::from_millis(16);
 const AUTO_END_HOLD: f32 = 1.5;
 /// Read aloud follows the narration again this long after the user last scrolled by hand.
 const REFOLLOW: Duration = Duration::from_secs(6);
+/// Auto-scroll picks up again this long after the user scrolled by hand.
+const AUTO_RESUME: Duration = Duration::from_millis(1600);
+/// Seconds auto-scroll takes to ease up to full speed when it starts or resumes.
+const AUTO_RAMP: f32 = 0.6;
 
 /// Chapter whose reader starts reading aloud as soon as it opens (set by the manga page).
 static PENDING_ALOUD: Mutex<Option<String>> = Mutex::new(None);
@@ -102,6 +107,8 @@ struct Loaded {
     pages: Vec<PageEntry>,
     start: usize,
     recap: Option<RecapOutputs>,
+    /// The manga's cover (URL or file), for the video thumbnail.
+    cover: Option<String>,
 }
 
 fn local_pages(ch: &Chapter) -> Vec<PathBuf> {
@@ -158,7 +165,7 @@ async fn load_chapter(chapter_id: String, at_end: bool) -> Result<Loaded> {
     } else {
         0
     };
-    Ok(Loaded { manga_title: m.title, source, chapters, chapter: ch, pages, start, recap })
+    Ok(Loaded { manga_title: m.title, source, chapters, chapter: ch, pages, start, recap, cover: m.cover_path })
 }
 
 /// Records an element's window bounds during prepaint (for click / drag math).
@@ -191,14 +198,14 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("end", "Last page"),
     ("n", "Next chapter"),
     ("p", "Previous chapter"),
-    ("a", "Start or stop auto-scroll"),
-    ("r", "Read aloud (chapters Studio narrated)"),
+    ("a", "Start or stop auto-scroll (or S)"),
+    ("r", "Listen: Studio's narration, pages follow along"),
     ("k", "Pause or play the narration"),
-    ("[", "Auto-scroll slower"),
-    ("]", "Auto-scroll faster"),
+    ("[", "Auto-scroll slower (or - in the long strip)"),
+    ("]", "Auto-scroll faster (or + in the long strip)"),
     ("m", "Change reading mode"),
     ("f", "Change page fit"),
-    ("=", "Zoom in (or Ctrl + mouse wheel, or double-click the middle)"),
+    ("=", "Zoom in (or Ctrl + mouse wheel, or double-click the middle); paged modes"),
     ("-", "Zoom out"),
     ("0", "Reset zoom"),
     ("f11", "Full screen"),
@@ -256,10 +263,20 @@ pub struct ReaderPage {
     auto_elapsed: f32,
     /// The custom timer field, while it is open.
     auto_custom: Option<(Entity<InputState>, Subscription)>,
+    /// The user scrolled by hand: auto-scroll waits until then, and picks up from where they are.
+    auto_hold: Option<Instant>,
+    /// The mouse is held down on the page: auto-scroll waits until it is let go.
+    auto_pressed: bool,
+    /// 0..1 while auto-scroll eases up to speed.
+    auto_ramp: f32,
     /// The chapter the reader was opened on (its route, to tell when it is the page on screen).
     route_chapter: String,
     /// Studio's recap of the open chapter, when it made one.
     recap: Option<RecapOutputs>,
+    /// The manga's cover (URL or file), for the video thumbnail.
+    cover: Option<String>,
+    /// The thumbnail of the open chapter's video (`thumbnail.jpg` in its Studio folder).
+    video_thumb: Option<PathBuf>,
     aloud: Option<Aloud>,
     aloud_loading: bool,
     aloud_bar: Rc<Cell<Bounds<Pixels>>>,
@@ -315,8 +332,13 @@ impl ReaderPage {
             auto_task: None,
             auto_elapsed: 0.,
             auto_custom: None,
+            auto_hold: None,
+            auto_pressed: false,
+            auto_ramp: 0.,
             route_chapter: chapter_id.clone(),
             recap: None,
+            cover: None,
+            video_thumb: None,
             aloud: None,
             aloud_loading: false,
             aloud_bar: Rc::new(Cell::new(Bounds::default())),
@@ -348,6 +370,7 @@ impl ReaderPage {
         // The narration belongs to the chapter that was open.
         self.aloud = None;
         self.recap = None;
+        self.video_thumb = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = mv_ui::bg::run(load_chapter(chapter_id, at_end)).await.and_then(|r| r);
@@ -371,8 +394,10 @@ impl ReaderPage {
                             }
                         };
                         this.recap = l.recap;
+                        this.cover = l.cover;
                         this.chapter = Some(l.chapter);
                         this.pages = Load::Ready(l.pages);
+                        this.load_video_thumb(cx);
                         this.page_scroll.set_offset(point(px(0.), px(0.)));
                         this.strip_scroll.set_offset(point(px(0.), px(0.)));
                         if this.current > 0 {
@@ -388,6 +413,63 @@ impl ReaderPage {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Draws (or reuses) the open chapter's video thumbnail: the manga's one shared image with a
+    /// local "Chapter N" badge. The first time a video of this manga is shown and Magnific is set
+    /// up, its one AI image is painted from the cover (once; a failure is not retried this session).
+    fn load_video_thumb(&mut self, cx: &mut Context<Self>) {
+        let (Some(r), Some(ch)) = (&self.recap, &self.chapter) else { return };
+        let Some(video) = r.video.clone() else { return };
+        let generation = self.generation;
+        let (mid, title, cover_url, ch) = (self.manga_id.clone(), self.title.clone(), self.cover.clone(), ch.clone());
+        let cv = mv_recap::media::ChapterVideo { chapter_id: ch.id.clone(), number: ch.number, label: logic::chapter_label(&ch), video, thumbnail: None };
+        cx.spawn(async move |this, cx| {
+            let draw = {
+                let (mid, title, cv) = (mid.clone(), title.clone(), cv.clone());
+                move || -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+                    let cover = videos::cover_file(cover_url.as_deref(), std::slice::from_ref(&ch));
+                    let th = videos::make_thumbs(&mid, &title, cover.as_deref(), std::slice::from_ref(&cv))?;
+                    Ok((th.chapters.get(&cv.chapter_id).cloned(), cover))
+                }
+            };
+            let first = mv_ui::bg::blocking(draw.clone()).await.and_then(|r| r);
+            let cover = match first {
+                Ok((thumb, cover)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.generation == generation {
+                            // It may have been drawn again on a new base: no stale picture.
+                            videos::forget_images(thumb.iter(), cx);
+                            this.video_thumb = thumb;
+                            cx.notify();
+                        }
+                    });
+                    cover
+                }
+                Err(e) => {
+                    eprintln!("[reader] video thumbnail: {e:#}");
+                    None
+                }
+            };
+            let Some(cover) = cover.filter(|_| mv_recap::thumb::should_auto_paint(&mv_recap::media::manga_dir(&mid))) else { return };
+            match videos::paint(mid, title, cover, false).await {
+                Ok(_) => {
+                    let again = mv_ui::bg::blocking(draw).await.and_then(|r| r);
+                    let _ = this.update(cx, |this, cx| {
+                        if let (Ok((Some(p), _)), true) = (&again, this.generation == generation) {
+                            videos::forget_images([p], cx);
+                            this.video_thumb = Some(p.clone());
+                        }
+                        mv_ui::toast::show(cx, mv_ui::toast::Toast::success("Made this manga's video thumbnail from its cover").icon(ph::IMAGE));
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |_, cx| mv_ui::toast::show(cx, mv_ui::toast::Toast::warning(format!("Could not make the AI video thumbnail: {e:#}"))));
+                }
+            }
         })
         .detach();
     }
@@ -562,6 +644,7 @@ impl ReaderPage {
 
     fn scroll_by(&mut self, viewport_fraction: f32, cx: &mut Context<Self>) {
         self.aloud_touched();
+        self.hold_auto();
         let h = self.strip_scroll.bounds().size.height;
         let o = self.strip_scroll.offset();
         let max = self.strip_scroll.max_offset().y;
@@ -673,6 +756,8 @@ impl ReaderPage {
         self.aloud = None;
         self.auto = true;
         self.auto_elapsed = 0.;
+        self.auto_ramp = 0.;
+        self.auto_hold = None;
         // Reading starts: the bars get out of the way.
         self.hide_overlay(cx);
         self.auto_task = Some(cx.spawn(async move |this, cx| {
@@ -695,6 +780,7 @@ impl ReaderPage {
         self.auto = false;
         self.auto_task = None;
         self.auto_elapsed = 0.;
+        self.auto_hold = None;
         if let Some(r) = reason {
             mv_ui::toast::show(cx, mv_ui::toast::Toast::info(r.to_string()).icon(ph::PAUSE_CIRCLE));
         }
@@ -748,7 +834,22 @@ impl ReaderPage {
 
     /// Something else has the reader's attention: the timer waits.
     fn auto_paused(&self) -> bool {
-        self.dragging || self.menu_open || self.show_keys || self.auto_custom.is_some() || self.pan.is_some() || !matches!(self.pages, Load::Ready(_)) || (!self.strip() && self.zoom > 1.)
+        self.dragging
+            || self.menu_open
+            || self.show_keys
+            || self.auto_custom.is_some()
+            || self.pan.is_some()
+            || self.auto_pressed
+            || self.auto_hold.is_some_and(|t| Instant::now() < t)
+            || !matches!(self.pages, Load::Ready(_))
+            || (!self.strip() && self.zoom > 1.)
+    }
+
+    /// The user scrolled by hand: auto-scroll waits a moment, then carries on from there.
+    fn hold_auto(&mut self) {
+        if self.auto {
+            self.auto_hold = Some(Instant::now() + AUTO_RESUME);
+        }
     }
 
     /// One auto-scroll frame. Long strip: one screen per `auto_secs`, then on to the next
@@ -756,8 +857,12 @@ impl ReaderPage {
     /// turns after `auto_secs`.
     fn auto_tick(&mut self, dt: f32, cx: &mut Context<Self>) {
         if self.auto_paused() {
+            self.auto_ramp = 0.;
             return;
         }
+        // Starting and resuming ease in instead of jumping straight to full speed.
+        self.auto_ramp = (self.auto_ramp + dt / AUTO_RAMP).min(1.);
+        let dt_scroll = dt * logic::smoothstep(self.auto_ramp);
         let strip = self.strip();
         let handle = if strip { self.strip_scroll.clone() } else { self.page_scroll.clone() };
         let h = f32::from(handle.bounds().size.height);
@@ -766,7 +871,7 @@ impl ReaderPage {
         let scrolls = (strip || self.transition.is_none()) && max > 1. && h > 0.;
         if scrolls && y < max - 0.5 {
             let o = handle.offset();
-            let ny = (y + logic::auto_step(h, self.auto_secs, dt)).min(max);
+            let ny = (y + logic::auto_step(h, self.auto_secs, dt_scroll)).min(max);
             handle.set_offset(point(o.x, px(-ny)));
             if strip {
                 self.sync_strip_page(cx);
@@ -1079,13 +1184,36 @@ impl ReaderPage {
                 .items_center()
                 .gap(px(4.))
                 .when_some(video, |d, v| {
-                    d.child(btn("recap-watch", "Watch recap", ButtonKind::Ghost).small().icon(ph::MONITOR_PLAY).tooltip("Play the recap video Studio made of this chapter").on_click(move |_, w, cx| {
-                        watch_recap(title.clone(), &v, w, cx);
+                    let mid = self.manga_id.clone();
+                    // The video's own thumbnail on the button (the manga's shared image with this
+                    // chapter's badge), so it reads as "this chapter's video".
+                    d.child(
+                        div()
+                            .id("recap-watch")
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(8.))
+                            .h(px(36.))
+                            .pl(px(3.))
+                            .pr(px(10.))
+                            .rounded(px(radius::MD))
+                            .text_size(px(size::SM))
+                            .text_color(Tokens::text_1())
+                            .hover(|s| s.bg(Tokens::hover()))
+                            .pressable()
+                            .tooltip(tip("Play the recap video Studio made of this chapter"))
+                            .child(videos::thumb_card(self.video_thumb.clone(), 54., true))
+                            .child("Watch video")
+                            .on_click(move |_, w, cx| watch_recap(title.clone(), &v, w, cx)),
+                    )
+                    .child(icon_button("recap-videos", ph::SQUARES_FOUR, "All of this manga's videos (Play all)").small().on_click(move |_, w, cx| {
+                        mv_ui::navigate(Route::MangaDetail { manga_id: mid.clone(), source_id: None }, w, cx);
                     }))
                 })
                 .when(r.can_read_aloud(), |d| {
                     d.child(
-                        btn("recap-aloud", if on { "Stop reading" } else { "Read aloud" }, if on { ButtonKind::Secondary } else { ButtonKind::Primary })
+                        btn("recap-aloud", if on { "Stop listening" } else { "Listen" }, if on { ButtonKind::Secondary } else { ButtonKind::Primary })
                             .small()
                             .icon(if on { ph::SPEAKER_X } else { ph::SPEAKER_HIGH })
                             .loading(self.aloud_loading)
@@ -1377,7 +1505,7 @@ impl ReaderPage {
             "left" | "pageup" | "up" => self.prev(cx),
             "home" => self.jump(0, cx),
             "end" => self.jump(self.total().saturating_sub(1), cx),
-            "a" => self.toggle_auto(cx),
+            "a" | "s" => self.toggle_auto(cx),
             "[" => self.set_auto_secs(logic::auto_nudge(self.auto_secs, -1), cx),
             "]" => self.set_auto_secs(logic::auto_nudge(self.auto_secs, 1), cx),
             "m" => {
@@ -1396,6 +1524,9 @@ impl ReaderPage {
             "p" => {
                 self.step_chapter(-1, cx);
             }
+            // Nothing zooms in the long strip, so there + and - set the auto-scroll speed.
+            "=" | "+" if self.strip() => self.set_auto_secs(logic::auto_nudge(self.auto_secs, 1), cx),
+            "-" if self.strip() => self.set_auto_secs(logic::auto_nudge(self.auto_secs, -1), cx),
             "=" | "+" => self.zoom_by(ZOOM_STEP, None, cx),
             "-" => self.zoom_by(1. / ZOOM_STEP, None, cx),
             "0" => self.set_zoom(1., None, cx),
@@ -2007,9 +2138,12 @@ impl Render for ReaderPage {
                     .items_center()
                     .on_scroll_wheel(cx.listener(|this, _, window, cx| {
                         this.aloud_touched();
+                        this.hold_auto();
                         // after the scroll has been applied
                         cx.defer_in(window, |this, _, cx| this.sync_strip_page(cx));
                     }))
+                    // Holding the mouse on the strip pauses auto-scroll until it is let go.
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, _| this.auto_pressed = true))
                     .on_click(cx.listener(|this, ev: &ClickEvent, w, cx| this.on_page_click(ev, w, cx)))
                     // one child per page, so `top_item` / `scroll_to_top_of_item` map to pages
                     .children((0..n).map(|i| div().w_full().max_w(px(STRIP_WIDTH)).flex_none().child(self.page_view(i, Fit::Width, true, false, cx))))
@@ -2029,6 +2163,7 @@ impl Render for ReaderPage {
                         cx.stop_propagation();
                     } else {
                         this.aloud_touched();
+                        this.hold_auto();
                     }
                 });
                 let surface: AnyElement = match self.transition {
@@ -2094,6 +2229,8 @@ impl Render for ReaderPage {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, ev: &MouseDownEvent, _, _| {
+                            // Holding the mouse on the page pauses auto-scroll.
+                            this.auto_pressed = true;
                             if this.zoom > 1. {
                                 this.pan = Some((ev.position, this.page_scroll.offset()));
                                 this.panned = false;
@@ -2115,11 +2252,13 @@ impl Render for ReaderPage {
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.dragging = false;
                 this.pan = None;
+                this.auto_pressed = false;
                 cx.notify();
             }))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.dragging = false;
                 this.pan = None;
+                this.auto_pressed = false;
                 cx.notify();
             }))
             .relative()

@@ -41,7 +41,9 @@ pub fn find(manga_id: &str, chapter_id: &str) -> Option<RecapOutputs> {
 
 /// [`find`] for a given Studio chapter folder.
 pub fn find_in(dir: &Path) -> Option<RecapOutputs> {
-    let video = Some(dir.join("video_final.mp4")).filter(|p| p.metadata().is_ok_and(|m| m.is_file() && m.len() > 0));
+    // Named as in the shared chapter-media contract (`mv_recap::media`); only a stat here, as the
+    // manga page asks this for every chapter.
+    let video = Some(dir.join(mv_recap::media::VIDEO)).filter(|p| p.metadata().is_ok_and(|m| m.is_file() && m.len() > 0));
     // A sync map without any voiced clip is a half-finished run: nothing to read aloud.
     let sync_map = Some(dir.join("sync_map.json")).filter(|p| p.is_file() && has_audio(&dir.join("audio")));
     (video.is_some() || sync_map.is_some()).then(|| RecapOutputs { dir: dir.to_path_buf(), video, sync_map })
@@ -87,6 +89,9 @@ pub struct Narration {
     /// Studio page index -> page file name (to match the reader's own page list).
     #[serde(skip)]
     pub page_files: HashMap<usize, String>,
+    /// The beats in the shared contract's form, for [`Self::focus`] (`mv_recap::media::point_at`).
+    #[serde(skip)]
+    pub timeline: Vec<mv_recap::media::Beat>,
 }
 
 fn u(v: &Value, k: &str) -> Option<u64> {
@@ -145,7 +150,9 @@ impl Narration {
                 continue;
             }
             let panel = b.get("panel").and_then(Value::as_str).and_then(panel_index).filter(|(p, _)| *p == page);
-            let (y0, y1) = panel.and_then(|k| bands.get(&k).copied()).unwrap_or((0., 1.));
+            // The narrator's focus box first (the video frames the same part), else the panel's box.
+            let focus = b.get("focus_point").and_then(mv_recap::media::focus_from_point).map(|[_, y, _, h]| (y, y + h));
+            let (y0, y1) = focus.or_else(|| panel.and_then(|k| bands.get(&k).copied())).unwrap_or((0., 1.));
             // A beat on the whole page names the page file itself.
             if panel.is_none() {
                 if let Some(f) = b.get("panel_image").and_then(Value::as_str).and_then(file_name).filter(|f| panel_index(f).is_none()) {
@@ -174,7 +181,11 @@ impl Narration {
         beats.sort_by_key(|b| b.start_ms);
         clips.sort_by_key(|c| c.start_ms);
         let total_ms = u(sync_map, "total_duration_ms").unwrap_or(0).max(clips.last().map(|c| c.end_ms).unwrap_or(0)).max(beats.last().map(|b| b.end_ms).unwrap_or(0));
-        Narration { beats, clips, total_ms, page_files }
+        let timeline = beats
+            .iter()
+            .map(|b| mv_recap::media::Beat { start_ms: b.start_ms, end_ms: b.end_ms, page: b.page, focus: (b.y0 > 0. || b.y1 < 1.).then_some([0., b.y0, 1., b.y1 - b.y0]) })
+            .collect();
+        Narration { beats, clips, total_ms, page_files, timeline }
     }
 
     /// Reads a chapter's narration from its Studio folder, keeping only clips whose audio exists.
@@ -209,19 +220,11 @@ impl Narration {
     /// The page being read at `ms` and the point of it to show (0..1 of its height). Inside a
     /// panel the point moves from the panel's top to its bottom as the passage goes on; a passage
     /// about the whole page moves down the page over all of that page's whole-page passages, so
-    /// the reader keeps flowing like someone reading along.
+    /// the reader keeps flowing like someone reading along. Near the end of a passage the point
+    /// eases into the next one on the same page. The same mapping the phone uses
+    /// ([`mv_recap::media::point_at`]).
     pub fn focus(&self, ms: u64) -> Option<(usize, f32)> {
-        let b = &self.beats[self.beat_at(ms)?];
-        let frac = |t: u64, a: u64, z: u64| if z > a { (t.clamp(a, z) - a) as f32 / (z - a) as f32 } else { 0. };
-        if b.y0 > 0. || b.y1 < 1. {
-            return Some((b.page, b.y0 + (b.y1 - b.y0) * frac(ms, b.start_ms, b.end_ms)));
-        }
-        // The run of whole-page beats around this one, on this page.
-        let i = self.beat_at(ms)?;
-        let whole = |x: &Beat| x.page == b.page && x.y0 <= 0. && x.y1 >= 1.;
-        let first = (0..=i).rev().take_while(|&j| whole(&self.beats[j])).last().unwrap_or(i);
-        let last = (i..self.beats.len()).take_while(|&j| whole(&self.beats[j])).last().unwrap_or(i);
-        Some((b.page, frac(ms, self.beats[first].start_ms, self.beats[last].end_ms)))
+        mv_recap::media::point_at(&self.timeline, ms)
     }
 
     /// Maps Studio page indices to the reader's page list by file name, falling back to the
@@ -399,6 +402,24 @@ mod tests {
         assert!((y - 0.8).abs() < 1e-5);
         assert_eq!(n.focus(30000), Some((3, 1.0)));
         assert_eq!(Narration::default().focus(0), None);
+    }
+
+    #[test]
+    fn focus_points_band_the_page_and_win_over_panels() {
+        let mut m = sample();
+        // Panel 0 of page 1 gets the narrator's focus box (rows 200..500 of 1000).
+        m["beat_segments"][2]["focus_point"] = json!([200, 0, 500, 1000]);
+        let n = Narration::parse(&m, Some(&read()));
+        assert_eq!((n.beats[2].y0, n.beats[2].y1), (0.2, 0.5));
+        // Without read.json too.
+        let n = Narration::parse(&m, None);
+        assert_eq!((n.beats[2].y0, n.beats[2].y1), (0.2, 0.5));
+        let (p, y) = n.focus(12500).unwrap();
+        assert!(p == 1 && (y - 0.35).abs() < 1e-5);
+        // The shared contract's timeline carries the same box.
+        let f = n.timeline[2].focus.unwrap();
+        assert!(f.iter().zip([0., 0.2, 1., 0.3]).all(|(a, b)| (a - b).abs() < 1e-5));
+        assert_eq!(n.timeline[0].focus, None);
     }
 
     #[test]

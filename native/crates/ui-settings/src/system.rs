@@ -6,10 +6,10 @@ use std::sync::Mutex;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::*;
 use mv_core::limits;
-use mv_ui::{ph, setting_section, size, skeleton, skeleton_line, usage_bar, Tokens};
+use mv_ui::{ph, settings_block, settings_group, size, skeleton, skeleton_line, usage_bar, SettingsRow, Tokens};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-use crate::ui::{divided, format_bytes, icon_row};
+use crate::ui::{format_bytes, icon_row};
 use crate::SettingsView;
 
 /// One reading of the meter.
@@ -99,7 +99,7 @@ pub fn limit_slider(window: &mut Window, cx: &mut Context<SettingsView>) -> Enti
 }
 
 /// A meter row: icon, label, hint, an 8px bar (warning colour above the limit) and the value.
-fn meter_row(icon: mv_ui::Ph, label: &str, hint: &str, fraction: f32, value: String, limit: Option<f32>) -> Div {
+fn meter_row(icon: mv_ui::Ph, label: &str, hint: &str, fraction: f32, value: String, limit: Option<f32>) -> SettingsRow {
     let color = if limit.is_some_and(|l| fraction > l + 0.02) { Tokens::warning() } else { Tokens::accent() };
     icon_row(
         icon,
@@ -109,8 +109,8 @@ fn meter_row(icon: mv_ui::Ph, label: &str, hint: &str, fraction: f32, value: Str
             .flex()
             .items_center()
             .gap(px(12.))
-            .child(div().w(px(200.)).child(usage_bar(&[(fraction.clamp(0.0, 1.0), color)], 1.0)))
-            .child(div().w(px(130.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(value)),
+            .child(div().w(px(180.)).child(usage_bar(&[(fraction.clamp(0.0, 1.0), color)], 1.0)))
+            .child(div().w(px(130.)).text_size(px(size::SM)).text_color(Tokens::text_2()).whitespace_nowrap().child(value)),
     )
 }
 
@@ -128,7 +128,7 @@ impl SettingsView {
                 if ram > 0 { format!(" and {} of memory", format_bytes(ram / 100 * p as u64)) } else { String::new() }
             )
         };
-        let limit = setting_section(
+        let limit = settings_group(
             "Resource limit",
             Some("How much of this PC MangaVox's heavy work may use: voice narration, video rendering, Python workers and local models. Lower it if the PC feels slow while Studio works.".into()),
         )
@@ -140,33 +140,33 @@ impl SettingsView {
                 .flex()
                 .items_center()
                 .gap(px(12.))
-                .child(div().w(px(200.)).child(Slider::new(&self.limit_slider)))
+                .child(div().w(px(180.)).child(Slider::new(&self.limit_slider)))
                 .child(div().w(px(44.)).text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(format!("{p}%"))),
         ));
 
-        let now = setting_section("Right now", Some("Updated every second.".into()));
+        let now = settings_group("Right now", Some("Updated every second.".into()));
         let now = match &self.meter {
             // Shaped like the four meter rows that are coming.
-            None => now.child(div().flex().flex_col().gap(px(18.)).py(px(14.)).children((0..4).map(|_| {
-                div().flex().items_center().gap(px(16.)).child(skeleton_line(px(140.))).child(div().flex_1()).child(skeleton(px(200.), px(8.), mv_ui::theme::radius::PILL)).child(skeleton_line(px(90.)))
-            }))),
+            None => now.child(settings_block(div().flex().flex_col().gap(px(18.)).py(px(2.)).children((0..4).map(|_| {
+                div().flex().items_center().gap(px(16.)).child(skeleton_line(px(140.))).child(div().flex_1()).child(skeleton(px(180.), px(8.), mv_ui::theme::radius::PILL)).child(skeleton_line(px(90.)))
+            })))),
             Some(m) => {
                 let mem = |b: u64| if m.mem_total > 0 { b as f32 / m.mem_total as f32 } else { 0.0 };
                 let cap = (p < limits::MAX_PERCENT).then_some(p as f32 / 100.0);
                 now.child(meter_row(ph::CPU, "CPU, whole PC", "Everything running on this computer.", m.cpu / 100.0, format!("{:.0}%", m.cpu), None))
-                    .child(divided(meter_row(
+                    .child(meter_row(
                         ph::CPU,
                         "CPU, MangaVox",
                         &if m.capped > 0 { format!("App plus {} worker process{} under the limit.", m.capped, if m.capped == 1 { "" } else { "es" }) } else { "App plus any workers it starts.".into() },
                         m.app_cpu / 100.0,
                         format!("{:.0}%", m.app_cpu),
                         cap,
-                    )))
-                    .child(divided(meter_row(ph::MEMORY, "Memory, whole PC", "", mem(m.mem_used), format!("{} of {}", format_bytes(m.mem_used), format_bytes(m.mem_total)), None)))
-                    .child(divided(meter_row(ph::MEMORY, "Memory, MangaVox", "", mem(m.app_mem), format_bytes(m.app_mem), cap)))
+                    ))
+                    .child(meter_row(ph::MEMORY, "Memory, whole PC", "", mem(m.mem_used), format!("{} of {}", format_bytes(m.mem_used), format_bytes(m.mem_total)), None))
+                    .child(meter_row(ph::MEMORY, "Memory, MangaVox", "", mem(m.app_mem), format_bytes(m.app_mem), cap))
             }
         };
-        div().flex().flex_col().gap(px(20.)).child(limit).child(now)
+        div().flex().flex_col().gap(px(mv_ui::settings::SETTINGS_GROUP_GAP)).child(limit).child(now)
     }
 
     /// Takes a meter reading off the UI thread (one at a time).

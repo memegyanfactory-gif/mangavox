@@ -76,7 +76,8 @@ pub fn last_played(imdb: &str) -> Option<(u32, u32)> {
 
 /// Remembers a series' season and episode for [`last_played`] (in the background).
 pub(crate) fn remember(req: &PlayRequest) {
-    if req.mal_id.is_none() {
+    // Private mode: nothing feeds Continue Watching or Resume.
+    if req.mal_id.is_none() && mv_core::privacy::records_history() {
         if let (Some(imdb), Some(s), Some(e)) = (req.imdb_id.clone(), req.season, req.episode) {
             bg::runtime().spawn_blocking(move || DataCache::shared().put(&last_key(&imdb), &(s, e)));
         }

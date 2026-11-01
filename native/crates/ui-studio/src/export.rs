@@ -208,7 +208,10 @@ pub(crate) struct Job {
 
 impl Job {
     pub(crate) fn new(manga_id: &str, label: &str) -> Job {
-        Job { manga_id: manga_id.to_string(), state: Arc::new(Mutex::new((0., label.to_string()))), cancel: Arc::new(AtomicBool::new(false)), phase: Mutex::new((label.to_string(), Instant::now())), turn: Arc::new(Mutex::new(None)) }
+        let job = Job { manga_id: manga_id.to_string(), state: Arc::new(Mutex::new((0., label.to_string()))), cancel: Arc::new(AtomicBool::new(false)), phase: Mutex::new((label.to_string(), Instant::now())), turn: Arc::new(Mutex::new(None)) };
+        // Shown as activity outside the page (the phone companion).
+        crate::pipeline::track_export(manga_id, &job.state);
+        job
     }
 
     /// Seconds left of the current step, once there is enough progress to tell (each step, e.g.

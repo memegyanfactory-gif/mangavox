@@ -7,10 +7,12 @@ use gpui_kit::component::select::Select;
 use gpui_kit::component::slider::{Slider, SliderState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_ui::theme::{icon as icon_px, radius, Palette, Preset};
-use mv_ui::{btn, glyphs, icon_button, ph, ph_icon, segmented, setting_row, setting_section, size, switch, ButtonKind, Interactive as _, Tokens, Tone, Weight};
+use mv_ui::theme::{icon as icon_px, radius, Palette, Preset, PresetGroup};
+use mv_ui::{
+    btn, glyphs, icon_button, ph, ph_icon, segmented, settings_block, settings_group, settings_note, settings_row, size, switch, AlertKind, ButtonKind, Interactive as _, Tokens, Tone, Weight,
+};
 
-use crate::ui::{divided, icon_row, path_row};
+use crate::ui::{icon_row, path_row};
 use crate::{data, SettingsView};
 
 /// Resolutions Studio renders (`StudioPrefs::resolution`).
@@ -26,35 +28,31 @@ pub fn round_speed(v: f32) -> f64 {
     ((v as f64) * 20.0).round() / 20.0
 }
 
-/// Fixed-width input with the "Saved" mark and any validation error beside it.
-fn field(state: &Entity<InputState>, saved: bool, error: Option<SharedString>) -> Div {
+/// Input with the "Saved" mark beside it. 280px wide, but it gives way on a narrow window
+/// instead of pushing past the card.
+fn field(state: &Entity<InputState>, saved: bool) -> Div {
+    div().flex().items_center().justify_end().gap(px(8.)).min_w_0().when(saved, |d| d.child(crate::ui::saved_mark())).child(div().w(px(280.)).min_w(px(160.)).child(Input::new(state)))
+}
+
+/// Validation message under a field's label.
+fn field_error(e: SharedString) -> Div {
     div()
         .flex()
-        .flex_col()
-        .items_end()
+        .items_start()
         .gap(px(4.))
-        .child(div().flex().items_center().gap(px(8.)).when(saved, |d| d.child(crate::ui::saved_mark())).child(div().w(px(280.)).child(Input::new(state))))
-        .when_some(error, |d, e| {
-            d.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .max_w(px(280.))
-                    .text_size(px(size::XS))
-                    .text_color(Tokens::danger())
-                    .child(ph_icon(ph::WARNING_CIRCLE, Weight::Fill, Tokens::danger(), icon_px::XS))
-                    .child(e),
-            )
-        })
+        .text_size(px(size::XS))
+        .line_height(px(16.))
+        .text_color(Tokens::danger())
+        .child(div().flex_none().pt(px(2.)).child(ph_icon(ph::WARNING_CIRCLE, Weight::Fill, Tokens::danger(), icon_px::XS)))
+        .child(div().flex_1().min_w_0().child(e))
 }
 
 impl SettingsView {
     pub(crate) fn render_profile(&self, _cx: &mut Context<Self>) -> Div {
-        div().flex().flex_col().gap(px(20.)).child(
-            setting_section("Profile", Some("Shown across MangaVox. Changes save when you leave a field or press Enter.".into()))
-                .child(setting_row("Display name", "How MangaVox greets you", field(&self.name, self.saved_now("name"), None)))
-                .child(divided(setting_row("Email", "Optional. Never sent anywhere", field(&self.email, self.saved_now("email"), self.email_error.clone())))),
+        div().flex().flex_col().gap(px(mv_ui::settings::SETTINGS_GROUP_GAP)).child(
+            settings_group("Profile", Some("Shown across MangaVox. Changes save when you leave a field or press Enter.".into()))
+                .child(settings_row("Display name", "How MangaVox greets you", field(&self.name, self.saved_now("name"))))
+                .child(settings_row("Email", "Optional. Never sent anywhere", field(&self.email, self.saved_now("email"))).when_some(self.email_error.clone(), |r, e| r.below(field_error(e)))),
         )
     }
 
@@ -63,10 +61,10 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
-            .gap(px(20.))
+            .gap(px(mv_ui::settings::SETTINGS_GROUP_GAP))
             .child(
-                setting_section("Episodes", Some("What happens when an episode ends.".into()))
-                    .child(setting_row(
+                settings_group("Episodes", Some("What happens when an episode ends.".into()))
+                    .child(settings_row(
                         "Auto-play next episode",
                         "Start the next episode when the current one ends",
                         switch("pb-autoplay", p.auto_play).on_click(cx.listener(|this, on: &bool, _, cx| {
@@ -74,38 +72,42 @@ impl SettingsView {
                             this.save_playback(cx);
                         })),
                     ))
-                    .child(divided(setting_row(
-                        "Auto-play countdown",
-                        if p.auto_play { "How long to wait before the next episode starts" } else { "Turn on auto-play to use a countdown" },
-                        Select::new(&self.timer).w(px(120.)).disabled(!p.auto_play),
-                    )))
-                    .child(divided(setting_row(
+                    .child(
+                        settings_row(
+                            "Auto-play countdown",
+                            if p.auto_play { "How long to wait before the next episode starts" } else { "Turn on auto-play to use a countdown" },
+                            Select::new(&self.timer).w(px(120.)).disabled(!p.auto_play),
+                        )
+                        .muted(!p.auto_play),
+                    )
+                    .child(settings_row(
                         "Skip intro automatically",
                         "Jump past opening sequences when they are detected",
                         switch("pb-skip-intro", p.skip_intro).on_click(cx.listener(|this, on: &bool, _, cx| {
                             this.playback.skip_intro = *on;
                             this.save_playback(cx);
                         })),
-                    )))
-                    .child(divided(setting_row(
+                    ))
+                    .child(settings_row(
                         "Pre-download next episode",
                         "Fetch the following episode in the background",
                         switch("pb-predownload", p.pre_download_next).on_click(cx.listener(|this, on: &bool, _, cx| {
                             this.playback.pre_download_next = *on;
                             this.save_playback(cx);
                         })),
-                    ))),
+                    )),
             )
             .child(
-                setting_section("Defaults", Some("Used when a source offers several options.".into()))
-                    .child(setting_row("Subtitle language", "Selected automatically when available", Select::new(&self.subtitle).w(px(180.))))
-                    .child(divided(setting_row("Preferred stream quality", "Streams at this quality are picked first", Select::new(&self.quality).w(px(120.))))),
+                settings_group("Defaults", Some("Used when a source offers several options.".into()))
+                    .child(settings_row("Subtitle language", "Selected automatically when available", Select::new(&self.subtitle).w(px(180.))))
+                    .child(settings_row("Preferred stream quality", "Streams at this quality are picked first", Select::new(&self.quality).w(px(180.)))),
             )
     }
 
     /// One theme preset: a miniature of the app in that preset's real colours (sidebar, a card,
-    /// an accent button), so the choice can be judged before it is made. Apple HIG dark mode,
-    /// preview appearance choices in place: <https://developer.apple.com/design/human-interface-guidelines/dark-mode>.
+    /// an accent button) and a strip of its swatches, so the choice can be judged before it is
+    /// made. Apple HIG dark mode, preview appearance choices in place:
+    /// <https://developer.apple.com/design/human-interface-guidelines/dark-mode>.
     fn preset_tile(&self, preset: &'static Preset, cx: &mut Context<Self>) -> Stateful<Div> {
         let pal = Palette::from_preset(preset);
         let active = self.preset == preset.id;
@@ -148,7 +150,7 @@ impl SettingsView {
         let preview = div()
             .relative()
             .flex()
-            .h(px(92.))
+            .h(px(84.))
             .rounded(px(radius::MD))
             .overflow_hidden()
             .bg(pal.base)
@@ -157,6 +159,10 @@ impl SettingsView {
             .child(sidebar)
             .child(content)
             .when(active, |d| d.child(div().absolute().top(px(6.)).right(px(6.)).child(mv_ui::selected_badge())));
+        // Page, card, text, accent, second colour: the five colours a preset is made of.
+        let swatches = div().flex().items_center().gap(px(3.)).children([pal.base, pal.surface, pal.text_1, pal.accent, pal.accent_2].map(|c| {
+            div().size(px(10.)).rounded_full().bg(c).border_1().border_color(Tokens::border_strong())
+        }));
         div()
             .id(id)
             .flex()
@@ -183,40 +189,41 @@ impl SettingsView {
                     .px(px(2.))
                     .min_w_0()
                     .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(preset.name))
-                    .when(preset.id == data::DEFAULT_PRESET, |d| d.child(mv_ui::tag("Default", Tone::Neutral))),
+                    .when(preset.id == data::DEFAULT_PRESET, |d| d.child(mv_ui::tag("Default", Tone::Neutral)))
+                    .child(swatches),
             )
             .child(div().px(px(2.)).h(px(32.)).text_size(px(size::XS)).line_height(px(16.)).text_color(Tokens::text_3()).line_clamp(2).text_ellipsis().child(preset.description))
     }
 
     pub(crate) fn render_appearance(&self, cx: &mut Context<Self>) -> Div {
-        let mut grid = div().grid().grid_cols(3).gap(px(12.));
-        for preset in data::PRESETS {
-            grid = grid.child(self.preset_tile(preset, cx));
+        let mut page = div().flex().flex_col().gap(px(mv_ui::settings::SETTINGS_GROUP_GAP));
+        for group in PresetGroup::ALL {
+            let mut grid = div().grid().grid_cols(3).gap(px(12.));
+            for preset in data::PRESETS.iter().filter(|p| p.group == group) {
+                grid = grid.child(self.preset_tile(preset, cx));
+            }
+            let title = format!("{} themes", group.label());
+            page = page.child(settings_group(title, Some(group.description().into())).bare().child(grid));
         }
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(20.))
-            .child(setting_section("Theme", Some("Each preset recolours the whole app, and the change applies at once.".into())).child(div().pt(px(8.)).pb(px(12.)).child(grid)))
-            .child(setting_section("Motion", None).child(setting_row(
-                "Reduce motion",
-                "Stops shimmer, fades and pops, and slows spinners. Windows' \"Animation effects\" setting is always respected.",
-                switch("ap-reduce-motion", self.reduce_motion).on_click(cx.listener(|this, on: &bool, _, cx| this.set_reduce_motion(*on, cx))),
-            )))
+        page.child(settings_group("Motion", None).child(settings_row(
+            "Reduce motion",
+            "Stops shimmer, fades and pops, and slows spinners. Windows' \"Animation effects\" setting is always respected.",
+            switch("ap-reduce-motion", self.reduce_motion).on_click(cx.listener(|this, on: &bool, _, cx| this.set_reduce_motion(*on, cx))),
+        )))
     }
 
     pub(crate) fn render_mode(&self, cx: &mut Context<Self>) -> Div {
         let studio = self.mode == "studio";
         let state = |on: bool| if on { mv_ui::tag("On", Tone::Success) } else { mv_ui::tag("Off", Tone::Neutral) };
-        div().flex().flex_col().gap(px(16.)).child(
-            setting_section("Workspace", Some("Changing modes never removes your library, downloads or settings.".into()))
-                .child(setting_row(
+        div().flex().flex_col().gap(px(mv_ui::settings::SETTINGS_GROUP_GAP)).child(
+            settings_group("Workspace", Some("Changing modes never removes your library, downloads or settings.".into()))
+                .child(settings_row(
                     "Studio mode",
                     "Off keeps MangaVox to manga, anime and movies. On adds the two tools below to the sidebar, plus Studio settings.",
                     switch("mode-studio", studio).on_click(cx.listener(|this, on: &bool, _, cx| this.set_mode(if *on { "studio" } else { "entertainment" }, cx))),
                 ))
-                .child(divided(icon_row(glyphs::STUDIO, "Studio", "Reads manga chapters and turns them into narrated recap videos.", state(studio))))
-                .child(divided(icon_row(glyphs::ASSISTANT, "Assistant", "Chat with local or cloud AI, with tools that act on your library.", state(studio)))),
+                .child(icon_row(glyphs::STUDIO, "Studio", "Reads manga chapters and turns them into narrated recap videos.", state(studio)))
+                .child(icon_row(glyphs::ASSISTANT, "Assistant", "Chat with local or cloud AI, with tools that act on your library.", state(studio))),
         )
     }
 
@@ -229,10 +236,10 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
-            .gap(px(20.))
+            .gap(px(mv_ui::settings::SETTINGS_GROUP_GAP))
             .child(
-                setting_section("Narration", Some("Defaults for new Studio projects.".into()))
-                    .child(setting_row(
+                settings_group("Narration", Some("Defaults for new Studio projects.".into()))
+                    .child(settings_row(
                         "Default voice",
                         voice,
                         btn("studio-voice", "Choose in Audio", ButtonKind::Secondary)
@@ -240,35 +247,26 @@ impl SettingsView {
                             .trailing_icon(ph::CARET_RIGHT)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.select_tab(crate::Tab::Audio, window, cx))),
                     ))
-                    .child(divided(setting_row(
+                    .child(settings_row(
                         "Speed",
                         "Speaking rate. 1.00× is normal.",
                         div()
                             .flex()
                             .items_center()
                             .gap(px(12.))
-                            .child(div().w(px(200.)).child(Slider::new(&self.studio_speed)))
+                            .child(div().w(px(180.)).child(Slider::new(&self.studio_speed)))
                             .child(div().w(px(48.)).text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(format!("{:.2}×", p.speed)))
                             .child(self.speed_preview(p.speed, cx)),
-                    ))),
+                    )),
             )
             .child(
-                setting_section("Output", None).child(setting_row(
+                settings_group("Output", None).child(settings_row(
                     "Default resolution",
                     "Video size for exported projects",
                     segmented("studio-res", RESOLUTIONS, res_ix).on_change(cx.listener(|this, ix: &usize, _, cx| this.set_resolution(RESOLUTIONS[*ix], cx))),
                 )),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .text_size(px(size::SM))
-                    .text_color(Tokens::text_3())
-                    .child(ph_icon(ph::INFO, Weight::Bold, Tokens::text_3(), icon_px::SM))
-                    .child("Pick the AI model in Studio's model button; it uses the same model as the Assistant."),
-            )
+            .child(settings_note(AlertKind::Info, "Pick the AI model in Studio's model button; it uses the same model as the Assistant."))
     }
 
     pub(crate) fn render_about(&self, cx: &mut Context<Self>) -> Div {
@@ -284,71 +282,67 @@ impl SettingsView {
                 }
             }))
         };
+        let hero = settings_block(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(16.))
+                .py(px(4.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size(px(52.))
+                        .rounded(px(radius::XL))
+                        .shadow(vec![BoxShadow { color: Tokens::accent_a(0.25).into(), offset: point(px(0.), px(4.)), blur_radius: px(18.), spread_radius: px(0.), inset: false }])
+                        .child(mv_ui::app_logo(52.)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("MangaVox"))
+                        .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(format!("Version {version} · Made by Aayush Datta")))
+                        .child(div().pt(px(4.)).text_size(px(size::SM)).line_height(px(18.)).text_color(Tokens::text_2()).child(
+                            "Browse, read and watch, then turn manga into narrated audio and video. Processing runs locally on your machine.",
+                        )),
+                ),
+        );
         div()
             .flex()
             .flex_col()
-            .gap(px(20.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(16.))
-                    .p(px(16.))
-                    .rounded(px(radius::LG))
-                    .bg(Tokens::surface())
-                    .border_1()
-                    .border_color(Tokens::border())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(px(52.))
-                            .rounded(px(radius::XL))
-                            .shadow(vec![BoxShadow { color: Tokens::accent_a(0.25).into(), offset: point(px(0.), px(4.)), blur_radius: px(18.), spread_radius: px(0.), inset: false }])
-                            .child(mv_ui::app_logo(52.)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("MangaVox"))
-                            .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).child(format!("Version {version} · Made by Aayush Datta")))
-                            .child(div().pt(px(4.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(
-                                "Browse, read and watch, then turn manga into narrated audio and video. Processing runs locally on your machine.",
-                            )),
-                    ),
-            )
-            .child(setting_section("Updates", None).child(mv_ui::update::about(cx)))
-            .child(setting_section("Setup", None).child(icon_row(
+            .gap(px(mv_ui::settings::SETTINGS_GROUP_GAP))
+            .child(settings_group("", None).child(hero).child(settings_block(div().flex().flex_col().min_w_0().child(mv_ui::update::about(cx)))))
+            .child(settings_group("Setup", None).child(icon_row(
                 ph::SPARKLE,
                 "Welcome setup",
                 "Choose sources, addons and voices again. Nothing changes until you confirm a screen.",
-                btn("about-welcome", "Run welcome setup again", ButtonKind::Secondary).icon(ph::ARROW_CLOCKWISE).on_click(|_, w, cx| mv_ui::navigate(mv_ui::Route::Welcome, w, cx)),
+                btn("about-welcome", "Run setup again", ButtonKind::Secondary).icon(ph::ARROW_CLOCKWISE).on_click(|_, w, cx| mv_ui::navigate(mv_ui::Route::Welcome, w, cx)),
             )))
             .child(
-                setting_section("Data", None)
+                settings_group("Data", None)
                     .child(path_row(glyphs::FOLDER, "Data folder", "Move it in Storage", data_dir.display().to_string(), reveal("about-data", data_dir.clone(), true, cx)))
-                    .child(divided(path_row(ph::FILE_TEXT, "Config file", "", config.display().to_string(), reveal("about-config", config.clone(), false, cx)))),
+                    .child(path_row(ph::FILE_TEXT, "Config file", "", config.display().to_string(), reveal("about-config", config.clone(), false, cx))),
             )
             .child(
-                setting_section("Links", None)
+                settings_group("Links", None)
                     .child(icon_row(
                         ph::GITHUB_LOGO,
                         "Source code",
                         "github.com/memegyanfactory-gif/mangavox",
                         btn("about-repo", "View source", ButtonKind::Ghost).trailing_icon(ph::ARROW_UP_RIGHT).on_click(|_, _, cx| cx.open_url("https://github.com/memegyanfactory-gif/mangavox")),
                     ))
-                    .child(divided(icon_row(
+                    .child(icon_row(
                         ph::BUG,
                         "Report a problem",
                         "Opens the issue tracker in your browser",
                         btn("about-issues", "Report", ButtonKind::Ghost).trailing_icon(ph::ARROW_UP_RIGHT).on_click(|_, _, cx| cx.open_url(crate::HELP_URL)),
-                    ))),
+                    )),
             )
     }
 }

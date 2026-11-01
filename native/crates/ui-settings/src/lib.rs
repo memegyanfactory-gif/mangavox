@@ -89,6 +89,10 @@ const STUDIO_GROUP: (&str, &[Tab]) = ("Studio", &[Tab::Studio, Tab::Magnific]);
 
 const HELP_URL: &str = "https://github.com/memegyanfactory-gif/mangavox/issues";
 
+/// Width of the Settings rail: the shell sidebar's (`SIDEBAR_W`), so opening Settings swaps the
+/// sidebar for the rail in place and the page column starts where pages always start.
+const RAIL_W: f32 = 256.;
+
 impl Tab {
     /// Route ids (`Route::Settings { tab }`). `themes` and `mode` are the Electron ids;
     /// `models:<page>` opens a Model Library page (e.g. `models:engines`).
@@ -551,6 +555,8 @@ impl SettingsView {
                 }
             });
             self._subs.push(sub);
+            // The page frame reads `wide()` (Get models widens the column), so follow its page.
+            self._subs.push(cx.observe(&lib, |_, _, cx| cx.notify()));
             self.library = Some(lib);
             return;
         }
@@ -801,7 +807,7 @@ impl SettingsView {
             shown += tabs.len();
             let mut group = div().flex().flex_col().gap(px(2.));
             if !title.is_empty() && !searching {
-                group = group.child(mv_ui::section_label(*title).px(px(8.)));
+                group = group.child(mv_ui::section_label(*title).px(px(10.)));
             }
             for tab in tabs {
                 group = group.child(self.rail_entry(tab, cx));
@@ -816,30 +822,41 @@ impl SettingsView {
             .child(ph_icon(ph::ARROW_UP_RIGHT, Weight::Bold, Tokens::text_3(), icon_px::XS))
             .tooltip(mv_ui::tip("Opens the issue tracker in your browser"))
             .on_click(|_, _, cx| cx.open_url(HELP_URL));
+        // The way out sits exactly where the sidebar's Settings entry was clicked (same inset,
+        // height and bottom offset as the shell's footer), so Settings then Back is one spot
+        // and never a trip to the top of the window. About and Help & feedback stack above it,
+        // like the shell's Mobile above Settings.
+        let back = mv_ui::back_label(cx).map(|l| format!("Back to {l}")).unwrap_or_else(|| "Back".into());
+        let back_item = mv_ui::nav_item("settings-back", glyphs::BACK, back.clone(), false, false)
+            .tooltip(mv_ui::tip_kbd(back, "escape"))
+            .on_click(|_, w, cx| mv_ui::navigate(Route::Back, w, cx));
         let bottom = div()
             .flex()
             .flex_col()
             .gap(px(2.))
-            .pt(px(10.))
+            .pt(px(8.))
             .border_t_1()
             .border_color(Tokens::border())
+            .when(!searching || about_match, |d| d.child(self.rail_entry(Tab::About, cx)))
             .child(help)
-            .when(!searching || about_match, |d| d.child(self.rail_entry(Tab::About, cx)));
+            .child(back_item);
 
         div()
-            .w(px(240.))
+            .w(px(RAIL_W))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
             .gap(px(12.))
-            .px(px(12.))
+            // 10px inset and bottom: the shell sidebar's (8px padding + 2px list inset), so the
+            // footer rows sit where the sidebar's footer rows were.
+            .px(px(10.))
             .pt(px(20.))
-            .pb(px(12.))
+            .pb(px(10.))
             .bg(Tokens::sidebar())
             .border_r_1()
             .border_color(Tokens::border())
-            .child(div().px(px(8.)).text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Settings"))
+            .child(div().px(px(10.)).text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Settings"))
             .child(Input::new(&self.search).cleanable(true).prefix(ph_icon(glyphs::SEARCH, Weight::Bold, Tokens::text_3(), icon_px::SM)))
             .child(div().id("settings-nav").flex_1().min_h_0().overflow_y_scroll().child(groups))
             .child(bottom)
@@ -868,43 +885,22 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content: AnyElement = match (&self.library, self.tab) {
-            // The library draws its own header; CLI update banners (an AI page) sit above it,
-            // which they never did before because this branch skipped them.
-            (Some(lib), Tab::Models) => {
-                let banners = self.render_cli_banners(cx);
-                if banners.is_empty() {
-                    div().flex_1().h_full().min_w_0().child(lib.clone()).into_any_element()
-                } else {
-                    div()
-                        .flex_1()
-                        .h_full()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(div().flex_none().flex().flex_col().gap(px(8.)).px(px(32.)).pt(px(16.)).children(banners))
-                        .child(div().flex_1().min_h_0().child(lib.clone()))
-                        .into_any_element()
-                }
-            }
-            _ => {
-                let tab = self.tab;
-                let body = div().flex().flex_col().gap(px(24.)).children(self.render_cli_banners(cx)).child(self.render_body(cx));
-                let column = div()
-                    .w_full()
-                    .max_w(px(780.))
-                    .px(px(40.))
-                    .pt(px(32.))
-                    .pb(px(48.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(24.))
-                    .child(ui::page_head(tab.icon(), tab.hue(), tab.label(), tab.description()))
-                    // A short fade on page change (instant under reduced motion).
-                    .child(mv_ui::appear(("settings-page", tab as usize), body));
-                div().id("settings-content").flex_1().h_full().min_w_0().overflow_y_scroll().child(column).into_any_element()
-            }
+        // One frame for every page, Model Library and its sub-pages included: the same column,
+        // the heading at the same offset, then any CLI update banners, then the page. The column
+        // is left-aligned, so a page that needs more width (Get models) widens to the right and
+        // the heading stays put.
+        let tab = self.tab;
+        let (body, wide) = match (&self.library, tab) {
+            (Some(lib), Tab::Models) => (lib.clone().into_any_element(), lib.read(cx).wide()),
+            _ => (self.render_body(cx), false),
         };
+        let column = mv_ui::settings_column()
+            .when(wide, |d| d.max_w(px(1200. + 2. * mv_ui::settings::SETTINGS_PAGE_X)))
+            .child(ui::page_head(tab.icon(), tab.hue(), tab.label(), tab.description()))
+            .children(self.render_cli_banners(cx))
+            // A short fade on page change (instant under reduced motion).
+            .child(mv_ui::appear(("settings-page", tab as usize), div().flex().flex_col().min_w_0().child(body)));
+        let content = div().id("settings-content").flex_1().h_full().min_w_0().overflow_y_scroll().child(column);
 
         div()
             .size_full()

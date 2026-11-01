@@ -64,6 +64,10 @@ impl DataCache {
         }
         let t = now();
         let path = self.file(key);
+        // Private mode: a new entry (a title's details, its stream links) can be cleared later.
+        if crate::privacy::active() && !path.exists() {
+            crate::privacy::record_file(&path);
+        }
         let _ = std::fs::create_dir_all(&self.dir);
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         if std::fs::write(&tmp, format!("{t}\n{body}")).is_ok() && std::fs::rename(&tmp, &path).is_err() {

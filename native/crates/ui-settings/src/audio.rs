@@ -20,13 +20,13 @@ use mv_studio::StudioError;
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    btn, confirm_inline, disclosure, filter_chip, icon_button, icon_tag, icon_toggle, inline_alert, ph, ph_icon, progress_bar, segmented, setting_row, setting_section, shimmer_text, size, skeleton_line,
-    spinner, status_tag, stepper, tag, AlertKind, ButtonKind, Hue, Ph, RampExt as _, StatusKind, Tokens, Tone, Weight,
+    btn, confirm_inline, disclosure, filter_chip, icon_button, icon_tag, icon_toggle, inline_alert, ph, ph_icon, progress_bar, segmented, settings_block, settings_group, settings_row, shimmer_text, size, skeleton_line,
+    spinner, status_tag, stepper, tag, AlertKind, ButtonKind, Hue, Ph, RampExt as _, SettingsGroup, StatusKind, Tokens, Tone, Weight,
 };
 use ui_studio::audio as player;
 use ui_studio::setup::{self, Env, VoiceReady};
 
-use crate::ui::{command_chip, default_tag, divided, fact, format_bytes, hero_tile, meter_fact, state_pill, surface};
+use crate::ui::{command_chip, default_tag, fact, format_bytes, hero_tile, meter_fact, state_pill, surface};
 use crate::SettingsView;
 
 /// Graphics memory Chatterbox needs while it narrates (measured 4.2 GB on an RTX 3080).
@@ -812,7 +812,7 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
-            .gap(px(24.))
+            .gap(px(mv_ui::settings::SETTINGS_GROUP_GAP))
             .child(self.render_narrator(cx))
             .child(self.render_engines(cx))
             .child(self.render_voices(cx))
@@ -826,7 +826,7 @@ impl SettingsView {
     }
 
     /// The default narrator: who it is, whether it can speak, and a preview.
-    fn render_narrator(&self, cx: &mut Context<Self>) -> Div {
+    fn render_narrator(&self, cx: &mut Context<Self>) -> SettingsGroup {
         let id = self.audio.default_voice.clone();
         let info = tts::find_voice(&id);
         let ready = self.readiness(&id);
@@ -859,11 +859,17 @@ impl SettingsView {
                 .when_some(not_playable(ready, "Set up this voice's engine to hear it"), |b, why| b.disabled(why))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.play_sample(v, cx)))
         });
-        let mut col = div().flex().flex_col().gap(px(12.)).child(
-            surface().flex_row().items_center().gap(px(16.)).p(px(16.)).child(hero_tile(ph::MICROPHONE_STAGE, Hue::Cyan, 52.)).child(
-                div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(mv_ui::section_label("Default narrator")).child(name).child(meta),
-            )
-            .children(preview),
+        // A bare group: the narrator card and any alert about it sit under one group title, like
+        // every other part of the page.
+        let mut col = settings_group("Default narrator", None).bare().child(
+            surface()
+                .flex_row()
+                .items_center()
+                .gap(px(16.))
+                .p(px(16.))
+                .child(hero_tile(ph::MICROPHONE_STAGE, Hue::Cyan, 48.))
+                .child(div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(name).child(meta))
+                .children(preview.map(|p| div().flex_none().child(p))),
         );
         let fix = engine.map(|e| (e, self.fix_target(e)));
         // While that engine's setup runs the alert says so instead of offering the same setup
@@ -906,13 +912,12 @@ impl SettingsView {
         col
     }
 
-    fn render_engines(&self, cx: &mut Context<Self>) -> Div {
-        let mut section = setting_section("Voice engines", Some("The programs that turn text into speech. They run on this PC, offline. One button sets up everything an engine needs.".into()));
-        let mut list = div().flex().flex_col().gap(px(12.)).pt(px(8.)).pb(px(6.));
+    fn render_engines(&self, cx: &mut Context<Self>) -> SettingsGroup {
+        // Each engine is a card of its own, so the group is bare (no card around cards).
+        let mut section = settings_group("Voice engines", Some("The programs that turn text into speech. They run on this PC, offline. One button sets up everything an engine needs.".into())).bare();
         for e in Engine::ALL {
-            list = list.child(self.engine_card(e, cx));
+            section = section.child(self.engine_card(e, cx));
         }
-        section = section.child(list);
         section
     }
 
@@ -1227,7 +1232,7 @@ impl SettingsView {
     }
 
     /// Every voice the engines speak, grouped by engine, filterable by language and readiness.
-    fn render_voices(&self, cx: &mut Context<Self>) -> Div {
+    fn render_voices(&self, cx: &mut Context<Self>) -> SettingsGroup {
         let all: Vec<(Engine, &'static str)> = Engine::ALL.iter().flat_map(|e| e.voices().into_iter().map(move |v| (*e, v))).collect();
         let usable = |v: &str| self.readiness(v).is_some_and(VoiceReady::usable);
         let lang = |v: &str| tts::voice_lang(v);
@@ -1263,7 +1268,7 @@ impl SettingsView {
             .child(chip("vf-en", "English", ph::TRANSLATE, VoiceFilter::English, cx))
             .child(chip("vf-hi", "Hindi", ph::TRANSLATE, VoiceFilter::Hindi, cx))
             .child(chip("vf-ready", "Ready to use", ph::CHECK_CIRCLE, VoiceFilter::Ready, cx));
-        let mut groups = div().flex().flex_col().gap(px(18.)).pt(px(10.)).pb(px(8.));
+        let mut groups = div().flex().flex_col().gap(px(18.)).pt(px(6.));
         let mut shown = 0;
         for e in Engine::ALL {
             let list: Vec<&'static str> = all.iter().filter(|(g, v)| *g == e && keep(v)).map(|(_, v)| *v).collect();
@@ -1296,7 +1301,8 @@ impl SettingsView {
             })));
             groups = groups.child(empty);
         }
-        setting_section("Voices", Some("Press play to hear a voice. The gold star marks the default narrator Studio uses.".into())).child(chips).child(groups)
+        // Voice tiles are cards themselves, so the group is bare.
+        settings_group("Voices", Some("Press play to hear a voice. The gold star marks the default narrator Studio uses.".into())).bare().child(chips).child(groups)
     }
 
     fn play_control(&self, voice: &'static str, ready: Option<VoiceReady>, cx: &mut Context<Self>) -> AnyElement {
@@ -1485,7 +1491,7 @@ impl SettingsView {
     }
 
     /// One line at three intensities, so the effect of a scene on a voice can be heard.
-    fn render_lab(&self, cx: &mut Context<Self>) -> Div {
+    fn render_lab(&self, cx: &mut Context<Self>) -> SettingsGroup {
         let voice = self.audio.lab_voice;
         let engine = Engine::of_voice(voice);
         let ready = self.readiness(voice);
@@ -1530,7 +1536,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap(px(12.))
-            .py(px(12.))
             .child(div().flex().flex_col().gap(px(8.)).child(div().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_2()).child("Scene")).child(chips))
             .child(note)
             .child(buttons);
@@ -1578,21 +1583,22 @@ impl SettingsView {
             }
             body = body.child(table).child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("Line: “{}” · spoken by {}", r.text, tts::engine_label(&r.engine))));
         }
-        setting_section("Voice Lab", Some("Hear how a voice delivers one line in a scene at three intensities, and the settings Studio sends the engine.".into()))
-            .child(setting_row("Voice", "Expressive voices are listed first", Select::new(&self.lab_voice).w(px(280.)).menu_width(px(320.))))
-            .child(divided(body))
+        settings_group("Voice Lab", Some("Hear how a voice delivers one line in a scene at three intensities, and the settings Studio sends the engine.".into()))
+            .child(settings_row("Voice", "Expressive voices are listed first", Select::new(&self.lab_voice).w(px(260.)).menu_width(px(320.))))
+            .child(settings_block(body))
     }
 
     fn render_advanced(&self, cx: &mut Context<Self>) -> Div {
-        let python: Div = match self.audio.env.as_ref().map(|e| &e.python) {
-            None => div().py(px(12.)).child(skeleton_line(px(220.))),
-            Some(Ok(p)) => setting_row(format!("Python {}", p.version), "Runs the voice engines in their own environment (~/.mangavox/tts-venv).", status_tag(StatusKind::Done).label("Found")),
-            Some(Err(_)) => div().flex().flex_col().gap(px(8.)).py(px(12.)).child(setting_row(
+        let python: AnyElement = match self.audio.env.as_ref().map(|e| &e.python) {
+            None => settings_block(skeleton_line(px(220.))).into_any_element(),
+            Some(Ok(p)) => settings_row(format!("Python {}", p.version), "Runs the voice engines in their own environment (~/.mangavox/tts-venv).", status_tag(StatusKind::Done).label("Found")).into_any_element(),
+            Some(Err(_)) => settings_row(
                 "Python not found",
                 "Setting up an engine installs a private copy automatically. To use your own, install Python 3.10 or newer:",
                 mv_ui::external_link("python.org", "https://www.python.org/downloads/"),
-            ))
-            .child(command_chip("py-cmd-copy", setup::python_install_cmd())),
+            )
+            .below(div().flex().min_w_0().max_w(px(460.)).child(command_chip("py-cmd-copy", setup::python_install_cmd())))
+            .into_any_element(),
         };
         let studio_grade: Vec<&str> = self
             .audio
@@ -1605,13 +1611,12 @@ impl SettingsView {
         } else {
             format!("Installed: {}.", studio_grade.join(", "))
         };
-        let content = div()
-            .flex()
-            .flex_col()
-            .child(python)
-            .child(divided(setting_row("Studio-grade engines", note, div())))
-            .child(divided(setting_row(
-                "Check the engines again",
+        let content = div().pt(px(10.)).child(
+            settings_group("", None)
+                .child(python)
+                .child(mv_ui::settings_text_row("Studio-grade engines", note))
+                .child(settings_row(
+                    "Check the engines again",
                 "After installing something outside MangaVox",
                 btn("engine-recheck", if self.audio.checking { "Checking…" } else { "Check again" }, ButtonKind::Secondary)
                     .small()
@@ -1622,7 +1627,7 @@ impl SettingsView {
                         this.check_engines(cx);
                     })),
             )));
-        div().flex().flex_col().border_t_1().border_color(Tokens::border()).pt(px(12.)).child(disclosure("audio-advanced", "Advanced: Python and other engines").content(content))
+        div().flex().flex_col().px(px(4.)).child(disclosure("audio-advanced", "Advanced: Python and other engines").content(content))
     }
 }
 

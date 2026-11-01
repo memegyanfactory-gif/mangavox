@@ -10,9 +10,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ai::{KeySource, ServiceDef, ServiceKind, Services, TestResult, SERVICES};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{badge, btn, external_link, ph, setting_row, setting_section, size, ButtonKind, Tokens, Tone};
-
-use crate::ui::divided;
+use mv_ui::settings::SETTINGS_GROUP_GAP;
+use mv_ui::{badge, btn, external_link, ph, settings_group, settings_note, settings_row, size, AlertKind, ButtonKind, SettingsGroup, SettingsRow, Tokens, Tone};
 
 #[derive(Clone)]
 enum Check {
@@ -98,7 +97,9 @@ impl ServicesPanel {
         cx.notify();
     }
 
-    fn row(&self, def: &'static ServiceDef, cx: &mut Context<Self>) -> Div {
+    /// One service: name and what it is for on the left, its state (badge and masked key) on the
+    /// right, then the key field with its actions and the last check's result under the text.
+    fn row(&self, def: &'static ServiceDef, cx: &mut Context<Self>) -> SettingsRow {
         let id = def.id;
         let key = self.services.key(id);
         let source = self.services.key_source(id);
@@ -111,13 +112,19 @@ impl ServicesPanel {
             (Some(_), None) => (Tone::Accent, "Saved"),
         };
         let input = self.inputs[id].clone();
-        let control = div()
+        let status = div()
             .flex()
             .items_center()
+            .gap(px(8.))
+            .when_some(key.as_deref().map(masked), |d, m| d.child(div().font_family(mv_ui::MONO_FONT).text_size(px(size::SM)).text_color(Tokens::text_2()).child(m)))
+            .child(badge(text, tone));
+        let key_line = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
             .gap(px(6.))
-            .child(badge(text, tone))
-            .when_some(key.as_deref().map(masked), |d, m| d.child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(m)))
-            .child(div().w(px(220.)).child(Input::new(&input).small().mask_toggle()))
+            .pt(px(4.))
+            .child(div().flex_1().min_w(px(160.)).max_w(px(300.)).child(Input::new(&input).small().mask_toggle()))
             .child(btn(SharedString::from(format!("svc-save-{id}")), "Save", ButtonKind::Secondary).small().icon(ph::KEY).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| this.save(id, w, cx))))
             .when(key.is_some(), |d| {
                 d.child(
@@ -131,7 +138,8 @@ impl ServicesPanel {
             })
             .when(source == Some(KeySource::Saved), |d| {
                 d.child(btn(SharedString::from(format!("svc-rm-{id}")), "Remove", ButtonKind::DangerGhost).small().icon(ph::TRASH).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.remove(id, cx))))
-            });
+            })
+            .child(div().pl(px(4.)).child(external_link("Get a key", def.key_url)));
         let hint = match source {
             Some(KeySource::Env) => format!("{} · from an environment variable", def.description),
             _ => def.description.to_string(),
@@ -139,27 +147,20 @@ impl ServicesPanel {
         let result = match check {
             Some(Check::Done(r)) => Some(
                 div()
-                    .pb(px(10.))
                     .text_size(px(size::SM))
-                    .whitespace_normal()
+                    .line_height(px(18.))
                     .text_color(if r.ok { Tokens::success() } else { Tokens::danger() })
                     .child(if r.ms > 0 { format!("{} · {} ms", r.message, r.ms) } else { r.message }),
             ),
             _ => None,
         };
-        div()
-            .flex()
-            .flex_col()
-            .child(setting_row(def.label, hint, control))
-            .child(div().flex().items_center().gap(px(12.)).pb(px(8.)).mt(px(-6.)).child(external_link("Get a key", def.key_url)))
-            .children(result)
+        settings_row(def.label, hint, status).below(key_line).when_some(result, |r, el| r.below(el))
     }
 
-    fn section(&self, kind: ServiceKind, title: &str, desc: &str, cx: &mut Context<Self>) -> Div {
-        let mut s = setting_section(title.to_string(), Some(desc.to_string().into()));
-        for (i, def) in SERVICES.iter().filter(|d| d.kind == kind).enumerate() {
-            let row = self.row(def, cx);
-            s = s.child(if i == 0 { row } else { divided(row) });
+    fn section(&self, kind: ServiceKind, title: &str, desc: &str, cx: &mut Context<Self>) -> SettingsGroup {
+        let mut s = settings_group(title.to_string(), Some(desc.to_string().into()));
+        for def in SERVICES.iter().filter(|d| d.kind == kind) {
+            s = s.child(self.row(def, cx));
         }
         s
     }
@@ -171,10 +172,12 @@ impl Render for ServicesPanel {
             .id("services-panel")
             .flex()
             .flex_col()
-            .gap(px(20.))
+            .gap(px(SETTINGS_GROUP_GAP))
             .w_full()
-            .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).whitespace_normal().child(
-                "Keys for image, video and voice services. Each key stays in this PC's config file and is only sent to its own service. Chat models (OpenAI, Together, Kimi…) are under AI providers; the Thumbnails generator uses Magnific (Settings › Magnific).",
+            .min_w_0()
+            .child(settings_note(
+                AlertKind::Info,
+                "Each key stays in this PC's config file and is only sent to its own service. Chat models (OpenAI, Together, Kimi…) are under AI providers; the Thumbnails generator uses Magnific (Settings › Magnific).",
             ))
             .child(self.section(ServiceKind::Image, "Images and video", "Text-to-image and video generation.", cx))
             .child(self.section(ServiceKind::Voice, "Voices", "Cloud text-to-speech.", cx))

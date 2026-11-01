@@ -5,6 +5,7 @@
 //! Saved per manga in `studio/<manga>/youtube_package.json`.
 mod assist;
 mod click;
+mod cover_thumb;
 mod logic;
 mod magnific;
 mod magnific_settings;

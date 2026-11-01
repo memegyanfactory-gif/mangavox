@@ -89,6 +89,9 @@ const ICONS = {
   pages: 'M4 4h7v16H4zM13 4h7v16h-7z',
   mouse: 'M12 3a6 6 0 0 0-6 6v6a6 6 0 0 0 12 0V9a6 6 0 0 0-6-6zM12 7v4',
   volup: 'M4 9v6h4l5 4V5L8 9zM16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12',
+  pulse: 'M3 12h4l3-8 4 16 3-8h4',
+  bell: 'M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0',
+  clock: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 7v5l3 2',
 };
 const SVGNS = 'http://www.w3.org/2000/svg';
 function icon(name, cls) {
@@ -269,7 +272,10 @@ let me = null;
 let mePromise = null;
 const getMe = () => mePromise || (mePromise = api('/api/me').then(d => { me = d || {}; $sub.textContent = subLine(); return me; }).catch(e => { mePromise = null; throw e; }));
 
-function setTitle(t) { $title.textContent = t || 'MangaVox'; document.title = t ? t + ' · MangaVox' : 'MangaVox'; }
+let baseTitle = 'MangaVox';
+function setTitle(t) { $title.textContent = t || 'MangaVox'; baseTitle = t ? t + ' · MangaVox' : 'MangaVox'; paintDocTitle(); }
+/** The page title, with the number of Activity updates not seen yet (it shows in the app switcher). */
+function paintDocTitle() { const u = Act.unread(); document.title = (u ? '(' + u + ') ' : '') + baseTitle; }
 function setActions(...els) { $actions.replaceChildren(...els.filter(Boolean)); }
 let backTarget = null;
 function setBack(fallback) { backTarget = fallback; $back.hidden = !fallback; }
@@ -399,6 +405,156 @@ function wakeLock() {
 }
 
 /* ======================================================================
+   Activity store: what the PC is doing, polled app-wide (fast on the Activity tab, slower
+   elsewhere, paused while the app is hidden unless system notifications are on). New events
+   (finished, failed, AI limit) become toasts, the Activity tab badge, the page title count and,
+   in a secure context with permission, one system notification per manga.
+   ====================================================================== */
+const ACTIVE = s => s === 'running' || s === 'limit' || s === 'waiting' || s === 'paused';
+// The Notification API, service workers and the app badge exist only in a secure context (HTTPS
+// or localhost). The companion is served over plain HTTP on the Wi-Fi, so on a phone this is
+// false today and the in-app tray stands in; the code below lights up once it is served securely.
+const canNotify = () => !!window.isSecureContext && 'Notification' in window && 'serviceWorker' in navigator;
+const notifyOn = () => canNotify() && Notification.permission === 'granted' && LS.get('mv.act.notify', true) !== false;
+const swReady = () => (canNotify() ? navigator.serviceWorker.ready : Promise.reject(new Error('no service worker')));
+const QUIET_ROUTES = new Set(['reader', 'watch', 'remote', 'touchpad']);
+const pctOf = t => Math.round(clamp(+t.progress || 0, 0, 1) * 100);
+
+const Act = (() => {
+  let data = null, timer = null, busy = false, fails = 0, fast = 0, started = false;
+  const subs = new Set();
+  // Newest event already announced, and newest the user has looked at (PC clock, ms).
+  let lastAt = LS.get('mv.act.lastAt', null);
+  let seenAt = LS.get('mv.act.seenAt', 0);
+  const events = () => arr(data && data.events);
+  const newest = () => events().reduce((m, e) => Math.max(m, +e.at || 0), 0);
+  const unread = () => events().filter(e => e.at > seenAt).length;
+
+  function delay() {
+    if (document.visibilityState !== 'visible') return notifyOn() ? 15000 : 0;
+    const base = fast > 0 ? 1500 : 5000;
+    return fails ? Math.min(30000, base * 2 ** Math.min(fails, 4)) : base;
+  }
+  function schedule() {
+    clearTimeout(timer); timer = null;
+    const d = delay();
+    if (d && started) timer = setTimeout(poll, d);
+  }
+  async function poll() {
+    clearTimeout(timer); timer = null;
+    if (busy || lockedOut) return;
+    busy = true;
+    try { take(await api('/api/activity')); fails = 0; }
+    catch (e) {
+      if (e.status === 401 || e.name === 'AbortError') { busy = false; return; }
+      fails++;
+      for (const f of subs) { try { f(data, e); } catch (x) { console.error(x); } }
+    }
+    busy = false;
+    schedule();
+  }
+  function take(d) {
+    data = d || {};
+    const top = newest();
+    if (lastAt == null) {
+      // First run on this phone: what happened before is not news.
+      lastAt = top; LS.set('mv.act.lastAt', top);
+      if (!seenAt) { seenAt = top; LS.set('mv.act.seenAt', top); }
+    } else {
+      const fresh = events().filter(e => e.at > lastAt);
+      if (fresh.length) { lastAt = top; LS.set('mv.act.lastAt', top); announce(fresh); }
+    }
+    if (document.visibilityState === 'visible' && document.body.dataset.route === 'activity') markSeen();
+    progressNotes();
+    paint();
+    for (const f of subs) { try { f(data, null); } catch (x) { console.error(x); } }
+  }
+  /** New events: toasts while the app is open, system notifications while it is hidden. */
+  function announce(fresh) {
+    const visible = document.visibilityState === 'visible';
+    if (visible) {
+      const route = document.body.dataset.route;
+      if (route === 'activity' || QUIET_ROUTES.has(route)) return;
+      fresh.slice(-2).forEach(e => toast(e.title + ' · ' + e.label + ': ' + e.text, e.state === 'failed' ? 'err' : e.state === 'done' ? 'ok' : 'info', 4200));
+      if (fresh.length > 2) toast('+' + (fresh.length - 2) + ' more in Activity', 'info', 4200);
+      return;
+    }
+    if (!notifyOn()) return;
+    swReady().then(reg => {
+      for (const e of fresh) {
+        reg.showNotification(e.title, {
+          tag: 'mv-' + e.manga_id, renotify: true, body: e.label + ': ' + e.text,
+          icon: '/icon.png', badge: '/icon.png', data: { url: '/#/activity' },
+        }).catch(() => {});
+      }
+    }).catch(() => {});
+  }
+  /** While hidden, each busy manga's notification shows its progress, updated silently. */
+  function progressNotes() {
+    if (!notifyOn()) return;
+    const hidden = document.visibilityState !== 'visible';
+    swReady().then(async reg => {
+      if (!hidden) {
+        // Back in the app: the progress notifications go, the finished / failed ones stay.
+        for (const n of await reg.getNotifications()) if (n.data && n.data.progress) n.close();
+        return;
+      }
+      for (const c of arr(data && data.manga).filter(c => ACTIVE(c.state))) {
+        const t = arr(c.tasks).find(t => ACTIVE(t.state));
+        if (!t) continue;
+        reg.showNotification(c.title, {
+          tag: 'mv-' + c.id, silent: true, renotify: false, body: t.label + ' · ' + t.line + (t.state === 'running' ? ' · ' + pctOf(t) + '%' : ''),
+          icon: '/icon.png', badge: '/icon.png', data: { url: '/#/activity', progress: true },
+        }).catch(() => {});
+      }
+    }).catch(() => {});
+  }
+  function markSeen() {
+    const top = newest();
+    if (top > seenAt) { seenAt = top; LS.set('mv.act.seenAt', top); paint(); }
+  }
+  /** The Activity tab badge (new updates, else how many manga are busy), page title, app badge. */
+  function paint() {
+    const tab = document.querySelector('#tabbar a[data-tab="activity"]');
+    const b = tab && tab.querySelector('.tb-badge');
+    const u = unread(), n = data ? data.busy | 0 : 0;
+    if (b) {
+      b.hidden = !u && !n;
+      b.className = 'tb-badge' + (u ? ' new' : '');
+      b.textContent = u ? (u > 9 ? '9+' : String(u)) : String(n);
+    }
+    if (tab) tab.setAttribute('aria-label', 'Activity' + (n ? ', ' + n + ' running' : '') + (u ? ', ' + u + ' new' : ''));
+    paintDocTitle();
+    if ('setAppBadge' in navigator) (u ? navigator.setAppBadge(u) : navigator.clearAppBadge()).catch(() => {});
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') poll(); else { progressNotes(); schedule(); }
+  });
+  addEventListener('online', () => { if (started) poll(); });
+  return {
+    start() { if (!started) { started = true; poll(); } },
+    poll,
+    data: () => data,
+    unread,
+    markSeen,
+    /** The Activity page holds this while open: polls every 1.5 s instead of 5 s. */
+    fast(on) { fast += on ? 1 : -1; if (on) poll(); else schedule(); },
+    sub(f) { subs.add(f); return () => subs.delete(f); },
+  };
+})();
+
+/** Forgetting this phone: drop the cached app shell and the notifications too. */
+async function forgetOffline() {
+  try {
+    if ('serviceWorker' in navigator) for (const r of await navigator.serviceWorker.getRegistrations()) {
+      for (const n of await r.getNotifications()) n.close();
+      await r.unregister();
+    }
+    if (window.caches) for (const k of await caches.keys()) await caches.delete(k);
+  } catch { /* nothing cached */ }
+}
+
+/* ======================================================================
    Router
    ====================================================================== */
 const ROUTES = [
@@ -409,6 +565,7 @@ const ROUTES = [
   ['anime', 'anime', /^\/anime$/, viewAnime],
   ['watch', '', /^\/watch$/, viewWatch],
   ['studio', 'studio', /^\/studio$/, viewStudio],
+  ['activity', 'activity', /^\/activity$/, viewActivity],
   ['more', 'more', /^\/more$/, viewMore],
   ['listen', 'more', /^\/listen$/, viewListen],
   ['remote', 'more', /^\/remote$/, viewRemote],
@@ -609,6 +766,7 @@ function viewManga(ctx, id) {
     h('div', { class: 'pad' }, Array.from({ length: 6 }, () => h('div', { class: 'skel', style: { height: '46px', margin: '10px 0' } }))));
   view.append(root);
   let desc = LS.get('mv.chsort', 'desc') === 'desc';
+  let vidSec = null; // built once, so a refresh of the page does not refetch or flash it
 
   function draw(m) {
     setTitle(m.title);
@@ -654,7 +812,8 @@ function viewManga(ctx, id) {
         refresh,
         h('button', { class: 'btn', type: 'button', onclick: () => openPc({ page: 'library', manga_id: id }) }, icon('pc'), 'On PC'),
         h('a', { class: 'btn', href: '#/studio?manga=' + enc(id) }, icon('sparkle'), 'Studio')),
-      descEl,
+      descEl || '',
+      vidSec || (vidSec = videosSection(id, m.title)),
       h('div', { class: 'sec-row', style: { marginTop: '16px', marginBottom: '6px' } },
         h('h2', { class: 'sec-h' }, 'Chapters', h('span', { class: 'count' }, chs.length ? read + ' / ' + chs.length + ' read' : '')), sortBtn),
       chs.length ? list : h('p', { class: 'pad muted' }, 'No chapters yet. Tap Refresh to check the source.'));
@@ -665,6 +824,26 @@ function viewManga(ctx, id) {
   ctx.refresh = load;
   load();
 }
+/** The chapter videos Studio made for a manga, with its one shared thumbnail: play one, or
+ *  "Play all" in chapter order (`/api/manga/<id>/videos`). Hidden when there are none. */
+function videosSection(mangaId, title) {
+  const sec = h('section', { class: 'sec vids', 'aria-label': 'Videos', hidden: true });
+  api('/api/manga/' + enc(mangaId) + '/videos').then(d => {
+    const vs = arr(d && d.videos);
+    if (!vs.length) return;
+    const items = vs.map(v => ({ id: 'chv.' + v.chapter_id, url: v.url, label: v.label || 'Chapter', title: (title ? title + ' · ' : '') + (v.label || 'Chapter'), poster: v.poster || d.thumbnail || null }));
+    sec.replaceChildren(
+      h('div', { class: 'sec-row' },
+        h('h2', { class: 'sec-h' }, 'Videos', h('span', { class: 'count' }, String(vs.length))),
+        vs.length > 1 && h('button', { class: 'btn sm primary', type: 'button', onclick: () => openPlaylist(items, 0, false) }, icon('play'), 'Play all')),
+      h('div', { class: 'hscroll' }, items.map((it, i) => h('button', { class: 'vcard', type: 'button', 'aria-label': 'Play ' + it.label, onclick: () => openPlaylist(items, i, true) },
+        h('div', { class: 'vcard-th' }, art(it.poster, W.card, '', initials(title)), h('span', { class: 'vcard-play', 'aria-hidden': 'true' }, icon('play'))),
+        h('div', { class: 'vcard-t' }, it.label)))));
+    sec.hidden = false;
+  }).catch(() => { /* none yet, or an older MangaVox */ });
+  return sec;
+}
+
 /** A chapter row. `onRecap` (title page) is called instead of opening the reader when Studio made
  *  a recap of the chapter, to offer it. */
 function chRow(c, current, onRecap) {
@@ -755,15 +934,21 @@ async function viewReader(ctx, chId, q) {
   const nextBtn = iconBtn('next', 'Next chapter', () => go(ch.next));
   prevBtn.disabled = ch.prev == null; nextBtn.disabled = ch.next == null;
   let ra = null; // the read-aloud controller while narration is on
-  const aloudBtn = iconBtn('headphones', 'Read aloud', () => { if (ra) ra.close(); else startAloud(); });
+  const aloudBtn = iconBtn('headphones', 'Listen', () => { if (ra) ra.close(); else startAloud(); });
   aloudBtn.hidden = true;
+  // What Studio made for this chapter (`/api/chapter/<id>/media`): narration to listen to, a video.
+  let media = null;
+  const watchBtn = iconBtn('video', 'Watch video', () => watchVideo());
+  watchBtn.hidden = true;
+  const autoBtn = paged ? null : iconBtn('scroll', 'Auto-scroll', () => auto.toggle());
   const top = h('div', { class: 'r-ov r-top' },
     iconBtn('back', 'Back to chapters', () => goBack(mangaHref)),
     h('div', { class: 'r-ttl' }, h('b', null, chLabel(ch)), ttlS),
     aloudBtn,
+    watchBtn,
     ch.manga_id != null && iconBtn('list', 'Chapters', () => chaptersSheet()),
     iconBtn('settings', 'Reading settings', () => settingsSheet()));
-  const bot = h('div', { class: 'r-ov r-bot' }, prevBtn, slider, pgLbl, nextBtn);
+  const bot = h('div', { class: 'r-ov r-bot' }, prevBtn, slider, pgLbl, autoBtn, nextBtn);
   const end = h('div', { class: 'r-end' },
     h('h2', null, 'End of ' + chLabel(ch)),
     ch.next != null
@@ -788,6 +973,12 @@ async function viewReader(ctx, chId, q) {
   };
   if (hit) fromManga(hit.data);
   else if (ch.manga_id != null) getManga(ch.manga_id).then(fromManga).catch(() => {});
+  api('/api/chapter/' + enc(chId) + '/media').then(md => {
+    if (!ctx.alive || !md) return;
+    media = md;
+    if (md.listen) aloudBtn.hidden = false;
+    if (md.video) watchBtn.hidden = false;
+  }).catch(() => { /* Studio made nothing, or an older MangaVox */ });
 
   // ----- progress -----
   let sliding = false, saveT = null, saved = cur, preloaded = false;
@@ -830,10 +1021,12 @@ async function viewReader(ctx, chId, q) {
 
   const engine = paged ? pagedEngine() : verticalEngine();
   root.replaceChildren(top, ...(n ? engine.els : [h('div', { class: 'state' }, icon('book'), h('h2', null, 'No pages'), h('p', null, 'This chapter has no pages yet. Download it on the PC or try again.')), end]), bot);
+  const auto = autoScroller();
+  ctx.onLeave(() => auto.dispose());
 
   root.addEventListener('click', e => {
     if (e.target.closest('.r-ov')) { showOv(true); return; }
-    if (e.target.closest('button, a, input, .ra')) return;
+    if (e.target.closest('button, a, input, .ra, .as-ctl')) return;
     if (engine.swallow && engine.swallow()) return;
     const x = e.clientX / innerWidth, y = e.clientY / innerHeight;
     if (paged) {
@@ -1015,12 +1208,99 @@ async function viewReader(ctx, chId, q) {
     aloudBtn.hidden = false;
     aloudBtn.classList.add('busy');
     let rc = null;
-    try { rc = await api('/api/chapter/' + enc(chId) + '/recap'); }
+    try {
+      // The joined narration (one file) when Studio made it, else the per-page clips.
+      const md = media || await api('/api/chapter/' + enc(chId) + '/media').catch(() => null);
+      if (md && md.narration && arr(md.timeline).length) rc = mediaTimeline(md);
+      else rc = await api('/api/chapter/' + enc(chId) + '/recap');
+    }
     catch (e) { if (ctx.alive && e.status !== 401) toast(e.status === 404 ? 'This chapter has no narration yet' : e.message, 'err'); }
     aloudBtn.classList.remove('busy');
     if (!ctx.alive || ra || !rc) return;
     if (!rc.aloud || !arr(rc.clips).length || !arr(rc.beats).length) { toast('This chapter has no narration yet', 'err'); return; }
+    auto.stop();
     ra = readAloud(rc);
+  }
+  /** `/media`'s timeline as the read-aloud controller's beats and one clip spanning it all; a
+   *  focus box `[x, y, w, h]` becomes the band of the page being read. */
+  function mediaTimeline(md) {
+    const tl = arr(md.timeline);
+    const total = Math.max(+md.total_ms || 0, ...tl.map(b => +b.end_ms || 0));
+    const beats = tl.map(b => {
+      const f = Array.isArray(b.focus) && b.focus.length === 4 ? b.focus : null;
+      return { page: b.page | 0, start_ms: +b.start_ms, end_ms: +b.end_ms, y0: f ? clamp(+f[1], 0, 1) : 0, y1: f ? clamp(+f[1] + +f[3], 0, 1) : 1, text: 'Page ' + ((b.page | 0) + 1) };
+    });
+    return { aloud: true, total_ms: total, beats, clips: [{ url: md.narration, start_ms: 0, end_ms: total }] };
+  }
+
+  function watchVideo() {
+    if (!media || !media.video) return;
+    if (ra) ra.close();
+    auto.stop();
+    openVideo({ id: 'chv.' + chId, url: media.video, poster: media.thumbnail, title: [ttlS.textContent, chLabel(ch)].filter(Boolean).join(' · ') });
+  }
+
+  /** Auto-scroll (vertical mode): the pages glide up at a set speed, drawn with
+   *  requestAnimationFrame. A touch pauses it, letting go resumes it a moment later; the end of the
+   *  chapter pauses it. The speed (1-10) is remembered. */
+  function autoScroller() {
+    const KEY = 'mv.auto.speed';
+    let speed = clamp(Math.round(+LS.get(KEY, 3) || 3), 1, 10);
+    let on = false, held = false, touching = false, raf = 0, last = 0, y = 0, resumeT = 0;
+    const pxs = () => 16 * Math.pow(1.45, speed - 1);
+    const lbl = h('span', { class: 'as-spd', 'aria-live': 'polite' });
+    const playB = h('button', { class: 'icon-btn as-play', type: 'button', onclick: () => { held = !held; paint(); kick(); } });
+    const step = d => () => { speed = clamp(speed + d, 1, 10); LS.set(KEY, speed); paint(); };
+    const ctl = h('div', { class: 'as-ctl', role: 'group', 'aria-label': 'Auto-scroll', hidden: true },
+      playB,
+      h('button', { class: 'icon-btn as-step', type: 'button', 'aria-label': 'Slower', onclick: step(-1) }, '−'),
+      lbl,
+      h('button', { class: 'icon-btn as-step', type: 'button', 'aria-label': 'Faster', onclick: step(1) }, '+'),
+      iconBtn('close', 'Stop auto-scroll', () => stop()));
+    if (!paged) root.append(ctl);
+    function paint() {
+      lbl.textContent = 'Speed ' + speed;
+      playB.replaceChildren(icon(held ? 'play' : 'pause'));
+      playB.setAttribute('aria-label', held ? 'Resume auto-scroll' : 'Pause auto-scroll');
+      ctl.hidden = !on;
+      root.classList.toggle('autoscroll', on);
+      if (autoBtn) { autoBtn.classList.toggle('on', on); autoBtn.setAttribute('aria-pressed', String(on)); }
+    }
+    function frame(ts) {
+      raf = 0;
+      if (!on || held || touching || !ctx.alive) { last = 0; return; }
+      const dt = last ? Math.min(0.1, (ts - last) / 1000) : 0;
+      last = ts;
+      // The page moved by itself (a tap-scroll, an image above loading): carry on from there.
+      if (Math.abs(scrollY - y) > 4) y = scrollY;
+      const max = document.documentElement.scrollHeight - innerHeight;
+      y = Math.min(max, y + pxs() * dt);
+      scrollTo(0, y);
+      if (y >= max - 1) { held = true; paint(); return; }
+      raf = requestAnimationFrame(frame);
+    }
+    function kick() {
+      if (raf || !on || held || touching) return;
+      last = 0; y = scrollY;
+      raf = requestAnimationFrame(frame);
+    }
+    function start() {
+      if (paged) return;
+      if (ra) { toast('Listen scrolls the pages with the narration: stop it to auto-scroll', 'info', 3200); return; }
+      on = true; held = false; showOv(false); paint(); kick();
+    }
+    function stop() { on = false; cancelAnimationFrame(raf); raf = 0; clearTimeout(resumeT); paint(); }
+    const sig = new AbortController();
+    const down = e => { if (!on || (e.target.closest && e.target.closest('.as-ctl'))) return; touching = true; clearTimeout(resumeT); };
+    const up = () => { if (!touching) return; touching = false; clearTimeout(resumeT); resumeT = setTimeout(kick, 1200); };
+    addEventListener('touchstart', down, { passive: true, signal: sig.signal });
+    addEventListener('touchend', up, { passive: true, signal: sig.signal });
+    addEventListener('touchcancel', up, { passive: true, signal: sig.signal });
+    addEventListener('mousedown', down, { signal: sig.signal });
+    addEventListener('mouseup', up, { signal: sig.signal });
+    addEventListener('wheel', () => { if (on) { touching = true; up(); } }, { passive: true, signal: sig.signal });
+    paint();
+    return { toggle() { if (on) stop(); else start(); }, start, stop, dispose() { stop(); sig.abort(); } };
   }
 
   /** Plays the narration clips back to back as one timeline and keeps the passage being read on
@@ -1603,24 +1883,64 @@ function createPlayer() {
 }
 let Player = null;
 
-function openVideo(item) {
+/** One video: a playlist of one. */
+function openVideo(item) { openPlaylist([item], 0, true); }
+
+/** Plays `items` ({ id, url, title, poster }) from `start`; unless `single`, each one's end
+ *  shows an up-next card and the next one starts after a short countdown (chapter order). Range
+ *  requests do the streaming; each video's place is remembered on this phone. */
+function openPlaylist(items, start, single) {
   Player.pause();
   openSheet((p, s) => {
-    const v = h('video', { controls: true, playsinline: true, 'webkit-playsinline': true, preload: 'metadata', autoplay: true, src: item.url, 'aria-label': item.title || 'Video' });
-    let last = 0;
-    const save = () => { if (isFinite(v.duration) && v.currentTime > 3 && v.currentTime < v.duration - 5) LS.set(posKey(item.id), { t: v.currentTime, d: v.duration }); };
-    v.addEventListener('loadedmetadata', () => { const pos = LS.get(posKey(item.id), null); if (pos && pos.t < v.duration - 8) v.currentTime = pos.t; });
+    let i = start, upT = null, last = 0;
+    const v = h('video', { controls: true, playsinline: true, 'webkit-playsinline': true, preload: 'metadata', autoplay: true, 'aria-label': 'Video' });
+    const ttl = h('b'), sub = h('span', { class: 'vp-sub' });
+    const dl = h('a', { class: 'icon-btn', download: '', 'aria-label': 'Download video' }, icon('download'));
+    const prevB = !single && iconBtn('prev', 'Previous video', () => go(i - 1));
+    const nextB = !single && iconBtn('next', 'Next video', () => go(i + 1));
+    const upNext = h('div', { class: 'vp-next', hidden: true, role: 'status' });
+    const it = () => items[i];
+    const save = () => { if (isFinite(v.duration) && v.currentTime > 3 && v.currentTime < v.duration - 5) LS.set(posKey(it().id), { t: v.currentTime, d: v.duration }); };
+    function clearUp() { clearInterval(upT); upT = null; upNext.hidden = true; }
+    function go(k) {
+      if (k < 0 || k >= items.length) return;
+      save(); clearUp();
+      i = k;
+      const x = it();
+      v.poster = x.poster || '';
+      v.src = x.url;
+      ttl.textContent = x.title || 'Video';
+      sub.textContent = single ? '' : (i + 1) + ' of ' + items.length;
+      dl.setAttribute('href', dlUrl(x.url));
+      if (prevB) prevB.disabled = i === 0;
+      if (nextB) nextB.disabled = i >= items.length - 1;
+      v.play().catch(() => { /* user can tap play */ });
+    }
+    function showUpNext() {
+      const nx = items[i + 1];
+      let left = 5;
+      const count = h('span', null, 'in ' + left + ' s');
+      upNext.replaceChildren(
+        nx.poster ? h('img', { src: nx.poster, alt: '', decoding: 'async' }) : '',
+        h('div', { class: 'vp-next-b' }, h('small', null, 'Up next ', count), h('b', null, nx.title || 'Next video'),
+          h('div', { class: 'row' },
+            h('button', { class: 'btn sm white', type: 'button', onclick: () => go(i + 1) }, icon('play'), 'Play now'),
+            h('button', { class: 'btn sm glass', type: 'button', onclick: () => clearUp() }, 'Cancel'))));
+      upNext.hidden = false;
+      upT = setInterval(() => { left--; count.textContent = 'in ' + left + ' s'; if (left <= 0) go(i + 1); }, 1000);
+    }
+    v.addEventListener('loadedmetadata', () => { const pos = LS.get(posKey(it().id), null); if (pos && pos.t < v.duration - 8) v.currentTime = pos.t; });
     v.addEventListener('timeupdate', () => { const now = Date.now(); if (now - last > 4000) { last = now; save(); } });
     v.addEventListener('pause', save);
-    v.addEventListener('ended', () => LS.del(posKey(item.id)));
-    v.addEventListener('error', () => { if (!s.closed) toast('Couldn’t play this video', 'err'); });
-    s.onClose.push(() => { save(); v.pause(); v.removeAttribute('src'); v.load(); });
+    v.addEventListener('play', clearUp);
+    v.addEventListener('ended', () => { LS.del(posKey(it().id)); if (!single && i + 1 < items.length) showUpNext(); });
+    v.addEventListener('error', () => { if (!s.closed && v.getAttribute('src')) toast('Couldn’t play this video', 'err'); });
+    s.onClose.push(() => { save(); clearUp(); v.pause(); v.removeAttribute('src'); v.load(); });
     p.append(
-      h('div', { class: 'vp-top' }, iconBtn('back', 'Close video', () => s.close()), h('b', null, item.title || 'Video'),
-        h('a', { class: 'icon-btn', href: dlUrl(item.url), download: '', 'aria-label': 'Download video' }, icon('download'))),
-      h('div', { class: 'vp-box' }, v));
-    v.play().catch(() => { /* user can tap play */ });
-  }, { cls: 'video', label: item.title || 'Video player' });
+      h('div', { class: 'vp-top' }, iconBtn('back', 'Close video', () => s.close()), h('div', { class: 'vp-ttl' }, ttl, sub), prevB, nextB, dl),
+      h('div', { class: 'vp-box' }, v, upNext));
+    go(start);
+  }, { cls: 'video', label: (items[start] && items[start].title) || 'Video player' });
 }
 const dlUrl = u => String(u).startsWith('/api/') ? u + (String(u).includes('?') ? '&' : '?') + 'download=1' : '#';
 
@@ -2881,6 +3201,202 @@ function viewTouchpad(ctx) {
 }
 
 /* ======================================================================
+   Activity: one card per manga, live
+   ====================================================================== */
+const KIND_IC = { download: 'download', generate: 'sparkle', voice: 'wave', read: 'book', export: 'video' };
+const STATE_TXT = { running: 'Running', limit: 'AI limit', waiting: 'Waiting', paused: 'Paused', failed: 'Failed', done: 'Done' };
+const STEP_TXT = { Transcript: 'Script' };
+function resumeIn(sec) {
+  const m = Math.max(0, Math.ceil(sec / 60));
+  if (m < 1) return 'in a moment';
+  return m < 60 ? 'in ' + m + ' min' : 'in ' + Math.floor(m / 60) + ' h ' + String(m % 60).padStart(2, '0') + ' min';
+}
+function agoMs(ms) {
+  const s = ms / 1000;
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+  return Math.floor(s / 86400) + ' d ago';
+}
+
+/** The notifications row: on / off / blocked where the phone allows them, else why not. */
+function notifyBox() {
+  const box = h('div');
+  const banner = (cls, ic, title, text, ...acts) => h('div', { class: 'banner act-note ' + cls }, icon(ic), h('div', { class: 'act-note-b' }, h('b', null, title), text), ...acts);
+  const paint = () => {
+    if (canNotify()) {
+      const p = Notification.permission;
+      if (p === 'granted' && notifyOn()) {
+        box.replaceChildren(banner('', 'bell', 'Notifications are on', 'One per manga when work finishes or fails, also while MangaVox is in the background.',
+          h('button', { class: 'btn sm ghost', type: 'button', onclick: () => { LS.set('mv.act.notify', false); paint(); } }, 'Turn off')));
+      } else if (p === 'denied') {
+        box.replaceChildren(banner('warn', 'bell', 'Notifications are blocked', 'Allow notifications for this site in your browser settings to get them.'));
+      } else {
+        box.replaceChildren(banner('', 'bell', 'Get notified', 'One notification per manga when a download, Generate run or export finishes or fails.',
+          h('button', { class: 'btn sm primary', type: 'button', onclick: async () => {
+            LS.set('mv.act.notify', true);
+            try { await Notification.requestPermission(); } catch { /* old browsers */ }
+            paint();
+          } }, 'Turn on')));
+      }
+    } else if (!LS.get('mv.act.hint', false)) {
+      box.replaceChildren(banner('', 'bell', 'Updates show in the app',
+        'Phone notifications need a secure (HTTPS) connection; MangaVox talks to your PC over plain Wi‑Fi. News shows as a badge on Activity and a toast.',
+        iconBtn('close', 'Dismiss', () => { LS.set('mv.act.hint', true); paint(); }, 'act-note-x')));
+    } else box.replaceChildren();
+  };
+  paint();
+  return box;
+}
+
+function viewActivity(ctx) {
+  setTitle('Activity');
+  const sum = h('div', { class: 'act-sum', hidden: true });
+  const nowH = h('h2', { class: 'sec-h', hidden: true }, 'Now');
+  const nowList = h('div', { class: 'act-list', 'aria-live': 'polite' },
+    Array.from({ length: 3 }, () => h('div', { class: 'skel act-skel' })));
+  const doneH = h('h2', { class: 'sec-h', hidden: true }, 'Finished');
+  const doneList = h('div', { class: 'act-list' });
+  const empty = h('div', { hidden: true });
+  const evH = h('h2', { class: 'sec-h', hidden: true }, 'Updates');
+  const evList = h('div', { class: 'act-ev' });
+  const errBox = h('div');
+  view.append(h('div', { class: 'page act' }, notifyBox(), errBox, sum, nowH, nowList, doneH, doneList, empty, evH, evList));
+
+  const cards = new Map(); // manga id -> its card parts (kept, so covers do not reload)
+  const lastPct = new Map(); // task key -> last width, so a rebuilt bar glides from it
+  const armed = new Map(); // task key -> until when its Cancel waits for the second tap
+  let lastData = null, evKey = '';
+
+  function cancelBtn(t) {
+    const on = (armed.get(t.key) || 0) > Date.now();
+    const b = h('button', { class: 'btn sm ghost act-cancel' + (on ? ' confirm' : ''), type: 'button', onclick: async () => {
+      if ((armed.get(t.key) || 0) <= Date.now()) {
+        armed.set(t.key, Date.now() + 3500);
+        b.classList.add('confirm'); b.replaceChildren(icon('close'), 'Tap again to cancel');
+        setTimeout(() => { if (b.isConnected && (armed.get(t.key) || 0) <= Date.now()) { b.classList.remove('confirm'); b.replaceChildren(icon('close'), 'Cancel'); } }, 3600);
+        return;
+      }
+      armed.delete(t.key);
+      b.disabled = true; b.classList.add('busy');
+      let err = null;
+      for (const id of arr(t.cancel)) { try { await post('/api/studio/jobs/' + enc(id) + '/cancel'); } catch (e) { err = e; } }
+      if (err && err.status !== 401) toast(err.message, 'err'); else toast('Cancelled on your PC', 'ok');
+      Act.poll();
+    } }, icon('close'), on ? 'Tap again to cancel' : 'Cancel');
+    return b;
+  }
+
+  function taskEl(t, now) {
+    const pct = pctOf(t);
+    const prev = lastPct.get(t.key);
+    lastPct.set(t.key, pct);
+    const bar = h('i', { style: { width: (prev != null ? prev : pct) + '%' } });
+    if (prev != null && prev !== pct) requestAnimationFrame(() => requestAnimationFrame(() => { bar.style.width = pct + '%'; }));
+    const count = t.total ? t.at + ' of ' + t.total : (t.state === 'running' ? pct + '%' : '');
+    const steps = arr(t.steps);
+    return h('div', { class: 'atask ' + t.state },
+      h('div', { class: 'atask-h' },
+        h('span', { class: 'atask-ic' }, icon(KIND_IC[t.kind] || 'pulse')),
+        h('b', null, t.label),
+        count && h('span', { class: 'atask-n' }, count)),
+      h('div', { class: 'atask-l' }, t.line),
+      h('div', { class: 'pbar' + (t.state === 'waiting' ? ' indet' : '') }, bar),
+      steps.length ? h('div', { class: 'steps', role: 'list', 'aria-label': 'Steps' }, steps.map(s =>
+        h('span', { class: 'step ' + s.state, role: 'listitem', title: s.name + ': ' + s.state }, h('i'), h('span', null, STEP_TXT[s.name] || s.name)))) : null,
+      t.state === 'limit' && t.resume_at ? h('div', { class: 'atask-x' }, icon('clock'), 'Carries on ', h('span', { 'data-until': String(t.resume_at) }, resumeIn(t.resume_at - now / 1000))) : null,
+      t.error ? h('div', { class: 'atask-e' }, t.error) : null,
+      arr(t.cancel).length ? h('div', { class: 'atask-a' }, cancelBtn(t)) : null);
+  }
+
+  function partsFor(c) {
+    let k = cards.get(c.id);
+    if (k) return k;
+    const link = c.id && !/^t:/.test(c.id) && c.id !== 'studio';
+    const ttl = h('b'), sub = h('span'), chip = h('span', { class: 'state-chip' });
+    const head = h(link ? 'a' : 'div', { class: 'acard-h', href: link ? '#/manga/' + enc(c.id) : null },
+      cover(c.cover, c.title), h('div', { class: 'acard-t' }, ttl, sub), chip);
+    const body = h('div', { class: 'acard-b' });
+    k = { el: h('article', { class: 'acard' }, head, body), ttl, sub, chip, body, json: '' };
+    cards.set(c.id, k);
+    return k;
+  }
+
+  function patch(k, c, now) {
+    k.el.className = 'acard s-' + c.state;
+    k.ttl.textContent = c.title;
+    k.sub.textContent = arr(c.tasks).map(t => t.label).join(' · ');
+    k.chip.className = 'state-chip ' + c.state;
+    k.chip.textContent = STATE_TXT[c.state] || c.state;
+    // Rebuilt only when a task changed; the countdown to an AI limit ticks either way.
+    const json = JSON.stringify(c.tasks) + '|' + [...armed].filter(([, u]) => u > Date.now()).map(([key]) => key).join();
+    if (json !== k.json) { k.json = json; k.body.replaceChildren(...arr(c.tasks).map(t => taskEl(t, now))); }
+    else for (const s of k.body.querySelectorAll('[data-until]')) s.textContent = resumeIn(+s.dataset.until - now / 1000);
+  }
+
+  /** Puts `els` into `list` in order, moving only what is out of place. */
+  function place(list, els) {
+    els.forEach((el, i) => { if (list.children[i] !== el) list.insertBefore(el, list.children[i] || null); });
+    while (list.children.length > els.length) list.lastChild.remove();
+  }
+
+  function draw(d, err) {
+    if (!ctx.alive) return;
+    if (err) {
+      if (!lastData) { nowList.replaceChildren(); errBox.replaceChildren(errorState(err, () => { errBox.replaceChildren(); Act.poll(); })); }
+      else errBox.replaceChildren(h('div', { class: 'banner warn act-stale' }, icon('wifioff'), h('div', null, h('b', null, 'Can’t reach your PC'), 'Showing the last update. Retrying…')));
+      return;
+    }
+    errBox.replaceChildren();
+    lastData = d;
+    const now = +d.now || Date.now();
+    const ms = arr(d.manga);
+    const live = ms.filter(c => ACTIVE(c.state)), over = ms.filter(c => !ACTIVE(c.state));
+    for (const id of [...cards.keys()]) if (!ms.some(c => c.id === id)) cards.delete(id);
+    const els = c => { const k = partsFor(c); patch(k, c, now); return k.el; };
+    if (nowList.querySelector('.act-skel')) nowList.replaceChildren();
+    place(nowList, live.map(els));
+    place(doneList, over.map(els));
+    nowH.hidden = !live.length || !over.length;
+    doneH.hidden = !over.length;
+
+    // Summary chips.
+    const n = s => ms.filter(c => s.includes(c.state)).length;
+    const chips = [[n(['running', 'limit']), 'running', 'ac'], [n(['waiting']), 'waiting', ''], [n(['paused']), 'paused', ''], [n(['failed']), 'failed', 'bad'], [n(['done']), 'done', 'ok']]
+      .filter(([k]) => k > 0).map(([k, t, cls]) => h('span', { class: 'chip ' + cls }, k + ' ' + t));
+    sum.hidden = !chips.length;
+    sum.replaceChildren(...chips);
+
+    empty.hidden = !!ms.length;
+    if (!ms.length && !empty.firstChild) {
+      empty.append(stateBox('pulse', 'All quiet on your PC', 'Downloads, Studio Generate runs, exports and AI reading show up here, live, while they run.',
+        h('a', { class: 'btn', href: '#/studio' }, icon('sparkle'), 'Open Studio')));
+    }
+
+    // Updates, newest first.
+    const evs = arr(d.events).slice().reverse();
+    const key = evs.map(e => e.id + ':' + e.at).join() + '|' + Math.floor(now / 30000);
+    if (key !== evKey) {
+      evKey = key;
+      evList.replaceChildren(...evs.slice(0, 25).map(e => h('div', { class: 'aev ' + e.state },
+        h('span', { class: 'aev-ic' }, icon(e.state === 'failed' ? 'alert' : e.state === 'limit' ? 'clock' : 'check')),
+        h('div', { class: 'aev-b' }, h('b', null, e.title), h('span', null, e.label + ': ' + e.text)),
+        h('time', null, agoMs(now - e.at)))));
+    }
+    evH.hidden = !evs.length;
+  }
+
+  const unsub = Act.sub(draw);
+  const refreshBtn = iconBtn('refresh', 'Refresh activity', () => { refreshBtn.classList.add('busy'); Act.poll().finally(() => refreshBtn.classList.remove('busy')); });
+  setActions(refreshBtn);
+  ctx.refresh = () => Act.poll();
+  ctx.onLeave(() => { unsub(); Act.fast(false); });
+  if (Act.data()) draw(Act.data(), null);
+  Act.fast(true);
+  Act.markSeen();
+}
+
+/* ======================================================================
    More: Listen, Remote, PC shortcuts, this phone
    ====================================================================== */
 function viewMore(ctx) {
@@ -2905,6 +3421,7 @@ function viewMore(ctx) {
     try { await post('/api/logout'); } catch (e) { if (e.status !== 401) { toast(e.message, 'err'); forget.classList.remove('busy'); forget.disabled = false; return; } }
     try { localStorage.clear(); } catch { /* ignore */ }
     lockedOut = true;
+    await forgetOffline();
     location.replace('/locked');
   } }, icon('logout'), 'Forget this phone');
   ctx.onLeave(() => clearTimeout(armT));
@@ -2936,7 +3453,7 @@ function viewMore(ctx) {
    ====================================================================== */
 function boot() {
   for (const a of tabs) {
-    a.prepend(h('span', { class: 'tb-ic' }, icon(a.dataset.ic)));
+    a.prepend(h('span', { class: 'tb-ic' }, icon(a.dataset.ic), a.dataset.tab === 'activity' ? h('span', { class: 'tb-badge', hidden: true, 'aria-hidden': 'true' }) : null));
     a.addEventListener('click', e => {
       e.preventDefault();
       const t = a.dataset.tab, home = a.getAttribute('href');
@@ -2963,6 +3480,10 @@ function boot() {
   net();
   Player = createPlayer();
   getMe().catch(() => {});
+  Act.start();
+  // The app shell cached for instant, offline-tolerant starts, and system notifications: only in a
+  // secure context (see canNotify), so not over the plain-HTTP Wi-Fi address today.
+  if (window.isSecureContext && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   if (!location.hash || location.hash === '#' || location.hash === '#/') {
     const last = String(LS.get('mv.last', '/library'));
     history.replaceState(null, '', '#' + (/^\/[a-z]/.test(last) ? last : '/library'));

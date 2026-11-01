@@ -11,6 +11,8 @@ mv-sources = { path = "../mv-sources" }
 mv-plugins = { path = "../mv-plugins" }
 mv-net = { path = "../mv-net" }
 ui-assistant = { path = "../ui-assistant" }
+# Studio's chapter media contract and video thumbnails (no UI).
+mv-recap = { path = "../mv-recap" }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }

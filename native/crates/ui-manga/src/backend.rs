@@ -502,6 +502,8 @@ pub async fn download_page(url: String, source_id: Option<String>) -> Result<Pat
     let (bytes, ext) = fetch_image(&url, source_id.as_deref()).await?;
     let path = dir.join(format!("{stem}.{ext}"));
     write_atomic(&path, &bytes)?;
+    // Private mode: pages viewed in the session can be cleared when it ends.
+    mv_core::privacy::record_file(&path);
     Ok(path)
 }
 
@@ -545,6 +547,7 @@ pub async fn ensure_cover(url: String, source_id: Option<String>) -> Option<Path
     let stem = format!("{:x}", md5::compute(url.as_bytes()));
     let path = mv_core::paths::covers().join(format!("{stem}.{ext}"));
     write_atomic(&path, &bytes).ok()?;
+    mv_core::privacy::record_file(&path);
     Some(path)
 }
 
@@ -624,12 +627,33 @@ pub fn browse_only() -> HashSet<String> {
 pub fn set_in_library(manga_id: &str, in_library: bool) {
     let mut set = browse_only();
     let changed = if in_library { set.remove(manga_id) } else { set.insert(manga_id.to_string()) };
+    if changed && in_library {
+        // Private mode: offered for clearing when the session ends.
+        mv_core::privacy::record_library_add(manga_id);
+    }
     if changed {
         let mut v: Vec<String> = set.into_iter().collect();
         v.sort();
         let _ = mv_core::config::Config::open_default().set(BROWSE_ONLY_KEY, serde_json::json!(v));
         bump_data();
     }
+}
+
+/// Deletes manga rows (their chapters go with them) and forgets them as browse-only. Used to
+/// clear titles a private session opened for the first time. Blocking.
+pub fn forget_titles(ids: &[String]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    with_db(|c| mv_core::repo::manga::remove_many(c, ids))?;
+    let mut set = browse_only();
+    if ids.iter().fold(false, |any, id| set.remove(id) || any) {
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        let _ = mv_core::config::Config::open_default().set(BROWSE_ONLY_KEY, serde_json::json!(v));
+    }
+    bump_data();
+    Ok(())
 }
 
 // ---------------------------------------------------------------- chapter extras

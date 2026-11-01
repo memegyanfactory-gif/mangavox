@@ -12,16 +12,19 @@
 //! - `bridge`: runs closures on the GPUI thread for the API modules (navigate, play, ...).
 //! - `api_manga`, `api_studio`, `api_media`, `api_anime`, `api_watch`, `api_img`, `screen`, `touchpad`: the `/api` routes
 //!   (`touchpad` moves the PC's real mouse pointer and types, through `SendInput`).
+//! - `activity`: `/api/activity`, what the PC is doing per manga (downloads, Generate, exports, AI runs).
 //! - `page`, `qr`: the desktop Mobile page with the QR code.
 use gpui_kit::*;
 use mv_ui::Route;
 
 pub mod api_anime;
+mod api_chapter_media;
 pub mod api_img;
 pub mod api_manga;
 pub mod api_media;
 pub mod api_studio;
 pub mod api_watch;
+mod activity;
 pub mod auth;
 pub mod bridge;
 pub mod firewall;

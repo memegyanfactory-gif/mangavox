@@ -10,11 +10,13 @@ mod export;
 pub mod hook;
 mod json;
 mod llm;
+pub mod media;
 mod read;
 mod reset;
 mod store;
 mod story;
 mod strip;
+pub mod thumb;
 mod transcript;
 mod types;
 

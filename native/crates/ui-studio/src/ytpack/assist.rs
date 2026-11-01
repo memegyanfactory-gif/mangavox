@@ -7,6 +7,9 @@ use ui_assistant::tools::{self as at, bool_arg, str_arg, Phrases, Risk, ToolDef,
 use super::{ask, logic, research, Panels, Saved, CAST_FOR_MATCH, CAST_FOR_PROMPT};
 
 pub(crate) fn register_tools() {
+    // Not a tool, but registered at the same startup call: the reader asks Studio for a manga's
+    // one AI video thumbnail through it (`mv_recap::thumb`).
+    super::cover_thumb::register();
     at::register(vec![ToolDef::new(
         "studio_youtube_package",
         "The YouTube package for a manga's recap: searches YouTube for recaps of the same manga (views, channels, a views prediction), then has the AI write a title, alternative titles, description and thumbnail concept, plus a thumbnail prompt for an image AI. Saved on the Studio dashboard's YouTube package card. `research: false` reuses the last search; `suggest: false` only researches.",
