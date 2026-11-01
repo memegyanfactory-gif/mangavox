@@ -49,6 +49,17 @@ pub fn updater(cx: &mut App) -> Entity<Updater> {
     e
 }
 
+/// Quits MangaVox for sure: GPUI's quit, then the process ends a few seconds later even when
+/// something hangs while shutting down (a copy left behind after an update kept running in the
+/// background, with no window, doubling the work and holding the phone port).
+pub fn quit(cx: &mut App) {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(5));
+        std::process::exit(0);
+    });
+    cx.quit();
+}
+
 pub fn version() -> &'static str {
     mv_update::VERSION
 }
@@ -173,7 +184,7 @@ impl Updater {
                     Ok(()) => {
                         u.status = Status::Installing(release.clone());
                         cx.notify();
-                        cx.quit();
+                        quit(cx);
                     }
                     Err(e) => {
                         u.status = Status::Failed(format!("Update failed: {e:#}"));

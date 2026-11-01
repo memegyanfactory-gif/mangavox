@@ -29,7 +29,7 @@ pub fn install(main: AnyWindowHandle, cx: &mut App) {
             }
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if ev.id == quit_id {
-                    cx.update(|cx| cx.quit());
+                    cx.update(mv_ui::update::quit);
                     return;
                 }
                 bring |= ev.id == show_id;

@@ -1,0 +1,34 @@
+{
+ "firstChapter": {
+  "number": 1,
+  "slug": "chapter-1"
+ },
+ "lastChapter": {
+  "number": 34,
+  "slug": "chapter-34"
+ },
+ "totalChapterCount": 34,
+ "post": {
+  "id": 633,
+  "slug": "i-became-a-transcendent-hunter-with-100000x-exp",
+  "postTitle": "I Became a Transcendent Hunter with 100,000x EXP",
+  "postContent": "<p><strong>Lee Ji-han was a hunter with zero talent.</strong></p><p><strong>When he unexpectedly regressed, he found out his EXP gain was multiplied by 100,000!</strong></p>",
+  "alternativeTitles": "경험치 10만배로 초월급 헌터가 되었다\n経験値10万倍で超越級ハンターになった\n",
+  "author": "",
+  "artist": "",
+  "featuredImage": "https://storage.vortexscans.org/upload/series/featured/4/0847db56-f17c-4ad7-bba8-6e51c1765205.png",
+  "seriesType": "MANHWA",
+  "seriesStatus": "ONGOING",
+  "isNovel": false,
+  "genres": [
+   {
+    "id": 1,
+    "name": "Action"
+   },
+   {
+    "id": 2,
+    "name": "Fantasy"
+   }
+  ]
+ }
+}

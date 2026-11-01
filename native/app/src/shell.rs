@@ -18,6 +18,7 @@ use mv_ui::toast::{self, Toast};
 use mv_ui::update::{version, Status, Updater};
 use mv_ui::{appear, btn, empty_view, glyphs, icon_button, icon_ph, kbd, nav_item, ph, section_label, segmented, size, skeleton_line, tip, ButtonKind, Interactive as _, Ph, Route, Tokens};
 
+use crate::activity::StudioRuns;
 use crate::keys::{self, Shortcut};
 use crate::palette::{self, Cmd, Palette, Title};
 use crate::prefs::{self, ShellPrefs, DOCK_MAX, DOCK_MIN};
@@ -133,6 +134,8 @@ pub struct Shell {
     serial_at_key: u64,
     /// "Check for updates" from the palette: report the result in a toast.
     manual_update_check: bool,
+    /// Studio's Generate runs, as cards in the activity corner.
+    studio_runs: Entity<StudioRuns>,
     _subs: Vec<Subscription>,
 }
 
@@ -157,9 +160,12 @@ impl Shell {
         subs.push(cx.observe_keystrokes(|this, ev, window, cx| this.on_keystroke(ev, window, cx)));
         let updater = mv_ui::update::updater(cx);
         subs.push(cx.observe(&updater, |this, u, cx| this.update_changed(u, cx)));
-        // The download notification and the Downloads badge follow the queue.
+        // The download cards and the Downloads badge follow the queue; the Generate cards
+        // follow Studio's.
         let dl = ui_manga::downloads(cx);
         subs.push(cx.observe(&dl, |_, _, cx| cx.notify()));
+        let studio_runs = cx.new(StudioRuns::new);
+        subs.push(cx.observe(&studio_runs, |_, _, cx| cx.notify()));
         // Title bar dims while the window is inactive.
         subs.push(cx.observe_window_activation(window, |_, _, cx| cx.notify()));
         let saved = prefs::load();
@@ -192,6 +198,7 @@ impl Shell {
             nav_serial: 0,
             serial_at_key: 0,
             manual_update_check: false,
+            studio_runs,
             _subs: subs,
         };
         shell.sync_back(cx);
@@ -1460,17 +1467,20 @@ impl Render for Shell {
             self.save_prefs();
         }
 
-        let page = div()
-            .id("page")
-            .relative()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_hidden()
-            .child(self.page.clone())
-            .when(!focus, |d| d.children(ui_manga::download_toast(cx)))
-            // App-wide toasts (mv_ui::toast::show), bottom centre of the page area. Mounted once.
-            .child(mv_ui::toast::host(cx));
+        // Background work (one card per title downloading, per Generate run) and the app-wide
+        // toast stack in the bottom-right corner of the page area. A card stays off the page that
+        // already lists its work. The reader and the player keep the screen: no cards, and the
+        // toast at the bottom centre.
+        let corner = if focus {
+            toast::host(cx)
+        } else {
+            let mut cards = if self.route == Route::MangaDownloads { vec![] } else { ui_manga::download_cards(cx) };
+            if self.route != Route::Studio {
+                cards.extend(self.studio_runs.read(cx).cards(&self.studio_runs));
+            }
+            mv_ui::activity::corner(cards, Some(toast::view(cx)), cx)
+        };
+        let page = div().id("page").relative().flex_1().min_w_0().h_full().overflow_hidden().child(self.page.clone()).child(corner);
 
         let mut body = div().relative().flex().flex_1().min_h_0().when(show_sidebar, |d| d.child(self.sidebar(rail, false, cx))).child(page);
         match dock {

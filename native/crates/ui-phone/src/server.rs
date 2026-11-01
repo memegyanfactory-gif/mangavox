@@ -14,10 +14,14 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::watch;
 
-use crate::{api_anime, api_img, api_manga, api_media, api_studio, api_watch, auth, screen, state};
+use crate::{api_anime, api_img, api_manga, api_media, api_studio, api_watch, auth, screen, state, touchpad};
 
 /// Ports tried after the configured one when it is busy.
 const PORT_TRIES: u16 = 20;
+/// How long the configured port is retried before the next ones are tried: right after an update
+/// or a quick restart the previous MangaVox can hold it for a moment, and moving to another port
+/// would break the address saved on paired phones (bookmark, home-screen icon).
+const PORT_WAIT: Duration = Duration::from_secs(4);
 
 struct Running {
     generation: u64,
@@ -73,8 +77,18 @@ pub fn stop() {
 }
 
 async fn bind(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let until = tokio::time::Instant::now() + PORT_WAIT;
+    loop {
+        match tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tokio::time::Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(_) => break,
+        }
+    }
     let mut last = None;
-    for p in port..=port.saturating_add(PORT_TRIES) {
+    for p in port.saturating_add(1)..=port.saturating_add(PORT_TRIES) {
         match tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, p)).await {
             Ok(l) => return Ok(l),
             Err(e) => last = Some(e),
@@ -149,6 +163,7 @@ fn lan_ip() -> Option<IpAddr> {
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const LOCKED_HTML: &str = include_str!("../web/locked.html");
+const LOCKED_JS: &str = include_str!("../web/locked.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
@@ -164,6 +179,15 @@ fn asset(body: impl Into<axum::body::Body>, mime: &'static str, no_cache: bool) 
     let cache = if no_cache { "no-cache" } else { "public, max-age=86400" };
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
     r
+}
+
+/// `/locked`: the locked page, or the app for a phone that is signed in after all (a tab left on
+/// `/locked`, or one the web app sent there, keeps working once the session does).
+async fn locked_route(headers: axum::http::HeaderMap) -> Response {
+    if auth::signed_in(&headers) {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/"), (header::CACHE_CONTROL, "no-store")]).into_response();
+    }
+    locked_page(StatusCode::OK)
 }
 
 /// The page every unpaired browser gets.
@@ -186,7 +210,8 @@ pub(crate) fn router() -> Router {
     Router::new()
         .route("/", get(|| async { asset(INDEX_HTML, "text/html; charset=utf-8", true) }))
         .route("/index.html", get(|| async { asset(INDEX_HTML, "text/html; charset=utf-8", true) }))
-        .route("/locked", get(|| async { locked_page(StatusCode::OK) }))
+        .route("/locked", get(locked_route))
+        .route("/locked.js", get(|| async { asset(LOCKED_JS, "text/javascript; charset=utf-8", true) }))
         .route("/app.js", get(|| async { asset(APP_JS, "text/javascript; charset=utf-8", true) }))
         .route("/app.css", get(|| async { asset(APP_CSS, "text/css; charset=utf-8", true) }))
         .route("/manifest.webmanifest", get(|| async { asset(MANIFEST, "application/manifest+json", true) }))
@@ -202,6 +227,7 @@ pub(crate) fn router() -> Router {
         .merge(api_img::routes())
         .merge(api_studio::routes())
         .merge(screen::routes())
+        .merge(touchpad::routes())
         .fallback(not_found)
         // Request bodies are small JSON (an input gesture, a chapter list): cap them well below
         // axum's 2 MiB default.

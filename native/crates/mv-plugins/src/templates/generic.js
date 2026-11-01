@@ -167,11 +167,19 @@ THEMES.generic = {
     return this.parseChapters(html, url);
   },
   READER: 'div#readerarea img, div.reading-content img, div.reader-area img, div.chapter-content img, div.container-chapter-reader img, div#chapter-images img, div.chapter-images img, div.page-break img, div#reader img, div.reader img, div.chapter-reader img, section.reader img, main img',
-  BAD_IMG: /logo|icon|avatar|banner|\/ads?\/|emoji|gravatar|favicon|sprite|button|badge|social|discord|patreon|kofi|ko-fi|loading|spinner/i,
+  // Matched against the file name only (plus ad / avatar folders): a series slug in the image path
+  // ("monologue", "silicon", "the-social-...") must not throw away every page of a chapter.
+  BAD_IMG: /logo|icon|avatar|banner|emoji|gravatar|favicon|sprite|button|badge|social|discord|patreon|kofi|ko-fi|loading|spinner/i,
+  BAD_DIR: /\/(ads?|avatars?|emojis?|icons?|logos?|banners?|badges?|gravatar)\//i,
+  badImg: function (u) {
+    var path = String(u || '').replace(/^https?:\/\/[^\/]+/i, '').replace(/[?#].*$/, '');
+    return THEMES.generic.BAD_DIR.test(path) || THEMES.generic.BAD_IMG.test(path.slice(path.lastIndexOf('/') + 1));
+  },
   pickPages: function (html, url) {
-    var pages = H.imgs(html, this.READER, url).filter(function (u) { return !THEMES.generic.BAD_IMG.test(u); });
+    var bad = THEMES.generic.badImg;
+    var pages = H.imgs(html, this.READER, url).filter(function (u) { return !bad(u); });
     if (pages.length >= 2) return pages;
-    var all = H.imgs(html, 'img', url).filter(function (u) { return /^https?:/i.test(u) && !THEMES.generic.BAD_IMG.test(u); });
+    var all = H.imgs(html, 'img', url).filter(function (u) { return /^https?:/i.test(u) && !bad(u); });
     var groups = {}, best = null;
     for (var i = 0; i < all.length; i++) {
       var dir = all[i].replace(/[?#].*$/, '').replace(/[^\/]*$/, '');

@@ -1,0 +1,81 @@
+{
+ "data": {
+  "id": 9001,
+  "number": "1",
+  "title": {
+   "id": 77,
+   "type": "manhwa"
+  },
+  "pages": [
+   {
+    "url": "https://static.mfcdn.example/ch/9001/001.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/002.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/003.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/004.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/005.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/006.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/007.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/008.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/009.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/010.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/011.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "https://static.mfcdn.example/ch/9001/012.jpg",
+    "width": 690,
+    "height": 1280
+   },
+   {
+    "url": "//static.mfcdn.example/ch/9001/013.webp",
+    "width": 690,
+    "height": 900
+   }
+  ],
+  "prev": null,
+  "next": {
+   "url": "/title/abcde-one-piece/chapter/9002"
+  }
+ }
+}

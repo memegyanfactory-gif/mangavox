@@ -2,7 +2,9 @@
 //! page generates itself, so everything runs through a [`crate::WallSolver`] (a hidden WebView):
 //! listings / details / reader are read from the rendered DOM, chapters come from the site's own
 //! API signed in-page (the interceptor is borrowed from the site's ES module), with the DOM pager
-//! rows as a fallback. Without a solver every method returns `SourceError::SolverRequired`.
+//! rows as a fallback. Page lists come from the same signed API (`/api/chapters/{id}`): the strip
+//! reader only mounts the `<img>`s near the viewport, so a rendered DOM holds just the first few
+//! pages. Without a solver every method returns `SourceError::SolverRequired`.
 
 use std::collections::HashSet;
 
@@ -214,6 +216,11 @@ pub fn parse_pager_rows(html: &str) -> Vec<ChapterInfo> {
 }
 
 /// Rendered reader page -> unique `img.reader-img` URLs in order.
+///
+/// NB: the strip reader only mounts the `<img>` of a page while its `.reader__page` slot is near
+/// the viewport, so a rendered DOM usually holds just the first handful of pages. Use
+/// [`reader_slot_count`] to tell whether this list is complete; the full list comes from the
+/// chapter API ([`api_pages_js`] / [`parse_api_pages`]).
 pub fn parse_reader_images(html: &str) -> Vec<String> {
     let doc = Html::parse_document(html);
     let mut seen = HashSet::new();
@@ -222,6 +229,53 @@ pub fn parse_reader_images(html: &str) -> Vec<String> {
         .map(protocol_fix)
         .filter(|u| seen.insert(u.clone()))
         .collect()
+}
+
+/// Number of page slots (`.reader__page`) in a rendered strip reader, rendered or not.
+pub fn reader_slot_count(html: &str) -> usize {
+    Html::parse_document(html).select(&sel(".reader__page")).count()
+}
+
+/// Page entries (`"url"` strings or `{url, width, height}` objects) -> unique URLs in order.
+fn page_entries(list: &[Value]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    list.iter()
+        .filter_map(|p| match p {
+            Value::String(s) => Some(s.as_str()),
+            _ => ["url", "src", "image"].iter().find_map(|k| p.get(*k).and_then(Value::as_str)),
+        })
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(protocol_fix)
+        .filter(|u| seen.insert(u.clone()))
+        .collect()
+}
+
+/// The chapter API's answer (`GET /api/chapters/{id}` -> `{data: {pages: [{url, width, height}]}}`,
+/// or the `{pages}` that [`api_pages_js`] resolves to) -> every page URL in reading order.
+pub fn parse_api_pages(json: &Value) -> Vec<String> {
+    ["/pages", "/data/pages", "/data/data/pages"]
+        .iter()
+        .find_map(|p| json.pointer(p).and_then(Value::as_array).filter(|a| !a.is_empty()))
+        .map(|a| page_entries(a))
+        .unwrap_or_default()
+}
+
+/// What [`READER_DOM_JS`] resolved to -> `(urls, complete)`. Complete means every page slot of the
+/// reader gave a URL.
+pub fn parse_reader_dom_result(json: &Value) -> (Vec<String>, bool) {
+    let raw = json.get("pages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let slots = json.get("slots").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let missing = raw.iter().any(|p| p.as_str().map_or(true, |s| s.trim().is_empty()));
+    let urls = page_entries(&raw);
+    let complete = !urls.is_empty() && !missing && (slots == 0 || raw.len() >= slots);
+    (urls, complete)
+}
+
+/// The numeric chapter id of a `{hid-slug}/chapter/{id}` source id.
+pub fn chapter_api_id(chapter_id: &str) -> Option<&str> {
+    let id = chapter_id.rsplit_once("/chapter/")?.1.split(['/', '?', '#']).next()?;
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())).then_some(id)
 }
 
 /// Seconds since the epoch -> `YYYY-MM-DDTHH:MM:SSZ` (civil-from-days, no chrono dependency).
@@ -294,8 +348,18 @@ pub fn api_chapters_js(hid: &str) -> String {
 
 /// [`api_chapters_js`] for the chapters in `lang` (a code from [`LANGUAGES`]).
 pub fn api_chapters_js_in(hid: &str, lang: &str) -> String {
-    let json = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
-    format!("{API_CHAPTERS_JS_HEAD}{}{}", json(hid), API_CHAPTERS_JS_TAIL.replace("__MV_LANG__", &json(lang)))
+    format!("{SIGNED_GET_JS}    const path = '/titles/' + {}{}", js_str(hid), API_CHAPTERS_JS_TAIL.replace("__MV_LANG__", &js_str(lang)))
+}
+
+/// Runs inside any mangafire.to page: the reader's own signed call, `GET /api/chapters/{id}`,
+/// which lists every page of the chapter. Resolves to `{pages: [{url, width, height}]}` or
+/// `{error}`; read it with [`parse_api_pages`].
+pub fn api_pages_js(chapter_api_id: &str) -> String {
+    format!("{SIGNED_GET_JS}{}", API_PAGES_JS_TAIL.replace("__MV_ID__", &js_str(chapter_api_id)))
+}
+
+fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
 /// Chapter languages MangaFire serves, most common first.
@@ -310,7 +374,9 @@ pub fn language_order(pref: Option<&str>) -> Vec<&'static str> {
     first.into_iter().chain(LANGUAGES.iter().filter(|l| Some(*l) != first)).copied().collect()
 }
 
-const API_CHAPTERS_JS_HEAD: &str = r##"(async () => {
+/// Opens an async IIFE + `try` and defines `get(path, params)`: a vrf-signed same-origin API GET.
+/// Every user appends its body and closes with `} catch (e) { return { error } } })()`.
+const SIGNED_GET_JS: &str = r##"(async () => {
   try {
     if (!window.__mvSign) {
       const urls = [].concat(
@@ -341,7 +407,48 @@ const API_CHAPTERS_JS_HEAD: &str = r##"(async () => {
       if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + path);
       return r.json();
     };
-    const path = '/titles/' + "##;
+"##;
+
+const API_PAGES_JS_TAIL: &str = r##"    const j = await get('/chapters/' + __MV_ID__, {});
+    const d = (j && j.data && !Array.isArray(j.data) ? j.data : j) || {};
+    const pages = d.pages || (d.data && d.data.pages) || [];
+    if (!pages.length) return { error: 'no pages in the chapter API answer' };
+    return { pages: pages.map(function (p) { return typeof p === 'string' ? p : { url: p.url || p.src || '', width: p.width || 0, height: p.height || 0 } }) };
+  } catch (e) { return { error: String(e && e.message || e) } }
+})()"##;
+
+/// Runs on a rendered reader page (fallback when the API call fails). The strip reader mounts a
+/// page's `<img>` only while its `.reader__page` slot is in view, but every slot's React props
+/// carry the page record, so read the URLs from there; slots that still have no URL are scrolled
+/// into view one by one (time-boxed). Resolves to `{pages: [url | ''], slots}`.
+pub const READER_DOM_JS: &str = r##"(async () => {
+  const sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms) }) };
+  const t0 = Date.now();
+  while (Date.now() - t0 < 10000 && !document.querySelector('.reader__page, img.reader-img')) await sleep(250);
+  const slots = [].slice.call(document.querySelectorAll('.reader__page'));
+  const fromFiber = function (el) {
+    const k = Object.keys(el).find(function (k) { return k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance$') === 0 });
+    let f = k ? el[k] : null;
+    for (let i = 0; f && i < 10; i++, f = f.return) {
+      const p = f.memoizedProps;
+      if (p && p.page && typeof p.page.url === 'string' && p.page.url) return p.page.url;
+    }
+    return '';
+  };
+  const imgOf = function (el) { const i = el.querySelector('img.reader-img'); return i ? (i.getAttribute('src') || i.getAttribute('data-src') || '') : '' };
+  if (!slots.length) {
+    const imgs = [].slice.call(document.querySelectorAll('img.reader-img')).map(function (i) { return i.getAttribute('src') || i.getAttribute('data-src') || '' });
+    return { pages: imgs, slots: 0 };
+  }
+  const pages = slots.map(function (el) { return fromFiber(el) || imgOf(el) });
+  const t1 = Date.now();
+  for (let i = 0; i < slots.length && Date.now() - t1 < 15000; i++) {
+    if (pages[i]) continue;
+    slots[i].scrollIntoView({ block: 'center' });
+    for (let w = 0; w < 10 && !pages[i]; w++) { await sleep(60); pages[i] = imgOf(slots[i]) || fromFiber(slots[i]) }
+  }
+  return { pages: pages, slots: slots.length };
+})()"##;
 
 const API_CHAPTERS_JS_TAIL: &str = r##" + '/chapters';
     const base = { language: __MV_LANG__, sort: 'number', order: 'desc', limit: 200 };
@@ -401,12 +508,46 @@ impl Source for MangaFire {
 
     async fn get_page_urls(&self, chapter_id: &str) -> Result<Vec<String>> {
         // chapter id looks like "{hid-slug}/chapter/{chapterId}"
+        let solver = self.ctx.solver("MangaFire")?;
+        let reader = format!("{BASE}/title/{chapter_id}");
+        // 1) The reader's own API call lists every page. Signed in-page; run on the title page,
+        //    which the hidden browser usually still has open from the chapter list.
+        if let Some(cid) = chapter_api_id(chapter_id) {
+            let manga = chapter_id.split("/chapter/").next().unwrap_or("");
+            let host = if manga.is_empty() { reader.clone() } else { format!("{BASE}/title/{manga}") };
+            if let Ok(v) = solver.eval_json(&host, &api_pages_js(cid)).await {
+                let urls = parse_api_pages(&v);
+                if !urls.is_empty() {
+                    return Ok(urls);
+                }
+            }
+        }
+        // 2) The rendered reader. Its strip view only mounts the images near the viewport (the
+        //    old DOM read stopped at ~6 pages), so read every slot's page record instead.
+        let mut best: Vec<String> = Vec::new();
+        if let Ok(v) = solver.eval_json(&reader, READER_DOM_JS).await {
+            let (urls, complete) = parse_reader_dom_result(&v);
+            if complete {
+                return Ok(urls);
+            }
+            best = urls;
+        }
+        // 3) Last resort: the DOM as rendered. Only trusted when no page slot is left without an image.
         let html = self.rendered(&format!("/title/{chapter_id}"), "img.reader-img").await?;
         let urls = parse_reader_images(&html);
-        if urls.is_empty() {
+        let slots = reader_slot_count(&html);
+        if !urls.is_empty() && (slots == 0 || urls.len() >= slots) && urls.len() >= best.len() {
+            return Ok(urls);
+        }
+        let found = urls.len().max(best.len());
+        if found == 0 {
             return Err(SourceError::Parse("MangaFire: no page images found (chapter may be unavailable or the site is blocking)".into()));
         }
-        Ok(urls)
+        // A partial list would be saved as a "complete" download with pages missing: refuse it.
+        Err(SourceError::Parse(format!(
+            "MangaFire: only {found} of {} pages could be read for this chapter (site slow or blocking); try again",
+            slots.max(found + 1)
+        )))
     }
 
     async fn get_tag_list(&self) -> Result<Vec<Tag>> {

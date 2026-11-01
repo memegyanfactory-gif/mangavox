@@ -680,9 +680,10 @@ mod tests {
     }
 
     #[test]
-    fn the_seven_builtin_sources_are_listed() {
+    fn the_eight_builtin_sources_are_listed() {
         let ids: Vec<String> = builtin_sources().into_iter().map(|s| s.id).collect();
-        assert_eq!(ids.len(), 7, "{ids:?}");
+        assert_eq!(ids.len(), 8, "{ids:?}");
+        assert!(ids.iter().any(|i| i == "vortexscans"), "{ids:?}");
         assert!(builtin_sources().iter().filter(|s| s.nsfw).count() >= 3);
     }
 }

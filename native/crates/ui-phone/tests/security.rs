@@ -28,6 +28,9 @@ const APP_CSS: &str = include_str!("../web/app.css");
 
 const SECRET: &str = "TOP-SECRET-FILE-CONTENTS";
 
+/// A touchpad batch: move, right click, type.
+const MOUSE: &str = r#"{"e":[{"t":"move","dx":40,"dy":-10},{"t":"click","b":"right"},{"t":"text","s":"hi"}]}"#;
+
 /// Every route the routers register (method, example path), from auth.rs, api_manga.rs,
 /// api_media.rs, api_anime.rs, api_watch.rs, api_img.rs, api_studio.rs and screen.rs, plus unknown
 /// ones the fallback answers.
@@ -68,11 +71,14 @@ const API_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/media/bTEvZnVsbF9yZWNhcC5tcDQ"),
     ("GET", "/api/screen/frame?w=900&q=60"),
     ("POST", "/api/screen/input"),
+    ("POST", "/api/mouse"),
     // Unknown routes and methods.
     ("GET", "/api/nope"),
     ("GET", "/api"),
     ("DELETE", "/api/media/x"),
     ("PUT", "/api/screen/input"),
+    ("PUT", "/api/mouse"),
+    ("GET", "/api/mouse"),
     ("PATCH", "/api/me"),
     ("HEAD", "/api/me"),
     ("HEAD", "/api/screen/frame"),
@@ -90,6 +96,7 @@ fn body_for(path: &str) -> &'static str {
         "/api/pc/open" => r#"{"page":"settings"}"#,
         "/api/studio/generate" => r#"{"chapters":["c1"],"what":"audio"}"#,
         "/api/screen/input" => r#"{"t":"text","s":"rm -rf /"}"#,
+        "/api/mouse" => MOUSE,
         _ => "{}",
     }
 }
@@ -114,6 +121,8 @@ fn setup() -> MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
     let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     root();
+    // The touchpad never moves the real mouse in tests: what it would send is recorded instead.
+    ui_phone::touchpad::dry_run_for_tests();
     g
 }
 
@@ -398,7 +407,7 @@ async fn revoked_devices_are_locked_out_at_once() {
 async fn state_changes_need_the_csrf_header_and_same_origin() {
     let _g = setup();
     let cookie = pair().await;
-    let paths = ["/api/logout", "/api/screen/input", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress"];
+    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress"];
     for path in paths {
         let body = body_for(path);
         let base = || req("POST", path, PEER).header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json");
@@ -448,6 +457,155 @@ async fn request_bodies_are_capped() {
     let big = format!(r#"{{"chapters":[{}],"what":"audio"}}"#, vec!["\"c\""; 200_000].join(","));
     let r = send(post("/api/studio/generate", PEER).header(header::COOKIE, &cookie).body(Body::from(big)).unwrap()).await;
     assert!(r.status().is_client_error(), "{}", r.status());
+}
+
+// ---------------------------------------------------------------- staying signed in
+
+fn set_cookie(r: &Response) -> Option<String> {
+    r.headers().get(header::SET_COOKIE).map(|v| v.to_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn reopening_the_used_qr_link_with_a_session_goes_straight_in() {
+    let _g = setup();
+    let peer = "192.168.1.130:5000";
+    let code = auth::new_pair_code();
+    let r = get(&format!("/pair?code={code}"), peer).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    let cookie = set_cookie(&r).unwrap().split(';').next().unwrap().to_string();
+    let with = |uri: String, peer: &str| req("GET", &uri, peer).header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+    let paired = auth::devices().len();
+
+    // The same, now used, link again (browser history, the camera, a bookmark): the app.
+    let r = send(with(format!("/pair?code={code}"), peer)).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()[header::LOCATION], "/");
+    assert!(set_cookie(&r).is_none(), "the session is kept, not replaced");
+    // Expired, junk or no code at all: the same.
+    for uri in ["/pair?code=junk", "/pair", "/pair?code="] {
+        let r = send(with(uri.to_string(), peer)).await;
+        assert_eq!(r.status(), StatusCode::SEE_OTHER, "{uri}");
+    }
+    assert_eq!(auth::devices().len(), paired, "reopening never adds a device");
+
+    // A signed-in phone on a fresh QR link neither uses the code up nor becomes a second device.
+    let fresh = auth::new_pair_code();
+    let r = send(with(format!("/pair?code={fresh}"), peer)).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(set_cookie(&r).is_none());
+    assert_eq!(auth::devices().len(), paired);
+    assert_eq!(get(&format!("/pair?code={fresh}"), "192.168.1.132:5000").await.status(), StatusCode::SEE_OTHER, "another phone still pairs with it");
+
+    // A signed-in phone is never rate limited, even from an address that hit the limit.
+    let flood = "192.168.1.131:5000";
+    for i in 0..25 {
+        get(&format!("/pair?code=guess{i}"), flood).await;
+    }
+    assert_eq!(get("/pair?code=x", flood).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    let r = send(with("/pair?code=x".into(), flood)).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn reopening_the_used_qr_link_without_a_session_explains_what_to_do() {
+    let _g = setup();
+    let code = auth::new_pair_code();
+    assert_eq!(get(&format!("/pair?code={code}"), "192.168.1.140:5000").await.status(), StatusCode::SEE_OTHER);
+    let stranger = "192.168.1.141:5000";
+    let r = get(&format!("/pair?code={code}"), stranger).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert!(set_cookie(&r).is_none());
+    // The locked page (never a raw error): on /pair it says the code was used and to scan the new
+    // one, and it loads the session check.
+    assert_eq!(text(r).await, LOCKED_HTML);
+    assert!(LOCKED_HTML.contains("already been used") && LOCKED_HTML.contains("Scan the new QR code"));
+    assert!(LOCKED_HTML.contains(r#"<script src="/locked.js""#));
+    // The check is public, carries no code, and asks a same-origin route that only a paired phone
+    // passes before it opens the app.
+    let r = get("/locked.js", stranger).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(r.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/javascript"));
+    let js = text(r).await;
+    assert!(js.contains("fetch('/api/me'") && js.contains("location.replace('/')") && js.contains("'/pair'"), "{js}");
+    assert!(!js.contains(&code) && !js.contains("pair?code"));
+    assert_eq!(get("/api/me", stranger).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(text(get("/locked", stranger).await).await, LOCKED_HTML);
+}
+
+#[tokio::test]
+async fn a_signed_in_phone_reopening_the_app_stays_signed_in() {
+    let _g = setup();
+    let cookie = pair_from("192.168.1.150:5000").await;
+    let secret = auth::cookie_value(&cookie, auth::COOKIE).unwrap().to_string();
+    // The tab reopened, a bookmark or the home-screen icon: the app, with the cookie renewed.
+    for path in ["/", "/index.html"] {
+        let r = get_with(path, &cookie).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let set = set_cookie(&r).unwrap_or_default();
+        assert!(set.starts_with(&format!("{}={secret};", auth::COOKIE)), "{path}: {set}");
+        assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict") && set.contains("Path=/") && set.contains("Max-Age=31536000"), "{set}");
+        assert_eq!(text(r).await, INDEX_HTML);
+    }
+    // API calls leave the cookie alone.
+    assert!(set_cookie(&get_with("/api/me", &cookie).await).is_none());
+    // A tab left on /locked opens the app while the session works.
+    let r = get_with("/locked", &cookie).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()[header::LOCATION], "/");
+
+    // Removed on the PC: none of that lets it back in, and nothing renews its cookie.
+    auth::revoke(&device_id(&cookie).await);
+    let r = get_with("/", &cookie).await;
+    assert!(set_cookie(&r).is_none());
+    assert_eq!(text(r).await, LOCKED_HTML);
+    let r = get_with("/locked", &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(text(r).await, LOCKED_HTML);
+    let r = get_with("/pair?code=used", &cookie).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert!(set_cookie(&r).is_none());
+}
+
+// ---------------------------------------------------------------- touchpad
+
+#[tokio::test]
+async fn only_a_signed_in_phone_moves_the_mouse() {
+    use ui_phone::touchpad::{take_sent_for_tests, Action, Button};
+    let _g = setup();
+    take_sent_for_tests();
+    let mouse = |b: request::Builder| send(b.body(Body::from(MOUSE)).unwrap());
+
+    // No cookie, a bogus one, no CSRF header, another origin, a peer off the LAN.
+    assert_eq!(mouse(post("/api/mouse", PEER)).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(mouse(post("/api/mouse", PEER).header(header::COOKIE, "mv_phone=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).await.status(), StatusCode::UNAUTHORIZED);
+    let cookie = pair_from("192.168.1.160:5000").await;
+    let r = mouse(req("POST", "/api/mouse", PEER).header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json")).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = mouse(req("POST", "/api/mouse", PEER).header(header::COOKIE, &cookie).header("X-MangaVox", "1").header(header::ORIGIN, "http://evil.example").header(header::CONTENT_TYPE, "application/json")).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(mouse(post("/api/mouse", "8.8.8.8:5000").header(header::COOKIE, &cookie)).await.status(), StatusCode::FORBIDDEN);
+    assert!(take_sent_for_tests().is_empty(), "nothing reached the mouse");
+
+    // The paired phone does.
+    let r = mouse(post("/api/mouse", PEER).header(header::COOKIE, &cookie)).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let sent = take_sent_for_tests();
+    assert_eq!(sent[..3], [Action::Move(40, -10), Action::Press(Button::Right), Action::Release(Button::Right)]);
+    assert_eq!(sent.len(), 3 + 4, "plus 'h' and 'i' pressed and let go");
+
+    // Junk is refused whole.
+    let many = format!(r#"{{"e":[{}]}}"#, vec![r#"{"t":"click"}"#; 65].join(","));
+    let long = format!(r#"{{"e":[{{"t":"text","s":"{}"}}]}}"#, "x".repeat(501));
+    for bad in [many.as_str(), long.as_str(), r#"{"e":[{"t":"move","dx":1,"dy":1},{"t":"key","key":"lwin"}]}"#, r#"{"e":[{"t":"nope"}]}"#, "not json"] {
+        let r = send(post("/api/mouse", PEER).header(header::COOKIE, &cookie).body(Body::from(bad.to_string())).unwrap()).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert!(take_sent_for_tests().is_empty(), "a refused batch sends nothing");
+
+    // Removed on the PC: locked out of the touchpad at once.
+    auth::revoke(&device_id(&cookie).await);
+    assert_eq!(mouse(post("/api/mouse", PEER).header(header::COOKIE, &cookie)).await.status(), StatusCode::UNAUTHORIZED);
+    assert!(take_sent_for_tests().is_empty());
 }
 
 // ---------------------------------------------------------------- files

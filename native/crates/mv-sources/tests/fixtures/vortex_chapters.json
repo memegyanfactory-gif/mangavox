@@ -1,0 +1,62 @@
+{
+ "post": {
+  "chapters": [
+   {
+    "id": 34568,
+    "slug": "chapter-34",
+    "number": 34,
+    "title": "",
+    "price": 100,
+    "mangaPostId": 633,
+    "createdAt": "2026-10-30T16:52:09.391Z",
+    "isLocked": true,
+    "isAccessible": false
+   },
+   {
+    "id": 34319,
+    "slug": "chapter-33",
+    "number": 33,
+    "title": "",
+    "price": 0,
+    "mangaPostId": 633,
+    "createdAt": "2026-10-23T16:33:00.118Z",
+    "isLocked": false,
+    "isAccessible": true
+   },
+   {
+    "id": 99001,
+    "slug": "chapter-10-5",
+    "number": 10.5,
+    "title": "Side Story",
+    "price": 0,
+    "mangaPostId": 633,
+    "createdAt": "2026-08-20T10:00:00.000Z",
+    "isLocked": false,
+    "isAccessible": true
+   },
+   {
+    "id": 31315,
+    "slug": "chapter-2",
+    "number": 2,
+    "title": "",
+    "price": 0,
+    "mangaPostId": 633,
+    "createdAt": "2026-07-24T19:53:08.985Z",
+    "isLocked": false,
+    "isAccessible": true
+   },
+   {
+    "id": 31318,
+    "slug": "chapter-1",
+    "number": 1,
+    "title": "",
+    "price": 0,
+    "mangaPostId": 633,
+    "createdAt": "2026-07-24T19:55:02.277Z",
+    "isLocked": false,
+    "isAccessible": true
+   }
+  ]
+ },
+ "totalChapterCount": 5
+}

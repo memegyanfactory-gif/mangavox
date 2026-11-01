@@ -641,6 +641,30 @@ async fn install_unknown_theme_uses_the_generic_engine() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The generic engine's junk-image filter used to test the whole URL, so a series whose slug
+/// holds "logo" / "icon" / "social" ("monologue", "silicon") lost every page of every chapter.
+#[tokio::test]
+async fn generic_engine_keeps_pages_whose_series_slug_looks_like_junk() {
+    let home = r#"<html><body><a href="https://g.test/manga/silicon-monologue/" title="Silicon Monologue"><img src="https://g.test/c/1.jpg"></a></body></html>"#;
+    let dirp = "https://g.test/uploads/silicon-monologue/chapter-1";
+    let reader = format!(
+        r#"<div class="reading-content"><img src="https://g.test/logos/site.png"><img src="https://g.test/wp/discord-button.png">{}</div>"#,
+        (1..=5).map(|i| format!(r#"<img src="https://g.test/lazy.gif" data-src="{dirp}/{i:02}.webp">"#)).collect::<String>()
+    );
+    let mock = Mock::default()
+        .route("=https://g.test/manga/silicon-monologue/chapter-1/", 200, &reader)
+        .route("=https://g.test/", 200, home);
+    let e = repo_ext("eu.kanade.tachiyomi.extension.en.plain2", "Plain2", "en", "https://g.test");
+    let (dir, r, mock) = install(mock, &e, "generic-junk").await;
+    assert_eq!(r.engine, Engine::Generic);
+    let p = load(&dir, &r.id, &mock).await;
+    let pages = p.get_page_urls("manga/silicon-monologue/chapter-1/").await.unwrap();
+    let pages: Vec<&str> = pages.as_array().unwrap().iter().map(|u| u.as_str().unwrap()).collect();
+    assert_eq!(pages.len(), 5, "every lazy page kept, the logo and button dropped: {pages:?}");
+    assert!(pages[0].starts_with(&format!("{dirp}/01.webp")) && pages[4].starts_with(&format!("{dirp}/05.webp")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn unreachable_site_installs_with_a_warning_and_detects_lazily() {
     let e = repo_ext("eu.kanade.tachiyomi.extension.en.foo", "Foo", "en", "https://foo.test");

@@ -654,6 +654,29 @@ body[data-route="remote"] { overflow: hidden; }
 .keys::-webkit-scrollbar { display: none; }
 .keys button { flex: none; min-width: 48px; height: 40px; padding: 0 12px; border-radius: 10px; background: var(--s2); border: 1px solid var(--line); font-weight: 700; font-size: 13px; color: var(--t1); }
 .keys button:active { background: var(--s3); transform: scale(.95); }
+
+/* Touchpad */
+body[data-route="touchpad"] { overflow: hidden; }
+.touchpad { position: fixed; left: var(--sal); right: var(--sar); top: var(--appbar-h); bottom: calc(var(--tabbar-h) + var(--player-h)); display: flex; flex-direction: column; gap: 8px; padding: 8px var(--gut); }
+.tp-bar { display: flex; gap: 8px; align-items: center; }
+.tp-bar .seg { flex: 1; max-width: 320px; }
+.tp-bar .seg button { flex: 1; }
+.tp-bar .icon-btn { margin-left: auto; background: var(--s1); border: 1px solid var(--line); }
+.tp-bar .icon-btn[aria-pressed="true"] { color: var(--ac); border-color: var(--ac-line); }
+.tp-pad { position: relative; flex: 1; min-height: 140px; border-radius: 18px; border: 1px solid var(--line); overflow: hidden; display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(90% 70% at 50% 0%, rgba(107, 111, 214, .14), transparent 70%), var(--s1);
+  touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; transition: border-color .15s; }
+.tp-pad.active { border-color: var(--ac-line); }
+.tp-hint { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 16px; text-align: center; color: var(--t3); font-size: 13px; pointer-events: none; }
+.tp-hint b { color: var(--t2); font-size: 15px; margin-bottom: 4px; }
+.tp-pad.active .tp-hint { opacity: .35; }
+.tp-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tp-mb { height: 58px; border-radius: 14px; background: var(--s2); border: 1px solid var(--line); color: var(--t1); font-weight: 700; font-size: 15px;
+  touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.tp-mb.down { background: var(--ac-soft); border-color: var(--ac-line); color: var(--ac); transform: scale(.98); }
+.touchpad > .keys button { flex: 1 0 auto; }
+.tp-kb { padding: 0; }
+@media (orientation: landscape) and (max-height: 500px) { .tp-mb { height: 44px; } }
 @media (orientation: landscape) and (max-height: 520px) {
   body[data-route="remote"] { --appbar-h: 0px; }
   body[data-route="remote"] .appbar { display: none; }

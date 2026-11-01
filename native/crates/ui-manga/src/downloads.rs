@@ -1,22 +1,21 @@
 //! Offline chapter downloads: one app-wide queue (an entity kept in a GPUI global) that saves
-//! chapters page by page into `~/.mangavox/downloads/<manga>/<chapter>/`, plus the sliding
-//! progress notification the shell shows over every page.
-use std::collections::{HashMap, VecDeque};
+//! chapters page by page into `~/.mangavox/downloads/<manga>/<chapter>/`, plus one progress card
+//! per title for the shell's activity corner.
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::repo::{chapter, manga};
-use mv_ui::theme::{icon as icon_px, radius};
-use mv_ui::{btn, icon_button, ph, ph_icon, progress_bar, progress_ring_sized, size, ButtonKind, Route, Tokens, Weight};
+use mv_ui::activity::{self, Card, Lead};
+use mv_ui::{btn, icon_button, ph, ButtonKind, Route};
 
 use crate::backend;
 
 /// Pages fetched at the same time inside one chapter.
 const PAGE_PARALLEL: usize = 4;
-/// A finished batch without failures closes its notification after this long.
+/// A title that finished without failures closes its card after this long.
 const AUTO_HIDE: Duration = Duration::from_secs(6);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,24 +41,154 @@ struct Active {
     pages_total: usize,
 }
 
+/// One title's share of the queue: what its card counts, from when the card appeared until the
+/// title's next downloads after it finished start a new count.
+#[derive(Clone, Debug, PartialEq)]
+struct Group {
+    manga_id: String,
+    title: String,
+    total: usize,
+    done: usize,
+    failed: Vec<Job>,
+    last_error: Option<String>,
+    /// Paused from its card: the title's chapters wait, other titles carry on.
+    held: bool,
+    /// Nothing of the title is queued or downloading any more.
+    finished: bool,
+    visible: bool,
+    /// Unique per count ([`activity::next_order`]): sorts and keys the card, so its slide-in plays
+    /// once, and tells a stale auto-hide timer apart.
+    serial: u64,
+}
+
+/// Every title's [`Group`]. Pure bookkeeping, so it is tested without a window.
+#[derive(Default)]
+struct Groups {
+    list: Vec<Group>,
+}
+
+impl Groups {
+    fn get(&self, manga_id: &str) -> Option<&Group> {
+        self.list.iter().find(|g| g.manga_id == manga_id)
+    }
+
+    fn get_mut(&mut self, manga_id: &str) -> Option<&mut Group> {
+        self.list.iter_mut().find(|g| g.manga_id == manga_id)
+    }
+
+    fn held(&self, manga_id: &str) -> bool {
+        self.get(manga_id).is_some_and(|g| g.held)
+    }
+
+    /// `n` more chapters of a title. Asking for a download runs the title again; one whose count
+    /// had finished starts a new count (and a new card, the newest in the stack).
+    fn add(&mut self, manga_id: &str, title: &str, n: usize) {
+        if let Some(g) = self.get_mut(manga_id).filter(|g| !g.finished) {
+            g.total += n;
+            g.held = false;
+            g.visible = true;
+            return;
+        }
+        self.list.retain(|g| g.manga_id != manga_id);
+        self.list.push(Group {
+            manga_id: manga_id.into(),
+            title: title.into(),
+            total: n,
+            done: 0,
+            failed: vec![],
+            last_error: None,
+            held: false,
+            finished: false,
+            visible: true,
+            serial: activity::next_order(),
+        });
+    }
+
+    /// Chapters of a title that will not download after all (cancelled).
+    fn drop_chapters(&mut self, manga_id: &str, n: usize) {
+        if let Some(g) = self.get_mut(manga_id) {
+            g.total = g.total.saturating_sub(n);
+        }
+    }
+
+    fn chapter_done(&mut self, manga_id: &str) {
+        if let Some(g) = self.get_mut(manga_id) {
+            g.done += 1;
+        }
+    }
+
+    fn chapter_failed(&mut self, job: Job, error: String) {
+        if let Some(g) = self.get_mut(&job.manga_id) {
+            g.last_error = Some(error);
+            g.failed.push(job);
+        }
+    }
+
+    /// Titles with nothing left to download finish: a fully cancelled one goes away, the others
+    /// show their result. Returns the serials that finished without failures (they hide soon).
+    fn settle(&mut self, pending: impl Fn(&str) -> bool) -> Vec<u64> {
+        let mut clean = vec![];
+        self.list.retain_mut(|g| {
+            if g.finished || pending(&g.manga_id) {
+                return true;
+            }
+            g.finished = true;
+            g.held = false;
+            if g.total == 0 && g.failed.is_empty() {
+                return false;
+            }
+            if g.failed.is_empty() {
+                clean.push(g.serial);
+            }
+            true
+        });
+        clean
+    }
+
+    /// The close button. A running title's card hides until the title gets more chapters; a
+    /// finished one goes, unless it has failures to keep for Retry failed.
+    fn dismiss(&mut self, manga_id: &str) {
+        if let Some(g) = self.get_mut(manga_id) {
+            g.visible = false;
+        }
+        self.list.retain(|g| !(g.manga_id == manga_id && g.finished && g.failed.is_empty()));
+    }
+
+    /// The auto-hide timer of count `serial` ran out. True when its card went.
+    fn expire(&mut self, serial: u64) -> bool {
+        let before = self.list.len();
+        self.list.retain(|g| !(g.serial == serial && g.finished && g.failed.is_empty()));
+        before != self.list.len()
+    }
+
+    /// Takes the failed chapters of every title (or of one) to queue them again.
+    fn take_failed(&mut self, manga_id: Option<&str>) -> Vec<Job> {
+        let mut out = vec![];
+        for g in self.list.iter_mut().filter(|g| manga_id.is_none_or(|m| g.manga_id == m)) {
+            // A title still running counts them again when they are queued.
+            g.total = g.total.saturating_sub(g.failed.len());
+            g.last_error = None;
+            out.append(&mut g.failed);
+        }
+        out
+    }
+
+    fn failed(&self) -> Vec<Job> {
+        self.list.iter().flat_map(|g| g.failed.iter().cloned()).collect()
+    }
+}
+
 pub struct Downloads {
     queue: VecDeque<Job>,
     active: Option<Active>,
     /// The active chapter should stop after its current pages.
     cancel: bool,
-    // Counters for the notification; a new batch starts when the previous one has finished.
-    batch_total: usize,
-    batch_done: usize,
-    failed: Vec<Job>,
-    last_error: Option<String>,
     /// Last failure per chapter id, shown on its row until it downloads or is queued again.
     errors: HashMap<String, String>,
     /// The queue waits after the current chapter (Pause in Downloads).
     paused: bool,
-    finished: bool,
-    visible: bool,
-    /// Bumped per batch so the slide-in animation plays once per notification.
-    serial: u64,
+    /// One card per title.
+    groups: Groups,
 }
 
 struct DownloadsGlobal(Entity<Downloads>);
@@ -70,20 +199,7 @@ pub fn downloads(cx: &mut App) -> Entity<Downloads> {
     if let Some(g) = cx.try_global::<DownloadsGlobal>() {
         return g.0.clone();
     }
-    let e = cx.new(|_| Downloads {
-        queue: VecDeque::new(),
-        active: None,
-        cancel: false,
-        batch_total: 0,
-        batch_done: 0,
-        failed: vec![],
-        last_error: None,
-        errors: HashMap::new(),
-        paused: false,
-        finished: false,
-        visible: false,
-        serial: 0,
-    });
+    let e = cx.new(|_| Downloads { queue: VecDeque::new(), active: None, cancel: false, errors: HashMap::new(), paused: false, groups: Groups::default() });
     cx.set_global(DownloadsGlobal(e.clone()));
     e
 }
@@ -124,9 +240,9 @@ impl Downloads {
         self.errors.get(chapter_id).map(String::as_str)
     }
 
-    /// Chapters of the last batch that failed (Retry failed queues them again).
-    pub fn failed_jobs(&self) -> &[Job] {
-        &self.failed
+    /// Chapters that failed and were not retried yet, every title (Retry failed queues them again).
+    pub fn failed_jobs(&self) -> Vec<Job> {
+        self.groups.failed()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -142,16 +258,36 @@ impl Downloads {
         }
     }
 
+    /// Pause one title from its card: its chapter in progress finishes, its other chapters wait
+    /// and the next title starts. Resuming also lifts a Pause of the whole queue.
+    pub fn set_held(&mut self, manga_id: &str, held: bool, cx: &mut Context<Self>) {
+        if let Some(g) = self.groups.get_mut(manga_id) {
+            g.held = held;
+        }
+        if !held {
+            self.paused = false;
+        }
+        cx.notify();
+        self.next(cx);
+    }
+
+    /// Drops the queued chapters `drop` picks; true when the active chapter is picked too (it
+    /// stops after its current pages).
+    fn remove(&mut self, drop: impl Fn(&Job) -> bool) -> bool {
+        let (gone, kept): (Vec<Job>, Vec<Job>) = self.queue.drain(..).partition(|j| drop(j));
+        self.queue = kept.into();
+        for j in &gone {
+            self.groups.drop_chapters(&j.manga_id, 1);
+        }
+        self.active.as_ref().is_some_and(|a| drop(&a.job))
+    }
+
     /// Stop one chapter: drop it from the queue, or stop it after its current pages.
     pub fn cancel_job(&mut self, chapter_id: &str, cx: &mut Context<Self>) {
-        let before = self.queue.len();
-        self.queue.retain(|j| j.chapter_id != chapter_id);
-        self.batch_total = self.batch_total.saturating_sub(before - self.queue.len());
-        if self.active.as_ref().is_some_and(|a| a.job.chapter_id == chapter_id) {
+        if self.remove(|j| j.chapter_id == chapter_id) {
             self.cancel = true;
-        } else if self.active.is_none() && self.queue.is_empty() {
-            self.finish(cx);
         }
+        self.settle(cx);
         cx.notify();
     }
 
@@ -165,16 +301,16 @@ impl Downloads {
         }
         // Asking for a download is a clear intent to run the queue.
         self.paused = false;
-        if self.finished || !self.is_busy() {
-            self.batch_total = 0;
-            self.batch_done = 0;
-            self.failed.clear();
-            self.last_error = None;
-            self.finished = false;
-            self.serial += 1;
+        let mut titles: Vec<(&str, &str, usize)> = vec![];
+        for j in &jobs {
+            match titles.iter_mut().find(|t| t.0 == j.manga_id) {
+                Some(t) => t.2 += 1,
+                None => titles.push((&j.manga_id, &j.manga_title, 1)),
+            }
         }
-        self.batch_total += jobs.len();
-        self.visible = true;
+        for (mid, title, n) in titles {
+            self.groups.add(mid, title, n);
+        }
         self.queue.extend(jobs);
         cx.notify();
         self.next(cx);
@@ -182,36 +318,36 @@ impl Downloads {
 
     /// Stop every queued and running chapter of one title.
     pub fn cancel_manga(&mut self, manga_id: &str, cx: &mut Context<Self>) {
-        let before = self.queue.len();
-        self.queue.retain(|j| j.manga_id != manga_id);
-        self.batch_total = self.batch_total.saturating_sub(before - self.queue.len());
-        if self.active.as_ref().is_some_and(|a| a.job.manga_id == manga_id) {
+        if self.remove(|j| j.manga_id == manga_id) {
             self.cancel = true;
-        } else if self.active.is_none() && self.queue.is_empty() {
-            self.finish(cx);
         }
+        self.settle(cx);
         cx.notify();
     }
 
     pub fn cancel_all(&mut self, cx: &mut Context<Self>) {
-        self.batch_total = self.batch_total.saturating_sub(self.queue.len());
-        self.queue.clear();
-        if self.active.is_some() {
+        if self.remove(|_| true) {
             self.cancel = true;
-        } else {
-            self.finish(cx);
         }
+        self.settle(cx);
         cx.notify();
     }
 
+    /// Queues every failed chapter again.
     pub fn retry_failed(&mut self, cx: &mut Context<Self>) {
-        let jobs = std::mem::take(&mut self.failed);
-        self.finished = true;
+        let jobs = self.groups.take_failed(None);
         self.enqueue(jobs, cx);
     }
 
-    pub fn dismiss(&mut self, cx: &mut Context<Self>) {
-        self.visible = false;
+    /// Queues one title's failed chapters again (Retry on its card).
+    pub fn retry_manga(&mut self, manga_id: &str, cx: &mut Context<Self>) {
+        let jobs = self.groups.take_failed(Some(manga_id));
+        self.enqueue(jobs, cx);
+    }
+
+    /// Hides one title's card (its downloads carry on).
+    pub fn dismiss(&mut self, manga_id: &str, cx: &mut Context<Self>) {
+        self.groups.dismiss(manga_id);
         cx.notify();
     }
 
@@ -264,11 +400,15 @@ impl Downloads {
     }
 
     fn next(&mut self, cx: &mut Context<Self>) {
-        if self.active.is_some() || (self.paused && !self.queue.is_empty()) {
+        if self.active.is_some() {
             return;
         }
-        let Some(job) = self.queue.pop_front() else {
-            self.finish(cx);
+        if self.queue.is_empty() {
+            self.settle(cx);
+            return;
+        }
+        // The first chapter of a title not paused from its card.
+        let Some(job) = self.queue.iter().position(|j| !self.groups.held(&j.manga_id)).filter(|_| !self.paused).and_then(|i| self.queue.remove(i)) else {
             return;
         };
         self.active = Some(Active { job: job.clone(), pages_done: 0, pages_total: 0 });
@@ -354,165 +494,213 @@ impl Downloads {
                 match res {
                     Ok(true) => {
                         d.errors.remove(&job.chapter_id);
-                        d.batch_done += 1
+                        d.groups.chapter_done(&job.manga_id);
                     }
-                    Ok(false) => d.batch_total = d.batch_total.saturating_sub(1),
+                    Ok(false) => d.groups.drop_chapters(&job.manga_id, 1),
                     Err(e) => {
                         let msg = format!("{e:#}");
                         d.errors.insert(job.chapter_id.clone(), msg.clone());
-                        d.last_error = Some(msg);
-                        d.failed.push(job);
+                        d.groups.chapter_failed(job, msg);
                     }
                 }
+                // The title whose last chapter this was shows its result.
+                d.settle(cx);
                 d.next(cx);
             });
         })
         .detach();
     }
 
-    fn finish(&mut self, cx: &mut Context<Self>) {
-        self.finished = true;
-        if self.batch_total == 0 {
-            // Everything was cancelled.
-            self.visible = false;
-        }
-        cx.notify();
-        if self.failed.is_empty() {
-            let serial = self.serial;
+    /// Titles with nothing left queued or downloading finish; the clean ones close after a while.
+    fn settle(&mut self, cx: &mut Context<Self>) {
+        let pending: HashSet<String> = self.queue.iter().chain(self.active.as_ref().map(|a| &a.job)).map(|j| j.manga_id.clone()).collect();
+        for serial in self.groups.settle(|m| pending.contains(m)) {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(AUTO_HIDE).await;
                 let _ = this.update(cx, |d, cx| {
-                    if d.serial == serial && d.finished {
-                        d.visible = false;
+                    if d.groups.expire(serial) {
                         cx.notify();
                     }
                 });
             })
             .detach();
         }
+        cx.notify();
     }
 }
 
-// ---------------------------------------------------------------- notification
 
-/// The sliding download notification (top right of the page area), or nothing when idle.
-/// The shell observes [`downloads`] and draws this over the current page. A persistent progress
-/// panel rather than a toast: it stays while work runs and offers Pause, Cancel and Retry.
+// ---------------------------------------------------------------- cards
+
+/// One card per title with downloads to show, for the shell's activity corner
+/// ([`mv_ui::activity::corner`]). A persistent progress card rather than a toast: it stays while
+/// the title downloads and offers Pause, Cancel and Retry.
 /// NN/g visibility of system status: <https://www.nngroup.com/articles/visibility-system-status/>
-pub fn toast(cx: &mut App) -> Option<AnyElement> {
+pub fn cards(cx: &mut App) -> Vec<Card> {
     let e = downloads(cx);
     let d = e.read(cx);
-    if !d.visible {
-        return None;
-    }
-    let busy = d.is_busy();
-    let paused = d.paused;
-    let done = d.batch_done;
-    let total = d.batch_total.max(1);
-    // Chapters finished plus the fraction of the one in progress.
-    let partial = d.active.as_ref().map_or(0., |a| if a.pages_total == 0 { 0. } else { a.pages_done as f32 / a.pages_total as f32 });
-    let frac = ((done as f32 + partial) / total as f32).min(1.);
-    let failed = d.failed.len();
-
-    let (lead, title, line): (AnyElement, String, String) = if busy {
-        let a = d.active.as_ref();
-        let title = a.map(|a| a.job.manga_title.clone()).unwrap_or_else(|| "Downloads".into());
-        let line = match a {
-            Some(a) if a.pages_total > 0 => format!("{} · page {} of {}", a.job.label, (a.pages_done + 1).min(a.pages_total), a.pages_total),
-            Some(a) => format!("{} · preparing", a.job.label),
-            None if paused => "Paused".into(),
-            None => "Starting".into(),
-        };
-        (progress_ring_sized(frac, icon_px::LG), title, line)
-    } else if failed > 0 {
-        let line = d.last_error.clone().unwrap_or_default();
-        (ph_icon(ph::WARNING, Weight::Fill, Tokens::warning(), icon_px::LG).into_any_element(), format!("{failed} of {} chapters failed", d.batch_total), line)
-    } else {
-        let n = d.batch_done;
-        (
-            ph_icon(ph::CHECK_CIRCLE, Weight::Fill, Tokens::success(), icon_px::LG).into_any_element(),
-            "Download complete".into(),
-            format!("{n} chapter{} saved for offline reading", if n == 1 { "" } else { "s" }),
-        )
-    };
-
-    let (e1, e2, e3, e4, e5) = (e.clone(), e.clone(), e.clone(), e.clone(), e.clone());
-    let el = div()
-        .id("dl-toast")
-        .absolute()
-        .top(px(16.))
-        .right(px(16.))
-        .w(px(340.))
-        .flex()
-        .flex_col()
-        .gap(px(10.))
-        .p(px(14.))
-        .rounded(px(radius::LG))
-        .bg(Tokens::glass_strong())
-        .border_1()
-        .border_color(Tokens::glass_border())
-        .shadow_lg()
-        .occlude()
-        .role(Role::Status)
-        .child(
-            div()
-                .flex()
-                .items_start()
-                .gap(px(10.))
-                .child(div().mt(px(1.)).flex_none().child(lead))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(div().truncate().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(title))
-                        .child(div().truncate().text_size(px(size::SM)).text_color(Tokens::text_3()).child(line)),
-                )
-                .child(icon_button("dl-close", ph::X, "Hide").small().on_click(move |_, _, cx| e1.update(cx, |d, cx| d.dismiss(cx)))),
-        )
-        .when(busy, |el| {
-            el.child(progress_bar("dl-toast-bar", frac, !paused)).child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .text_size(px(size::SM))
-                    .text_color(Tokens::text_2())
-                    .child(div().flex_1().child(format!("{} of {} chapters", (done + 1).min(d.batch_total), d.batch_total)))
-                    .child(
-                        icon_button("dl-pause", if paused { ph::PLAY } else { ph::PAUSE }, if paused { "Resume downloads" } else { "Pause after this chapter" })
-                            .small()
-                            .on_click(move |_, _, cx| e2.update(cx, |d, cx| d.set_paused(!paused, cx))),
-                    )
-                    .child(btn("dl-cancel", "Cancel all", ButtonKind::Ghost).small().icon(ph::X).on_click(move |_, _, cx| e3.update(cx, |d, cx| d.cancel_all(cx)))),
-            )
-        })
-        .when(!busy, |el| {
-            el.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(4.))
-                    .when(failed > 0, |r| r.child(btn("dl-retry", "Retry", ButtonKind::Ghost).small().icon(ph::ARROW_CLOCKWISE).on_click(move |_, _, cx| e4.update(cx, |d, cx| d.retry_failed(cx)))))
-                    .child(btn("dl-open", "Open Downloads", ButtonKind::Ghost).small().trailing_icon(ph::ARROW_RIGHT).on_click(move |_, w, cx| {
-                        e5.update(cx, |d, cx| d.dismiss(cx));
-                        mv_ui::navigate(Route::MangaDownloads, w, cx);
-                    })),
-            )
-        });
-    if mv_ui::motion::reduced() {
-        return Some(el.into_any_element());
-    }
-    Some(
-        el.with_animation(
-            SharedString::from(format!("dl-toast-{}", d.serial)),
-            Animation::new(Duration::from_millis(320)).with_easing(ease_out_quint()),
-            |el, t| el.opacity(t).mr(px((1.0 - t) * -360.0)),
-        )
-        .into_any_element(),
-    )
+    d.groups.list.iter().filter(|g| g.visible).map(|g| card(&e, d, g)).collect()
 }
 
+fn card(e: &Entity<Downloads>, d: &Downloads, g: &Group) -> Card {
+    let key = format!("dl-{}", g.serial);
+    let mid = g.manga_id.clone();
+    let on = |f: fn(&mut Downloads, &str, &mut Context<Downloads>)| {
+        let (e, mid) = (e.clone(), mid.clone());
+        move |_: &ClickEvent, _: &mut Window, cx: &mut App| e.update(cx, |d, cx| f(d, &mid, cx))
+    };
+    let open = {
+        let (e, mid) = (e.clone(), mid.clone());
+        btn("open", "Open Downloads", ButtonKind::Ghost).small().trailing_icon(ph::ARROW_RIGHT).on_click(move |_, w, cx| {
+            e.update(cx, |d, cx| d.dismiss(&mid, cx));
+            mv_ui::navigate(Route::MangaDownloads, w, cx);
+        })
+    };
+    let close = {
+        let (e, mid) = (e.clone(), mid.clone());
+        move |_: &mut Window, cx: &mut App| e.update(cx, |d, cx| d.dismiss(&mid, cx))
+    };
+
+    if g.finished {
+        let failed = g.failed.len();
+        if failed > 0 {
+            let why = g.last_error.as_deref().map(|e| format!(": {e}")).unwrap_or_default();
+            return Card::new(key, g.serial, Lead::Failed, g.title.clone(), format!("{failed} of {} chapters failed{why}", g.total))
+                .action(btn("retry", "Retry", ButtonKind::Ghost).small().icon(ph::ARROW_CLOCKWISE).on_click(on(|d, m, cx| d.retry_manga(m, cx))))
+                .action(open)
+                .on_close(close);
+        }
+        let n = g.done;
+        return Card::new(key, g.serial, Lead::Done, g.title.clone(), format!("{n} chapter{} saved for offline reading", if n == 1 { "" } else { "s" })).action(open).on_close(close);
+    }
+
+    let active = d.active.as_ref().filter(|a| a.job.manga_id == g.manga_id);
+    let paused = d.paused || g.held;
+    // Chapters finished plus the fraction of the one in progress.
+    let partial = active.map_or(0., |a| if a.pages_total == 0 { 0. } else { a.pages_done as f32 / a.pages_total as f32 });
+    let frac = ((g.done as f32 + partial) / g.total.max(1) as f32).min(1.);
+    let line = match active {
+        Some(a) if paused => format!("{} · pausing after this chapter", a.job.label),
+        Some(a) if a.pages_total > 0 => format!("{} · page {} of {}", a.job.label, (a.pages_done + 1).min(a.pages_total), a.pages_total),
+        Some(a) => format!("{} · preparing", a.job.label),
+        None if paused => "Paused".into(),
+        None => "Waiting for the downloads before it".into(),
+    };
+    let at = if active.is_some() { (g.done + 1).min(g.total) } else { g.done };
+    Card::new(key, g.serial, Lead::Progress(frac), g.title.clone(), line)
+        .progress(frac, active.is_some() && !paused)
+        .count(format!("{at} of {} chapters", g.total))
+        .action(
+            icon_button("pause", if paused { ph::PLAY } else { ph::PAUSE }, if paused { "Resume" } else { "Pause after this chapter" })
+                .small()
+                .on_click(on(if paused { |d, m, cx| d.set_held(m, false, cx) } else { |d, m, cx| d.set_held(m, true, cx) })),
+        )
+        .action(btn("cancel", "Cancel", ButtonKind::Ghost).small().icon(ph::X).tooltip("Stop downloading this title").on_click(on(|d, m, cx| d.cancel_manga(m, cx))))
+        .on_close(close)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Groups, Job};
+
+    fn job(manga: &str, ch: &str) -> Job {
+        Job { manga_id: manga.into(), manga_title: manga.to_uppercase(), chapter_id: ch.into(), label: format!("Ch. {ch}") }
+    }
+
+    #[test]
+    fn one_card_per_title() {
+        let mut g = Groups::default();
+        g.add("a", "A", 3);
+        g.add("b", "B", 2);
+        g.add("a", "A", 1);
+        assert_eq!(g.list.len(), 2);
+        assert_eq!(g.get("a").unwrap().total, 4);
+        assert_eq!(g.get("b").unwrap().total, 2);
+        // The second title's card is newer.
+        assert!(g.get("b").unwrap().serial > g.get("a").unwrap().serial);
+    }
+
+    #[test]
+    fn a_title_finishes_on_its_own() {
+        let mut g = Groups::default();
+        g.add("a", "A", 1);
+        g.add("b", "B", 2);
+        g.chapter_done("a");
+        // Only "b" still has chapters waiting.
+        let clean = g.settle(|m| m == "b");
+        assert_eq!(clean, vec![g.get("a").unwrap().serial]);
+        assert!(g.get("a").unwrap().finished);
+        assert!(!g.get("b").unwrap().finished);
+        // Its auto-hide removes it; a second expiry does nothing.
+        let s = g.get("a").unwrap().serial;
+        assert!(g.expire(s));
+        assert!(!g.expire(s));
+        assert!(g.get("b").is_some());
+    }
+
+    #[test]
+    fn a_fully_cancelled_title_goes_away() {
+        let mut g = Groups::default();
+        g.add("a", "A", 2);
+        g.drop_chapters("a", 2);
+        assert!(g.settle(|_| false).is_empty());
+        assert!(g.list.is_empty());
+    }
+
+    #[test]
+    fn failures_stay_until_retried() {
+        let mut g = Groups::default();
+        g.add("a", "A", 2);
+        g.chapter_done("a");
+        g.chapter_failed(job("a", "2"), "timeout".into());
+        assert!(g.settle(|_| false).is_empty(), "a title with failures does not hide by itself");
+        let s = g.get("a").unwrap().serial;
+        assert!(!g.expire(s));
+        // Closing hides the card but keeps the failure for Retry failed.
+        g.dismiss("a");
+        assert!(!g.get("a").unwrap().visible);
+        assert_eq!(g.failed(), vec![job("a", "2")]);
+        // Retrying starts a new count with a new card.
+        let again = g.take_failed(Some("a"));
+        assert_eq!(again, vec![job("a", "2")]);
+        g.add("a", "A", again.len());
+        let a = g.get("a").unwrap();
+        assert!(a.serial > s && a.visible && !a.finished);
+        assert_eq!((a.total, a.done), (1, 0));
+    }
+
+    #[test]
+    fn retrying_while_running_does_not_double_count() {
+        let mut g = Groups::default();
+        g.add("a", "A", 3);
+        g.chapter_failed(job("a", "1"), "x".into());
+        let again = g.take_failed(None);
+        g.add("a", "A", again.len());
+        assert_eq!(g.get("a").unwrap().total, 3);
+    }
+
+    #[test]
+    fn closing_a_running_card_hides_it_until_more_chapters() {
+        let mut g = Groups::default();
+        g.add("a", "A", 2);
+        g.dismiss("a");
+        assert!(!g.get("a").unwrap().visible);
+        g.add("a", "A", 1);
+        assert!(g.get("a").unwrap().visible);
+        // A finished, clean card is dropped when closed.
+        g.chapter_done("a");
+        g.settle(|_| false);
+        g.dismiss("a");
+        assert!(g.get("a").is_none());
+    }
+
+    #[test]
+    fn asking_again_lifts_a_title_pause() {
+        let mut g = Groups::default();
+        g.add("a", "A", 2);
+        g.get_mut("a").unwrap().held = true;
+        assert!(g.held("a"));
+        g.add("a", "A", 1);
+        assert!(!g.held("a"));
+    }
+}

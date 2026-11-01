@@ -87,6 +87,8 @@ const ICONS = {
   cc: 'M3 5h18v14H3zM10.5 10.2a2.4 2.4 0 1 0 0 3.6M17.5 10.2a2.4 2.4 0 1 0 0 3.6',
   phone: 'M7 2h10v20H7zM11 18h2',
   pages: 'M4 4h7v16H4zM13 4h7v16h-7z',
+  mouse: 'M12 3a6 6 0 0 0-6 6v6a6 6 0 0 0 12 0V9a6 6 0 0 0-6-6zM12 7v4',
+  volup: 'M4 9v6h4l5 4V5L8 9zM16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12',
 };
 const SVGNS = 'http://www.w3.org/2000/svg';
 function icon(name, cls) {
@@ -410,6 +412,7 @@ const ROUTES = [
   ['more', 'more', /^\/more$/, viewMore],
   ['listen', 'more', /^\/listen$/, viewListen],
   ['remote', 'more', /^\/remote$/, viewRemote],
+  ['touchpad', 'more', /^\/touchpad$/, viewTouchpad],
 ];
 let ctx = null;
 let navCount = 0;
@@ -2719,6 +2722,165 @@ function viewRemote(ctx) {
 }
 
 /* ======================================================================
+   Touchpad: this phone as the PC's mouse and keyboard (POST /api/mouse)
+   ====================================================================== */
+function viewTouchpad(ctx) {
+  setTitle('Touchpad');
+  setBack('#/more');
+  const SPEEDS = { slow: 0.7, normal: 1, fast: 1.5 };
+  let speed = LS.get('mv.tp.speed', 'normal');
+  if (!SPEEDS[speed]) speed = 'normal';
+
+  // ----- sending: one request in flight, at most one per frame; moves of a frame summed -----
+  const FRAME = 16;
+  let queue = [], mx = 0, my = 0, sx = 0, sy = 0, inFlight = false, lastSent = 0, timer = null, errAt = 0;
+  const flushMotion = () => {
+    if (mx || my) { queue.push({ t: 'move', dx: +mx.toFixed(2), dy: +my.toFixed(2) }); mx = my = 0; }
+    if (sx || sy) { queue.push({ t: 'scroll', dx: +sx.toFixed(3), dy: +sy.toFixed(3) }); sx = sy = 0; }
+  };
+  const push = ev => { flushMotion(); queue.push(ev); pump(); };
+  function pump() {
+    if (inFlight || timer || !ctx.alive) return;
+    if (!queue.length && !mx && !my && !sx && !sy) return;
+    const wait = FRAME - (performance.now() - lastSent);
+    if (wait > 0) { timer = setTimeout(() => { timer = null; pump(); }, wait); return; }
+    flushMotion();
+    const batch = queue.splice(0, 64);
+    inFlight = true;
+    lastSent = performance.now();
+    post('/api/mouse', { e: batch }).catch(e => {
+      const now = Date.now();
+      if (e.status !== 401 && now - errAt > 2500) { errAt = now; toast(e.message, 'err'); }
+    }).finally(() => { inFlight = false; pump(); });
+  }
+
+  // ----- layout -----
+  const pad = h('div', { class: 'tp-pad', role: 'application', 'aria-label': 'Touchpad: move one finger to move the pointer, tap to click' },
+    h('div', { class: 'tp-hint', 'aria-hidden': 'true' },
+      h('b', null, 'Touchpad'),
+      h('span', null, 'One finger: move · Tap: click'),
+      h('span', null, 'Two-finger tap: right click'),
+      h('span', null, 'Two fingers: scroll')));
+  const held = new Set();
+  // The PC lets go of a held button after 10 s without requests (a phone that slept mid-drag):
+  // while one is held here, say so every few seconds even when the finger rests.
+  let holdPing = null;
+  const syncPing = () => {
+    if (held.size && !holdPing) holdPing = setInterval(() => { if (!inFlight) post('/api/mouse', { e: [] }).catch(() => {}); }, 3000);
+    else if (!held.size && holdPing) { clearInterval(holdPing); holdPing = null; }
+  };
+  const mbtn = (b, label) => {
+    const el = h('button', { type: 'button', class: 'tp-mb', 'aria-label': label + ' click (hold to drag)' }, label);
+    const down = e => { e.preventDefault(); if (held.has(b)) return; held.add(b); el.classList.add('down'); push({ t: 'down', b }); syncPing(); if (navigator.vibrate) navigator.vibrate(8); };
+    const up = () => { if (!held.has(b)) return; held.delete(b); el.classList.remove('down'); push({ t: 'up', b }); syncPing(); };
+    el.addEventListener('pointerdown', down);
+    el.addEventListener('pointerup', up);
+    el.addEventListener('pointercancel', up);
+    el.addEventListener('pointerleave', up);
+    el.addEventListener('contextmenu', e => e.preventDefault());
+    // Keyboard / screen readers: a plain click.
+    el.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); push({ t: 'click', b }); } });
+    return el;
+  };
+  const btns = h('div', { class: 'tp-btns' }, mbtn('left', 'Left'), mbtn('right', 'Right'));
+  const kbBtn = iconBtn('keyboard', 'Keyboard', () => toggleKb());
+  kbBtn.setAttribute('aria-pressed', 'false');
+  const textIn = h('input', { type: 'text', placeholder: 'Type to send to PC', 'aria-label': 'Text to type on the PC', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', enterkeyhint: 'send' });
+  const KEYS = [['escape', 'Esc'], ['tab', 'Tab'], ['backspace', '⌫'], ['delete', 'Del'], ['enter', 'Enter'], ['left', '←'], ['up', '↑'], ['down', '↓'], ['right', '→'], ['home', 'Home'], ['end', 'End'], ['pageup', 'PgUp'], ['pagedown', 'PgDn']];
+  const MEDIA = [['volumedown', 'Vol −'], ['volumemute', 'Mute'], ['volumeup', 'Vol +'], ['mediaprev', '⏮'], ['playpause', '⏯'], ['medianext', '⏭']];
+  const LABEL = { escape: 'Escape', backspace: 'Backspace', delete: 'Delete', left: 'Left arrow', up: 'Up arrow', down: 'Down arrow', right: 'Right arrow', pageup: 'Page up', pagedown: 'Page down',
+    volumedown: 'Volume down', volumemute: 'Mute', volumeup: 'Volume up', mediaprev: 'Previous track', playpause: 'Play or pause', medianext: 'Next track' };
+  const keyRow = (list, label) => h('div', { class: 'keys', role: 'toolbar', 'aria-label': label },
+    list.map(([k, l]) => h('button', { type: 'button', 'aria-label': LABEL[k] || l, onclick: () => push({ t: 'key', key: k }) }, l)));
+  const kb = h('div', { class: 'rm-kb tp-kb', hidden: true },
+    h('form', { onsubmit: e => { e.preventDefault(); const s = textIn.value; if (s) { push({ t: 'text', s: s.slice(0, 500) }); textIn.value = ''; } else push({ t: 'key', key: 'enter' }); } },
+      textIn, h('button', { class: 'btn primary', type: 'submit' }, 'Send')),
+    keyRow(KEYS, 'Special keys'));
+  const bar = h('div', { class: 'tp-bar' },
+    segmented([['slow', 'Slow'], ['normal', 'Normal'], ['fast', 'Fast']], speed, v => { speed = v; LS.set('mv.tp.speed', v); }, 'Pointer speed'),
+    kbBtn);
+  view.append(h('div', { class: 'touchpad' }, bar, pad, btns, keyRow(MEDIA, 'Media keys'), kb));
+  function toggleKb(force) {
+    const on = force ?? kb.hidden;
+    kb.hidden = !on; kbBtn.setAttribute('aria-pressed', String(on));
+    if (on) textIn.focus(); else textIn.blur();
+  }
+  function ripple(x, y, cls) {
+    const r = pad.getBoundingClientRect();
+    const d = h('span', { class: 'ripple' + (cls ? ' ' + cls : ''), style: { left: (x - r.left) + 'px', top: (y - r.top) + 'px' } });
+    pad.append(d);
+    setTimeout(() => d.remove(), 900);
+  }
+
+  // ----- gestures -----
+  // Pointer gain: phone pixels are big, so slow moves get ~1.4x for precision and fast flicks up
+  // to ~4x to cross the screen (on top of the speed setting).
+  const gain = v => SPEEDS[speed] * 1.4 * (1 + Math.min(1.9, Math.max(0, v - 0.2) * 1.6));
+  const SCROLL_PX = 28; // finger travel per wheel notch
+  const TAP_SLOP = 8, TAP_MS = 260, TWO_TAP_MS = 320;
+  const pts = new Map();
+  let g = null; // the gesture since the first finger went down
+  pad.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    try { pad.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: e.timeStamp });
+    if (!g) g = { t0: e.timeStamp, max: 0, travel: 0, sx: e.clientX, sy: e.clientY };
+    g.max = Math.max(g.max, pts.size);
+    pad.classList.add('active');
+  });
+  pad.addEventListener('pointermove', e => {
+    const p = pts.get(e.pointerId);
+    if (!p || !g) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    const dt = Math.max(1, e.timeStamp - p.t);
+    p.x = e.clientX; p.y = e.clientY; p.t = e.timeStamp;
+    g.travel = Math.max(g.travel, Math.hypot(e.clientX - p.sx, e.clientY - p.sy));
+    if (g.max === 1) {
+      const k = gain(Math.hypot(dx, dy) / dt);
+      mx += dx * k; my += dy * k;
+      pump();
+    } else if (pts.size === 2) {
+      // Each finger contributes half, so the scroll follows the two fingers' average. Natural
+      // direction, like scrolling a page on the phone: fingers up -> content down.
+      sy += -dy / SCROLL_PX / 2; sx += -dx / SCROLL_PX / 2;
+      pump();
+    }
+  });
+  const end = e => {
+    if (!pts.delete(e.pointerId) || !g) return;
+    if (pts.size) return;
+    const cur = g; g = null;
+    pad.classList.remove('active');
+    if (e.type === 'pointercancel') return;
+    const dur = e.timeStamp - cur.t0;
+    if (cur.travel > TAP_SLOP) return;
+    if (cur.max === 1 && dur < TAP_MS) { ripple(e.clientX, e.clientY); push({ t: 'click', b: 'left' }); }
+    else if (cur.max === 2 && dur < TWO_TAP_MS) { ripple(e.clientX, e.clientY, 'long'); push({ t: 'click', b: 'right' }); if (navigator.vibrate) navigator.vibrate(15); }
+    else if (cur.max >= 3 && dur < TWO_TAP_MS) { ripple(e.clientX, e.clientY, 'long'); push({ t: 'click', b: 'middle' }); }
+  };
+  pad.addEventListener('pointerup', end);
+  pad.addEventListener('pointercancel', end);
+  pad.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Never leave a button held on the PC: let go when leaving the page or the app.
+  const releaseAll = () => { for (const b of [...held]) { held.delete(b); push({ t: 'up', b }); } for (const el of btns.children) el.classList.remove('down'); syncPing(); };
+  const onVis = () => { if (document.visibilityState !== 'visible') { releaseAll(); flushMotion(); } };
+  document.addEventListener('visibilitychange', onVis);
+  const wl = wakeLock(); wl.on();
+  ctx.onLeave(() => {
+    if (held.size) {
+      const e = [...held].map(b => ({ t: 'up', b }));
+      held.clear();
+      api('/api/mouse', { method: 'POST', body: { e }, keepalive: true }).catch(() => {});
+    }
+    clearTimeout(timer); timer = null;
+    clearInterval(holdPing); holdPing = null;
+    document.removeEventListener('visibilitychange', onVis);
+    wl.dispose();
+  });
+}
+
+/* ======================================================================
    More: Listen, Remote, PC shortcuts, this phone
    ====================================================================== */
 function viewMore(ctx) {
@@ -2752,7 +2914,8 @@ function viewMore(ctx) {
     group('Media',
       h('div', { class: 'cells' },
         cell('#/listen', 'headphones', 'Listen', 'Narration audio and recap videos'),
-        cell('#/remote', 'remote', 'Remote control', 'See and control MangaVox on your PC'))),
+        cell('#/remote', 'remote', 'Remote control', 'See and control MangaVox on your PC'),
+        cell('#/touchpad', 'mouse', 'Touchpad', 'Use this phone as your PC’s mouse and keyboard'))),
     group('Open on your PC',
       h('div', { class: 'pc-chips' }, PAGES.map(([p, l]) => h('button', { class: 'chip', type: 'button', onclick: () => openPc({ page: p }, 'Opened ' + l + ' on your PC') }, l)))),
     group('This phone',

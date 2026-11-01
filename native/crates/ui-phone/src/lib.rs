@@ -10,7 +10,8 @@
 //! - `auth`: pairing, device sessions and the request guard (LAN-only peers, Host check, CSRF).
 //! - `server`: binding, the router and start / stop.
 //! - `bridge`: runs closures on the GPUI thread for the API modules (navigate, play, ...).
-//! - `api_manga`, `api_studio`, `api_media`, `api_anime`, `api_watch`, `api_img`, `screen`: the `/api` routes.
+//! - `api_manga`, `api_studio`, `api_media`, `api_anime`, `api_watch`, `api_img`, `screen`, `touchpad`: the `/api` routes
+//!   (`touchpad` moves the PC's real mouse pointer and types, through `SendInput`).
 //! - `page`, `qr`: the desktop Mobile page with the QR code.
 use gpui_kit::*;
 use mv_ui::Route;
@@ -29,6 +30,7 @@ pub mod qr;
 pub mod screen;
 pub mod server;
 pub mod state;
+pub mod touchpad;
 
 /// Called once at launch with the main window: installs the UI bridge and, when Phone access was
 /// left on, starts the server.

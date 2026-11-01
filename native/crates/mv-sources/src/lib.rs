@@ -3,7 +3,7 @@
 //! * [`Source`] / [`SourceCtx`] / [`WallSolver`]: the plugin-equivalent interface.
 //! * Native scrapers: [`mangadex`], [`webtoon`], [`ehentai`], [`hentai2read`] (plain HTTP) and
 //!   [`comick`], [`nhentai`] (plain HTTP with a `WallSolver` fallback), [`mangafire`] (needs a
-//!   `WallSolver`: the site is a JS SPA with signed requests).
+//!   `WallSolver`: the site is a JS SPA with signed requests), [`vortexscans`] (Iken JSON API + SSR reader).
 //! * [`SourceRegistry`]: list / look up the built-in sources.
 //!
 //! Every parser is a pure function over a response body (`parse_*`), covered by offline tests
@@ -19,6 +19,7 @@ mod registry;
 mod source;
 mod types;
 pub mod util;
+pub mod vortexscans;
 pub mod webtoon;
 
 pub use registry::{builtin_for_host, SourceRegistry};

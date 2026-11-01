@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::source::{Source, SourceCtx};
 use crate::types::SourceInfo;
-use crate::{comick, ehentai, hentai2read, mangadex, mangafire, nhentai, webtoon};
+use crate::{comick, ehentai, hentai2read, mangadex, mangafire, nhentai, vortexscans, webtoon};
 
 /// Lookup table of sources by id, in display order.
 #[derive(Default, Clone)]
@@ -15,13 +15,14 @@ impl SourceRegistry {
         Self::default()
     }
 
-    /// All seven built-in sources sharing one [`SourceCtx`].
+    /// All built-in sources sharing one [`SourceCtx`].
     pub fn builtin(ctx: SourceCtx) -> Self {
         let mut r = Self::new();
         r.register(Arc::new(mangadex::MangaDex::new(ctx.clone())));
         r.register(Arc::new(comick::Comick::new(ctx.clone())));
         r.register(Arc::new(mangafire::MangaFire::new(ctx.clone())));
         r.register(Arc::new(webtoon::Webtoon::new(ctx.clone())));
+        r.register(Arc::new(vortexscans::VortexScans::new(ctx.clone())));
         r.register(Arc::new(ehentai::EHentai::new(ctx.clone())));
         r.register(Arc::new(hentai2read::Hentai2Read::new(ctx.clone())));
         r.register(Arc::new(nhentai::NHentai::new(ctx)));
@@ -61,6 +62,7 @@ pub fn builtin_for_host(url: &str) -> Option<&'static str> {
         _ if host.starts_with("comick.") => comick::ID,
         _ if is("mangafire.to") => mangafire::ID,
         _ if is("webtoons.com") => webtoon::ID,
+        _ if is("vortexscans.org") => vortexscans::ID,
         _ if is("e-hentai.org") || is("exhentai.org") => ehentai::ID,
         _ if is("hentai2read.com") => hentai2read::ID,
         _ if is("nhentai.net") => nhentai::ID,
@@ -77,6 +79,7 @@ mod tests {
         assert_eq!(builtin_for_host("https://mangadex.org"), Some("mangadex"));
         assert_eq!(builtin_for_host("https://www.webtoons.com/en/"), Some("webtoons"));
         assert_eq!(builtin_for_host("http://comick.io"), Some("comick"));
+        assert_eq!(builtin_for_host("https://vortexscans.org/series/x"), Some("vortexscans"));
         assert_eq!(builtin_for_host("https://hentaifox.com"), None);
         assert_eq!(builtin_for_host("https://notmangadex.org"), None);
     }

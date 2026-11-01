@@ -1,6 +1,7 @@
 //! Shared UI foundation for every MangaVox page crate:
 //! design tokens, the component kit, navigation and a background runtime.
 //! See docs/RUST_REWRITE_PLAN.md §3 for the design rules and COMPONENTS.md for the kit.
+pub mod activity;
 pub mod assets;
 pub mod bg;
 pub mod components;

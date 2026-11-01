@@ -1,0 +1,33 @@
+{
+ "posts": [
+  {
+   "id": 705,
+   "slug": "transcendent-martial-emperor",
+   "postTitle": "Transcendent Martial Emperor",
+   "featuredImage": "https://storage.vortexscans.org/upload/series/featured/lxJf4GmfzvG3XexqIAuF8KOjIGtbS5BK/6766567c-4dc7-443e-af07-88a796fc76fe.png",
+   "seriesType": "MANHWA",
+   "seriesStatus": "ONGOING",
+   "genres": []
+  },
+  {
+   "id": 633,
+   "slug": "i-became-a-transcendent-hunter-with-100000x-exp",
+   "postTitle": "I Became a Transcendent Hunter with 100,000x EXP",
+   "featuredImage": "https://storage.vortexscans.org/upload/series/featured/4/0847db56-f17c-4ad7-bba8-6e51c1765205.png",
+   "seriesType": "MANHWA",
+   "seriesStatus": "ONGOING",
+   "genres": []
+  },
+  {
+   "id": 9002,
+   "slug": "a-sample-novel",
+   "postTitle": "A Sample Novel",
+   "featuredImage": "",
+   "seriesType": "NOVEL",
+   "seriesStatus": "ONGOING",
+   "genres": []
+  }
+ ],
+ "totalCount": 3,
+ "searchTerm": "transcendent"
+}

@@ -1,5 +1,6 @@
 //! App-wide toast (snackbar): brief, non-blocking feedback with at most one action, one at a
-//! time, at the bottom centre of the page area.
+//! time, in the bottom-right corner of the page area under the activity cards
+//! ([`crate::activity::corner`]); the reader and the player keep it at the bottom centre.
 //!
 //! ```ignore
 //! mv_ui::toast::show(cx, Toast::success("Chapter deleted").action("Undo", |window, cx| restore(window, cx)));
@@ -9,7 +10,8 @@
 //!   pauses the timer (WCAG 2.2.1 Timing Adjustable).
 //! - A new toast waits for the current one, which then leaves after at most 1.5 s more. The same
 //!   message twice restarts the timer instead of stacking.
-//! - Never takes focus. The shell renders [`host`] once over the page.
+//! - Never takes focus. The shell renders [`view`] once in its corner stack; other windows mount
+//!   [`host`].
 //!
 //! Material 3 snackbar: <https://m3.material.io/components/snackbar/guidelines>;
 //! Fluent 2 toast: <https://fluent2.microsoft.design/components/web/react/core/toast/usage>
@@ -294,9 +296,15 @@ pub fn dismiss(cx: &mut App) {
     });
 }
 
-/// The toast layer. Mount it once as the last child of the page area (a `relative()` container):
-/// `.child(mv_ui::toast::host(cx))`.
-pub fn host(cx: &mut App) -> AnyView {
+/// A bottom-centre toast layer, for a window or overlay without the activity corner. Mount it
+/// once as the last child of a `relative()` container: `.child(mv_ui::toast::host(cx))`.
+pub fn host(cx: &mut App) -> AnyElement {
+    div().absolute().left_0().right_0().bottom(px(24.)).px(px(16.)).flex().justify_center().child(view(cx)).into_any_element()
+}
+
+/// The toast itself (or nothing), for a layout that places it: the shell's bottom-right corner
+/// passes it to [`crate::activity::corner`].
+pub fn view(cx: &mut App) -> AnyView {
     center(cx).into()
 }
 
@@ -313,6 +321,8 @@ impl Render for ToastHost {
         let card = div()
             .id(ElementId::NamedInteger("mv-toast".into(), id))
             .relative()
+            // Space above it in the corner stack; an empty host adds none.
+            .mt(px(crate::activity::GAP))
             .occlude()
             .flex()
             .items_center()
@@ -324,9 +334,10 @@ impl Render for ToastHost {
             .pr(px(6.))
             .py(px(6.))
             .rounded(px(radius::LG))
-            .bg(Tokens::glass_strong())
+            // Opaque, like the activity cards it stacks with.
+            .bg(Tokens::surface_2())
             .border_1()
-            .border_color(Tokens::glass_border())
+            .border_color(Tokens::border_strong())
             .shadow_lg()
             .role(if t.kind == AlertKind::Error { Role::Alert } else { Role::Status })
             .on_hover(cx.listener(move |h, hovered: &bool, _, cx| {
@@ -351,12 +362,11 @@ impl Render for ToastHost {
                     h.changed(cx);
                 });
             }));
-        let card = if reduced() {
+        if reduced() {
             card.into_any_element()
         } else {
             card.with_animation(ElementId::NamedInteger("mv-toast-in".into(), id), Animation::new(duration::BASE).with_easing(easing::enter), |d, t| d.opacity(t).top(px((1. - t) * 12.))).into_any_element()
-        };
-        div().absolute().left_0().right_0().bottom(px(24.)).px(px(16.)).flex().justify_center().child(card).into_any_element()
+        }
     }
 }
 

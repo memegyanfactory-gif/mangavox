@@ -94,7 +94,7 @@ Every `Tokens::*()` reads the live Appearance preset, so never cache a colour in
 - **Accent**: `accent`, `accent_hover`, `accent_pressed`, `accent_soft`, `accent_border`, `accent_a(alpha)`, `on_accent` (text on an accent fill), `accent_2` (preset secondary).
 - **Status** (status only): `success`, `info`, `warning`, `danger`, each with `_soft`; `warning_border`, `danger_border`.
 - **Stars**: `favorite()` and `rating()` (one gold, #FACC15). Never use `warning` for a star.
-- **Floating**: `glass` (over images), `glass_strong` (toasts, floating bars), `glass_border`, `overlay` (dialog backdrop), `scrim` (text on images), `overlay_gradient(angle)`.
+- **Floating**: `glass` (over images), `glass_strong` (floating bars), `glass_border`, `overlay` (dialog backdrop), `scrim` (text on images), `overlay_gradient(angle)`.
 - **Categories**: `Tokens::hue(Hue::Blue)` and `hue_soft(..)` for icon tiles, storage segments and chart series (Blue, Violet, Cyan, Green, Amber, Orange, Rose, Slate; `Hue::ALL`). Not for status.
 - **Scales**: `theme::icon` XS 12 / SM 14 / MD 16 / LG 20 / XL 24 / HERO 32 / EMPTY 40; `theme::radius` XS 4 / SM 6 / MD 8 / LG 12 / XL 16 / PILL; `theme::space` 2 to 48 on a 4-pt grid; `theme::duration` FAST 120 / BASE 180 / SLOW 280 ms; `theme::easing::{standard, enter, exit}`.
 - **Type**: `.ramp(ramp::BODY)` (Fluent 2 ramp: CAPTION_2 11/14 ... DISPLAY 68/92) sets size, line height and weight; the older `size::*` still works.
@@ -111,8 +111,13 @@ Every `Tokens::*()` reads the live Appearance preset, so never cache a colour in
 ## Toasts
 
 - `toast::show(cx, Toast::info|success|warning|error(msg))`, optional `.action(label, f)`, `.icon(ph)`, `.duration(d)`, `.sticky()`.
-- One at a time at the bottom centre of the page area. 4 s, or 6 s with an action or for warnings and errors; hovering pauses. A newer toast replaces the current one after 1.5 s; the same message twice restarts the timer.
-- The shell already mounts `toast::host(cx)`. A standalone window must add `.child(mv_ui::toast::host(cx))` to a `relative()` container.
+- One at a time, opaque, in the bottom-right corner of the page area under the activity cards (bottom centre in the reader and the player). 4 s, or 6 s with an action or for warnings and errors; hovering pauses. A newer toast replaces the current one after 1.5 s; the same message twice restarts the timer.
+- The shell already mounts the toast (`toast::view` inside `activity::corner`). A standalone window must add `.child(mv_ui::toast::host(cx))` to a `relative()` container.
+
+## Activity cards
+
+- Long background work (chapter downloads, Studio's Generate) shows as `activity::Card`s: one per independent activity (a title's downloads, a manga's Generate run), opaque, stacked in the bottom-right corner above the toast, newest at the bottom. More than 4 fold into a "+N more" row.
+- A producer builds its cards from its own state on every render (`Card::new(key, activity::next_order(), lead, title, line).progress(..).count(..).action(..).on_close(..)`); the shell passes them to `activity::corner`.
 
 ## Confirmations
 

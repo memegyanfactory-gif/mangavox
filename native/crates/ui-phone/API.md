@@ -13,7 +13,16 @@ JSON bodies use `Content-Type: application/json`. Errors: HTTP 4xx/5xx with `{"e
   On success: create a device (id = random 8 bytes hex, name from User-Agent, e.g. "iPhone · Safari"),
   a 32-byte random session secret; persist `sha256(secret)` in `<root>/phone/devices.json`;
   set cookie `mv_phone=<secret>; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`; 303 to `/`.
-- Every other route except `/locked`, `/favicon.ico`, `/manifest.webmanifest`, `/icon.png`,
+- Staying signed in: `/pair` with a valid cookie always 303s to `/` (checked before the rate limit
+  and the code, so reopening a used QR link never errors, never uses up the code on screen and never
+  adds a second device). Opening `/` renews the cookie. `/locked` with a valid cookie 303s to `/`.
+  A failed `/pair` without a cookie gets the locked page (403), which says the QR code was used or
+  expired and loads the public `/locked.js`: it calls `/api/me` same-origin and opens `/` when that
+  succeeds (a link opened from another app is cross-site, so the browser leaves out the Strict cookie
+  on that navigation only). `devices.json` is re-read when another process changed it (two MangaVox
+  instances on one data folder), and the server retries its configured port for a few seconds before
+  moving to the next one, so the address saved on the phone keeps working after a restart.
+- Every other route except `/locked`, `/locked.js`, `/favicon.ico`, `/manifest.webmanifest`, `/icon.png`,
   `/icon-512.png`, `/logo.png` requires a valid `mv_phone` cookie. Without it: HTML routes return `/locked` (200, the locked page),
   `/api/*` returns 401 `{"error":"not paired"}`.
 - State-changing requests (POST/DELETE) must also carry header `X-MangaVox: 1` (CSRF; the web app
@@ -37,6 +46,7 @@ Known limits (design tradeoffs, not bugs):
 - Plain HTTP on the LAN: someone who can sniff the Wi-Fi (open network, or a WPA2-PSK network whose
   password they know) can read the QR link as the phone opens it and the `mv_phone` cookie after, and
   reuse them. The cookie cannot be `Secure`. Remove a device from the Mobile page to cut it off.
+- A paired phone controls the PC's mouse and keyboard through the touchpad (`/api/mouse`), in any app.
 - A paired phone controls the MangaVox window like someone sitting at it (remote screen + input),
   so it can do whatever the app's UI can (Settings, the Mobile page's QR code, Studio jobs). It cannot
   reach other windows: input is posted to the MangaVox window only, and the screen-copy fallback is
@@ -168,3 +178,15 @@ Known limits (design tradeoffs, not bugs):
   `{ "t":"key","key": "enter"|"escape"|"backspace"|"tab"|"left"|"right"|"up"|"down"|"space"|"pageup"|"pagedown"|"home"|"end", "ctrl"?:bool, "shift"?:bool, "alt"?:bool }` |
   `{ "t":"text","s":"hello" }`
   -> `{}`. Input goes to the MangaVox window only (posted window messages, the PC's cursor is not moved).
+
+### Touchpad (touchpad.rs)
+- `POST /api/mouse` body `{ "e": [event, ...] }` (at most 64 events, 500 typed characters), events:
+  `{ "t":"move","dx","dy" }` (relative pixels, each axis clamped to ±4000, fractions carry over) |
+  `{ "t":"click","b"?:"left"|"right"|"middle","n"?:1..3 }` |
+  `{ "t":"down","b"? }` / `{ "t":"up","b"? }` (hold a button; let go automatically after 10 s without requests) |
+  `{ "t":"scroll","dx"?,"dy"? }` (wheel notches, ±30, +dy down, +dx right, fractions carry over) |
+  `{ "t":"text","s" }` (typed as Unicode; \n = Enter, \t = Tab, other control characters dropped) |
+  `{ "t":"key","key": "enter"|"escape"|"backspace"|"tab"|"space"|"delete"|"left"|"right"|"up"|"down"|"home"|"end"|"pageup"|"pagedown"|"volumeup"|"volumedown"|"volumemute"|"playpause"|"medianext"|"mediaprev" }`
+  -> `{}`; 400 (nothing sent) for a bad batch. One batch = one `SendInput` call: this moves the PC's
+  real pointer and types into whatever app has focus (not into elevated apps or the lock screen).
+  The phone sends at most one batch per ~16 ms with one request in flight.

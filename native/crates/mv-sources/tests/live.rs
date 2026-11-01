@@ -97,3 +97,21 @@ async fn live_mangafire_needs_solver() {
     let s = mangafire::MangaFire::new(ctx());
     assert!(matches!(s.search_manga("one piece", 1).await, Err(SourceError::SolverRequired(_))));
 }
+
+/// The owner's reference chapter: every page of "I Became a Transcendent Hunter with 100,000x
+/// EXP" chapter 1 (64 on the site when checked), plus the whole chapter list.
+#[tokio::test]
+#[ignore]
+async fn live_vortexscans_reference_chapter() {
+    let s = vortexscans::VortexScans::new(ctx());
+    let slug = "i-became-a-transcendent-hunter-with-100000x-exp";
+    let pages = s.get_page_urls(&format!("{slug}/chapter-1")).await.unwrap();
+    println!("vortexscans: {} pages in chapter 1, first = {}, last = {}", pages.len(), pages[0], pages[pages.len() - 1]);
+    assert!(pages.len() > 6, "the full chapter, not the first eager-loaded images");
+    let chapters = s.get_chapter_list(slug).await.unwrap();
+    println!("vortexscans: {} readable chapters, {:?} .. {:?}", chapters.len(), chapters.first().and_then(|c| c.number), chapters.last().and_then(|c| c.number));
+    assert_eq!(chapters[0].number, Some(1.0));
+    let d = s.get_manga_details(slug).await.unwrap();
+    println!("vortexscans: details title = {:?}, status = {:?}", d.title, d.status);
+    smoke(&s, "transcendent").await;
+}

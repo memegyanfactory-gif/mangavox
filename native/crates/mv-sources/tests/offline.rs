@@ -374,6 +374,85 @@ fn mangafire_parsers() {
     assert_eq!(mangafire::language_order(Some("ja")).len(), mangafire::LANGUAGES.len());
 }
 
+/// The bug behind "a chapter shows only 6 images": the strip reader mounts a page's <img> only
+/// near the viewport, so the rendered DOM lists a few pages while the chapter API lists them all.
+#[test]
+fn mangafire_full_page_list_comes_from_the_chapter_api() {
+    let lazy = fx("mangafire_reader_lazy.html");
+    assert_eq!(mangafire::parse_reader_images(&lazy).len(), 3, "only the mounted images are in the DOM");
+    assert_eq!(mangafire::reader_slot_count(&lazy), 13, "...but every page has a slot");
+
+    let pages = mangafire::parse_api_pages(&fj("mangafire_chapter_api.json"));
+    assert_eq!(pages.len(), 13);
+    assert_eq!(pages[0], "https://static.mfcdn.example/ch/9001/001.jpg");
+    assert_eq!(pages[12], "https://static.mfcdn.example/ch/9001/013.webp", "protocol-relative webp kept");
+    // What the in-page script resolves to (`{pages}`) parses the same way; strings are accepted too.
+    assert_eq!(mangafire::parse_api_pages(&json!({"pages": ["https://a/1.jpg", {"url": "https://a/2.avif"}, ""]})), ["https://a/1.jpg", "https://a/2.avif"]);
+    assert!(mangafire::parse_api_pages(&json!({"error": "HTTP 403"})).is_empty());
+
+    // DOM fallback: complete only when every slot produced a URL.
+    let (u, complete) = mangafire::parse_reader_dom_result(&json!({"pages": ["https://a/1.jpg", "https://a/2.jpg"], "slots": 2}));
+    assert!(complete && u.len() == 2);
+    let (u, complete) = mangafire::parse_reader_dom_result(&json!({"pages": ["https://a/1.jpg", ""], "slots": 2}));
+    assert!(!complete && u.len() == 1);
+
+    assert_eq!(mangafire::chapter_api_id("09vvk-some-title/chapter/9448447"), Some("9448447"));
+    assert_eq!(mangafire::chapter_api_id("09vvk-some-title"), None);
+    let js = mangafire::api_pages_js("9448447");
+    assert!(js.contains("get('/chapters/' + \"9448447\"") && js.contains("window.__mvSign"));
+}
+
+// ── Vortex Scans (curl of vortexscans.org chapter 1 of "I Became a Transcendent Hunter with
+//    100,000x EXP", trimmed to the reader; api.vortexscans.org query / post / chapters, trimmed)
+
+#[test]
+fn vortexscans_reader_lists_every_page() {
+    let pages = vortexscans::parse_reader_images(&fx("vortex_chapter.html"));
+    assert_eq!(pages.len(), 64, "all 64 pages, including the loading=\"lazy\" ones");
+    assert!(pages[0].ends_with("/page-0001_001_1784925641100-573528.webp"));
+    assert!(pages[5].contains("/page-0006_"), "page 6 is followed by...");
+    assert!(pages[6].contains("/page-0007_"), "...page 7 (the old cut-off point)");
+    assert!(pages[63].contains("/page-0064_"));
+    assert!(pages.iter().all(|u| u.starts_with("https://storage.vortexscans.org/upload/series/i-became-a-transcendent-hunter-with-100000x-exp/")), "cover / header images are not pages");
+
+    // Order comes from data-reader-index, not document order.
+    let shuffled = r#"<img src="https://s/2.webp" data-reader-page-image="true" data-reader-index="1"><img src="https://s/1.webp" data-reader-page-image="true" data-reader-index="0">"#;
+    assert_eq!(vortexscans::parse_reader_images(shuffled), ["https://s/1.webp", "https://s/2.webp"]);
+    // Markup without the reader attributes: the seroval `publicImages` blob is the fallback.
+    let blob = r#"<script>l:$R[63]={chapter:$R[65]={id:1,publicContentHtml:"",publicImages:$R[67]=[$R[68]={id:9,url:"https://s/a.webp",order:0},$R[69]={id:10,url:"https://s/b.avif",order:1}],introImage:""}}</script>"#;
+    assert_eq!(vortexscans::parse_reader_images(blob), ["https://s/a.webp", "https://s/b.avif"]);
+    assert_eq!(vortexscans::parse_public_images(r#"{"publicImages":[{"url":"https:\/\/s\/c.jpg"}]}"#), ["https://s/c.jpg"]);
+}
+
+#[test]
+fn vortexscans_api_parsers() {
+    let hits = vortexscans::parse_posts(&fj("vortex_query.json"));
+    assert_eq!(hits.len(), 2, "novels are skipped");
+    let h = hits.iter().find(|h| h.source_id == "i-became-a-transcendent-hunter-with-100000x-exp").unwrap();
+    assert_eq!(h.title, "I Became a Transcendent Hunter with 100,000x EXP");
+    assert!(h.cover_url.as_deref().unwrap().starts_with("https://storage.vortexscans.org/"));
+    assert_eq!(h.status.as_deref(), Some("ongoing"));
+
+    let post = fj("vortex_post.json");
+    assert_eq!(vortexscans::post_id(&post), Some(633));
+    let d = vortexscans::parse_details(&post, "i-became-a-transcendent-hunter-with-100000x-exp").unwrap();
+    assert_eq!(d.title, "I Became a Transcendent Hunter with 100,000x EXP");
+    assert!(d.description.as_deref().unwrap().starts_with("Lee Ji-han was a hunter with zero talent.\nWhen he"));
+    assert_eq!(d.author, None, "empty strings are not authors");
+    assert_eq!(d.genres, Some(vec!["Action".to_string(), "Fantasy".to_string()]));
+
+    let (rows, total) = vortexscans::chapter_rows(&fj("vortex_chapters.json"));
+    assert_eq!((rows.len(), total), (5, Some(5)));
+    let ch = vortexscans::parse_chapters("i-became-a-transcendent-hunter-with-100000x-exp", &rows);
+    let nums: Vec<_> = ch.iter().map(|c| c.number.unwrap()).collect();
+    assert_eq!(nums, [1.0, 2.0, 10.5, 33.0], "ascending; the locked chapter 34 is left out");
+    assert_eq!(ch[0].source_id, "i-became-a-transcendent-hunter-with-100000x-exp/chapter-1");
+    assert_eq!(ch[2].title.as_deref(), Some("Chapter 10.5: Side Story"));
+    assert_eq!(vortexscans::chapter_url(&ch[0].source_id), "https://vortexscans.org/series/i-became-a-transcendent-hunter-with-100000x-exp/chapter-1");
+    assert_eq!(vortexscans::series_slug("https://vortexscans.org/series/abc/"), "abc");
+    assert_eq!(vortexscans::series_slug("abc"), "abc");
+}
+
 // ── Source plumbing: registry, WallSolver hand-off ────────────────────
 
 fn ctx() -> SourceCtx {
@@ -385,7 +464,7 @@ fn registry_lists_builtin_sources() {
     let reg = SourceRegistry::builtin(ctx());
     let list = reg.list();
     let ids: Vec<_> = list.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, ["mangadex", "comick", "mangafire", "webtoons", "ehentai", "hentai2read", "nhentai"]);
+    assert_eq!(ids, ["mangadex", "comick", "mangafire", "webtoons", "vortexscans", "ehentai", "hentai2read", "nhentai"]);
     let nsfw: Vec<_> = list.iter().filter(|s| s.nsfw).map(|s| s.id.as_str()).collect();
     assert_eq!(nsfw, ["ehentai", "hentai2read", "nhentai"]);
     assert!(list.iter().all(|s| s.lang == "en" && !s.name.is_empty() && s.icon.is_some()));
@@ -436,9 +515,67 @@ impl WallSolver for FakeSolver {
     }
     async fn eval_json(&self, page_url: &str, script: &str) -> Result<Value> {
         self.calls.lock().unwrap().push(format!("eval_json {page_url}"));
+        if script.contains("get('/chapters/'") {
+            assert!(script.contains("\"1\""), "the numeric chapter id is sent");
+            let mut v = fj("mangafire_chapter_api.json");
+            return Ok(json!({"pages": v["data"]["pages"].take()}));
+        }
         assert!(script.contains("\"abcde\""), "hid is the part before the first dash");
         Ok(json!({"items": [{"id": 1, "number": "1", "name": "One", "createdAt": 1_600_000_000}], "total": 1}))
     }
+}
+
+/// A solver whose page script fails: get_page_urls must fall back to the rendered reader and
+/// refuse a page list that is visibly partial instead of returning it as the whole chapter.
+#[derive(Default)]
+struct LazyReaderSolver;
+
+#[async_trait]
+impl WallSolver for LazyReaderSolver {
+    async fn cookies(&self, _url: &str) -> Result<Vec<(String, String)>> {
+        Err(SourceError::Solver("no cookies".into()))
+    }
+    async fn fetch_text(&self, _url: &str, _h: &[(String, String)]) -> Result<String> {
+        Err(SourceError::Solver("offline".into()))
+    }
+    async fn fetch_html(&self, _url: &str, _wait_for: Option<&str>) -> Result<String> {
+        Ok(fx("mangafire_reader_lazy.html"))
+    }
+    async fn eval_json(&self, _page_url: &str, script: &str) -> Result<Value> {
+        if script.contains("get('/chapters/'") {
+            return Ok(json!({"error": "vrf signer not found"}));
+        }
+        // The reader script reads every slot's page record.
+        let pages: Vec<String> = (1..=13).map(|i| format!("https://static.mfcdn.example/ch/9001/{i:03}.jpg")).collect();
+        Ok(json!({"pages": pages, "slots": 13}))
+    }
+}
+
+#[tokio::test]
+async fn mangafire_pages_fall_back_to_the_reader_slots_never_a_partial_dom() {
+    let mf = mangafire::MangaFire::new(ctx().with_solver(Arc::new(LazyReaderSolver)));
+    assert_eq!(mf.get_page_urls("abcde-one-piece/chapter/9001").await.unwrap().len(), 13);
+
+    // Same, but the reader script also comes up short: the 3-of-13 DOM read is an error.
+    struct Broken;
+    #[async_trait]
+    impl WallSolver for Broken {
+        async fn cookies(&self, _u: &str) -> Result<Vec<(String, String)>> {
+            Err(SourceError::Solver("x".into()))
+        }
+        async fn fetch_text(&self, _u: &str, _h: &[(String, String)]) -> Result<String> {
+            Err(SourceError::Solver("x".into()))
+        }
+        async fn fetch_html(&self, _u: &str, _w: Option<&str>) -> Result<String> {
+            Ok(fx("mangafire_reader_lazy.html"))
+        }
+        async fn eval_json(&self, _p: &str, _s: &str) -> Result<Value> {
+            Err(SourceError::Solver("script error".into()))
+        }
+    }
+    let mf = mangafire::MangaFire::new(ctx().with_solver(Arc::new(Broken)));
+    let err = mf.get_page_urls("abcde-one-piece/chapter/9001").await.unwrap_err().to_string();
+    assert!(err.contains("only 3 of 13 pages"), "{err}");
 }
 
 #[tokio::test]
@@ -454,7 +591,7 @@ async fn mangafire_works_through_a_solver_and_errors_without_one() {
     assert_eq!(mf.get_manga_details("abcde-one-piece").await.unwrap().title, "One Piece");
     let ch = mf.get_chapter_list("abcde-one-piece").await.unwrap();
     assert_eq!(ch[0].source_id, "abcde-one-piece/chapter/1");
-    assert_eq!(mf.get_page_urls("abcde-one-piece/chapter/1").await.unwrap().len(), 2);
+    assert_eq!(mf.get_page_urls("abcde-one-piece/chapter/1").await.unwrap().len(), 13, "every page, from the chapter API");
     let tags = mf.get_tag_list().await.unwrap();
     assert!(tags.iter().any(|t| t.id == "slice-of-life"));
     let calls = solver.calls.lock().unwrap().clone();

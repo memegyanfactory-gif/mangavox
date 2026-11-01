@@ -5,6 +5,12 @@
 //! A phone pairs by opening `/pair?code=<code>` from the QR code. Codes are single use, expire after
 //! [`PAIR_TTL_SECS`] and only the newest one works. Devices are stored in
 //! `<root>/phone/devices.json` with the SHA-256 of their session secret, never the secret itself.
+//!
+//! A paired phone stays signed in until it is removed: reopening the (used) QR link with a valid
+//! cookie goes straight to the app, the cookie is renewed whenever the app is opened, the device
+//! list survives restarts and is shared with any other MangaVox using the same data folder, and
+//! when a navigation from another app did not carry the `SameSite=Strict` cookie, the locked page
+//! checks the session with a same-origin request and goes in (`web/locked.js`).
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -125,6 +131,27 @@ struct Devices {
     list: Vec<Stored>,
     /// When each device's `last_seen` was last written to disk (unix seconds).
     written: HashMap<String, i64>,
+    /// The file as this process last read or wrote it (modified time, length). When it differs,
+    /// another MangaVox sharing the data folder changed it (the installed app next to a dev build,
+    /// or an old instance still closing after an update): the list is read again, so a phone
+    /// paired or removed there is known here too, and saving here never drops it.
+    disk: Option<(std::time::SystemTime, u64)>,
+}
+
+impl Devices {
+    /// Takes the list another process wrote, keeping the newer `last_seen` of devices both know.
+    fn reload(&mut self, mut list: Vec<Stored>) {
+        for s in &mut list {
+            if let Some(old) = self.list.iter().find(|o| o.id == s.id) {
+                s.last_seen = s.last_seen.max(old.last_seen);
+            }
+        }
+        self.written.retain(|id, _| list.iter().any(|s| &s.id == id));
+        for s in &list {
+            self.written.entry(s.id.clone()).or_insert(s.last_seen);
+        }
+        self.list = list;
+    }
 }
 
 static DEVICES: Mutex<Option<Devices>> = Mutex::new(None);
@@ -148,28 +175,52 @@ fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+fn disk_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// The stored devices; `None` when the file is missing or cannot be read right now (another
+/// process replacing it): the caller keeps what it has rather than signing every phone out.
+fn read_store(path: &std::path::Path) -> Option<Vec<Stored>> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
 fn with_devices<T>(f: impl FnOnce(&mut Devices) -> T) -> T {
+    let path = store_path();
     let mut g = DEVICES.lock().unwrap_or_else(|e| e.into_inner());
     let d = g.get_or_insert_with(|| {
-        let list: Vec<Stored> = std::fs::read(store_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let read = read_store(&path);
+        // An unreadable file is read again on the next request (`disk` stays unknown).
+        let disk = read.as_ref().and_then(|_| disk_stamp(&path));
+        let list = read.unwrap_or_default();
         let written = list.iter().map(|s| (s.id.clone(), s.last_seen)).collect();
-        Devices { list, written }
+        Devices { list, written, disk }
     });
+    let now = disk_stamp(&path);
+    if now.is_some() && now != d.disk {
+        if let Some(list) = read_store(&path) {
+            d.reload(list);
+            d.disk = now;
+        }
+    }
     f(d)
 }
 
-fn save(list: &[Stored]) {
+fn save(d: &mut Devices) {
     let path = store_path();
     let res = (|| -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("json.part");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(list).unwrap_or_default())?;
+        // Per process, so two MangaVox instances never write the same temp file.
+        let tmp = path.with_extension(format!("json.{}.part", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&d.list).unwrap_or_default())?;
         std::fs::rename(&tmp, &path)
     })();
-    if let Err(e) = res {
-        eprintln!("[phone] could not save paired devices: {e}");
+    match res {
+        Ok(()) => d.disk = disk_stamp(&path),
+        Err(e) => eprintln!("[phone] could not save paired devices: {e}"),
     }
 }
 
@@ -196,7 +247,7 @@ pub fn revoke(id: &str) {
         d.written.remove(id);
         let changed = d.list.len() != before;
         if changed {
-            save(&d.list);
+            save(d);
         }
         changed
     });
@@ -210,7 +261,7 @@ pub fn revoke_all() {
     with_devices(|d| {
         d.list.clear();
         d.written.clear();
-        save(&d.list);
+        save(d);
     });
     eprintln!("[phone] all devices revoked");
     state::changed();
@@ -228,7 +279,7 @@ fn add_device(name: String) -> (Device, String) {
     with_devices(|d| {
         d.written.insert(id, now);
         d.list.push(s);
-        save(&d.list);
+        save(d);
     });
     state::changed();
     (dev, secret)
@@ -256,7 +307,7 @@ fn device_for(secret: &str) -> Option<Device> {
         let last = d.written.get(&id).copied().unwrap_or(0);
         if now - last >= SEEN_WRITE_EVERY {
             d.written.insert(id, now);
-            save(&d.list);
+            save(d);
             persisted = true;
         }
         Some(public(&d.list[i]))
@@ -365,7 +416,7 @@ pub fn device_name(ua: &str) -> String {
 
 /// Paths a phone may open without being paired.
 fn is_public(path: &str) -> bool {
-    matches!(path, "/pair" | "/locked" | "/favicon.ico" | "/manifest.webmanifest" | "/icon.png" | "/icon-512.png" | "/logo.png")
+    matches!(path, "/pair" | "/locked" | "/locked.js" | "/favicon.ico" | "/manifest.webmanifest" | "/icon.png" | "/icon-512.png" | "/logo.png")
 }
 
 fn json_err(status: StatusCode, msg: &str) -> Response {
@@ -397,9 +448,12 @@ pub async fn guard(mut req: Request, next: Next) -> Response {
         return next.run(req).await;
     }
     let api = path.starts_with("/api/") || path == "/api";
-    let Some(dev) = session_secret(req.headers()).and_then(|s| device_for(&s)) else {
+    let secret = session_secret(req.headers());
+    let Some(dev) = secret.as_deref().and_then(device_for) else {
         return if api { json_err(StatusCode::UNAUTHORIZED, "not paired") } else { crate::server::locked_page(StatusCode::OK) };
     };
+    // Opening the app renews the cookie, so a phone in use never reaches its expiry.
+    let renew = req.method() == Method::GET && matches!(path.as_str(), "/" | "/index.html");
     if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
         let csrf = req.headers().get("x-mangavox").and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() == "1");
         if !csrf {
@@ -415,7 +469,20 @@ pub async fn guard(mut req: Request, next: Next) -> Response {
         }
     }
     req.extensions_mut().insert(dev);
-    next.run(req).await
+    let mut res = next.run(req).await;
+    if renew && res.status().is_success() {
+        if let (Some(s), false) = (secret.as_deref(), res.headers().contains_key(header::SET_COOKIE)) {
+            if let Ok(v) = session_cookie(s).parse() {
+                res.headers_mut().insert(header::SET_COOKIE, v);
+            }
+        }
+    }
+    res
+}
+
+/// The request carries the cookie of a paired device.
+pub(crate) fn signed_in(headers: &HeaderMap) -> bool {
+    session_secret(headers).is_some_and(|s| device_for(&s).is_some())
 }
 
 // ---------------------------------------------------------------- routes
@@ -429,16 +496,21 @@ struct PairQuery {
 async fn pair(headers: HeaderMap, ConnectInfo(peer): ConnectInfo<SocketAddr>, Query(q): Query<PairQuery>) -> Response {
     let now = Instant::now();
     let ip = peer.ip();
+    // Already paired (the QR link reopened from history, a bookmark or the camera): just open the
+    // app. Checked first, so a signed-in phone is never rate limited, never uses up the code on
+    // screen and never becomes a second device.
+    if signed_in(&headers) {
+        return redirect_home(None);
+    }
     if too_many_fails(ip, now) {
         return json_err(StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again in a few minutes");
     }
     if !take_code(q.code.trim(), now) {
-        // Already paired (an old QR scanned again): just open the app.
-        if session_secret(&headers).and_then(|s| device_for(&s)).is_some() {
-            return redirect_home(None);
-        }
         record_fail(ip, now);
         eprintln!("[phone] pairing refused for {ip} (expired or wrong code)");
+        // The locked page says the QR code was used and, when this browser does hold a session
+        // the navigation did not send (SameSite=Strict on a link opened from another app), goes
+        // straight in (`/locked.js`).
         return crate::server::locked_page(StatusCode::FORBIDDEN);
     }
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -450,12 +522,16 @@ async fn pair(headers: HeaderMap, ConnectInfo(peer): ConnectInfo<SocketAddr>, Qu
 fn redirect_home(secret: Option<&str>) -> Response {
     let mut r = (StatusCode::SEE_OTHER, [(header::LOCATION, "/"), (header::CACHE_CONTROL, "no-store")]).into_response();
     if let Some(s) = secret {
-        let c = format!("{COOKIE}={s}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000");
-        if let Ok(v) = c.parse() {
+        if let Ok(v) = session_cookie(s).parse() {
             r.headers_mut().insert(header::SET_COOKIE, v);
         }
     }
     r
+}
+
+/// The `Set-Cookie` value for a session secret (a year, renewed whenever the app is opened).
+fn session_cookie(secret: &str) -> String {
+    format!("{COOKIE}={secret}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000")
 }
 
 async fn me(Extension(dev): CurrentDevice) -> Json<serde_json::Value> {
@@ -602,6 +678,43 @@ pub(crate) mod tests {
         revoke_all();
         assert!(device_for(&s2).is_none());
         assert!(devices().is_empty());
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Writes the store the way another MangaVox process on the same data folder would.
+    fn write_as_other_instance(path: &std::path::Path, list: &[Stored]) {
+        std::fs::write(path, serde_json::to_vec_pretty(list).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn devices_paired_or_removed_by_another_instance_are_seen() {
+        let _g = serial();
+        let path = temp_store("shared");
+        let (a, sa) = add_device("A".into());
+        // The other instance pairs phone B (its list has A too).
+        let sb = random_b64(32);
+        let mut list = read_store(&path).unwrap();
+        list.push(Stored { id: "bbbbbbbbbbbbbbbb".into(), name: "B".into(), created: 1, last_seen: 1, hash: hash_hex(&sb) });
+        write_as_other_instance(&path, &list);
+        assert_eq!(device_for(&sb).map(|d| d.id).as_deref(), Some("bbbbbbbbbbbbbbbb"), "a phone paired there gets in here");
+        assert!(device_for(&sa).is_some());
+        // Saving here (pairing C) keeps B on disk.
+        let (_, sc) = add_device("C".into());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(&hash_hex(&sb)) && raw.contains(&hash_hex(&sc)), "{raw}");
+        // A restart of this instance still knows all three.
+        use_store(path.clone());
+        assert!(device_for(&sa).is_some() && device_for(&sb).is_some() && device_for(&sc).is_some());
+        // The other instance removes A: it is locked out here at once.
+        let list: Vec<Stored> = read_store(&path).unwrap().into_iter().filter(|s| s.id != a.id).collect();
+        write_as_other_instance(&path, &list);
+        assert!(device_for(&sa).is_none());
+        assert!(device_for(&sb).is_some());
+        // A file caught half-written never signs phones out.
+        std::fs::write(&path, b"[{\"id\":").unwrap();
+        assert!(device_for(&sb).is_some() && device_for(&sc).is_some());
         if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
