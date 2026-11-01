@@ -4,7 +4,7 @@ import unittest
 
 from python.video_generator import (
     FPS, PAGE_TRANSITIONS, SAME_PAGE_TRANSITION, _Progress,
-    clip_frames, clip_key, pick_motion, plan_chunks, plan_transitions, xfade_chain,
+    clip_frames, clip_key, pick_motion, plan_segments, plan_transitions, xfade_chain,
 )
 
 
@@ -68,13 +68,20 @@ class XfadeChainTests(unittest.TestCase):
 
 
 class ChunkAndMotionTests(unittest.TestCase):
-    def test_chunks_cover_every_clip_once(self):
-        chunks = plan_chunks(100, 14)
-        self.assertEqual(chunks[0], (0, 14))
-        self.assertEqual(chunks[-1][1], 100)
-        for (a, b), (c, _) in zip(chunks, chunks[1:]):
-            self.assertEqual(b, c)
-        self.assertEqual(plan_chunks(5, 14), [(0, 5)])
+    def test_segments_cut_only_where_no_transition_runs(self):
+        durations = [4.0, 0.5, 6.0, 3.0, 9.0, 2.5]
+        starts, trans = plan_transitions(durations, [0, 1, 2, 3, 4, 5])
+        total = math.ceil(sum(durations) * FPS)
+        cuts = plan_segments(starts, trans, total, 4)
+        self.assertEqual((cuts[0], cuts[-1]), (0, total))
+        self.assertEqual(cuts, sorted(set(cuts)))
+        first = [round(s * FPS) for s in starts]
+        for c in cuts[1:-1]:
+            k = max(i for i, f in enumerate(first) if f <= c)
+            self.assertGreaterEqual(c, first[k] + math.ceil(trans[k][1] * FPS) + 1)
+            self.assertLess(c, first[k + 1] if k + 1 < len(first) else total)
+            self.assertGreaterEqual(c - max(x for x in cuts if x < c), 2 * FPS)
+        self.assertEqual(plan_segments(starts, trans, total, 1), [0, total])
 
     def test_motion_never_repeats_back_to_back(self):
         prev = None
@@ -94,7 +101,7 @@ class ResumeAndProgressTests(unittest.TestCase):
 
     def test_progress_climbs_through_every_stage_to_the_end(self):
         seen = []
-        report = _Progress(lambda stage, cur, total: seen.append(cur), has_chunks=False)
+        report = _Progress(lambda stage, cur, total: seen.append(cur))
         report("prepare", 1.0)
         for f in (0.0, 0.5, 1.0):
             report("clips", f)

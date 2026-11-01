@@ -16,12 +16,11 @@ import shutil
 import wave
 import math
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FPS = 30
 AUDIO_RATE = 48000
-# Clips per intermediate xfade pass (keeps the number of open decoders bounded).
-CHUNK_CLIPS = 14
 # Panel inset from the frame edge (fraction of the frame) when the blurred fill is used.
 FG_MARGIN = 0.05
 # Ken Burns: push-in / pull-out amount and the fixed zoom used while panning.
@@ -49,7 +48,7 @@ FG_WINDOW = {
     "pan_right": ("{e}", "0.5"), "pan_left": ("(1-{e})", "0.5"),
 }
 # Bumped whenever the look of a rendered clip changes, so cached clips are not reused.
-CLIP_VERSION = 5
+CLIP_VERSION = 6
 
 # Looks (Studio → Video → Look): how panels are laid out and move, which transitions turn the
 # page, and what the finished picture gets. "duo" puts tall panels side by side like the big
@@ -225,11 +224,50 @@ def duo_geometry(iw, ih, w, h, slot):
     return {"size": (dw, dh), "vis": vis, "pos": (int(cx - dw / 2) // 2 * 2, (h - vis) // 4 * 2), "slack": dh - vis}
 
 
-def look_filters(look, w, h, src, out, particles=None):
+def vignette_angle(look):
+    """The vignette's angle for `look` (its strength scaled by the editor), or None when off."""
+    vk = look.get("vignette_k", 1.0)
+    if not look.get("vignette") or vk <= 0:
+        return None
+    return math.pi / 6 if vk == 1.0 else round(min(1.4, math.pi / 6 * vk), 4)
+
+
+def make_vignette_mask(w, h, angle, work_dir):
+    """The vignette as one still (yuva420p, FFV1): luma 0 under an alpha of 1 - the vignette
+    filter's own factor (cos^4 of the angle times the distance from the centre over the
+    half-diagonal), so laying it over a frame multiplies the luma and pulls the chroma to grey
+    exactly as `vignette` does, at a fraction of the cost (the filter works every pixel out in
+    floating point on every frame, single-threaded). Made once per size and angle, cached."""
+    root = fx_cache_dir() or work_dir
+    path = os.path.join(root, f"vignette_{w}x{h}_{angle:.4f}_v{FX_VERSION}.mkv")
+    if os.path.exists(path) and os.path.getsize(path) > 100:
+        return path
+    tmp = f"{path}.part{os.getpid()}_{threading.get_ident()}.mkv"
+    # (Commas inside an option value of the lavfi graph are escaped.)
+    alpha = f"255*(1-pow(cos({angle:.6f}*min(1\\,hypot(trunc(X-W/2)\\,trunc(Y-H/2))/hypot(W/2\\,H/2))),4))"
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=1:d=1,format=yuva420p,geq=lum=0:cb=128:cr=128:a='{alpha}'",
+        "-frames:v", "1", "-c:v", "ffv1", tmp,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0 or not os.path.exists(tmp):
+        raise RuntimeError(f"vignette mask failed: {result.stderr[:300]}")
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        if not os.path.exists(path):
+            return tmp
+        os.unlink(tmp)
+    return path
+
+
+def look_filters(look, w, h, src, out, particles=None, vignette=None):
     """Finishing filters for `look` on [src] (a w x h picture), labelled [out]: a gentle grade
     and colour preset (one lookup table), floating particles (the looped [particles] stream,
-    when given), a vignette, fine film grain and letterbox bars, each only when the look has it
-    on. (The glow is baked into each still instead: it would cost more than the rest together
+    when given), a vignette (the [vignette] mask of make_vignette_mask laid over, when given,
+    else the vignette filter), fine film grain and letterbox bars, each only when the look has
+    it on. (The glow is baked into each still instead: it would cost more than the rest together
     per frame.)"""
     parts = []
     cur = src
@@ -243,7 +281,10 @@ def look_filters(look, w, h, src, out, particles=None):
         cur = f"{out}_p"
     tail = []
     vk, gk = look.get("vignette_k", 1.0), look.get("grain_k", 1.0)
-    if look.get("vignette") and vk > 0:
+    if look.get("vignette") and vk > 0 and vignette:
+        parts.append(f"[{cur}][{vignette}]overlay=0:0:format=yuv420[{out}_v]")
+        cur = f"{out}_v"
+    elif look.get("vignette") and vk > 0:
         tail.append("vignette=angle=PI/6" if vk == 1.0 else f"vignette=angle={min(1.4, math.pi / 6 * vk):.4f}")
     if look.get("grain") and round(4 * gk) > 0:
         tail.append(f"noise=alls={round(4 * gk)}:allf=t")
@@ -489,11 +530,6 @@ def ramp_ease(var, frames, ramp=False):
     return f"(0.65*{lin}+0.35*{_ease(var, frames)})"
 
 
-def plan_chunks(n, size=CHUNK_CLIPS):
-    """Split n clips into consecutive [first, end) runs of at most `size` clips."""
-    return [(i, min(n, i + size)) for i in range(0, n, size)]
-
-
 def clip_frames(starts, trans, k, last_duration):
     """Frames clip k must render: up to the next clip's start plus that fade's tail (and a
     spare frame), or its own duration for the last clip."""
@@ -698,7 +734,23 @@ def _bloom(img):
     return ImageChops.screen(img, glow)
 
 
-# ── Light leaks, film burns and particles (made once per render, small, then scaled) ──
+# ── Light leaks, film burns and particles (made once, small, then scaled) ──
+
+# Bumped whenever the drawn flare frames change (they are cached by size between renders).
+FX_VERSION = 1
+
+
+def fx_cache_dir():
+    """Folder the size-only effect frames are kept in between renders (MANGAVOX_FX_CACHE, else
+    the system temp folder), or None when it cannot be made."""
+    import tempfile
+    path = os.environ.get("MANGAVOX_FX_CACHE") or os.path.join(tempfile.gettempdir(), "mangavox-fx")
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except OSError:
+        return None
+
 
 def _glow_sprite(size, color, alpha):
     """A soft round light: `color` with a radial falloff, `alpha` (0..1) at its centre."""
@@ -731,13 +783,22 @@ def make_flare_frames(kind, w, h, work_dir):
     sw, sh = max(32, w // 4), max(32, h // 4)
     seconds = LEAK_SEC if kind == "leak" else BURN_SEC
     count = max(2, round(seconds * FPS))
-    folder = os.path.join(work_dir, f"fx_{kind}_{sw}x{sh}")
+    # The frames depend on the size only, so they are kept between renders (they take seconds
+    # to draw): in a shared cache when there is one, else next to the clips.
+    root = fx_cache_dir() or work_dir
+    folder = os.path.join(root, f"fx_{kind}_{sw}x{sh}_v{FX_VERSION}")
     pattern = os.path.join(folder, "f_%03d.png")
     if os.path.exists(os.path.join(folder, f"f_{count - 1:03d}.png")):
         return pattern, count
-    os.makedirs(folder, exist_ok=True)
+    # Drawn into a folder of its own and moved into place whole, so a render running at the
+    # same time never reads half a set.
+    tmp = f"{folder}.part{os.getpid()}_{id(work_dir)}"
+    os.makedirs(tmp, exist_ok=True)
     rng = random.Random(7)
-    for i in range(count):
+    # The burn's flicker, drawn in frame order so every frame gets the same value as before.
+    flicker = [0.88 + 0.12 * rng.random() for _ in range(count)]
+
+    def draw(i):
         u = i / (count - 1)
         img = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
         if kind == "leak":
@@ -754,7 +815,7 @@ def make_flare_frames(kind, w, h, work_dir):
             # Swells to cover the frame at BURN_PEAK, then burns out; a little flicker.
             peak = BURN_PEAK / BURN_SEC
             env = (u / peak) ** 1.5 if u < peak else (1 - (u - peak) / (1 - peak)) ** 1.3
-            env *= 0.88 + 0.12 * rng.random()
+            env *= flicker[i]
             grow = 0.55 + 1.9 * min(1.0, u / peak) ** 0.8
             cx, cy = sw * 0.12, sh * 0.62
             _paint(img, _glow_sprite((sh * 2.6 * grow, sh * 2.2 * grow), (232, 64, 18), 0.95 * env), cx, cy)
@@ -762,7 +823,17 @@ def make_flare_frames(kind, w, h, work_dir):
             _paint(img, _glow_sprite((sh * 1.2 * grow, sh * 1.0 * grow), (255, 244, 220), 0.98 * env), cx + 0.1 * sw, cy - 0.04 * sh)
             # A second, smaller burn from the far edge.
             _paint(img, _glow_sprite((sh * 1.4 * grow, sh * 1.2 * grow), (255, 120, 30), 0.7 * env), sw * 0.95, sh * 0.2)
-        img.save(os.path.join(folder, f"f_{i:03d}.png"))
+        img.save(os.path.join(tmp, f"f_{i:03d}.png"), compress_level=1)
+
+    with ThreadPoolExecutor(max_workers=max(2, min(16, os.cpu_count() or 4))) as pool:
+        list(pool.map(draw, range(count)))
+    try:
+        os.replace(tmp, folder)
+    except OSError:
+        # Another render got there first (or the cache cannot be renamed into): use what is there.
+        if not os.path.exists(os.path.join(folder, f"f_{count - 1:03d}.png")):
+            return os.path.join(tmp, "f_%03d.png"), count
+        shutil.rmtree(tmp, ignore_errors=True)
     return pattern, count
 
 
@@ -826,14 +897,21 @@ def _prepare_duo_images(src, idx, w, h, slot, work_dir, glow=False, inset=0, dri
     img = Image.open(src)
     img.load()
     img = img.convert("RGB")
-    geo = duo_geometry(img.width, img.height, w, h - 2 * inset, slot)
-    geo["pos"] = (geo["pos"][0], geo["pos"][1] + inset)
+    geo = duo_slot(img.size, w, h, slot, inset)
     fg_path = os.path.join(work_dir, f"dfg_{idx:04d}.jpg")
     fg = img.resize(geo["size"], Image.LANCZOS)
     (_bloom(fg) if glow else fg).save(fg_path, "JPEG", quality=95)
     bg_path = os.path.join(work_dir, f"dbg_{idx:04d}{'_d' if drift else ''}.jpg")
     _blurred_fill(img, w + 2 * drift, h).save(bg_path, "JPEG", quality=92)
-    return {"fg": fg_path, "bg": bg_path, "geo": geo, "drift": drift}
+    # The stills are the same for either half (only where they go differs): see duo_slot.
+    return {"fg": fg_path, "bg": bg_path, "geo": geo, "drift": drift, "src_size": img.size}
+
+
+def duo_slot(src_size, w, h, slot, inset=0):
+    """duo_geometry for a panel of `src_size` in `slot`, between letterbox bars `inset` high."""
+    geo = duo_geometry(src_size[0], src_size[1], w, h - 2 * inset, slot)
+    geo["pos"] = (geo["pos"][0], geo["pos"][1] + inset)
+    return geo
 
 
 def panel_margins(w, h, fill, inset=0):
@@ -918,18 +996,23 @@ def _flash(impact):
 
 def _encode_clip(inputs, graph, frames, out_path):
     tmp = out_path + ".part.mp4"
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        *inputs,
-        "-filter_complex", ";".join(graph),
-        "-map", "[v]", "-frames:v", str(frames), "-r", str(FPS),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-an", tmp,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0 or not os.path.exists(tmp):
-        raise RuntimeError(f"clip render failed: {result.stderr[:300]}")
-    os.replace(tmp, out_path)
+    threads = ffmpeg_threads(render_jobs())
+    stderr = ""
+    for codec in clip_codecs(threads):
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-filter_complex_threads", str(threads),
+            *inputs,
+            "-filter_complex", ";".join(graph),
+            "-map", "[v]", "-frames:v", str(frames), "-r", str(FPS),
+            *codec, "-an", tmp,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0 and os.path.exists(tmp):
+            os.replace(tmp, out_path)
+            return
+        stderr = result.stderr
+        encoder_failed(codec)
+    raise RuntimeError(f"clip render failed: {stderr[:300]}")
 
 
 # Stills (full-range JPEG) are turned into video (limited) range once, before they are held,
@@ -1245,34 +1328,78 @@ def run_ffmpeg_progress(cmd, seconds, on_fraction=None, timeout=7200):
     return proc.returncode, stderr
 
 
+def _env_int(name):
+    try:
+        v = int(os.environ.get(name, ""))
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
 def render_jobs():
-    """ffmpeg runs at once while rendering clips and chunks: about one per three cores, 2 to 6."""
-    return max(2, min(6, (os.cpu_count() or 4) // 3))
+    """ffmpeg runs at once while rendering clips: about one per three cores, 2 to 6
+    (MANGAVOX_RENDER_JOBS overrides)."""
+    return _env_int("MANGAVOX_RENDER_JOBS") or max(2, min(6, (os.cpu_count() or 4) // 3))
 
 
-def _render_chunk(paths, starts, trans, out_path, seconds=0.0, on_fraction=None):
-    """Crossfade a run of clips into one intermediate video."""
-    inputs = []
-    graph = []
-    labels = []
-    for i, p in enumerate(paths):
-        inputs += ["-i", p]
-        graph.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[c{i}]")
-        labels.append(f"c{i}")
-    graph.append(xfade_chain(labels, starts, trans, "v"))
-    tmp = out_path + ".part.mp4"
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        *inputs,
-        "-filter_complex", ";".join(graph),
-        "-map", "[v]", "-r", str(FPS),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-an", tmp,
-    ]
-    code, stderr = run_ffmpeg_progress(cmd, seconds, on_fraction, timeout=3600)
-    if code != 0 or not os.path.exists(tmp):
-        raise RuntimeError(f"Failed to join clips: {stderr[:300]}")
-    os.replace(tmp, out_path)
+def ffmpeg_threads(jobs):
+    """Threads each of `jobs` ffmpeg runs side by side may use (MANGAVOX_FFMPEG_THREADS
+    overrides), so together they fill the cores without swamping them and the PC stays usable."""
+    return _env_int("MANGAVOX_FFMPEG_THREADS") or max(2, (os.cpu_count() or 4) // max(1, jobs))
+
+
+# Video encoders. NVENC (an NVIDIA GPU) when this ffmpeg has it and it works here, checked once
+# per process; libx264 otherwise, or with MANGAVOX_VIDEO_GPU=0. A run that fails on NVENC turns
+# it off for the rest of the process and is retried on the CPU.
+_NVENC = None
+_NVENC_LOCK = threading.Lock()
+
+
+def nvenc_available():
+    global _NVENC
+    with _NVENC_LOCK:
+        if _NVENC is None:
+            if os.environ.get("MANGAVOX_VIDEO_GPU", "").strip().lower() in ("0", "off", "false", "no"):
+                _NVENC = False
+            else:
+                try:
+                    r = subprocess.run(
+                        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=black:s=640x360:r=30:d=0.2",
+                         "-c:v", "h264_nvenc", "-preset", "p4", "-f", "null", "-"],
+                        capture_output=True, timeout=60,
+                    )
+                    _NVENC = r.returncode == 0
+                except Exception:
+                    _NVENC = False
+        return _NVENC
+
+
+def encoder_failed(codec):
+    """A run failed with `codec` (args from clip_codecs / final_codecs): stop using NVENC."""
+    global _NVENC
+    if "h264_nvenc" in codec:
+        with _NVENC_LOCK:
+            _NVENC = False
+
+
+def clip_codecs(threads):
+    """Encoder args to try in order for a clip (an intermediate, decoded once more by the
+    finish): near-lossless on the GPU, else what the CPU path always used."""
+    # A keyframe every second, so a part of the finish that starts inside a clip seeks to it.
+    cpu = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-g", str(FPS), "-pix_fmt", "yuv420p", "-threads", str(threads)]
+    gpu = ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "constqp", "-qp", "14", "-bf", "0", "-g", str(FPS), "-pix_fmt", "yuv420p"]
+    return [gpu, cpu] if nvenc_available() else [cpu]
+
+
+def final_codecs(threads):
+    """Encoder args to try in order for the finished picture."""
+    cpu = ["-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p", "-threads", str(threads)]
+    # Constant quality 27 with adaptive quantisation: measured against a near-lossless render of
+    # the same chapter it scores a little above libx264 -crf 21 (SSIM 0.9961 vs 0.9958) at about
+    # 1.3x the size.
+    gpu = ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "27", "-b:v", "0",
+           "-spatial-aq", "1", "-temporal-aq", "1", "-bf", "3", "-rc-lookahead", "20", "-pix_fmt", "yuv420p"]
+    return [gpu, cpu] if nvenc_available() else [cpu]
 
 
 def _build_narration(clips, work_dir, out_path):
@@ -1329,18 +1456,15 @@ def _retime_clips(clips, caption_segments, work_dir):
 
 
 # Share of the video step's progress bar each stage takes (they add up to 1).
-PROGRESS_SPLIT = {"prepare": 0.05, "clips": 0.55, "chunks": 0.15, "finalize": 0.25}
+PROGRESS_SPLIT = {"prepare": 0.05, "clips": 0.6, "finalize": 0.35}
 
 
 class _Progress:
     """Maps stage-local 0..1 fractions onto one 0..1000 bar for progress_cb("video", ...)."""
 
-    def __init__(self, cb, has_chunks):
+    def __init__(self, cb):
         self.cb = cb
-        split = dict(PROGRESS_SPLIT)
-        if not has_chunks:
-            split["clips"] += split.pop("chunks")
-        self.split = split
+        self.split = dict(PROGRESS_SPLIT)
         self.last = -1
 
     def __call__(self, stage, fraction):
@@ -1424,12 +1548,13 @@ def apply_edit_clips(items, clips):
     return out
 
 
-def overlay_graph(overlays, w, h, total, src, out, first_input, work_dir):
+def overlay_graph(overlays, w, h, total, src, out, first_input, work_dir, t0=0.0):
     """Image and text layers from the Video editor drawn over [src] (a w x h picture) into
     [out]. Each overlay: kind "image" (path, scale = width share of the frame) or "text" (text,
     size = height share of the frame, color, box), centred at x/y percent, with opacity, shown
     from start to end seconds. Images become ffmpeg inputs from `first_input` on; text is read
-    from files in `work_dir`. Returns (extra input args, filter string)."""
+    from files in `work_dir`. `t0` is where [src] starts on the video's clock (a part of the
+    video made on its own): the images are shifted to it. Returns (extra input args, filter string)."""
     from caption_engine import FONTS_DIR, ffmpeg_filter_path
     inputs, parts = [], []
     cur = src
@@ -1452,9 +1577,10 @@ def overlay_graph(overlays, w, h, total, src, out, first_input, work_dir):
                 continue
             ow = max(2, round(w * _num(o.get("scale"), 0.2, 0.02, 1.0)) // 2 * 2)
             idx = first_input + len(inputs) // 6
+            shift = f",setpts=PTS+{t0:.6f}/TB" if t0 else ""
             inputs += ["-loop", "1", "-t", f"{total:.3f}", "-i", path]
             parts.append(
-                f"[{idx}:v]scale={ow}:-2,format=rgba,colorchannelmixer=aa={alpha:.2f}[{nxt}_i];"
+                f"[{idx}:v]scale={ow}:-2,format=rgba,colorchannelmixer=aa={alpha:.2f}{shift}[{nxt}_i];"
                 f"[{cur}][{nxt}_i]overlay=x='{x:.4f}*W-w/2':y='{y:.4f}*H-h/2':{enable}[{nxt}]"
             )
         elif o.get("kind") == "text":
@@ -1577,7 +1703,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     elif os.path.exists(final_video) and os.path.getsize(final_video) > 1000 and (fmt == "reels") == os.path.isdir(reels_dir):
         return final_video
 
-    report = _Progress(progress_cb, False)
+    report = _Progress(progress_cb)
 
     # ── Step 1: Resolve every clip (image, audio slice, timing) and prepare its stills ──
     clips = []
@@ -1595,15 +1721,15 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     duo_prev = None
     last_impact = -IMPACT_GAP
 
-    for idx, seg in enumerate(render_items):
-        report("prepare", idx / total)
-
+    def prepare(idx, seg):
+        """The clip's source, focus crop and stills (independent of every other clip, so they
+        are made side by side), or None when it cannot be shown."""
         page_num = seg["page"]
         audio_file = seg.get("audio_file", f"page_{page_num:04d}.wav")
         audio_path = os.path.join(audio_dir, audio_file)
 
         if not os.path.exists(audio_path):
-            continue
+            return None
 
         # Image: a beat carries its exact panel crop; otherwise resolve the page.
         page_image = seg.get("panel_image") if use_beats else None
@@ -1619,7 +1745,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         if not page_image and isinstance(page_num, int) and page_num < len(page_files):
             page_image = page_files[page_num]
         if not page_image:
-            continue
+            return None
         source_image = page_image
 
         # Crop to focus point if present (aspect matched to the panel box, or to a half of
@@ -1644,6 +1770,39 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         else:
             focus_point = None
 
+        override = seg.get("motion") if seg.get("motion") in EDIT_MOTIONS else None
+        try:
+            tall = False
+            # A beat may ask to be shown whole ("layout": "single"), like the hook's closing cover,
+            # and an editor motion other than a shake moves the panel on its own.
+            if duo_on and seg.get("layout") != "single" and override in (None, "shake"):
+                from PIL import Image
+                with Image.open(page_image) as im:
+                    tall = im.width < DUO_MAX_ASPECT * im.height
+            if tall:
+                # Placed in its half below (the stills are the same for either half).
+                duo, images = _prepare_duo_images(page_image, idx, w, h, 0, video_dir, look["glow"], inset, drift), None
+            else:
+                duo, images = None, _prepare_clip_images(page_image, idx, w, h, fill, video_dir, look["glow"], inset, drift)
+        except Exception as e:
+            print(f"[video] Skipping unreadable image for page {page_num}: {e}", file=sys.stderr)
+            return None
+        return {"audio_path": audio_path, "source": source_image, "focus": focus_point, "duo": duo, "images": images}
+
+    prepared = [None] * total
+    with ThreadPoolExecutor(max_workers=max(2, min(16, os.cpu_count() or 4))) as pool:
+        futures = {pool.submit(prepare, idx, seg): idx for idx, seg in enumerate(render_items)}
+        for n, done in enumerate(as_completed(futures)):
+            prepared[futures[done]] = done.result()
+            report("prepare", (n + 1) / total)
+
+    for idx, seg in enumerate(render_items):
+        p = prepared[idx]
+        if p is None:
+            continue
+        page_num = seg["page"]
+        audio_path, source_image, focus_point = p["audio_path"], p["source"], p["focus"]
+
         # For beats, play just this panel's slice of the page audio; for pages,
         # use the whole file.
         audio_offset = 0.0
@@ -1661,34 +1820,23 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         duration = round(duration, 3)
 
         override = seg.get("motion") if seg.get("motion") in EDIT_MOTIONS else None
-        try:
-            tall = False
-            # A beat may ask to be shown whole ("layout": "single"), like the hook's closing cover,
-            # and an editor motion other than a shake moves the panel on its own.
-            if duo_on and seg.get("layout") != "single" and override in (None, "shake"):
-                from PIL import Image
-                with Image.open(page_image) as im:
-                    tall = im.width < DUO_MAX_ASPECT * im.height
-            if tall:
-                same = duo_prev is not None and duo_prev["source"] == source_image and duo_prev["focus"] == focus_point
-                if same:
-                    duo = dict(duo_prev["duo"], hold=True, bg_prev=None)
-                else:
-                    slot = 0 if duo_prev is None else 1 - duo_prev["duo"]["slot"]
-                    duo = _prepare_duo_images(page_image, idx, w, h, slot, video_dir, look["glow"], inset, drift)
-                    duo["slot"] = slot
-                    # The background drifts the way the panel slides in (and back with the next).
-                    duo["bg_dir"] = 1 if slot == 0 else -1
-                    duo["bg_prev_dir"] = duo_prev["duo"].get("bg_dir", 1) if duo_prev else 1
-                    duo["bg_prev"] = duo_prev["duo"]["bg"] if duo_prev else None
-                    duo["partner"] = {"fg": duo_prev["duo"]["fg"], "geo": duo_prev["duo"]["geo"]} if duo_prev else None
-                images = None
+        if p["duo"]:
+            same = duo_prev is not None and duo_prev["source"] == source_image and duo_prev["focus"] == focus_point
+            if same:
+                duo = dict(duo_prev["duo"], hold=True, bg_prev=None)
             else:
-                duo = None
-                images = _prepare_clip_images(page_image, idx, w, h, fill, video_dir, look["glow"], inset, drift)
-        except Exception as e:
-            print(f"[video] Skipping unreadable image for page {page_num}: {e}", file=sys.stderr)
-            continue
+                slot = 0 if duo_prev is None else 1 - duo_prev["duo"]["slot"]
+                duo = dict(p["duo"], geo=duo_slot(p["duo"]["src_size"], w, h, slot, inset))
+                duo["slot"] = slot
+                # The background drifts the way the panel slides in (and back with the next).
+                duo["bg_dir"] = 1 if slot == 0 else -1
+                duo["bg_prev_dir"] = duo_prev["duo"].get("bg_dir", 1) if duo_prev else 1
+                duo["bg_prev"] = duo_prev["duo"]["bg"] if duo_prev else None
+                duo["partner"] = {"fg": duo_prev["duo"]["fg"], "geo": duo_prev["duo"]["geo"]} if duo_prev else None
+            images = None
+        else:
+            duo = None
+            images = p["images"]
 
         motion = "still"
         move = None
@@ -1737,8 +1885,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     if not clips:
         raise RuntimeError("No video segments were generated")
 
-    chunks = plan_chunks(len(clips), CHUNK_CLIPS)
-    report = _Progress(progress_cb, len(chunks) > 1)
+    report = _Progress(progress_cb)
     report("prepare", 1.0)
 
     # ── Step 2: Render each clip's video (with a tail that the next crossfade eats) ──
@@ -1825,31 +1972,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     narration = os.path.join(video_dir, "narration.wav")
     _build_narration(clips, video_dir, narration)
 
-    # ── Step 3: Crossfade runs of clips into chunks (long chapters only) ──
-    if len(chunks) == 1:
-        video_inputs = clip_paths
-        video_starts, video_trans = starts, trans
-    else:
-        video_inputs, video_starts, video_trans = [], [], []
-        jobs = []
-        for ci, (a, b) in enumerate(chunks):
-            names = [os.path.basename(p) for p in clip_paths[a:b]]
-            ckey = clip_key("", None, [names, trans[a + 1:b]], 0, w, h, fill)
-            chunk_path = os.path.join(video_dir, f"chunk_{ci:03d}_{ckey}.mp4")
-            span = (starts[b] if b < len(starts) else timeline) - starts[a]
-            if not (os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 100):
-                jobs.append((clip_paths[a:b], starts[a:b], [None] + trans[a + 1:b], chunk_path, span))
-            video_inputs.append(chunk_path)
-            video_starts.append(starts[a])
-            video_trans.append(trans[a])
-        # Chunks are independent too: join them side by side.
-        joined = len(chunks) - len(jobs)
-        report("chunks", joined / len(chunks))
-        with ThreadPoolExecutor(max_workers=render_jobs()) as pool:
-            for done in as_completed([pool.submit(_render_chunk, *j) for j in jobs]):
-                done.result()
-                joined += 1
-                report("chunks", joined / len(chunks))
+    # The clips go straight into the finish (made in parts side by side, see
+    # _finalize_video_with_audio_mix_and_captions): no intermediate join, so no extra encode.
+    video_inputs, video_starts, video_trans = clip_paths, starts, trans
 
     # ── Step 4: Burn captions + mix narration and music + move to final location ──
     bg_music = config.get("bg_music")
@@ -1963,22 +2088,71 @@ def _measure_loudness(audio_inputs, mix_graph):
         return None
 
 
+def plan_segments(starts, trans, total_frames, count, min_frames=2 * FPS):
+    """Where the finished picture is split so its parts can be made side by side: frame indexes
+    [0, c1, ..., total_frames]. Every cut sits inside one clip, after the crossfade into it has
+    finished and before the next one starts, so a part never begins mid-transition; cuts land as
+    near to total_frames / count apart as that allows, no part shorter than `min_frames`.
+    starts / trans as for xfade_chain."""
+    base = round(starts[0] * FPS)
+    first = [round(s * FPS) - base for s in starts]
+    windows = []
+    for k, s in enumerate(first):
+        lo = s + (math.ceil(trans[k][1] * FPS) + 1 if k and trans[k] else 0)
+        hi = first[k + 1] - 1 if k + 1 < len(first) else total_frames - 1
+        if lo <= hi:
+            windows.append((lo, hi))
+    cuts = [0]
+    for i in range(1, max(1, count)):
+        ideal = total_frames * i / count
+        best = None
+        for lo, hi in windows:
+            c = min(hi, max(lo, round(ideal)))
+            if c - cuts[-1] < min_frames or total_frames - c < min_frames:
+                continue
+            if best is None or abs(c - ideal) < abs(best - ideal):
+                best = c
+        if best is not None and best > cuts[-1]:
+            cuts.append(best)
+    return cuts + [total_frames]
+
+
+def segment_jobs():
+    """Parts of the finished picture made at once: each is one ffmpeg (decode, crossfades, look,
+    captions, encode) moving whole 1440p frames through memory, so more than about four at
+    once only fight over memory bandwidth (measured on a 16-core desktop): one per four cores, 2 to 4
+    (MANGAVOX_RENDER_JOBS overrides)."""
+    return _env_int("MANGAVOX_RENDER_JOBS") or max(2, min(4, (os.cpu_count() or 4) // 4))
+
+
+def _concat_list(paths, list_path):
+    """An ffmpeg concat-demuxer list of `paths`."""
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in paths:
+            q = os.path.abspath(p).replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{q}'\n")
+
+
 def _finalize_video_with_audio_mix_and_captions(
     video, narration, output_video, ass_path, bg_music,
     narration_vol, bg_vol, bg_loop, w, h, total, score=None, music_volume=1.0, on_fraction=None,
 ):
     """
-    Joins the clip/chunk videos with their crossfades, burns subtitles, and mixes the
-    narration with the score (or looped background music) in a single FFmpeg command.
-    With music, a second "Narration only" audio track is written too.
+    Joins the clip videos with their crossfades, gives them the look, burns subtitles, and
+    mixes the narration with the score (or looped background music). With music, a second
+    "Narration only" audio track is written too.
+
+    The picture is made in parts side by side (plan_segments; each its own ffmpeg, cut where no
+    transition runs, on the whole video's clock so captions and layers line up) while the audio
+    is mixed beside it; the parts are then joined without re-encoding and the audio muxed in.
 
     Loudness is two-pass and linear: the mix is measured first, then one fixed gain brings
     it to LOUD_I and a limiter catches peaks, so music never swells in narration pauses.
     """
-    inputs = []
-    for p in video["inputs"]:
-        inputs += ["-i", p]
-    n_video = len(video["inputs"])
+    import bisect
+    import threading
+    work = video.get("work_dir") or os.path.dirname(os.path.abspath(output_video))
+    os.makedirs(work, exist_ok=True)
 
     # The chapter's own score replaces any looped background track.
     has_score = bool(score) and os.path.exists(score) and music_volume > 0
@@ -1993,78 +2167,204 @@ def _finalize_video_with_audio_mix_and_captions(
             audio_inputs += ["-stream_loop", "-1"]
         audio_inputs += ["-i", bg_music]
         music_vol = bg_vol * music_volume
-
     has_music = has_score or has_bg
     if on_fraction:
         on_fraction(0.0)
-    measured = _measure_loudness(audio_inputs, _audio_mix_graph(0, has_music, narration_vol, music_vol))
-    gain_db = 0.0 if measured is None else max(-20.0, min(20.0, LOUD_I - measured))
-    limit = round(10 ** (LOUD_TP / 20), 4)
-    if on_fraction:
-        on_fraction(0.05)
 
-    graph = []
-    # 1. Video: crossfade the parts, then captions
-    labels = []
-    for i in range(n_video):
-        graph.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[p{i}]")
-        labels.append(f"p{i}")
-    graph.append(xfade_chain(labels, video["starts"], video["trans"], "vraw"))
-    # The look's finish (grade, colour, particles, vignette, grain, bars) under the captions.
-    first_extra = n_video + audio_inputs.count("-i")
-    extra_inputs = []
-    if video.get("look"):
-        particles = None
-        if video["look"].get("particles") and video.get("particles") and os.path.exists(video["particles"]):
-            extra_inputs = ["-stream_loop", "-1", "-i", video["particles"]]
-            particles = f"{first_extra}:v"
-        graph.append(look_filters(video["look"], w, h, "vraw", "vx", particles))
-    else:
-        graph.append("[vraw]null[vx]")
-    # The editor's image and text layers, over the picture and under the captions.
-    first_overlay = first_extra + extra_inputs.count("-i")
-    overlay_inputs, overlays = overlay_graph(video.get("overlays"), w, h, total, "vx", "vo", first_overlay, video.get("work_dir") or ".")
-    graph.append(overlays)
+    # ── Audio (made beside the picture): measure, then one gain, a limiter, AAC ──
+    audio_path = os.path.join(work, "final_audio.m4a")
+
+    def make_audio():
+        measured = _measure_loudness(audio_inputs, _audio_mix_graph(0, has_music, narration_vol, music_vol))
+        gain_db = 0.0 if measured is None else max(-20.0, min(20.0, LOUD_I - measured))
+        limit = round(10 ** (LOUD_TP / 20), 4)
+        graph = [
+            _audio_mix_graph(0, has_music, narration_vol, music_vol, solo=has_music),
+            f"[mix]volume={gain_db:.2f}dB,alimiter=limit={limit}:level=0:latency=1,aresample={AUDIO_RATE}[a]",
+        ]
+        maps = ["-map", "[a]"]
+        if has_music:
+            graph.append(f"[solo]volume={gain_db:.2f}dB,alimiter=limit={limit}:level=0:latency=1,aresample={AUDIO_RATE}[a2]")
+            maps += ["-map", "[a2]"]
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *audio_inputs,
+            "-filter_complex", ";".join(graph), *maps,
+            "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-t", f"{total:.3f}", audio_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if result.returncode != 0 or not os.path.exists(audio_path):
+            raise RuntimeError(f"audio mix failed: {result.stderr[:300]}")
+
+    # ── The picture, in parts ──
+    starts, trans = video["starts"], video["trans"]
+    base = round(starts[0] * FPS)
+    first = [round(s * FPS) - base for s in starts]
+    total_frames = max(1, math.ceil(total * FPS - 1e-6))
+    jobs = segment_jobs()
+    # Two parts per job at least, and no more than about four clips per part (each opens its
+    # clips at the frames it needs), so a long chapter never opens dozens of decoders at once.
+    count = max(jobs * 2, math.ceil(len(starts) / 4))
+    cuts = plan_segments(starts, trans, total_frames, max(1, min(count, total_frames // (3 * FPS))))
+    parts = [(a, b, os.path.join(work, f"final_{i:03d}.mp4")) for i, (a, b) in enumerate(zip(cuts, cuts[1:]))]
+    jobs = min(jobs, len(parts))
+    threads = ffmpeg_threads(jobs)
     has_subs = bool(ass_path) and os.path.exists(ass_path)
-    if has_subs:
-        from caption_engine import subtitles_filter
-        graph.append(f"[vo]{subtitles_filter(ass_path)},format=yuv420p[v]")
-    else:
-        graph.append("[vo]format=yuv420p[v]")
+    particles = video.get("particles") if video.get("look") and video["look"].get("particles") else None
+    if particles and not os.path.exists(particles):
+        particles = None
+    vmask = None
+    if video.get("look") and vignette_angle(video["look"]):
+        try:
+            vmask = make_vignette_mask(w, h, vignette_angle(video["look"]), work)
+        except Exception as e:
+            print(f"[video] {e}; using the vignette filter", file=sys.stderr)
 
-    # 2. Audio: mix, one measured gain, limiter (and the narration alone, when there is music)
-    graph.append(_audio_mix_graph(n_video, has_music, narration_vol, music_vol, solo=has_music))
-    graph.append(f"[mix]volume={gain_db:.2f}dB,alimiter=limit={limit}:level=0:latency=1,aresample={AUDIO_RATE}[a]")
-    maps = ["-map", "[v]", "-map", "[a]"]
-    # MP4 keeps a track's name as its handler name (players list tracks by it).
-    first = "Narration + music" if has_music else "Narration"
-    tracks = ["-metadata:s:a:0", f"title={first}", "-metadata:s:a:0", f"handler_name={first}", "-disposition:a:0", "default"]
-    if has_music:
-        graph.append(f"[solo]volume={gain_db:.2f}dB,alimiter=limit={limit}:level=0:latency=1,aresample={AUDIO_RATE}[a2]")
-        maps += ["-map", "[a2]"]
-        tracks += ["-metadata:s:a:1", "title=Narration only", "-metadata:s:a:1", "handler_name=Narration only", "-disposition:a:1", "0"]
+    def part_cmd(a, b, path, codec):
+        ka = bisect.bisect_right(first, a) - 1
+        kb = bisect.bisect_right(first, b - 1) - 1
+        inputs, graph, labels = [], [], []
 
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        *inputs, *audio_inputs, *extra_inputs, *overlay_inputs,
-        "-filter_complex", ";".join(graph),
-        *maps,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", str(FPS),
-        "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE),
-        *tracks,
-        "-t", f"{total:.3f}",
-        "-movflags", "+faststart",
-        output_video,
-    ]
+        def clip_input(k, start):
+            """Clip k from its frame `start` (seeking half a frame early, so rounding never
+            drops that frame; only frames from the keyframe before it are decoded)."""
+            seek = ["-ss", f"{(start - 0.5) / FPS:.6f}"] if start else []
+            inputs.extend(["-threads", str(threads), *seek, "-i", video["inputs"][k]])
+            n = len(labels)
+            labels.append(f"p{n}")
+            graph.append(f"[{n}:v]settb=AVTB,setpts=PTS-STARTPTS[p{n}]")
+            return f"p{n}"
+
+        # The part as a run of pieces: each clip alone between transitions, and each transition
+        # crossfaded from just the frames it covers. Every input is opened at the frame it is
+        # needed from, so nothing is decoded twice or held in memory waiting for its turn.
+        ends = []
+        for k in range(ka + 1, kb + 1):
+            ends.append(min(b, first[k] + math.ceil(trans[k][1] * FPS) + 1))
+        overlapping = any(e > (first[k + 1] if k + 1 <= kb else b) for k, e in zip(range(ka + 1, kb + 1), ends))
+        if overlapping:
+            # Transitions closer together than their own length: one crossfade chain instead.
+            labels_ = [clip_input(k, a - first[k] if k == ka else 0) for k in range(ka, kb + 1)]
+            graph.append(xfade_chain(labels_, [(a + base) / FPS] + list(starts[ka + 1:kb + 1]), [None] + list(trans[ka + 1:kb + 1]), "vcat"))
+        else:
+            pieces = []
+            pos = a
+            for k in range(ka, kb + 1):
+                if k > ka:
+                    # The transition into clip k: from where it starts until it has finished. It is
+                    # crossfaded from one frame earlier and that frame dropped, so the crossfade's
+                    # offset (a hair before the frame, see xfade_chain) is the whole video's.
+                    end = ends[k - ka - 1]
+                    prev = clip_input(k - 1, first[k] - 1 - first[k - 1])
+                    cur = clip_input(k, 0)
+                    graph.append(xfade_chain([prev, cur], [(first[k] - 1) / FPS, first[k] / FPS], [None, trans[k]], f"x{k}"))
+                    graph.append(f"[x{k}]trim=start_frame=1:end_frame={end - first[k] + 1},setpts=PTS-STARTPTS[t{k}]")
+                    pieces.append(f"t{k}")
+                    pos = end
+                stop = min(b, first[k + 1]) if k < kb else b
+                if stop > pos:
+                    lab = clip_input(k, pos - first[k])
+                    graph.append(f"[{lab}]trim=end_frame={stop - pos},setpts=PTS-STARTPTS[s{k}]")
+                    pieces.append(f"s{k}")
+                    pos = stop
+            if len(pieces) == 1:
+                graph.append(f"[{pieces[0]}]null[vcat]")
+            else:
+                graph.append("".join(f"[{q}]" for q in pieces) + f"concat=n={len(pieces)}:v=1:a=0[vcat]")
+        # Back on an exact frame clock, starting at 0.
+        graph.append(f"[vcat]settb=AVTB,setpts=N/({FPS}*TB)[vrel]")
+        # On the whole video's clock from here, so the captions, layers and particles line up.
+        t0 = a / FPS
+        graph.append(f"[vrel]setpts=PTS+{t0:.6f}/TB[vraw]")
+        extra = []
+        if video.get("look"):
+            plabel = vlabel = None
+            if particles:
+                loop = round(PARTICLE_SEC * FPS)
+                graph.append(f"[{len(labels) + extra.count('-i')}:v]trim=start_frame={a % loop},settb=AVTB,setpts=(N+{a})/({FPS}*TB)[ptc]")
+                extra += ["-stream_loop", "-1", "-i", particles]
+                plabel = "ptc"
+            if vmask:
+                # One still: overlay repeats it on every frame.
+                vlabel = f"{len(labels) + extra.count('-i')}:v"
+                extra += ["-i", vmask]
+            graph.append(look_filters(video["look"], w, h, "vraw", "vx", plabel, vlabel))
+        else:
+            graph.append("[vraw]null[vx]")
+        overlay_inputs, overlays = overlay_graph(
+            video.get("overlays"), w, h, total, "vx", "vo", len(labels) + extra.count("-i"), work, t0=t0,
+        )
+        graph.append(overlays)
+        if has_subs:
+            from caption_engine import subtitles_filter
+            graph.append(f"[vo]{subtitles_filter(ass_path)},setpts=PTS-STARTPTS,format=yuv420p[v]")
+        else:
+            graph.append("[vo]setpts=PTS-STARTPTS,format=yuv420p[v]")
+        return [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-filter_complex_threads", str(threads),
+            *inputs, *extra, *overlay_inputs,
+            "-filter_complex", ";".join(graph),
+            "-map", "[v]", "-frames:v", str(b - a), "-r", str(FPS),
+            *codec, "-an", path,
+        ]
+
+    lock = threading.Lock()
+    progress = {}
+
+    def report_part(i, f):
+        if on_fraction:
+            with lock:
+                progress[i] = f * (parts[i][1] - parts[i][0])
+                on_fraction(min(0.98, 0.98 * sum(progress.values()) / total_frames))
+
+    def make_part(i):
+        a, b, path = parts[i]
+        tmp = path + ".part.mp4"
+        stderr = ""
+        for codec in final_codecs(threads):
+            code, stderr = run_ffmpeg_progress(part_cmd(a, b, tmp, codec), (b - a) / FPS, lambda f: report_part(i, f), timeout=3600)
+            if code == 0 and os.path.exists(tmp):
+                os.replace(tmp, path)
+                return
+            print(f"[video] Part {i + 1} of the picture failed with {codec[1]}: {stderr[:300]}", file=sys.stderr)
+            encoder_failed(codec)
+        raise RuntimeError(f"part {i + 1} of the picture failed: {stderr[:300]}")
 
     try:
-        code, stderr = run_ffmpeg_progress(
-            cmd, total, (lambda f: on_fraction(0.05 + 0.95 * f)) if on_fraction else None,
-        )
-        if code != 0:
-            print(f"[video] Finalization command failed: {stderr[:400]}", file=sys.stderr)
+        # The audio takes a slot of its own for its second or two.
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(make_audio)] + [pool.submit(make_part, i) for i in range(len(parts))]
+            for f in as_completed(futures):
+                f.result()
+    except Exception as e:
+        print(f"[video] Finalization failed: {e}", file=sys.stderr)
+        return False
+
+    # ── Join the parts (no re-encode) and mux the audio in ──
+    list_path = os.path.join(work, "final_parts.txt")
+    _concat_list([p for _, _, p in parts], list_path)
+    first_track = "Narration + music" if has_music else "Narration"
+    # MP4 keeps a track's name as its handler name (players list tracks by it).
+    tracks = ["-metadata:s:a:0", f"title={first_track}", "-metadata:s:a:0", f"handler_name={first_track}", "-disposition:a:0", "default"]
+    if has_music:
+        tracks += ["-metadata:s:a:1", "title=Narration only", "-metadata:s:a:1", "handler_name=Narration only", "-disposition:a:1", "0"]
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", list_path, "-i", audio_path,
+        "-map", "0:v:0", "-map", "1:a", "-c", "copy",
+        # The concat demuxer rounds each part's length, which drifts the picture's timestamps by
+        # a fraction of a millisecond per part: snap them back onto the frame clock.
+        "-bsf:v", f"setts=pts=round(PTS*TB*{FPS})/(TB*{FPS}):dts=round(DTS*TB*{FPS})/(TB*{FPS})",
+        *tracks,
+        "-movflags", "+faststart", output_video,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if result.returncode != 0:
+            print(f"[video] Joining the picture failed: {result.stderr[:400]}", file=sys.stderr)
             return False
+        if on_fraction:
+            on_fraction(1.0)
         return os.path.exists(output_video) and os.path.getsize(output_video) > 1000
     except Exception as e:
-        print(f"[video] Finalization command error: {e}", file=sys.stderr)
+        print(f"[video] Joining the picture failed: {e}", file=sys.stderr)
         return False
