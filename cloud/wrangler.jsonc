@@ -1,0 +1,22 @@
+// MangaVox cloud relay: https://app.bhippi.com/mangavox (native/crates/ui-phone/CLOUD.md).
+// `npm run dev` runs it on http://localhost:8787/mangavox; point a dev build at it with
+// MANGAVOX_CLOUD_URL=http://localhost:8787/mangavox.
+{
+  "name": "mangavox-relay",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-27",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "not_found_handling": "none"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "Room" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  // app.bhippi.com serves only this Worker: the connector page is the phone's trust anchor, and
+  // anything else on the same origin could use its keys (CLOUD.md, "Threat notes").
+  "routes": [{ "pattern": "app.bhippi.com", "custom_domain": true }],
+  "observability": { "enabled": true }
+}

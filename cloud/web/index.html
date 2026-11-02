@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#09090f">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MangaVox">
+<title>MangaVox</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon.png">
+<link rel="apple-touch-icon" href="icon-512.png">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="connect.js"></script>
+</head>
+<body>
+<main class="card" id="card">
+  <img class="logo" src="icon.png" alt="" width="64" height="64">
+  <h1 id="title">MangaVox</h1>
+  <p class="lead" id="lead">Connecting…</p>
+
+  <section id="choose" hidden>
+    <a class="opt" id="opt-lan" href="#">
+      <span class="ic" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M2 8.5a15 15 0 0 1 20 0M5 12a10 10 0 0 1 14 0M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1.2"/></svg>
+      </span>
+      <span class="txt"><b>Same Wi‑Fi</b><small>Fastest. Works while your phone is on your PC’s network.</small></span>
+    </a>
+    <button class="opt" id="opt-cloud" type="button">
+      <span class="ic" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .6-7.96A6 6 0 0 0 6.1 9.1 4.5 4.5 0 0 0 7 18z"/><path d="M10 13.5l1.6 1.6 3-3.2"/></svg>
+      </span>
+      <span class="txt"><b>From anywhere</b><small>End‑to‑end encrypted. Works on mobile data or any Wi‑Fi.</small></span>
+    </button>
+  </section>
+
+  <section id="busy" hidden>
+    <div class="spin" aria-hidden="true"></div>
+  </section>
+
+  <section id="actions" hidden>
+    <button class="btn" id="retry" type="button" hidden>Try again</button>
+    <button class="btn ghost" id="forget" type="button" hidden>Forget this PC</button>
+  </section>
+
+  <p class="fine" id="fine">End-to-end encrypted between this phone and your PC.</p>
+</main>
+<iframe id="app" title="MangaVox" allow="fullscreen; picture-in-picture; autoplay; clipboard-write; screen-wake-lock" allowfullscreen hidden></iframe>
+</body>
+</html>

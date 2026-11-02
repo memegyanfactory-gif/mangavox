@@ -57,6 +57,10 @@ pub fn start() {
     let port = Some(state::settings().port).filter(|p| *p != 0).unwrap_or(state::DEFAULT_PORT);
     let task = mv_ui::bg::runtime().spawn(run(generation, port, rx));
     *g = Some(Running { generation, stop: tx, task });
+    drop(g);
+    if state::settings().cloud {
+        crate::cloud::start();
+    }
 }
 
 /// Stops the server; paired phones stay paired for next time.
@@ -72,6 +76,7 @@ pub fn stop() {
         });
         eprintln!("[phone] server stopped");
     }
+    crate::cloud::stop();
     api_watch::stop_all();
     state::set_status(state::Status::default());
 }
@@ -266,14 +271,19 @@ pub fn test_router() -> Router {
 
 const CSP: &str = "default-src 'self'; img-src 'self' data: blob: http: https:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; \
                    script-src 'self'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+/// Through the cloud the app runs in a frame of the relay's connector page (CLOUD.md, "On the
+/// phone"), which is the same origin: only that page may frame it.
+const CLOUD_CSP: &str = "default-src 'self'; img-src 'self' data: blob: https:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; \
+                         script-src 'self'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'self'; base-uri 'none'; form-action 'self'";
 
 async fn security_headers(req: Request, next: Next) -> Response {
+    let cloud = req.extensions().get::<auth::CloudPeer>().is_some();
     let mut r = next.run(req).await;
     let h = r.headers_mut();
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     h.insert("referrer-policy", HeaderValue::from_static("same-origin"));
-    h.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    h.entry(header::CONTENT_SECURITY_POLICY).or_insert(HeaderValue::from_static(CSP));
+    h.insert("x-frame-options", HeaderValue::from_static(if cloud { "SAMEORIGIN" } else { "DENY" }));
+    h.entry(header::CONTENT_SECURITY_POLICY).or_insert(HeaderValue::from_static(if cloud { CLOUD_CSP } else { CSP }));
     let json = h.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("application/json"));
     if json {
         h.entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));

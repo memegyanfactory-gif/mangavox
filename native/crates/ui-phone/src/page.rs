@@ -8,12 +8,13 @@ use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius, ramp, space};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
-    btn, confirm_inline, empty_view, glyphs, inline_alert, ph, ph_icon, pulse_dot, section_header, size, spinner, switch, AlertKind, ButtonKind, Ph, RampExt as _, Tokens,
-    Weight, MONO_FONT,
+    btn, confirm_inline, empty_view, glyphs, icon_tag, inline_alert, ph, ph_icon, pulse_dot, section_header, size, spinner, switch, AlertKind, ButtonKind, Ph, RampExt as _,
+    Tokens, Tone, Weight, MONO_FONT,
 };
 
 use crate::auth::{self, Device};
-use crate::state::{self, Status};
+use crate::cloud;
+use crate::state::{self, CloudStatus, Status};
 
 const SUBTITLE: &str = "Read, listen, generate and control MangaVox from your phone on the same Wi-Fi.";
 /// The QR code's side in px.
@@ -25,6 +26,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// page that is not visible never replaces the code the visible one shows.
 struct Code {
     code: String,
+    /// The cloud code issued with it (CLOUD.md, "QR code").
+    cloud: String,
     issued: Instant,
     /// Paired phones when the code was issued: one more means it was used.
     devices: usize,
@@ -32,9 +35,10 @@ struct Code {
 
 static CODE: Mutex<Option<Code>> = Mutex::new(None);
 
-/// The current code and when it was issued; issues a new one when there is none, it expired, a
-/// phone paired with it, or `force`.
-fn current_code(devices: usize, force: bool) -> Option<(String, Instant)> {
+/// The current codes (Wi-Fi, cloud) and when they were issued; issues new ones when there are
+/// none, they expired, a phone paired with them, the cloud code was used (a phone asked, allowed
+/// or not), or `force`.
+fn current_code(devices: usize, cloud_on: bool, force: bool) -> Option<(String, String, Instant)> {
     let mut cur = CODE.lock().unwrap_or_else(|e| e.into_inner());
     let ttl = Duration::from_secs(auth::PAIR_TTL_SECS);
     let stale = match cur.as_mut() {
@@ -43,14 +47,16 @@ fn current_code(devices: usize, force: bool) -> Option<(String, Instant)> {
             let used = devices > c.devices;
             // A phone removed: remember the lower count so the next pairing still renews.
             c.devices = c.devices.min(devices);
-            force || used || c.issued.elapsed() >= ttl
+            let cloud_used = cloud_on && auth::cloud_code_current(Instant::now()).as_deref() != Some(c.cloud.as_str());
+            force || used || cloud_used || c.issued.elapsed() >= ttl
         }
     };
     if stale {
         let code = auth::new_pair_code();
-        *cur = (!code.is_empty()).then(|| Code { code, issued: Instant::now(), devices });
+        let cloud = auth::new_cloud_code();
+        *cur = (!code.is_empty()).then(|| Code { code, cloud, issued: Instant::now(), devices });
     }
-    cur.as_ref().map(|c| (c.code.clone(), c.issued))
+    cur.as_ref().map(|c| (c.code.clone(), c.cloud.clone(), c.issued))
 }
 
 fn forget_code() {
@@ -59,6 +65,11 @@ fn forget_code() {
 
 pub struct MobilePage {
     enabled: bool,
+    /// Cloud access (from anywhere) is on.
+    cloud: bool,
+    cloud_status: CloudStatus,
+    /// Phones waiting for Allow / Deny.
+    asking: Vec<cloud::Pending>,
     status: Status,
     devices: Vec<Device>,
     epoch: u64,
@@ -96,8 +107,12 @@ impl MobilePage {
                 break;
             }
         });
+        let settings = state::settings();
         let mut page = Self {
-            enabled: state::settings().enabled,
+            enabled: settings.enabled,
+            cloud: settings.cloud,
+            cloud_status: state::cloud_status(),
+            asking: cloud::pending(),
             status: state::status(),
             devices: vec![],
             epoch: state::epoch(),
@@ -179,6 +194,8 @@ impl MobilePage {
     fn refresh(&mut self) {
         self.epoch = state::epoch();
         self.status = state::status();
+        self.cloud_status = state::cloud_status();
+        self.asking = cloud::pending();
         self.devices = auth::devices();
         self.devices.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         // An error counts only once the server reported after this start (not a stale one).
@@ -202,7 +219,7 @@ impl MobilePage {
             self.run_checks(cx);
         }
         if self.status.running {
-            current_code(self.devices.len(), false);
+            current_code(self.devices.len(), self.cloud, false);
         }
         if self.starting.is_some_and(|t| t.elapsed() >= START_TIMEOUT) {
             self.starting = None;
@@ -251,7 +268,36 @@ impl MobilePage {
     }
 
     fn new_code(&mut self, cx: &mut Context<Self>) {
-        current_code(self.devices.len(), true);
+        current_code(self.devices.len(), self.cloud, true);
+        cx.notify();
+    }
+
+    fn set_cloud(&mut self, on: bool, cx: &mut Context<Self>) {
+        let mut s = state::settings();
+        s.cloud = on;
+        state::save_settings(&s);
+        self.cloud = on;
+        if on && self.enabled {
+            cloud::start();
+        } else {
+            cloud::stop();
+        }
+        current_code(self.devices.len(), on, true);
+        self.refresh();
+        cx.notify();
+    }
+
+    fn answer(&mut self, id: u64, allow: bool, name: String, cx: &mut Context<Self>) {
+        cloud::answer(id, allow);
+        self.refresh();
+        let msg = if allow { format!("{name} can now connect from anywhere") } else { format!("{name} was not allowed") };
+        toast::show(cx, Toast::success(msg));
+        cx.notify();
+    }
+
+    fn set_control(&mut self, id: String, on: bool, cx: &mut Context<Self>) {
+        auth::set_control(&id, on);
+        self.refresh();
         cx.notify();
     }
 
@@ -349,10 +395,17 @@ impl MobilePage {
 
     /// The QR code card, or the reason there is none yet.
     fn qr_card(&self, cx: &mut Context<Self>) -> Div {
-        let code = self.status.running.then(|| current_code(self.devices.len(), false)).flatten();
-        let url = code.as_ref().and_then(|(c, _)| state::pair_url(c));
+        let code = self.status.running.then(|| current_code(self.devices.len(), self.cloud, false)).flatten();
+        let url = code.as_ref().and_then(|(c, cloud_code, _)| {
+            let lan = state::pair_url(c);
+            if self.cloud {
+                cloud::pair_link(cloud_code, lan.as_deref())
+            } else {
+                lan
+            }
+        });
         let body = match (&url, &code) {
-            (Some(url), Some((_, issued))) => {
+            (Some(url), Some((_, _, issued))) => {
                 let left = auth::PAIR_TTL_SECS.saturating_sub(issued.elapsed().as_secs());
                 div()
                     .flex()
@@ -414,12 +467,128 @@ impl MobilePage {
                     .text_size(px(size::SM))
                     .line_height(px(18.))
                     .text_color(Tokens::text_3())
-                    .child("Scan with your phone's camera. The code works once and only for 5 minutes, so nobody else on your network can connect without it."),
+                    .child(if self.cloud {
+                        "Scan with your phone's camera, then choose Same Wi-Fi or From anywhere. The code works once and only for 5 minutes."
+                    } else {
+                        "Scan with your phone's camera. The code works once and only for 5 minutes, so nobody else on your network can connect without it."
+                    }),
             )
     }
 
-    /// Status, the address and the steps beside the code.
-    fn details(&self) -> Div {
+    /// A phone that scanned the code and asks to connect from anywhere: Allow / Deny.
+    fn asking_card(&self, p: &cloud::Pending, cx: &mut Context<Self>) -> Div {
+        let left = cloud::APPROVAL_WAIT.saturating_sub(p.asked.elapsed()).as_secs();
+        let (id, name) = (p.id, p.name.clone());
+        let name2 = name.clone();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(space::LG))
+            .p(px(space::XL))
+            .rounded(px(radius::XL))
+            .bg(Tokens::accent_soft())
+            .border_1()
+            .border_color(Tokens::accent_border())
+            .child(tile(ph::CLOUD, 44.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(260.))
+                    .gap(px(2.))
+                    .child(div().ramp(ramp::SUBTITLE_2).text_color(Tokens::text_1()).child(format!("{} wants to connect from anywhere", p.name)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(space::SM))
+                            .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Code on the phone:"))
+                            .child(div().font_family(MONO_FONT).text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(p.code.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(size::SM))
+                            .line_height(px(18.))
+                            .text_color(Tokens::text_2())
+                            .child(format!("Allow only if your phone shows this same code. It could then use MangaVox from any network. ({})", countdown(left))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(space::SM))
+                    .child(btn(("deny", p.id), "Deny", ButtonKind::Secondary).on_click(cx.listener(move |this, _, _, cx| this.answer(id, false, name.clone(), cx))))
+                    .child(btn(("allow", p.id), "Allow", ButtonKind::Primary).icon(ph::CHECK).on_click(cx.listener(move |this, _, _, cx| this.answer(id, true, name2.clone(), cx)))),
+            )
+    }
+
+    /// The From anywhere switch and the relay connection's state.
+    fn cloud_row(&self, cx: &mut Context<Self>) -> Div {
+        let st = &self.cloud_status;
+        let host = cloud::base_url().split("//").nth(1).unwrap_or_default().split('/').next().unwrap_or_default().to_string();
+        let status = if !self.cloud {
+            None
+        } else if st.connected {
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(pulse_dot("cloud-live", Tokens::success(), 7.))
+                    .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("Connected to {host}"))),
+            )
+        } else if let Some(e) = &st.error {
+            Some(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(6.))
+                    .child(div().pt(px(1.)).child(ph_icon(ph::WARNING, Weight::Fill, Tokens::warning(), icon_px::SM)))
+                    .child(div().flex_1().min_w_0().text_size(px(size::SM)).line_height(px(18.)).text_color(Tokens::text_2()).child(format!("{e}. Retrying…"))),
+            )
+        } else {
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(spinner("cloud-wait", Tokens::accent(), icon_px::SM))
+                    .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("Connecting to {host}…"))),
+            )
+        };
+        div()
+            .flex()
+            .items_start()
+            .gap(px(space::MD))
+            .child(tile(ph::CLOUD, 36.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .child(div().ramp(ramp::BODY_STRONG).text_color(Tokens::text_1()).child("From anywhere"))
+                    .child(
+                        div()
+                            .text_size(px(size::SM))
+                            .line_height(px(18.))
+                            .text_color(Tokens::text_3())
+                            .child("Use MangaVox on mobile data or any Wi-Fi. Phones connect through bhippi.com, end-to-end encrypted between the phone and this PC. No router setup."),
+                    )
+                    .children(status),
+            )
+            .child(
+                switch("cloud-access", self.cloud)
+                    .tooltip(if self.cloud { "Turn off: phones can only connect on this Wi-Fi" } else { "Let paired phones connect from anywhere" })
+                    .on_click(cx.listener(|this, on: &bool, _, cx| this.set_cloud(*on, cx))),
+            )
+    }
+
+    /// Status, the address, From anywhere and the steps beside the code.
+    fn details(&self, cx: &mut Context<Self>) -> Div {
         let addr = self.status.lan_ip.zip(self.status.addr).map(|(ip, a)| format!("http://{ip}:{}", a.port()));
         let status = if self.status.running {
             div()
@@ -500,12 +669,18 @@ impl MobilePage {
             .gap(px(space::XL))
             .child(div().flex().flex_col().gap(px(space::MD)).child(status).children(url_row))
             .child(div().h(px(1.)).bg(Tokens::border()))
+            .child(self.cloud_row(cx))
+            .child(div().h(px(1.)).bg(Tokens::border()))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(space::LG))
-                    .child(step(1, "Join the same Wi-Fi", "Connect your phone to the network this PC is on."))
+                    .child(if self.cloud {
+                        step(1, "Join any network", "Same Wi-Fi is fastest; From anywhere works on mobile data too.")
+                    } else {
+                        step(1, "Join the same Wi-Fi", "Connect your phone to the network this PC is on.")
+                    })
                     .child(step(2, "Scan the code", "Open the camera and point it at the code. Tap the link that appears."))
                     .child(step(3, "Add to Home screen", "In your browser's share or menu button, choose Add to Home screen for an app-like experience.")),
             )
@@ -640,6 +815,13 @@ impl MobilePage {
         } else {
             let rows = self.devices.iter().enumerate().map(|(i, d)| {
                 let (id, name) = (d.id.clone(), d.name.clone());
+                let control_id = d.id.clone();
+                let control = d.cloud.then(|| {
+                    switch(("control", i), d.control)
+                        .label("Allow control")
+                        .tooltip("Let this phone see and control this window and use the touchpad from anywhere (it could then also allow new phones)")
+                        .on_click(cx.listener(move |this, on: &bool, _, cx| this.set_control(control_id.clone(), *on, cx)))
+                });
                 div()
                     .flex()
                     .items_center()
@@ -655,9 +837,18 @@ impl MobilePage {
                             .flex_1()
                             .min_w_0()
                             .gap(px(2.))
-                            .child(div().ramp(ramp::BODY_STRONG).text_color(Tokens::text_1()).truncate().child(d.name.clone()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(space::SM))
+                                    .min_w_0()
+                                    .child(div().ramp(ramp::BODY_STRONG).text_color(Tokens::text_1()).truncate().child(d.name.clone()))
+                                    .when(d.cloud, |r| r.child(icon_tag(ph::CLOUD, "From anywhere", Tone::Accent))),
+                            )
                             .child(div().text_size(px(size::SM)).text_color(Tokens::text_3()).truncate().child(format!("Last active {} · Paired {}", ago(now - d.last_seen), ago(now - d.created)))),
                     )
+                    .children(control)
                     .child(
                         btn(("remove", i), "Remove", ButtonKind::DangerGhost)
                             .small()
@@ -712,7 +903,13 @@ impl Render for MobilePage {
                 )
                 .into_any_element()
         } else {
-            div().flex().flex_wrap().items_start().gap(px(space::XL)).child(self.qr_card(cx)).child(self.details()).into_any_element()
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::LG))
+                .children(self.asking.clone().iter().map(|p| self.asking_card(p, cx)))
+                .child(div().flex().flex_wrap().items_start().gap(px(space::XL)).child(self.qr_card(cx)).child(self.details(cx)))
+                .into_any_element()
         };
 
         mv_ui::page("mobile-page").child(

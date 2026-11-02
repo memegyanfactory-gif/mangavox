@@ -39,6 +39,10 @@ pub struct Device {
     /// Unix seconds.
     pub created: i64,
     pub last_seen: i64,
+    /// Paired through the cloud relay (CLOUD.md) rather than on the Wi-Fi.
+    pub cloud: bool,
+    /// A cloud phone may use the remote screen and touchpad.
+    pub control: bool,
 }
 
 /// Seconds the current pairing code stays valid.
@@ -61,6 +65,10 @@ struct Code {
 }
 
 static CODE: Mutex<Option<Code>> = Mutex::new(None);
+/// The cloud pairing code, issued alongside the LAN one (CLOUD.md, "QR code").
+static CLOUD_CODE: Mutex<Option<Code>> = Mutex::new(None);
+/// Failed cloud pairings (the relay hides the phone's address, so they are counted together).
+static CLOUD_FAILS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
 static FAILS: Mutex<Option<HashMap<IpAddr, Vec<Instant>>>> = Mutex::new(None);
 
 pub(crate) fn random_b64(n: usize) -> String {
@@ -86,9 +94,56 @@ pub fn expire_pair_code_for_tests() {
     }
 }
 
+/// A fresh single-use cloud pairing code; older unused ones stop working.
+pub fn new_cloud_code() -> String {
+    let value = random_b64(32);
+    *CLOUD_CODE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Code { value: value.clone(), issued: Instant::now() });
+    value
+}
+
+/// The cloud code a pairing phone has to know, while it is valid (not used up here: see
+/// [`take_cloud_code`]). `None` while cloud pairing is rate limited.
+pub(crate) fn cloud_code_live(now: Instant) -> Option<String> {
+    if cloud_too_many_fails(now) {
+        return None;
+    }
+    cloud_code_current(now)
+}
+
+/// The cloud code on screen while it is unused and unexpired, rate limit or not: the Mobile page
+/// renews its QR code only when this changes (a rate limit must not keep replacing both codes).
+pub(crate) fn cloud_code_current(now: Instant) -> Option<String> {
+    let g = CLOUD_CODE.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().filter(|c| now.saturating_duration_since(c.issued) < Duration::from_secs(PAIR_TTL_SECS)).map(|c| c.value.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn clear_cloud_code() {
+    *CLOUD_CODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Uses up the cloud code when it still is `code` and has not expired.
+pub(crate) fn take_cloud_code(code: &str, now: Instant) -> bool {
+    take_from(&CLOUD_CODE, code, now)
+}
+
+fn cloud_too_many_fails(now: Instant) -> bool {
+    let mut g = CLOUD_FAILS.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|t| now.saturating_duration_since(*t) < FAIL_WINDOW);
+    g.len() >= MAX_FAILS
+}
+
+pub(crate) fn record_cloud_fail(now: Instant) {
+    CLOUD_FAILS.lock().unwrap_or_else(|e| e.into_inner()).push(now);
+}
+
 /// Uses up the current code when `code` matches it and it has not expired.
 fn take_code(code: &str, now: Instant) -> bool {
-    let mut g = CODE.lock().unwrap_or_else(|e| e.into_inner());
+    take_from(&CODE, code, now)
+}
+
+fn take_from(slot: &Mutex<Option<Code>>, code: &str, now: Instant) -> bool {
+    let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
     let Some(cur) = g.as_ref() else { return false };
     if now.saturating_duration_since(cur.issued) >= Duration::from_secs(PAIR_TTL_SECS) {
         *g = None;
@@ -117,14 +172,19 @@ fn record_fail(ip: IpAddr, now: Instant) {
 
 // ---------------------------------------------------------------- devices
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Stored {
     id: String,
     name: String,
     created: i64,
     last_seen: i64,
-    /// Hex SHA-256 of the session secret.
+    /// Hex SHA-256 of the session secret; empty for a cloud phone (no cookie ever matches it).
     hash: String,
+    /// A cloud phone's device key (base64url P-256 point, CLOUD.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    control: bool,
 }
 
 struct Devices {
@@ -229,7 +289,7 @@ fn hash_hex(secret: &str) -> String {
 }
 
 fn public(s: &Stored) -> Device {
-    Device { id: s.id.clone(), name: s.name.clone(), created: s.created, last_seen: s.last_seen }
+    Device { id: s.id.clone(), name: s.name.clone(), created: s.created, last_seen: s.last_seen, cloud: s.key.is_some(), control: s.key.is_some() && s.control }
 }
 
 /// Paired devices, most recently seen first.
@@ -269,12 +329,10 @@ pub fn revoke_all() {
 
 /// Creates a device and returns it with its session secret (the cookie value).
 fn add_device(name: String) -> (Device, String) {
-    let mut id = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut id);
-    let id: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    let id = new_device_id();
     let secret = random_b64(32);
     let now = now_secs();
-    let s = Stored { id: id.clone(), name, created: now, last_seen: now, hash: hash_hex(&secret) };
+    let s = Stored { id: id.clone(), name, created: now, last_seen: now, hash: hash_hex(&secret), ..Default::default() };
     let dev = public(&s);
     with_devices(|d| {
         d.written.insert(id, now);
@@ -283,6 +341,64 @@ fn add_device(name: String) -> (Device, String) {
     });
     state::changed();
     (dev, secret)
+}
+
+fn new_device_id() -> String {
+    let mut id = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut id);
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Adds a phone paired through the cloud, known by its device key.
+pub(crate) fn add_cloud_device(name: String, key: String) -> Device {
+    let id = new_device_id();
+    let now = now_secs();
+    let s = Stored { id: id.clone(), name, created: now, last_seen: now, key: Some(key), ..Default::default() };
+    let dev = public(&s);
+    with_devices(|d| {
+        d.written.insert(id, now);
+        d.list.push(s);
+        save(d);
+    });
+    state::changed();
+    dev
+}
+
+/// A cloud phone and its device key.
+pub(crate) fn cloud_device(id: &str) -> Option<(Device, String)> {
+    with_devices(|d| d.list.iter().find(|s| s.id == id).and_then(|s| Some((public(s), s.key.clone()?))))
+}
+
+/// Lets a cloud phone use the remote screen and touchpad, or stops it.
+pub fn set_control(id: &str, on: bool) {
+    with_devices(|d| {
+        if let Some(s) = d.list.iter_mut().find(|s| s.id == id && s.key.is_some()) {
+            s.control = on;
+            save(d);
+        }
+    });
+    state::changed();
+}
+
+/// A cloud phone by id; refreshes its `last_seen` like [`device_for`].
+fn cloud_device_seen(id: &str) -> Option<Device> {
+    let now = now_secs();
+    let mut persisted = false;
+    let dev = with_devices(|d| {
+        let i = d.list.iter().position(|s| s.id == id && s.key.is_some())?;
+        d.list[i].last_seen = now;
+        let last = d.written.get(id).copied().unwrap_or(0);
+        if now - last >= SEEN_WRITE_EVERY {
+            d.written.insert(id.to_string(), now);
+            save(d);
+            persisted = true;
+        }
+        Some(public(&d.list[i]))
+    });
+    if persisted {
+        state::changed();
+    }
+    dev
 }
 
 /// The device a session secret belongs to; refreshes its `last_seen` (written to disk now and then).
@@ -434,8 +550,46 @@ fn host_of(headers: &HeaderMap) -> Option<&str> {
 /// The paired device making the request (set by [`guard`]; handlers take `CurrentDevice`).
 pub type CurrentDevice = Extension<Device>;
 
+/// Marks a request that came through an authenticated cloud session (`cloud.rs`). It is added
+/// in-process only, so a request from the network can never carry it.
+#[derive(Clone, Debug)]
+pub struct CloudPeer {
+    pub device: String,
+}
+
+/// Routes that see or drive the PC itself: a cloud phone needs "Allow control" for them.
+fn is_control(path: &str) -> bool {
+    path.starts_with("/api/screen/") || path == "/api/mouse"
+}
+
+/// The guard for tunnelled requests (CLOUD.md, "On the PC"): the session already proved which
+/// phone this is, so only "is it still paired" and the control switch are checked.
+async fn cloud_guard(mut req: Request, next: Next, device: &str) -> Response {
+    let path = req.uri().path().to_string();
+    if path == "/pair" {
+        return json_err(StatusCode::NOT_FOUND, "not found");
+    }
+    let Some(dev) = cloud_device_seen(device) else { return json_err(StatusCode::UNAUTHORIZED, "not paired") };
+    // The CSRF header, as on the Wi-Fi: the app sends it, a form or link from another site
+    // that reaches the connector's frame cannot.
+    if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        let csrf = req.headers().get("x-mangavox").and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() == "1");
+        if !csrf {
+            return json_err(StatusCode::FORBIDDEN, "missing X-MangaVox header");
+        }
+    }
+    if is_control(&path) && !dev.control {
+        return json_err(StatusCode::FORBIDDEN, "Remote control is off for this phone. Turn on Allow control for it in MangaVox → Mobile on your PC.");
+    }
+    req.extensions_mut().insert(dev);
+    next.run(req).await
+}
+
 /// Middleware applied to every route (see the module docs).
 pub async fn guard(mut req: Request, next: Next) -> Response {
+    if let Some(cloud) = req.extensions().get::<CloudPeer>().cloned() {
+        return cloud_guard(req, next, &cloud.device).await;
+    }
     let Some(peer) = peer_of(&req) else { return json_err(StatusCode::FORBIDDEN, "forbidden") };
     if !is_lan(peer.ip()) {
         return json_err(StatusCode::FORBIDDEN, "only devices on the local network can connect");
@@ -696,7 +850,7 @@ pub(crate) mod tests {
         // The other instance pairs phone B (its list has A too).
         let sb = random_b64(32);
         let mut list = read_store(&path).unwrap();
-        list.push(Stored { id: "bbbbbbbbbbbbbbbb".into(), name: "B".into(), created: 1, last_seen: 1, hash: hash_hex(&sb) });
+        list.push(Stored { id: "bbbbbbbbbbbbbbbb".into(), name: "B".into(), created: 1, last_seen: 1, hash: hash_hex(&sb), ..Default::default() });
         write_as_other_instance(&path, &list);
         assert_eq!(device_for(&sb).map(|d| d.id).as_deref(), Some("bbbbbbbbbbbbbbbb"), "a phone paired there gets in here");
         assert!(device_for(&sa).is_some());

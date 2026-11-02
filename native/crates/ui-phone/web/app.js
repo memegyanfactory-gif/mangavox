@@ -13,6 +13,13 @@ const LS = {
   del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } },
 };
 const PROPS = new Set(['value', 'checked', 'disabled', 'hidden', 'muted', 'indeterminate', 'selected']);
+// Through the cloud the app runs in a frame of the bhippi.com connector (CLOUD.md), which owns
+// the session and the service worker: being locked out or forgetting the phone is its job.
+const CLOUD = location.pathname.startsWith('/mangavox/') && window.parent !== window;
+const toConnector = mv => window.parent.postMessage({ mv }, location.origin);
+const REACH_PC = CLOUD
+  ? 'Make sure MangaVox is running on your PC with From anywhere turned on.'
+  : 'Make sure MangaVox is running on your PC and this phone is on the same Wi‑Fi.';
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 function safeHref(v) {
@@ -174,7 +181,8 @@ let lockedOut = false;
 function goLocked() {
   if (lockedOut) return;
   lockedOut = true;
-  location.replace('/locked');
+  if (CLOUD) toConnector('locked');
+  else location.replace('/locked');
 }
 async function api(path, opts = {}) {
   const { method = 'GET', body, signal, raw, keepalive } = opts;
@@ -305,7 +313,7 @@ function stateBox(ic, title, text, ...actions) {
 function errorState(e, retry, ...more) {
   const off = e && e.offline;
   return stateBox(off ? 'wifioff' : 'alert', off ? 'Can’t reach your PC' : 'Something went wrong',
-    off ? 'Make sure MangaVox is running on your PC and this phone is on the same Wi‑Fi.' : (e instanceof ApiError && e.message) || 'Couldn’t load this. Try again in a moment.',
+    off ? REACH_PC : (e instanceof ApiError && e.message) || 'Couldn’t load this. Try again in a moment.',
     retry && h('button', { class: 'btn primary', type: 'button', onclick: retry }, icon('refresh'), 'Try again'), ...more);
 }
 const spinner = label => h('div', { class: 'state' }, h('div', { class: 'spin-ring', role: 'progressbar', 'aria-label': label || 'Loading' }));
@@ -414,7 +422,7 @@ const ACTIVE = s => s === 'running' || s === 'limit' || s === 'waiting' || s ===
 // The Notification API, service workers and the app badge exist only in a secure context (HTTPS
 // or localhost). The companion is served over plain HTTP on the Wi-Fi, so on a phone this is
 // false today and the in-app tray stands in; the code below lights up once it is served securely.
-const canNotify = () => !!window.isSecureContext && 'Notification' in window && 'serviceWorker' in navigator;
+const canNotify = () => !CLOUD && !!window.isSecureContext && 'Notification' in window && 'serviceWorker' in navigator;
 const notifyOn = () => canNotify() && Notification.permission === 'granted' && LS.get('mv.act.notify', true) !== false;
 const swReady = () => (canNotify() ? navigator.serviceWorker.ready : Promise.reject(new Error('no service worker')));
 const QUIET_ROUTES = new Set(['reader', 'watch', 'remote', 'touchpad']);
@@ -2658,7 +2666,7 @@ function viewWatch(ctx, q) {
     catch (e) {
       clearTimeout(slow);
       if (!ctx.alive) return;
-      if (e.offline) fail('Can’t reach your PC', 'Make sure MangaVox is running on your PC and this phone is on the same Wi‑Fi.', false, begin);
+      if (e.offline) fail('Can’t reach your PC', REACH_PC, false, begin);
       else if (e.status === 503) fail('FFmpeg is needed', e.message || 'Install FFmpeg on your PC to watch this on your phone.', true, begin);
       else if (e.status === 404) fail('Can’t play this here', e.message || 'No sources found for this title.', true, begin);
       else fail('Couldn’t start playback', e.message, true, begin);
@@ -3118,7 +3126,7 @@ function viewRemote(ctx) {
   }
   function showMsg(e) {
     let title = 'Can’t show your PC', text = e.message || '';
-    if (e.offline) { title = 'Can’t reach your PC'; text = 'Make sure MangaVox is running and this phone is on the same Wi‑Fi.'; }
+    if (e.offline) { title = 'Can’t reach your PC'; text = REACH_PC; }
     else if (e.status === 409) title = 'MangaVox isn’t visible';
     else if (e.status === 501 || e.status === 404) title = 'Remote view unavailable';
     msg.replaceChildren(icon(e.offline ? 'wifioff' : 'pc'), h('b', null, title), text && h('span', null, text),
@@ -3626,6 +3634,7 @@ function viewMore(ctx) {
     try { await post('/api/logout'); } catch (e) { if (e.status !== 401) { toast(e.message, 'err'); forget.classList.remove('busy'); forget.disabled = false; return; } }
     try { localStorage.clear(); } catch { /* ignore */ }
     lockedOut = true;
+    if (CLOUD) { toConnector('forget'); return; }
     await forgetOffline();
     location.replace('/locked');
   } }, icon('logout'), 'Forget this phone');
@@ -3688,7 +3697,8 @@ function boot() {
   Act.start();
   // The app shell cached for instant, offline-tolerant starts, and system notifications: only in a
   // secure context (see canNotify), so not over the plain-HTTP Wi-Fi address today.
-  if (window.isSecureContext && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  if (!CLOUD && window.isSecureContext && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  if (CLOUD) off.textContent = 'You’re offline. Check your connection.';
   if (!location.hash || location.hash === '#' || location.hash === '#/') {
     const last = String(LS.get('mv.last', '/library'));
     history.replaceState(null, '', '#' + (/^\/[a-z]/.test(last) ? last : '/library'));

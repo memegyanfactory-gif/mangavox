@@ -9,6 +9,8 @@
 //! - `state`: the shared state (settings, pairing codes, paired devices, server status).
 //! - `auth`: pairing, device sessions and the request guard (LAN-only peers, Host check, CSRF).
 //! - `server`: binding, the router and start / stop.
+//! - `cloud`, `cloud_crypto`: access from anywhere through the bhippi.com relay, end-to-end
+//!   encrypted (CLOUD.md).
 //! - `bridge`: runs closures on the GPUI thread for the API modules (navigate, play, ...).
 //! - `api_manga`, `api_studio`, `api_media`, `api_anime`, `api_watch`, `api_img`, `screen`, `touchpad`: the `/api` routes
 //!   (`touchpad` moves the PC's real mouse pointer and types, through `SendInput`).
@@ -29,6 +31,8 @@ mod activity;
 mod studio_chain;
 pub mod auth;
 pub mod bridge;
+pub mod cloud;
+mod cloud_crypto;
 pub mod firewall;
 pub mod page;
 pub mod qr;

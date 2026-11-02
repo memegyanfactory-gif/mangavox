@@ -15,11 +15,13 @@ pub struct Settings {
     /// Phone access is on: the server runs (also after a restart).
     pub enabled: bool,
     pub port: u16,
+    /// Cloud access is on: paired phones reach this PC from anywhere through the relay (CLOUD.md).
+    pub cloud: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: false, port: DEFAULT_PORT }
+        Self { enabled: false, port: DEFAULT_PORT, cloud: false }
     }
 }
 
@@ -44,6 +46,29 @@ pub struct Status {
 }
 
 static STATUS: Mutex<Option<Status>> = Mutex::new(None);
+
+/// The relay connection, for the Mobile page.
+#[derive(Clone, Debug, Default)]
+pub struct CloudStatus {
+    pub running: bool,
+    pub connected: bool,
+    /// Why the last attempt failed (cleared once connected).
+    pub error: Option<String>,
+}
+
+static CLOUD: Mutex<Option<CloudStatus>> = Mutex::new(None);
+
+pub fn cloud_status() -> CloudStatus {
+    CLOUD.lock().map(|s| s.clone().unwrap_or_default()).unwrap_or_default()
+}
+
+pub fn set_cloud_status(s: CloudStatus) {
+    if let Ok(mut cur) = CLOUD.lock() {
+        *cur = Some(s);
+    }
+    changed();
+}
+
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
 pub fn status() -> Status {

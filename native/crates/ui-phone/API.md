@@ -42,6 +42,10 @@ JSON bodies use `Content-Type: application/json`. Errors: HTTP 4xx/5xx with `{"e
   expiry and rate limit, revocation, media path traversal incl. junctions, image proxy SSRF,
   unknown watch sessions, recap clip names and recap video sessions).
 
+- Cloud access ("From anywhere", off by default): requests that come through the bhippi.com relay
+  enter the same router with a `CloudPeer` extension instead of a peer address and get their own
+  checks; see CLOUD.md.
+
 Known limits (design tradeoffs, not bugs):
 - Plain HTTP on the LAN: someone who can sniff the Wi-Fi (open network, or a WPA2-PSK network whose
   password they know) can read the QR link as the phone opens it and the `mv_phone` cookie after, and

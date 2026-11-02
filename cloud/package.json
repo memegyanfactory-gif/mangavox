@@ -1,0 +1,14 @@
+{
+  "name": "mangavox-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs && wrangler dev --port 8787 --var SELF_ORIGIN:http://localhost:8787",
+    "deploy": "node build.mjs && wrangler deploy",
+    "test": "node test/e2e.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.125.0"
+  }
+}
