@@ -130,9 +130,30 @@ impl ForYouView {
         }
         self.generation += 1;
         let generation = self.generation;
-        self.state = Load::Loading;
+        // Shown suggestions stay up while new ones are built (a refresh asked for shows the wait).
+        let shown = matches!(self.state, Load::Ready(_));
+        if force || !shown {
+            self.state = Load::Loading;
+        }
         cx.notify();
         cx.spawn(async move |this, cx| {
+            // First open: the ones the last run kept, then build new ones only when those are stale.
+            if !force && !shown {
+                if let Ok(Some((fy, fresh))) = mv_ui::bg::blocking(suggest::for_you_kept).await {
+                    let stop = this
+                        .update(cx, |this, cx| {
+                            if this.generation != generation {
+                                return true;
+                            }
+                            this.set_ready(fy, cx);
+                            fresh
+                        })
+                        .unwrap_or(true);
+                    if stop {
+                        return;
+                    }
+                }
+            }
             let res = mv_ui::bg::run(suggest::for_you()).await.and_then(|r| r);
             let _ = this.update(cx, |this, cx| {
                 if this.generation != generation {
@@ -140,6 +161,8 @@ impl ForYouView {
                 }
                 match res {
                     Ok(fy) => this.set_ready(fy, cx),
+                    // A failed rebuild keeps what is shown.
+                    Err(_) if matches!(this.state, Load::Ready(_)) => {}
                     Err(e) => this.state = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();
@@ -151,6 +174,7 @@ impl ForYouView {
     fn set_ready(&mut self, fy: ForYou, cx: &mut Context<Self>) {
         let urls: Vec<(String, Option<String>)> = fy.items.iter().filter_map(|s| s.item.cover_url.clone().map(|u| (u, Some(s.source.clone())))).collect();
         self.state = Load::Ready(fy);
+        mv_ui::perf::ready("For you");
         cx.notify();
         cx.spawn(async move |this, cx| {
             if let Ok((have, missing)) = mv_ui::bg::blocking(move || backend::resolve_covers(urls)).await {

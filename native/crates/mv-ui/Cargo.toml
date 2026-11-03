@@ -11,6 +11,8 @@ anyhow = { workspace = true }
 mv-update = { path = "../mv-update" }
 mv-core = { path = "../mv-core" }
 serde_json = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+md5 = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

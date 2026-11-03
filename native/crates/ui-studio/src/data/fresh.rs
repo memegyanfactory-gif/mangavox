@@ -33,6 +33,8 @@ pub enum Why {
     Look,
     /// Made before Studio stamped its videos, so what it was made with is not known.
     Unknown,
+    /// On the timeline (its narration is timed) but never rendered.
+    Unrendered,
 }
 
 /// What decides a chapter's state, read from its files ([`facts`]).
@@ -82,13 +84,17 @@ pub fn facts(ch: &ChapterItem, look: &serde_json::Value) -> Facts {
     Facts { stamp: vm::stamp(&ch.output_dir), key, edit, edit_key }
 }
 
-/// The chapters of `chapters` that have a video which is not current, in order (blocking).
+/// The chapters of `chapters` whose video is not current, or that are on the timeline without a
+/// video yet, in order (blocking).
 pub fn stale_of(chapters: &[ChapterItem]) -> Vec<Stale> {
     let look = crate::look::video_config();
     chapters
         .iter()
-        .filter(|c| c.output_dir.join(super::VIDEO_FILE).metadata().is_ok_and(|m| m.len() > 0))
         .filter_map(|c| {
+            if !c.output_dir.join(super::VIDEO_FILE).metadata().is_ok_and(|m| m.len() > 0) {
+                let timed = c.output_dir.join("sync_map.json").is_file();
+                return timed.then(|| Stale { item: c.clone(), why: Why::Unrendered, key: vm::current_key(c) });
+            }
             let f = facts(c, &look);
             if let Some(why) = why_stale(&f) {
                 return Some(Stale { item: c.clone(), why, key: f.key });
@@ -116,10 +122,21 @@ fn kept() -> HashSet<(String, u64)> {
     KEPT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
 
+/// Remembers the user's "use the current videos" for `stale`. A chapter with no video is never
+/// remembered: it is asked about again next time, rather than silently left out of every export.
 fn keep(stale: &[Stale]) {
     let mut g = KEPT.lock().unwrap_or_else(|e| e.into_inner());
     let set = g.get_or_insert_with(HashSet::new);
-    set.extend(stale.iter().map(|s| (s.item.id.clone(), s.key)));
+    set.extend(stale.iter().filter(|s| s.why != Why::Unrendered).map(|s| (s.item.id.clone(), s.key)));
+}
+
+/// The cancel choice of the question: chapters without a video can only be left out.
+pub fn keep_label(stale: &[Stale]) -> &'static str {
+    match stale.iter().filter(|s| s.why == Why::Unrendered).count() {
+        0 => "Use the current videos",
+        n if n == stale.len() => "Leave them out",
+        _ => "Use the current videos, leave out the unrendered",
+    }
 }
 
 /// What to do before playing or exporting.
@@ -145,10 +162,23 @@ pub fn decide(stale: Vec<Stale>, kept: &HashSet<(String, u64)>) -> Decision {
 pub fn question(stale: &[Stale], verb: &str) -> (String, String) {
     let n = stale.len();
     let count = |w: Why| stale.iter().filter(|s| s.why == w).count();
-    let (edits, looks, unknown) = (count(Why::Edit), count(Why::Look), count(Why::Unknown));
-    let title = if n == 1 { "1 chapter changed since it was rendered".to_string() } else { format!("{n} chapters changed since they were rendered") };
+    let (edits, looks, unknown, unrendered) = (count(Why::Edit), count(Why::Look), count(Why::Unknown), count(Why::Unrendered));
     let all = |k: usize| k == n;
+    let title = if all(unrendered) {
+        if n == 1 { "1 chapter isn't rendered yet".to_string() } else { format!("{n} chapters aren't rendered yet") }
+    } else if n == 1 {
+        "1 chapter changed since it was rendered".to_string()
+    } else {
+        format!("{n} chapters changed since they were rendered")
+    };
     let mut why = vec![];
+    if unrendered > 0 {
+        why.push(if all(unrendered) {
+            format!("{} on the timeline, but {} video{} not made yet.", if n == 1 { "It is" } else { "They are" }, if n == 1 { "its" } else { "their" }, if n == 1 { " is" } else { "s are" })
+        } else {
+            format!("{unrendered} {} on the timeline without a video yet.", if unrendered == 1 { "is" } else { "are" })
+        });
+    }
     if edits > 0 {
         why.push(if all(edits) {
             if n == 1 { "It has Video editor changes that aren't rendered yet.".to_string() } else { "They have Video editor changes that aren't rendered yet.".to_string() }
@@ -219,8 +249,12 @@ fn ask(stale: Vec<Stale>, verb: &'static str, after: After, then: Then, window: 
     let (t1, t2) = (then.clone(), then);
     confirm_dialog(title, body, "Render them first", false)
         .icon(ph::FILM_STRIP)
-        .cancel_label("Use the current videos")
+        .cancel_label(keep_label(&keep_list))
         .on_cancel(move |window, cx| {
+            let left_out = keep_list.iter().filter(|s| s.why == Why::Unrendered).count();
+            if left_out > 0 {
+                toast::show(cx, Toast::info(format!("{left_out} chapter{} without a video {} left out", if left_out == 1 { "" } else { "s" }, if left_out == 1 { "is" } else { "are" })));
+            }
             keep(&keep_list);
             run(&t1, window, cx);
         })
@@ -403,6 +437,27 @@ mod tests {
         assert!(b.contains("1 has Video editor changes") && b.contains("since 1 of them was rendered") && b.contains("1 was made before"), "{b}");
         let (_, b) = question(&[stale("a", Why::Edit, 1), stale("b", Why::Edit, 2)], "playing");
         assert!(b.starts_with("They have Video editor changes"), "{b}");
+    }
+
+    #[test]
+    fn chapters_without_a_video_are_never_kept_as_they_are() {
+        let list = vec![stale("a", Why::Unrendered, 1), stale("b", Why::Look, 2)];
+        assert_eq!(keep_label(&list), "Use the current videos, leave out the unrendered");
+        assert_eq!(keep_label(&list[..1]), "Leave them out");
+        assert_eq!(keep_label(&list[1..]), "Use the current videos");
+        keep(&list);
+        // Asked about again: only the one with a video is remembered.
+        assert_eq!(decide(list.clone(), &kept()), Decision::Ask(vec![list[0].clone()]));
+    }
+
+    #[test]
+    fn chapters_on_the_timeline_without_a_video_are_rendered_first() {
+        let (t, b) = question(&[stale("a", Why::Unrendered, 1), stale("b", Why::Unrendered, 2)], "exporting");
+        assert_eq!(t, "2 chapters aren't rendered yet");
+        assert!(b.starts_with("They are on the timeline, but their videos are not made yet.") && b.contains("Render them first"), "{b}");
+        let (t, b) = question(&[stale("a", Why::Unrendered, 1), stale("b", Why::Look, 2)], "exporting");
+        assert_eq!(t, "2 chapters changed since they were rendered");
+        assert!(b.starts_with("1 is on the timeline without a video yet.") && b.contains("since 1 of them was rendered"), "{b}");
     }
 
     #[test]

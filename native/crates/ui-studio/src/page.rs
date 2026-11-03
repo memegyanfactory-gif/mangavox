@@ -16,7 +16,7 @@ use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
 use mv_ui::{
     btn, checkbox, empty_view, error_view, fmt_bytes, glyphs, icon_button, icon_ph, inline_alert, interactive, list_row, ph, ph_icon, size, skeleton, skeleton_line, spinner,
-    step_cards, stepper, tip, AlertKind, StepMark, ButtonKind, CheckState, Route, Tokens, Weight,
+    step_cards_small, stepper, tip, AlertKind, StepMark, ButtonKind, CheckState, Route, Tokens, Weight,
 };
 
 use crate::data::{self, ChapterItem, MangaGroup};
@@ -34,6 +34,9 @@ pub const MONO: &str = if cfg!(windows) {
 };
 const POLL: Duration = Duration::from_millis(300);
 const SAVE_DELAY: Duration = Duration::from_millis(700);
+
+/// The library as last loaded, so a reopened Studio shows it at once while it reloads.
+static LAST_LIBRARY: std::sync::Mutex<Option<(Vec<MangaGroup>, HashMap<String, PhaseStatus>)>> = std::sync::Mutex::new(None);
 pub(crate) const LIBRARY_W: f32 = 288.;
 pub(crate) const SIDE_W: f32 = 384.;
 
@@ -241,6 +244,9 @@ pub struct StudioPage {
     pub(crate) setup: Entity<SetupView>,
     pub(crate) library: Load<Vec<MangaGroup>>,
     pub(crate) statuses: HashMap<String, PhaseStatus>,
+    /// A library load is running / another was asked for meanwhile (loads never overlap).
+    library_busy: bool,
+    library_again: bool,
     pub(crate) open_groups: HashSet<String>,
     pub(crate) selected: BTreeSet<String>,
     pub(crate) search: Entity<InputState>,
@@ -393,10 +399,19 @@ impl StudioPage {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let style = crate::export::style_view::StyleUi::load();
+        let (library, statuses) = match LAST_LIBRARY.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            Some((groups, statuses)) => {
+                mv_ui::perf::ready("Studio library (cached)");
+                (Load::Ready(groups), statuses)
+            }
+            None => (Load::Loading, HashMap::new()),
+        };
         let mut page = Self {
             setup,
-            library: Load::Loading,
-            statuses: HashMap::new(),
+            library,
+            statuses,
+            library_busy: false,
+            library_again: false,
             open_groups: prefs.open_groups.iter().cloned().collect(),
             dash_collapsed: prefs.dash_collapsed.iter().cloned().collect(),
             selected: prefs.selected.iter().cloned().collect(),
@@ -477,18 +492,51 @@ impl StudioPage {
     // ------------------------------------------------------------ loading
 
     pub(crate) fn reload_library(&mut self, cx: &mut Context<Self>) {
+        if self.library_busy {
+            self.library_again = true;
+            return;
+        }
+        self.library_busy = true;
+        let started = std::time::Instant::now();
+        let cold = matches!(self.library, Load::Loading);
         cx.spawn(async move |this, cx| {
+            // First open since launch: show the saved snapshot while the full load runs.
+            if cold {
+                if let Ok(Some((groups, statuses))) = mv_ui::bg::blocking(data::read_snapshot).await {
+                    let _ = this.update(cx, |this, cx| {
+                        if matches!(this.library, Load::Loading) {
+                            eprintln!("[perf] studio library snapshot shown in {} ms", started.elapsed().as_millis());
+                            mv_ui::perf::ready("Studio library (snapshot)");
+                            this.statuses = statuses;
+                            this.library = Load::Ready(groups);
+                            cx.notify();
+                        }
+                    });
+                }
+            }
             let res = mv_ui::bg::blocking(|| {
                 let groups = data::load()?;
                 let statuses: HashMap<String, PhaseStatus> =
                     groups.iter().flat_map(|g| g.chapters.iter()).map(|c| (c.id.clone(), mv_recap::chapter_status(&chref(c)))).collect();
-                anyhow::Ok((groups, statuses))
+                let snap = (groups, statuses);
+                // Private mode leaves no trace: nothing it downloaded goes into a snapshot.
+                if !mv_core::privacy::active() && LAST_LIBRARY.lock().unwrap_or_else(|e| e.into_inner()).as_ref() != Some(&snap) {
+                    data::write_snapshot(&snap);
+                }
+                anyhow::Ok(snap)
             })
             .await
             .and_then(|r| r);
             let _ = this.update(cx, |this, cx| {
+                this.library_busy = false;
+                if std::mem::take(&mut this.library_again) {
+                    this.reload_library(cx);
+                }
                 match res {
                     Ok((groups, statuses)) => {
+                        eprintln!("[perf] studio library loaded in {} ms", started.elapsed().as_millis());
+                        mv_ui::perf::ready("Studio library");
+                        *LAST_LIBRARY.lock().unwrap_or_else(|e| e.into_inner()) = (!mv_core::privacy::active()).then(|| (groups.clone(), statuses.clone()));
                         if this.open_groups.is_empty() {
                             if let Some(g) = groups.first() {
                                 this.open_groups.insert(g.id.clone());
@@ -516,6 +564,9 @@ impl StudioPage {
                         this.selected.retain(|id| groups.iter().flat_map(|g| g.chapters.iter()).any(|c| &c.id == id));
                         this.library = Load::Ready(groups);
                     }
+                    // A failed refresh keeps the library already on screen (the database can be
+                    // busy for a moment, e.g. behind a download).
+                    Err(e) if matches!(this.library, Load::Ready(_)) => eprintln!("[studio] could not refresh the library: {e:#}"),
                     Err(e) => this.library = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();
@@ -1868,14 +1919,19 @@ impl StudioPage {
             .collect();
         let blocker = self.reset_blocker(&c.id);
         let (id, item, reset_item) = (c.id.clone(), c.clone(), c.clone());
+        // The number first ("Ch. 12", as chapters are named across the app), then the chapter's own
+        // title when it has one beyond its number; the full label on hover.
+        let number = c.number.map(|n| crate::pipeline::short_label(Some(n), None));
+        let title = row_title(c.number, c.title.as_deref());
         list_row(SharedString::from(format!("ch-{}", c.id)), focused)
             .group("ch-row")
-            .h(px(34.))
-            .min_h(px(34.))
-            .pl(px(36.))
+            .h(px(28.))
+            .min_h(px(28.))
+            .pl(px(32.))
             .pr(px(4.))
             .py(px(0.))
             .gap(px(6.))
+            .tooltip(tip(c.label()))
             .when(checked && !focused, |d| d.bg(Tokens::accent_soft()))
             .child(
                 checkbox(SharedString::from(format!("chk-{}", c.id)), checked)
@@ -1888,8 +1944,34 @@ impl StudioPage {
                         cx.notify();
                     })),
             )
-            .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).child(c.label()))
-            .child(step_cards(format!("row-steps-{}", c.id), cards))
+            .when_some(number, |d, n| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .px(px(5.))
+                        .py(px(1.))
+                        .rounded(px(radius::XS))
+                        .bg(if focused { Tokens::accent_soft() } else { Tokens::active() })
+                        .text_size(px(size::XS))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if focused { Tokens::accent() } else { Tokens::text_1() })
+                        .child(n),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(size::XS))
+                    .text_color(Tokens::text_2())
+                    .child(match (&title, c.number) {
+                        (Some(t), _) => t.clone(),
+                        (None, None) => c.label(),
+                        (None, Some(_)) => String::new(),
+                    }),
+            )
+            .child(step_cards_small(format!("row-steps-{}", c.id), cards))
             .child(
                 icon_button(SharedString::from(format!("ch-reset-{}", c.id)), glyphs::DELETE, "Reset chapter")
                     .small()
@@ -1944,6 +2026,20 @@ impl StudioPage {
             window.focus(&self.focus_handle, cx);
         }
     }
+}
+
+/// A chapter row's title beside its number: the chapter's own title without the "Chapter 12" /
+/// "Ch. 12:" it often repeats, or `None` when that is all it says.
+pub(crate) fn row_title(number: Option<f64>, title: Option<&str>) -> Option<String> {
+    let t = title.map(str::trim).filter(|t| !t.is_empty())?;
+    let lower = t.to_lowercase();
+    // A prefix only as a word of its own ("Ch. 4", "Chapter12"), never the start of "Chaos".
+    let prefix = ["chapter", "episode", "ch.", "ch", "ep.", "ep"].into_iter().find(|p| lower.starts_with(p) && !lower[p.len()..].starts_with(|c: char| c.is_alphabetic()));
+    let rest = match (number, prefix) {
+        (Some(_), Some(p)) => t[p.len()..].trim_start().trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').trim_start_matches([':', '-', '·', '–', ' ']).trim(),
+        _ => t,
+    };
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 impl Render for StudioPage {
@@ -2116,6 +2212,18 @@ pub(crate) fn plural(n: usize) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chapter_rows_show_the_number_and_only_a_real_title() {
+        use super::row_title;
+        assert_eq!(row_title(Some(170.), Some("Chapter 170")), None);
+        assert_eq!(row_title(Some(83.), Some("Ch. 83")), None);
+        assert_eq!(row_title(Some(4.2), Some("Ch. 4.2: (1r0n)")), Some("(1r0n)".to_string()));
+        assert_eq!(row_title(Some(12.), Some("Chapter 12 - The Return")), Some("The Return".to_string()));
+        assert_eq!(row_title(Some(3.), Some("Chaos Arrives")), Some("Chaos Arrives".to_string()));
+        assert_eq!(row_title(None, Some("Prologue")), Some("Prologue".to_string()));
+        assert_eq!(row_title(Some(1.), None), None);
+    }
+
     // Explicit imports: with test-support, `gpui_kit::*` carries a `test` macro that shadows `#[test]`.
     use super::{join_and, NarratedBy, Phase};
 

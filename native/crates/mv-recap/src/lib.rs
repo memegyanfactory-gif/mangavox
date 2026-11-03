@@ -30,7 +30,7 @@ pub use store::{
     chapter_dir, chapter_status, clear_audio, list_pages, load_read, load_story, load_transcript, panel_path, save_read, save_story, save_transcript,
     studio_root,
 };
-pub use story::{style_hint, write_story};
+pub use story::{style_hint, write_story, write_story_for_manga};
 pub use transcript::{merge_transcript, rewrite_page, transcript_from_read, update_transcript};
 pub use types::*;
 

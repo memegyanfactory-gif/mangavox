@@ -8,12 +8,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, empty_view, external_link, icon_button, icon_ph, inline_alert, list_row, ph, progress_bar, size, spinner, AlertKind, ButtonKind, Tokens};
+use mv_ui::{btn, external_link, icon_button, icon_ph, inline_alert, ph, progress_bar, size, spinner, AlertKind, ButtonKind, Tokens};
 use mv_youtube::{planner, seo, LocalEpisode, MetaContext, UploadItem, UploadState, VideoEdit};
 
 use crate::chart::{bars, trend_chip};
 use crate::hub::{self, fmt_num, fmt_when};
-use crate::page::{card, card_title, hint, thumb, AiState, Focus, YouTubePage};
+use crate::page::{thumb, yt_card as card, yt_card_title as card_title, yt_hint as hint, AiState, Focus, YouTubePage};
+use crate::{when, yt};
 
 fn state_chip(s: UploadState) -> Div {
     let (fg, bg, icon) = match s {
@@ -36,56 +37,113 @@ impl YouTubePage {
     pub(crate) fn content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let h = self.hub.read(cx);
         if h.videos.is_empty() {
-            return empty_view(ph::FILM_STRIP, if h.loading { "Loading videos…" } else { "No videos yet" }, "Videos on your channel show up here with their numbers. Upload Studio recaps from Schedule.").build().into_any_element();
+            return div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(16.))
+                .py(px(64.))
+                .child(yt::icon_of(ph::FILM_STRIP, 64., yt::TEXT_3))
+                .child(yt::text(14., 20., FontWeight::NORMAL, yt::TEXT_2).child(if h.loading { "Loading videos…" } else { "No content available" }))
+                .child(yt::pill_primary("yt-empty-sched", "Upload videos").on_click(cx.listener(|this, _, _, cx| this.set_tab(crate::page::Tab::Schedule, cx))))
+                .into_any_element();
         }
-        let rows: Vec<_> = h.videos.iter().map(|v| (v.clone(), h.trend_of(&v.id), h.video_daily.get(&v.id).map(|d| d.iter().map(|s| s.views).collect::<Vec<u64>>()))).collect();
+        let q = self.filter.read(cx).value().to_lowercase();
+        let rows: Vec<_> = h
+            .videos
+            .iter()
+            .filter(|v| q.trim().is_empty() || v.title.to_lowercase().contains(q.trim()) || v.tags.iter().any(|t| t.to_lowercase().contains(q.trim())))
+            .map(|v| (v.clone(), h.trend_of(&v.id), h.video_daily.get(&v.id).map(|d| d.iter().map(|s| s.views).collect::<Vec<u64>>())))
+            .collect();
         let header = div()
             .flex()
             .items_center()
-            .gap(px(space::MD))
-            .px(px(space::SM))
-            .pb(px(space::XS))
-            .text_size(px(size::XS))
-            .text_color(Tokens::text_3())
-            .child(div().flex_1().child("Video"))
-            .child(div().w(px(120.)).child("Visibility"))
-            .child(div().w(px(90.)).child("Trend"))
-            .child(div().w(px(64.)).text_right().child("Views"))
-            .child(div().w(px(56.)).text_right().child("Likes"))
-            .child(div().w(px(56.)).text_right().child("Comments"));
-        card()
-            .gap(px(2.))
+            .gap(px(16.))
+            .h(px(40.))
+            .px(px(8.))
+            .border_b_1()
+            .border_color(yt::tone(0.1))
+            .child(div().flex_1().min_w_0().child(yt::text(12., 18., FontWeight::MEDIUM, yt::TEXT_2).child("Video")))
+            .child(yt::th(130., false, "Visibility"))
+            .child(yt::th(150., false, "Date"))
+            .child(yt::th(90., false, "Trend"))
+            .child(yt::th(80., true, "Views"))
+            .child(yt::th(90., true, "Comments"))
+            .child(yt::th(70., true, "Likes"));
+        let filter = div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .h(px(40.))
+            .border_b_1()
+            .border_color(yt::tone(0.1))
+            .child(yt::icon_of(ph::FUNNEL, 20., yt::TEXT_2))
+            .child(div().flex_1().child(Input::new(&self.filter).appearance(false)))
+            .child(yt::caption(format!("{} videos", rows.len())));
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .child(filter)
             .child(header)
             .children(rows.into_iter().enumerate().map(|(i, (v, trend, daily))| {
                 let id = v.id.clone();
-                let vis = if v.is_scheduled() { format!("Scheduled · {}", v.publish_at.map(fmt_when).unwrap_or_default()) } else { capitalize(&v.privacy) };
-                list_row(("yt-video", i), false)
+                let (vis_icon, vis) = if v.is_scheduled() {
+                    (ph::CALENDAR_CHECK, "Scheduled".to_string())
+                } else {
+                    (
+                        match v.privacy.as_str() {
+                            "public" => ph::GLOBE,
+                            "unlisted" => ph::LINK,
+                            _ => ph::LOCK_SIMPLE,
+                        },
+                        capitalize(&v.privacy),
+                    )
+                };
+                let (date, date_sub) = match v.publish_at.filter(|_| v.is_scheduled()) {
+                    Some(t) => (when::date(t), format!("Goes public {}", when::clock(t))),
+                    None => (when::date(v.published_at), if v.privacy == "public" { "Published".to_string() } else { "Uploaded".to_string() }),
+                };
+                div()
+                    .id(("yt-video", i))
                     .flex()
                     .items_center()
-                    .gap(px(space::MD))
-                    .p(px(space::SM))
-                    .rounded(px(radius::SM))
+                    .gap(px(16.))
+                    .px(px(8.))
+                    .py(px(8.))
+                    .min_w_0()
+                    .border_b_1()
+                    .border_color(yt::tone(0.1))
+                    .hover(|s| s.bg(yt::tone(0.05)))
+                    .cursor_pointer()
                     .on_click(cx.listener(move |this, _, w, cx| this.open_editor(Focus::Video(id.clone()), w, cx)))
-                    .child(thumb(&v.thumbnail, 96.))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .gap(px(2.))
-                            .child(div().text_size(px(size::MD)).font_weight(FontWeight::MEDIUM).line_clamp(2).child(v.title.clone()))
-                            .child(hint(v.description.lines().next().unwrap_or("Add a description").chars().take(90).collect::<String>()))
-                            .child(hint(hub::fmt_ago(v.published_at))),
+                            .gap(px(12.))
+                            .child(yt::thumb(&v.thumbnail, 120., Some(yt::duration(v.duration_secs))))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap(px(2.))
+                                    .child(yt::line(14., FontWeight::NORMAL, yt::TEXT, v.title.clone()))
+                                    .child(yt::para(12., yt::TEXT_2, 2, if v.description.trim().is_empty() { "Add description".to_string() } else { v.description.clone() })),
+                            ),
                     )
-                    .child(div().w(px(120.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(vis))
-                    .child(div().w(px(90.)).child(match daily {
-                        Some(d) if d.len() > 1 => crate::chart::sparkline(&d, Tokens::accent()).into_any_element(),
+                    .child(yt::col(130., false).child(div().flex().items_center().gap(px(6.)).child(yt::icon_of(vis_icon, 18., yt::TEXT_2)).child(yt::line(14., FontWeight::NORMAL, yt::TEXT, vis))))
+                    .child(yt::col(150., false).child(div().flex().flex_col().min_w_0().child(yt::line(14., FontWeight::NORMAL, yt::TEXT, date)).child(yt::caption(date_sub))))
+                    .child(yt::col(90., false).child(match daily {
+                        Some(d) if d.len() > 1 => crate::chart::sparkline(&d, yt::c(yt::LINK)).into_any_element(),
                         _ => trend_chip(trend).into_any_element(),
                     }))
-                    .child(div().w(px(64.)).text_right().text_size(px(size::SM)).child(fmt_num(v.views)))
-                    .child(div().w(px(56.)).text_right().text_size(px(size::SM)).child(fmt_num(v.likes)))
-                    .child(div().w(px(56.)).text_right().text_size(px(size::SM)).child(fmt_num(v.comments)))
+                    .child(yt::col(80., true).child(yt::text(14., 20., FontWeight::NORMAL, yt::TEXT).child(fmt_num(v.views))))
+                    .child(yt::col(90., true).child(yt::text(14., 20., FontWeight::NORMAL, yt::TEXT).child(fmt_num(v.comments))))
+                    .child(yt::col(70., true).child(yt::text(14., 20., FontWeight::NORMAL, yt::TEXT).child(fmt_num(v.likes))))
             }))
             .into_any_element()
     }
@@ -168,7 +226,7 @@ impl YouTubePage {
         items.sort_by_key(|i| (i.publish_at.unwrap_or(0), chapter_key(i.chapter)));
         let mut days: BTreeMap<String, Vec<UploadItem>> = BTreeMap::new();
         for i in items {
-            let key = i.publish_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d · %A").to_string()).unwrap_or_else(|| "0 · As soon as it uploads".into());
+            let key = i.publish_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d · %A, %B %-d").to_string()).unwrap_or_else(|| "0 · As soon as it uploads".into());
             days.entry(key).or_default().push(i);
         }
         let uploading = h.uploading;
@@ -187,7 +245,7 @@ impl YouTubePage {
             .child(hint("Uploaded videos stay private until their time, then YouTube publishes them, even when MangaVox is closed."))
             .when(days.is_empty(), |d| d.child(hint("The queue is empty. Pick the next chapter above.")))
             .children(days.into_iter().map(|(day, items)| {
-                let label = day.split_once(" · ").map(|(d, w)| if d == "0" { w.to_string() } else { format!("{w}, {d}") }).unwrap_or(day.clone());
+                let label = day.split_once(" · ").map(|(_, w)| w.to_string()).unwrap_or(day.clone());
                 div().flex().flex_col().gap(px(space::XS)).pt(px(space::SM)).child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_3()).child(label.to_uppercase())).children(items.into_iter().map(|i| self.queue_row(i, uploading, cx)))
             }));
 
@@ -212,7 +270,7 @@ impl YouTubePage {
                     .flex()
                     .items_center()
                     .gap(px(space::SM))
-                    .child(div().w(px(48.)).text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(i.publish_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_else(|| "Now".into())))
+                    .child(div().w(px(72.)).flex_none().whitespace_nowrap().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(i.publish_at.map(when::clock).unwrap_or_else(|| "Now".into())))
                     .child(
                         div()
                             .flex()
@@ -377,7 +435,7 @@ impl YouTubePage {
             .gap(px(space::XS))
             .child(Input::new(&self.when))
             .child(div().flex().flex_wrap().gap(px(space::XS)).children(slots.into_iter().enumerate().map(|(i, t)| {
-                mv_ui::chip(("ed-slot", i), format!("Free slot · {}", fmt_when(t)), false).on_click(cx.listener(move |this, _, w, cx| this.when.update(cx, |s, cx| s.set_value(hub::to_local_input(t), w, cx))))
+                mv_ui::chip(("ed-slot", i), format!("Free slot · {}", fmt_when(t)), false).on_click(cx.listener(move |this, _, w, cx| this.when.update(cx, |s, cx| s.set_value(crate::when::input(t), w, cx))))
             })))
             .into_any_element()
     }
@@ -449,10 +507,10 @@ impl YouTubePage {
         let at = if when_text.trim().is_empty() {
             None
         } else {
-            match hub::parse_local(&when_text) {
+            match crate::when::parse(&when_text) {
                 Some(t) if t > hub::now() + 15 * 60 => Some(t),
                 Some(_) => return Self::toast_err(cx, "Pick a release time at least 15 minutes from now"),
-                None => return Self::toast_err(cx, "Write the release time as YYYY-MM-DD HH:MM"),
+                None => return Self::toast_err(cx, "Write the release time like 2026-11-03 6:30 PM"),
             }
         };
         if title.is_empty() {

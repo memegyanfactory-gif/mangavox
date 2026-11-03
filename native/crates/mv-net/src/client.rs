@@ -276,6 +276,16 @@ impl Http {
         Ok(())
     }
 
+    /// Switch the User-Agent (e.g. to the browser whose cookies are replayed). Cookies are kept.
+    pub fn set_user_agent(&self, ua: &str) -> crate::Result<()> {
+        let mut cfg = self.inner.cfg.read().unwrap().clone();
+        cfg.user_agent = ua.to_string();
+        let client = build_client(&cfg, &self.inner.jar)?;
+        *self.inner.cfg.write().unwrap() = cfg;
+        *self.inner.client.write().unwrap() = client;
+        Ok(())
+    }
+
     pub fn proxy(&self) -> Option<String> {
         self.inner.cfg.read().unwrap().proxy.clone()
     }

@@ -9,6 +9,12 @@ pub fn mark_start() {
     START.get_or_init(Instant::now);
 }
 
+/// Startup timeline: `[perf] startup <what> at N ms` since [`mark_start`].
+pub fn step(what: &str) {
+    let ms = START.get().map(|s| s.elapsed().as_millis()).unwrap_or(0);
+    eprintln!("[perf] startup {what} at {ms} ms");
+}
+
 /// Called from the root render; logs once.
 pub fn first_frame() {
     FIRST.get_or_init(|| {

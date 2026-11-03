@@ -39,6 +39,8 @@ pub enum ApiErrorKind {
 struct ApiError {
     kind: ApiErrorKind,
     msg: String,
+    /// YouTube's machine reason ("quotaExceeded", "commentsDisabled"...), empty when none.
+    reason: String,
 }
 
 impl std::fmt::Display for ApiError {
@@ -50,7 +52,7 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 fn api_err(kind: ApiErrorKind, msg: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(ApiError { kind, msg: msg.into() })
+    anyhow::Error::new(ApiError { kind, msg: msg.into(), reason: String::new() })
 }
 
 fn signed_out() -> anyhow::Error {
@@ -74,6 +76,23 @@ pub fn error_kind(e: &anyhow::Error) -> ApiErrorKind {
     }
 }
 
+/// A classified error for tests in other modules.
+#[cfg(test)]
+pub(crate) fn test_error(status: u16, body: &str) -> anyhow::Error {
+    anyhow::Error::new(classify(status, body))
+}
+
+/// YouTube's machine reason ("commentsDisabled", "quotaExceeded"...) of an error from this module.
+pub fn error_reason(e: &anyhow::Error) -> Option<String> {
+    e.chain().find_map(|c| c.downcast_ref::<ApiError>()).map(|a| a.reason.clone()).filter(|r| !r.is_empty())
+}
+
+/// Only these reasons on a Data API call mean the project's 10,000 daily units are gone;
+/// `uploadLimitExceeded` is a per-channel upload cap, and Analytics has a quota of its own.
+fn exhausts_data_quota(url: &str, reason: &str) -> bool {
+    !url.contains("youtubeanalytics.googleapis.com") && matches!(reason, "quotaExceeded" | "dailyLimitExceeded")
+}
+
 /// Turns a failed HTTP answer into a typed error.
 fn classify(status: u16, body: &str) -> ApiError {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -84,13 +103,14 @@ fn classify(status: u16, body: &str) -> ApiError {
         .or_else(|| v.get("error_description").and_then(Value::as_str).map(str::to_string))
         .or_else(|| v.get("error").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| body.chars().take(300).collect());
+    let reason = v.pointer("/error/errors/0/reason").and_then(Value::as_str).unwrap_or("").to_string();
     let quota = (status == 403 || status == 400) && ["quotaExceeded", "dailyLimitExceeded", "uploadLimitExceeded"].iter().any(|m| body.contains(m));
     if quota {
-        ApiError { kind: ApiErrorKind::Quota, msg: format!("YouTube's quota is used up for now (it resets at midnight Pacific time): {detail}") }
+        ApiError { kind: ApiErrorKind::Quota, msg: format!("YouTube's quota is used up for now (it resets at midnight Pacific time): {detail}"), reason }
     } else if status == 401 {
-        ApiError { kind: ApiErrorKind::SignedOut, msg: format!("YouTube rejected the sign-in (HTTP 401): {detail}. Connect your channel again.") }
+        ApiError { kind: ApiErrorKind::SignedOut, msg: format!("YouTube rejected the sign-in (HTTP 401): {detail}. Connect your channel again."), reason }
     } else {
-        ApiError { kind: ApiErrorKind::Other, msg: format!("YouTube returned HTTP {status}: {detail}") }
+        ApiError { kind: ApiErrorKind::Other, msg: format!("YouTube returned HTTP {status}: {detail}"), reason }
     }
 }
 
@@ -247,7 +267,9 @@ fn apply_edit(id: &str, original: &Value, edit: &VideoEdit) -> Result<Value> {
     Ok(json!({ "id": id, "snippet": snippet, "status": status }))
 }
 
-/// The resumable-upload metadata for `item`.
+/// The resumable-upload metadata for `item`. A `publish_public` item whose `publish_at` has
+/// already passed goes public at once, at an arbitrary hour: callers must roll it forward to a
+/// future time first (`automation::roll_forward`).
 fn upload_metadata(item: &UploadItem, settings: &Settings, now: i64) -> Value {
     let mut snippet = json!({
         "title": crate::seo::clean_title(&item.title),
@@ -259,14 +281,27 @@ fn upload_metadata(item: &UploadItem, settings: &Settings, now: i64) -> Value {
         snippet["defaultLanguage"] = settings.language.clone().into();
         snippet["defaultAudioLanguage"] = settings.language.clone().into();
     }
-    let privacy = if settings.privacy.is_empty() { "private" } else { settings.privacy.as_str() };
+    let privacy = if item.publish_public {
+        "public"
+    } else if settings.privacy.is_empty() {
+        "private"
+    } else {
+        settings.privacy.as_str()
+    };
     let mut status = json!({ "privacyStatus": privacy, "selfDeclaredMadeForKids": settings.made_for_kids });
     // `publishAt` makes YouTube publish the video publicly, so a private upload stays private.
+    // The automation's items ask to go public, so theirs are private + `publishAt` until then.
     if let Some(at) = item.publish_at.filter(|&t| t > now && privacy != "private") {
         status["privacyStatus"] = "private".into();
         status["publishAt"] = rfc3339_z(at).into();
     }
     json!({ "snippet": snippet, "status": status })
+}
+
+/// The edit that brings a video uploaded through a resumed session up to date with `item`.
+fn resumed_edit(item: &UploadItem, settings: &Settings, now: i64) -> VideoEdit {
+    let schedule = item.publish_at.filter(|&t| t > now && (settings.privacy != "private" || item.publish_public));
+    VideoEdit { title: Some(item.title.clone()), description: Some(item.description.clone()), tags: Some(item.tags.clone()), publish_at: schedule.map(Some), privacy: None }
 }
 
 /// Analytics rows → by date. Columns are read by name so their order does not matter.
@@ -440,7 +475,10 @@ impl YouTube {
         let mut force = false;
         loop {
             let token = self.token(force).await?;
-            let resp = build(&token).send().await.context("Could not reach YouTube")?;
+            let req = build(&token).build().context("Could not build the YouTube request")?;
+            let url = req.url().to_string();
+            self.charge(crate::quota::cost(req.method().as_str(), &url));
+            let resp = self.http.execute(req).await.context("Could not reach YouTube")?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(resp);
@@ -450,16 +488,42 @@ impl YouTube {
                 continue;
             }
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(classify(status.as_u16(), &body)));
+            let err = classify(status.as_u16(), &body);
+            if err.kind == ApiErrorKind::Quota && exhausts_data_quota(&url, &err.reason) {
+                self.quota_used_up();
+            }
+            return Err(anyhow::Error::new(err));
         }
     }
 
-    async fn get_json(&self, url: &str, query: &[(&str, String)]) -> Result<Value> {
+    fn charge(&self, units: u32) {
+        if units > 0 {
+            let _ = self.store.update_quota(now_ts(), |q| q.spend(units, now_ts()));
+        }
+    }
+
+    /// YouTube said the quota is gone: count it as used up until the reset.
+    fn quota_used_up(&self) {
+        let _ = self.store.update_quota(now_ts(), |q| q.used = q.used.max(crate::quota::DAILY));
+    }
+
+    /// Today's estimated Data API spending (resets at midnight Pacific), read from `quota.json`
+    /// so every `YouTube` in the process agrees.
+    pub fn quota(&self) -> crate::quota::Usage {
+        self.store.quota_today(now_ts())
+    }
+
+    /// A background read of `units` may run without eating into the next upload.
+    pub fn can_spare(&self, units: u32) -> bool {
+        self.quota().can_spare(units, now_ts())
+    }
+
+    pub(crate) async fn get_json(&self, url: &str, query: &[(&str, String)]) -> Result<Value> {
         let resp = self.request(|t| self.http.get(url).query(query).bearer_auth(t).timeout(REQUEST_TIMEOUT)).await?;
         resp.json().await.context("YouTube sent an unreadable answer")
     }
 
-    async fn send_json(&self, method: reqwest::Method, url: &str, query: &[(&str, String)], body: &Value) -> Result<Value> {
+    pub(crate) async fn send_json(&self, method: reqwest::Method, url: &str, query: &[(&str, String)], body: &Value) -> Result<Value> {
         let resp = self.request(|t| self.http.request(method.clone(), url).query(query).bearer_auth(t).json(body).timeout(REQUEST_TIMEOUT)).await?;
         resp.json().await.context("YouTube sent an unreadable answer")
     }
@@ -478,7 +542,13 @@ impl YouTube {
             return Ok(vec![]);
         }
         let playlist = self.channel().await?.uploads_playlist;
-        if playlist.is_empty() {
+        self.videos_of(&playlist, max).await
+    }
+
+    /// [`Self::videos`] when the uploads playlist is already known (saves a `channels.list`).
+    pub async fn videos_of(&self, playlist: &str, max: usize) -> Result<Vec<Video>> {
+        let playlist = playlist.to_string();
+        if playlist.is_empty() || max == 0 {
             return Ok(vec![]);
         }
         let mut ids: Vec<String> = Vec::new();
@@ -534,12 +604,33 @@ impl YouTube {
     /// future the video is private with `publishAt`; otherwise `settings.privacy`. Resumes from
     /// `item.resume_url` when it is still valid. Returns the video id. `on_session` gets the
     /// session URL as soon as it exists so the caller can save it for resuming.
+    /// A resumed session keeps the details it started with, so the item's current title,
+    /// description, tags and schedule are applied once it is done.
     pub async fn upload(
         &self,
         item: &UploadItem,
         settings: &Settings,
         on_session: impl Fn(&str) + Send + Sync,
         progress: impl Fn(f32) + Send + Sync,
+    ) -> Result<String> {
+        let mut resumed = false;
+        let id = self.upload_inner(item, settings, &on_session, &progress, &mut resumed).await?;
+        if resumed {
+            let edit = resumed_edit(item, settings, now_ts());
+            if let Err(e) = self.update_video(&id, &edit).await {
+                eprintln!("youtube: could not refresh the details of resumed upload {id}: {e:#}");
+            }
+        }
+        Ok(id)
+    }
+
+    async fn upload_inner(
+        &self,
+        item: &UploadItem,
+        settings: &Settings,
+        on_session: impl Fn(&str) + Send + Sync,
+        progress: impl Fn(f32) + Send + Sync,
+        resumed: &mut bool,
     ) -> Result<String> {
         let total = tokio::fs::metadata(&item.file).await.with_context(|| format!("Cannot read {}", item.file.display()))?.len();
         if total == 0 {
@@ -550,10 +641,12 @@ impl YouTube {
         if let Some(url) = item.resume_url.as_deref().filter(|u| !u.is_empty()) {
             match self.upload_status(url, total).await? {
                 UploadStatus::Done(id) => {
+                    *resumed = true;
                     progress(1.0);
                     return Ok(id);
                 }
                 UploadStatus::Resume(off) => {
+                    *resumed = true;
                     offset = off;
                     session = Some(url.to_string());
                 }
@@ -836,6 +929,56 @@ mod tests {
     }
 
     #[test]
+    fn quota_exhaustion_is_data_api_only() {
+        let data = "https://www.googleapis.com/youtube/v3/videos";
+        let analytics = "https://youtubeanalytics.googleapis.com/v2/reports";
+        assert!(exhausts_data_quota(data, "quotaExceeded"));
+        assert!(exhausts_data_quota(data, "dailyLimitExceeded"));
+        assert!(!exhausts_data_quota(data, "uploadLimitExceeded"));
+        assert!(!exhausts_data_quota(analytics, "quotaExceeded"));
+        let e = anyhow::Error::new(classify(400, r#"{"error":{"message":"The user has exceeded the number of videos they may upload.","errors":[{"reason":"uploadLimitExceeded"}]}}"#));
+        assert_eq!(error_kind(&e), ApiErrorKind::Quota);
+        assert_eq!(error_reason(&e).as_deref(), Some("uploadLimitExceeded"));
+    }
+
+    #[test]
+    fn keeps_the_machine_reason() {
+        let e = anyhow::Error::new(classify(403, r#"{"error":{"message":"The video identified by the videoId parameter has disabled comments.","errors":[{"reason":"commentsDisabled"}]}}"#));
+        assert_eq!(error_reason(&e).as_deref(), Some("commentsDisabled"));
+        assert_eq!(error_reason(&e.context("x")).as_deref(), Some("commentsDisabled"));
+        assert_eq!(error_reason(&anyhow!("boom")), None);
+    }
+
+    #[test]
+    fn quota_is_shared_between_instances() {
+        let d = tempfile::tempdir().unwrap();
+        let a = YouTube::new(Store::new(d.path()));
+        let b = YouTube::new(Store::new(d.path()));
+        a.charge(100);
+        b.charge(50);
+        a.charge(1);
+        assert_eq!(a.quota().used, 151);
+        assert_eq!(b.quota().used, 151);
+        b.quota_used_up();
+        assert_eq!(a.quota().used, crate::quota::DAILY);
+        assert!(!d.path().join("quota.json.tmp").exists());
+    }
+
+    #[test]
+    fn resumed_upload_gets_the_current_details() {
+        let item = UploadItem { title: "New".into(), description: "d".into(), tags: vec!["a".into()], publish_at: Some(2_000_000_000), publish_public: true, ..Default::default() };
+        let e = resumed_edit(&item, &Settings::default(), 1_000_000_000);
+        assert_eq!((e.title.as_deref(), e.description.as_deref(), e.tags.as_deref()), (Some("New"), Some("d"), Some(&["a".to_string()][..])));
+        assert_eq!(e.publish_at, Some(Some(2_000_000_000)));
+        // Private default and not meant to go public: no schedule. Past time: no schedule.
+        let private = UploadItem { publish_public: false, ..item.clone() };
+        assert_eq!(resumed_edit(&private, &Settings::default(), 1_000_000_000).publish_at, None);
+        assert_eq!(resumed_edit(&item, &Settings::default(), 2_100_000_000).publish_at, None);
+        let public = Settings { privacy: "public".into(), ..Default::default() };
+        assert_eq!(resumed_edit(&private, &public, 1_000_000_000).publish_at, Some(Some(2_000_000_000)));
+    }
+
+    #[test]
     fn parses_video_and_channel() {
         let v = json!({
             "id": "abc",
@@ -908,6 +1051,14 @@ mod tests {
         let m = upload_metadata(&item, &s, 2_100_000_000);
         assert_eq!(m["status"]["privacyStatus"], "public");
         assert!(m["status"].get("publishAt").is_none());
+        // The automation's items: private + publishAt with the default (private) settings, so
+        // YouTube itself publishes them; public right away when the time has passed.
+        let auto = UploadItem { publish_public: true, ..item.clone() };
+        let m = upload_metadata(&auto, &Settings::default(), 1_000_000_000);
+        assert_eq!(m["status"]["privacyStatus"], "private");
+        assert_eq!(m["status"]["publishAt"], rfc3339_z(2_000_000_000));
+        let m = upload_metadata(&auto, &Settings::default(), 2_100_000_000);
+        assert_eq!(m["status"]["privacyStatus"], "public");
     }
 
     #[test]

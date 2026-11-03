@@ -32,6 +32,7 @@ pub fn routes() -> Router {
         .route("/api/manga/{id}/library", post(library))
         .route("/api/manga/{id}/favorite", post(favorite))
         .route("/api/manga/{id}/download", post(download))
+        .route("/api/privacy", get(privacy).post(set_privacy))
 }
 
 /// How long one source request may take before the phone is told it timed out.
@@ -277,6 +278,24 @@ async fn favorite(UrlPath(id): UrlPath<String>, raw: axum::body::Bytes) -> ApiRe
     .await?;
     backend::bump_data();
     Ok(Json(json!({ "favorite": b.on, "in_library": b.on || in_library(&m.id) })))
+}
+
+// ---------------------------------------------------------------- private mode
+
+/// Private mode is the desktop's (`mv_core::privacy`): one switch for the PC and every phone. What
+/// the phone reads or watches goes through the same writes, which record nothing while it is on.
+async fn privacy() -> Json<Value> {
+    Json(json!({ "private": mv_core::privacy::active() }))
+}
+
+/// On or off through the desktop's own toggle, so ending it opens the PC's offer to clear what
+/// the session created.
+async fn set_privacy(raw: axum::body::Bytes) -> ApiResult<Json<Value>> {
+    let b: OnBody = body(&raw)?;
+    if b.on != mv_core::privacy::active() {
+        crate::bridge::on_ui(|w, cx| mv_ui::nav::toggle_private(w, cx)).await.map_err(ApiError::unavailable)?;
+    }
+    Ok(Json(json!({ "private": mv_core::privacy::active() })))
 }
 
 // ---------------------------------------------------------------- downloads

@@ -1,10 +1,12 @@
 //! Watch on the phone (API.md "Watch on phone"). Finds a source like the desktop Play button, opens
 //! it on the PC's torrent engine (or its direct proxy for http links) without the desktop player,
 //! probes it with ffprobe and streams it to the phone: as is with HTTP Range when the phone can
-//! play the file, else as fragmented MP4 from ffmpeg (video copied or re-encoded to H.264, audio to
-//! AAC stereo). Sessions are random ids tied to the device, end after [`IDLE`] without requests,
-//! and the phone never names a URL or path: only a title id, or a chapter id for that chapter's
-//! Studio recap video (a local file, served as is; not watch history).
+//! play the file, else as on-demand HLS (`watch_hls`: H.264 + AAC stereo in fMP4 segments, which
+//! iPhone Safari plays) and, for older phone apps, as fragmented MP4 piped from ffmpeg (video
+//! copied or re-encoded to H.264, audio to AAC stereo). Sessions are random ids tied to the
+//! device, end after [`IDLE`] without requests, and the phone never names a URL or path: only a
+//! title id, or a chapter id for that chapter's Studio recap video (a local file, served as is;
+//! not watch history). Local files come only from the PC's own source list.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -32,6 +34,7 @@ use crate::api_anime::mal_ok;
 use crate::api_media::friendly;
 use crate::auth::{random_b64, CurrentDevice};
 use crate::server::{ApiError, ApiResult};
+use crate::watch_hls;
 
 /// A session nobody asked anything of for this long is stopped.
 const IDLE: Duration = Duration::from_secs(30 * 60);
@@ -54,6 +57,8 @@ const MAX_EXTERNAL: usize = 5;
 pub const NO_FFMPEG: &str = "Install FFmpeg on your PC to watch this on your phone";
 
 pub fn routes() -> Router {
+    // Built at server start: no session can be using an HLS folder yet.
+    watch_hls::clear_all();
     Router::new()
         .route("/api/watch", post(start))
         .route("/api/watch/{id}/stream", get(stream))
@@ -61,6 +66,7 @@ pub fn routes() -> Router {
         .route("/api/watch/{id}/progress", post(progress))
         .route("/api/watch/{id}/stop", post(stop))
         .route("/api/watch/{id}/sub/{file}", get(subtitle))
+        .route("/api/watch/{id}/hls/{q}/{file}", get(hls_file))
 }
 
 // ---------------------------------------------------------------- probing and mode
@@ -102,6 +108,9 @@ pub(crate) struct Probe {
     pub duration: Option<f64>,
     /// (stream index, codec, pixel format).
     pub video: Option<(usize, String, String)>,
+    /// The video's size in pixels (picks the HLS qualities).
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     /// (stream index, codec).
     pub audio: Option<(usize, String)>,
     pub subs: Vec<Track>,
@@ -125,7 +134,11 @@ pub(crate) fn parse_probe(v: &Value) -> Probe {
         let idx = st.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         let codec = s(st, "codec_name");
         match st.get("codec_type").and_then(Value::as_str) {
-            Some("video") if p.video.is_none() && !flag(st, "attached_pic") => p.video = Some((idx, codec, s(st, "pix_fmt"))),
+            Some("video") if p.video.is_none() && !flag(st, "attached_pic") => {
+                let px = |k: &str| st.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+                (p.width, p.height) = (px("width"), px("height"));
+                p.video = Some((idx, codec, s(st, "pix_fmt")));
+            }
             Some("audio") => {
                 if p.audio.is_none() {
                     p.audio = Some((idx, codec.clone()));
@@ -172,7 +185,7 @@ pub(crate) fn decide(p: &Probe, file_name: &str) -> Mode {
 }
 
 /// Encoder threads: half the cores (at least 2), so the PC stays usable while it encodes.
-fn threads() -> usize {
+pub(crate) fn threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(2).max(2)
 }
 
@@ -300,31 +313,119 @@ struct Tools {
     ffprobe: Option<PathBuf>,
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(&exe)).find(|p| p.is_file())
+fn exe_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
 }
 
-/// ffmpeg and ffprobe on PATH (ffprobe also next to ffmpeg). Looked up again while missing, so
-/// installing FFmpeg works without restarting.
-fn tools() -> Arc<Tools> {
-    static T: Mutex<Option<Arc<Tools>>> = Mutex::new(None);
-    let mut g = T.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(t) = g.as_ref().filter(|t| t.ffmpeg.is_some() && t.ffprobe.is_some()) {
-        return t.clone();
+/// A `Path` value of the registry's user (`HKCU\Environment`) or machine environment, read fresh:
+/// the app's own PATH is the one it started with, so an FFmpeg installed since (winget adds
+/// itself to the user's Path) is only found here.
+#[cfg(windows)]
+fn registry_path(machine: bool) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (root, key) = if machine { (HKEY_LOCAL_MACHINE, wide(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")) } else { (HKEY_CURRENT_USER, wide("Environment")) };
+    let value = wide("Path");
+    let mut size: u32 = 32 * 1024;
+    for _ in 0..3 {
+        let mut buf = vec![0u16; (size as usize).div_ceil(2) + 1];
+        let mut got = (buf.len() * 2) as u32;
+        // SAFETY: the key and value names are NUL-terminated UTF-16 that outlive the call, and
+        // `got` is the byte size of `buf`. RRF_RT_REG_SZ also accepts REG_EXPAND_SZ, expanded.
+        let r = unsafe { RegGetValueW(root, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut got) };
+        match r {
+            0 => {
+                let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+                return Some(String::from_utf16_lossy(&buf[..len]));
+            }
+            234 => size = got.max(size * 2), // ERROR_MORE_DATA
+            _ => return None,
+        }
     }
-    let ffmpeg = which("ffmpeg");
-    let ffprobe = which("ffprobe").or_else(|| {
-        let p = ffmpeg.as_ref()?.with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
-        p.is_file().then_some(p)
-    });
-    let t = Arc::new(Tools { ffmpeg, ffprobe });
-    *g = Some(t.clone());
+    None
+}
+
+/// Folders that may hold ffmpeg, in order: PATH, then (Windows) the registry's current user and
+/// machine Path, winget's links and any package named like FFmpeg, C:\ffmpeg,
+/// Chocolatey, Scoop, and the folder of this exe.
+fn tool_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    #[cfg(windows)]
+    {
+        for machine in [false, true] {
+            if let Some(p) = registry_path(machine) {
+                dirs.extend(std::env::split_paths(&p));
+            }
+        }
+        let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+        if let Some(local) = env("LOCALAPPDATA") {
+            let winget = local.join("Microsoft").join("WinGet");
+            dirs.push(winget.join("Links"));
+            if let Ok(rd) = std::fs::read_dir(winget.join("Packages")) {
+                // Any package named like FFmpeg (Gyan.FFmpeg, yt-dlp.FFmpeg_..., BtbN...): ffmpeg.exe
+                // in it, its bin, or a direct subfolder (ffmpeg-<version>-win64-gpl) or its bin.
+                for pkg in rd.flatten().filter(|e| e.file_name().to_string_lossy().to_ascii_lowercase().contains("ffmpeg")) {
+                    let p = pkg.path();
+                    dirs.extend([p.clone(), p.join("bin")]);
+                    if let Ok(inner) = std::fs::read_dir(&p) {
+                        for sub in inner.flatten().filter(|e| e.path().is_dir()) {
+                            dirs.extend([sub.path().join("bin"), sub.path()]);
+                        }
+                    }
+                }
+            }
+        }
+        dirs.push(PathBuf::from(r"C:\ffmpeg\bin"));
+        if let Some(pd) = env("ProgramData") {
+            dirs.push(pd.join("chocolatey").join("bin"));
+        }
+        if let Some(home) = env("USERPROFILE") {
+            dirs.push(home.join("scoop").join("shims"));
+        }
+    }
+    if let Some(d) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        dirs.push(d);
+    }
+    dirs
+}
+
+/// ffmpeg and ffprobe: `MANGAVOX_FFMPEG` (the ffmpeg binary, or its folder; ffprobe next to it),
+/// else the first [`tool_dirs`] folder that has them (ffprobe preferably next to ffmpeg).
+fn find_tools() -> Tools {
+    let (ffmpeg_exe, ffprobe_exe) = (exe_name("ffmpeg"), exe_name("ffprobe"));
+    let set = std::env::var_os("MANGAVOX_FFMPEG").filter(|v| !v.is_empty()).map(PathBuf::from).map(|p| if p.is_dir() { p.join(&ffmpeg_exe) } else { p }).filter(|p| p.is_file());
+    let dirs = std::cell::OnceCell::new();
+    let dirs = || dirs.get_or_init(tool_dirs);
+    let ffmpeg = set.or_else(|| dirs().iter().map(|d| d.join(&ffmpeg_exe)).find(|p| p.is_file()));
+    let beside = ffmpeg.as_ref().map(|f| f.with_file_name(&ffprobe_exe)).filter(|p| p.is_file());
+    let ffprobe = beside.or_else(|| dirs().iter().map(|d| d.join(&ffprobe_exe)).find(|p| p.is_file()));
+    Tools { ffmpeg, ffprobe }
+}
+
+/// [`find_tools`], cached once both are found. While one is missing the folders are searched again
+/// (at most every few seconds), so installing FFmpeg works without restarting the app.
+fn tools() -> Arc<Tools> {
+    static T: Mutex<Option<(Arc<Tools>, Instant)>> = Mutex::new(None);
+    let mut g = T.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((t, at)) = g.as_ref() {
+        if (t.ffmpeg.is_some() && t.ffprobe.is_some()) || at.elapsed() < Duration::from_secs(3) {
+            return t.clone();
+        }
+    }
+    let t = Arc::new(find_tools());
+    if let Some(f) = &t.ffmpeg {
+        eprintln!("[phone] ffmpeg: {}", f.display());
+    }
+    *g = Some((t.clone(), Instant::now()));
     t
 }
 
 /// A command that never opens a console window, killed when dropped.
-fn quiet(program: &PathBuf) -> tokio::process::Command {
+pub(crate) fn quiet(program: &PathBuf) -> tokio::process::Command {
     let mut c = tokio::process::Command::new(program);
     c.stdin(Stdio::null()).kill_on_drop(true);
     #[cfg(windows)]
@@ -367,6 +468,8 @@ struct Session {
     mode: Mode,
     probe: Probe,
     subs: Vec<Sub>,
+    /// On-demand HLS (`watch_hls`), for sources the phone cannot play as is.
+    hls: Option<Arc<watch_hls::Hls>>,
     created: Instant,
     live: Mutex<Live>,
 }
@@ -386,10 +489,14 @@ fn with_sessions<T>(f: impl FnOnce(&mut HashMap<String, Arc<Session>>) -> T) -> 
     f(SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
 }
 
-/// Kills the session's ffmpeg and releases its torrent unless another session still streams it.
+/// Kills the session's ffmpeg (and HLS encoder, deleting its segments) and releases its torrent
+/// unless another session still streams it.
 fn release(s: &Session) {
     if let Some(tx) = s.live().ffmpeg.take() {
         let _ = tx.send(());
+    }
+    if let Some(h) = &s.hls {
+        h.shutdown();
     }
     if let Some(h) = &s.hash {
         let shared = with_sessions(|m| m.values().any(|o| o.hash.as_ref() == Some(h)));
@@ -422,8 +529,8 @@ pub fn stop_all() {
     }
 }
 
-/// Adds a session (stopping the device's oldest past [`MAX_PER_DEVICE`]) and returns its id.
-fn insert(s: Session) -> String {
+/// Adds session `id` (from [`new_id`]; stopping the device's oldest past [`MAX_PER_DEVICE`]).
+fn insert(id: &str, s: Session) {
     static SWEEPER: OnceLock<()> = OnceLock::new();
     SWEEPER.get_or_init(|| {
         tokio::spawn(async {
@@ -442,9 +549,23 @@ fn insert(s: Session) -> String {
             remove(id);
         }
     }
-    let id = random_b64(24);
-    with_sessions(|m| m.insert(id.clone(), Arc::new(s)));
-    id
+    with_sessions(|m| m.insert(id.to_string(), Arc::new(s)));
+}
+
+/// A session id, made before the session so its HLS folder can be named after it. URL-safe
+/// base64; on a case-insensitive disk 24 random bytes still never collide.
+fn new_id() -> String {
+    random_b64(24)
+}
+
+/// The HLS fields of the `POST /api/watch` answer (none without HLS).
+fn hls_json(id: &str, hls: Option<&watch_hls::Hls>, out: &mut Value) {
+    let Some(h) = hls else { return };
+    let q = watch_hls::default_quality(&h.qualities);
+    out["hls"] = json!(format!("/api/watch/{id}/hls/{}/index.m3u8", q.as_str()));
+    out["hls_base"] = json!(format!("/api/watch/{id}/hls/"));
+    out["qualities"] = json!(h.qualities.iter().map(|q| q.as_str()).collect::<Vec<_>>());
+    out["quality"] = json!(q.as_str());
 }
 
 /// The device's session `id` (refreshing its idle timer); 404 for anyone else's or unknown ids.
@@ -490,22 +611,39 @@ struct Opened {
     url: String,
     hash: Option<String>,
     file_name: String,
+    /// A video file on this PC, served from disk.
+    file: Option<PathBuf>,
 }
 
-/// Opens a source on the PC's engine: torrents wait for metadata, http links go through the
-/// engine's Range-forwarding proxy. Local files are never streamed from here.
+/// Video file types a local source may be: the source list is the PC's own, but a path is only
+/// ever served when it really is a video file.
+const LOCAL_VIDEO: [&str; 12] = ["mp4", "m4v", "mkv", "webm", "mov", "avi", "ts", "m2ts", "wmv", "flv", "mpg", "mpeg"];
+
+fn local_video(path: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(path);
+    let ext = p.extension()?.to_string_lossy().to_ascii_lowercase();
+    (p.is_absolute() && LOCAL_VIDEO.contains(&ext.as_str()) && p.is_file()).then_some(p)
+}
+
+/// Opens a source: torrents on the PC's engine (waiting for metadata), http links through the
+/// engine's Range-forwarding proxy, local video files (from the PC's source list, never a path
+/// the phone sent) straight from disk.
 async fn open(req: &PlayRequest) -> Result<Opened, String> {
-    let engine = backend::engine().await.map_err(|e| format!("The PC's stream engine did not start: {e}"))?;
+    let engine = || async { backend::engine().await.map_err(|e| format!("The PC's stream engine did not start: {e}")) };
     match logic::classify_source(&req.source) {
         SourceKind::Torrent(src) => {
-            let added = engine.add(src, mv_torrent::AddOptions { file_idx: req.file_idx, ..Default::default() }).await.map_err(|e| format!("The torrent could not be opened: {e}"))?;
-            Ok(Opened { url: added.stream_url, hash: Some(added.info_hash), file_name: added.file_name })
+            let added = engine().await?.add(src, mv_torrent::AddOptions { file_idx: req.file_idx, ..Default::default() }).await.map_err(|e| format!("The torrent could not be opened: {e}"))?;
+            Ok(Opened { url: added.stream_url, hash: Some(added.info_hash), file_name: added.file_name, file: None })
         }
         SourceKind::Url(u) => {
             let file_name = reqwest::Url::parse(&u).ok().and_then(|p| p.path_segments().and_then(|mut s| s.next_back().map(str::to_string))).unwrap_or_default();
-            Ok(Opened { url: engine.direct_url(&u), hash: None, file_name })
+            Ok(Opened { url: engine().await?.direct_url(&u), hash: None, file_name, file: None })
         }
-        SourceKind::File(_) => Err("This source cannot be streamed to a phone".into()),
+        SourceKind::File(path) => {
+            let file = local_video(&path).ok_or_else(|| "This source cannot be streamed to a phone".to_string())?;
+            let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            Ok(Opened { url: file.to_string_lossy().into_owned(), hash: None, file_name, file: Some(file) })
+        }
     }
 }
 
@@ -654,29 +792,44 @@ async fn start(Extension(dev): CurrentDevice, Json(b): Json<WatchBody>) -> ApiRe
     let title = req.title.clone();
     let sub_list: Vec<(String, String, String)> = subs.iter().map(|s| (s.id.clone(), s.label.clone(), s.lang.clone())).collect();
     let now = Instant::now();
-    let id = insert(Session {
-        device: dev.id.clone(),
-        ident: Some(ident),
-        hash: o.hash,
-        url: o.url,
-        file: None,
-        mode,
-        probe,
-        subs,
-        created: now,
-        live: Mutex::new(Live { last: now, ffmpeg: None, subs: HashMap::new() }),
-    });
-    let subtitles: Vec<Value> = sub_list.into_iter().map(|(sid, label, lang)| json!({ "id": sid, "label": label, "lang": lang, "url": format!("/api/watch/{id}/sub/{sid}.vtt") })).collect();
-    Ok(Json(json!({
+    let id = new_id();
+    let hls = hls_for(&id, mode, &o.url, &probe, resume, tools.ffmpeg.is_some());
+    let mut out = json!({
         "id": id,
         "title": title,
         "duration": duration,
         "mode": mode.as_str(),
         "url": format!("/api/watch/{id}/stream"),
         "resume": resume,
-        "subtitles": subtitles,
+        "subtitles": sub_list.into_iter().map(|(sid, label, lang)| json!({ "id": sid, "label": label, "lang": lang, "url": format!("/api/watch/{id}/sub/{sid}.vtt") })).collect::<Vec<_>>(),
         "next": next,
-    })))
+    });
+    hls_json(&id, hls.as_deref(), &mut out);
+    insert(
+        &id,
+        Session {
+            device: dev.id.clone(),
+            ident: Some(ident),
+            hash: o.hash,
+            url: o.url,
+            file: o.file,
+            mode,
+            probe,
+            subs,
+            hls,
+            created: now,
+            live: Mutex::new(Live { last: now, ffmpeg: None, subs: HashMap::new() }),
+        },
+    );
+    Ok(Json(out))
+}
+
+/// HLS for a source the phone cannot play as is, when ffmpeg is there and the length is known.
+fn hls_for(id: &str, mode: Mode, input: &str, probe: &Probe, resume: Option<f64>, ffmpeg: bool) -> Option<Arc<watch_hls::Hls>> {
+    if mode == Mode::Direct || !ffmpeg {
+        return None;
+    }
+    watch_hls::Hls::new(id, input.to_string(), probe, resume).map(Arc::new)
 }
 
 /// A chapter's Studio recap video: a local MP4 (H.264 + AAC from Studio), played as is when ffprobe
@@ -701,19 +854,9 @@ async fn start_recap(dev: crate::auth::Device, chapter: Option<String>, title: S
     let probe = probe.unwrap_or_default();
     let duration = probe.duration;
     let now = Instant::now();
-    let id = insert(Session {
-        device: dev.id.clone(),
-        ident: None,
-        hash: None,
-        url,
-        file: Some(video),
-        mode,
-        probe,
-        subs: vec![],
-        created: now,
-        live: Mutex::new(Live { last: now, ffmpeg: None, subs: HashMap::new() }),
-    });
-    Ok(Json(json!({
+    let id = new_id();
+    let hls = hls_for(&id, mode, &url, &probe, None, tools.ffmpeg.is_some());
+    let mut out = json!({
         "id": id,
         "title": label,
         "duration": duration,
@@ -722,7 +865,25 @@ async fn start_recap(dev: crate::auth::Device, chapter: Option<String>, title: S
         "resume": null,
         "subtitles": [],
         "next": null,
-    })))
+    });
+    hls_json(&id, hls.as_deref(), &mut out);
+    insert(
+        &id,
+        Session {
+            device: dev.id.clone(),
+            ident: None,
+            hash: None,
+            url,
+            file: Some(video),
+            mode,
+            probe,
+            subs: vec![],
+            hls,
+            created: now,
+            live: Mutex::new(Live { last: now, ffmpeg: None, subs: HashMap::new() }),
+        },
+    );
+    Ok(Json(out))
 }
 
 fn release_opened(o: &Opened) {
@@ -768,6 +929,34 @@ async fn stream(Extension(dev): CurrentDevice, UrlPath(id): UrlPath<String>, Que
         },
         _ => piped(s, q.start.filter(|t| t.is_finite()).unwrap_or(0.0).clamp(0.0, 1e6)),
     }
+}
+
+/// `/api/watch/<id>/hls/<q>/<file>`: the playlist, `init.mp4` or a segment (`watch_hls`). `q` and
+/// `file` are matched against fixed sets; no path is ever built from them.
+async fn hls_file(Extension(dev): CurrentDevice, UrlPath((id, q, file)): UrlPath<(String, String, String)>) -> ApiResult<Response> {
+    let s = session(&id, &dev.id)?;
+    let hls = s.hls.clone().ok_or_else(|| ApiError::not_found("This video has no HLS stream"))?;
+    let q = watch_hls::Quality::parse(&q).filter(|q| hls.qualities.contains(q)).ok_or_else(|| ApiError::not_found("No such quality"))?;
+    let asset = watch_hls::parse_asset(&file).ok_or_else(|| ApiError::not_found("No such file"))?;
+    let (body, mime) = match asset {
+        watch_hls::Asset::Playlist => (hls.playlist().into_bytes(), "application/vnd.apple.mpegurl"),
+        asset => {
+            let ffmpeg = tools().ffmpeg.clone().ok_or_else(|| ApiError::unavailable(NO_FFMPEG))?;
+            let encoder = watch_hls::video_encoder(&ffmpeg).await;
+            let bytes = match asset {
+                watch_hls::Asset::Seg(n) => hls.segment(&ffmpeg, encoder, q, n).await?,
+                _ => hls.init(&ffmpeg, encoder, q).await?,
+            };
+            s.touch();
+            (bytes, "video/mp4")
+        }
+    };
+    let len = body.len();
+    let mut r = Response::new(Body::from(body));
+    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    r.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(r)
 }
 
 /// The file as is from the engine, forwarding Range so the phone seeks natively.

@@ -30,7 +30,7 @@ use crate::reader::{open_read_aloud, watch_recap};
 use crate::recap::{self, RecapOutputs};
 use crate::store;
 use crate::tags::MAX_RECS;
-use crate::ui::{action_tile, cover_src, fill_menu, icon_trigger, skeleton_cover, spawn_cover_downloads, Entry, Grid, Load};
+use crate::ui::{action_tile, cover_src, fill_menu, icon_trigger, skeleton_cover, spawn_cover_downloads, Entry, Grid, Load, Snapshot};
 use crate::videos::{self, Thumbs};
 
 /// Fixed list rows before the chapters: the header and the chapter toolbar.
@@ -97,6 +97,7 @@ pub struct DetailPage {
     _watch: Subscription,
 }
 
+#[derive(Clone)]
 struct Loaded {
     manga: Manga,
     chapters: Vec<Chapter>,
@@ -104,9 +105,29 @@ struct Loaded {
     cats: Vec<LibraryCategory>,
     member: Vec<String>,
     recaps: HashMap<String, RecapOutputs>,
+    in_library: bool,
+}
+
+/// The titles opened last (newest last), painted at once when opened again, then re-read.
+static LAST: Snapshot<Vec<(String, Loaded)>> = Snapshot::new();
+const KEEP_LAST: usize = 24;
+
+fn last(id: &str) -> Option<Loaded> {
+    LAST.read(|v| v.iter().find(|(k, _)| k == id).map(|(_, l)| l.clone())).flatten()
+}
+
+fn keep_last(id: &str, l: &Loaded) {
+    LAST.update(|slot| {
+        let v = slot.get_or_insert_with(Vec::new);
+        v.retain(|(k, _)| k != id);
+        v.push((id.to_string(), l.clone()));
+        let extra = v.len().saturating_sub(KEEP_LAST);
+        v.drain(..extra);
+    });
 }
 
 fn load(id: String, lang: String) -> anyhow::Result<Loaded> {
+    let in_library = !backend::browse_only().contains(&id);
     backend::with_db(|c| {
         let m = manga::get(c, &id)?.ok_or_else(|| anyhow::anyhow!("This title is no longer in the database"))?;
         let cs = store::chapters(c, &id, &lang)?;
@@ -115,7 +136,7 @@ fn load(id: String, lang: String) -> anyhow::Result<Loaded> {
         let member = category::manga_category_map(c)?.remove(&id).unwrap_or_default();
         // Only downloaded chapters can have been through Studio.
         let recaps = cs.iter().filter(|c| c.download_status == "complete").filter_map(|c| Some((c.id.clone(), recap::find(&id, &c.id)?))).collect();
-        Ok(Loaded { manga: m, chapters: cs, cover, cats, member, recaps })
+        Ok(Loaded { manga: m, chapters: cs, cover, cats, member, recaps, in_library })
     })
 }
 
@@ -166,8 +187,26 @@ impl DetailPage {
             queue,
             _watch: watch,
         };
+        if let Some(l) = last(&p.manga_id) {
+            p.apply(l, cx);
+            mv_ui::perf::ready("Manga detail (cached)");
+        }
         p.reload(cx);
         p
+    }
+
+    /// Show loaded data (a kept copy on open, then the fresh read).
+    fn apply(&mut self, l: Loaded, cx: &mut Context<Self>) {
+        if l.cover.is_some() {
+            self.cover = l.cover;
+        }
+        self.in_library = l.in_library;
+        self.cats = l.cats;
+        self.member = l.member;
+        self.recaps = l.recaps;
+        self.set_data(l.manga, l.chapters);
+        self.sync_videos(cx);
+        self.maybe_load_recs(cx);
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -185,16 +224,9 @@ impl DetailPage {
                 match res {
                     Ok(l) => {
                         let empty = l.chapters.is_empty();
-                        if l.cover.is_some() {
-                            this.cover = l.cover;
-                        }
-                        this.in_library = !backend::browse_only().contains(&this.manga_id);
-                        this.cats = l.cats;
-                        this.member = l.member;
-                        this.recaps = l.recaps;
-                        this.set_data(l.manga, l.chapters);
-                        this.sync_videos(cx);
-                        this.maybe_load_recs(cx);
+                        keep_last(&this.manga_id, &l);
+                        this.apply(l, cx);
+                        mv_ui::perf::ready("Manga detail");
                         // A title without chapters has never been synced: fetch them once.
                         if empty && !this.auto_refreshed {
                             this.auto_refreshed = true;
@@ -206,6 +238,8 @@ impl DetailPage {
                             this.merge(false, true, cx);
                         }
                     }
+                    // A failed re-read keeps the kept copy on screen.
+                    Err(e) if matches!(this.state, Load::Ready(_)) => eprintln!("[manga] could not re-read the title: {e:#}"),
                     Err(e) => this.state = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();
@@ -372,19 +406,47 @@ impl DetailPage {
         self.list.remeasure_items(0..1.min(self.list.item_count()));
         cx.notify();
         cx.spawn(async move |this, cx| {
+            let covers_of = |list: &[Suggestion]| -> Vec<_> { list.iter().filter_map(|s| s.item.cover_url.clone().map(|u| (u, Some(s.source.clone())))).collect() };
+            // The last answer kept on disk first; looked up again only when it is stale.
+            let (src, sid) = (ctx.source.clone(), ctx.source_id.clone());
+            let kept = mv_ui::bg::blocking(move || {
+                let (list, age) = suggest::for_title_kept(&src, &sid)?;
+                let covers = backend::resolve_covers(covers_of(&list[..]));
+                Some((list, age, covers))
+            })
+            .await
+            .ok()
+            .flatten();
+            let mut shown = false;
+            if let Some((list, age, (have, missing))) = kept {
+                shown = true;
+                let fresh = age < suggest::KEPT_TTL;
+                let _ = this.update(cx, |this, cx| {
+                    this.recs = Some(Load::Ready(list));
+                    this.rec_covers.extend(have);
+                    spawn_cover_downloads(cx, missing, |t: &mut Self| &mut t.rec_covers);
+                    this.list.remeasure_items(0..1.min(this.list.item_count()));
+                    cx.notify();
+                });
+                if fresh {
+                    return;
+                }
+            }
             let res = mv_ui::bg::run(suggest::for_title(ctx)).await.and_then(|r| r);
             let covers = match &res {
                 Ok(list) => {
-                    let urls: Vec<_> = list.iter().filter_map(|s| s.item.cover_url.clone().map(|u| (u, Some(s.source.clone())))).collect();
+                    let urls = covers_of(&list[..]);
                     mv_ui::bg::blocking(move || backend::resolve_covers(urls)).await.ok()
                 }
                 Err(_) => None,
             };
             let _ = this.update(cx, |this, cx| {
-                this.recs = Some(match res {
-                    Ok(r) => Load::Ready(r),
-                    Err(e) => Load::Failed(format!("{e:#}")),
-                });
+                match res {
+                    Ok(r) => this.recs = Some(Load::Ready(r)),
+                    // A failed look-up keeps the kept list.
+                    Err(_) if shown => {}
+                    Err(e) => this.recs = Some(Load::Failed(format!("{e:#}"))),
+                }
                 if let Some((have, missing)) = covers {
                     this.rec_covers.extend(have);
                     spawn_cover_downloads(cx, missing, |t: &mut Self| &mut t.rec_covers);
@@ -565,6 +627,7 @@ impl DetailPage {
         let range = mv_recap::thumb::badge_label(&numbers);
         let shared = self.video_thumbs.shared(&self.videos);
         let ai = self.video_thumbs.ai;
+        let picked = self.video_thumbs.picked;
         let play_all = {
             let (mid, title, list) = (m.id.clone(), m.title.clone(), self.videos.clone());
             move |_: &ClickEvent, w: &mut Window, cx: &mut App| {
@@ -578,7 +641,9 @@ impl DetailPage {
         let heading = section_header("Videos", Some(ph::MONITOR_PLAY))
             .mb(px(10.))
             .trailing(muted(if n == 1 { "1 chapter video made in Studio".to_string() } else { format!("{n} chapter videos made in Studio") }).mr(px(8.)))
-            .when(mv_recap::thumb::can_paint(), |h| {
+            // A thumbnail made on Studio's Thumbnails page wins over the AI image from the cover.
+            .when(picked, |h| h.trailing(muted("Thumbnail made in Studio").mr(px(8.))))
+            .when(mv_recap::thumb::can_paint() && !picked, |h| {
                 h.trailing(
                     btn("videos-ai", if ai { "Regenerate thumbnail" } else { "Make AI thumbnail" }, ButtonKind::Ghost)
                         .small()
@@ -922,7 +987,7 @@ impl DetailPage {
             .w_full()
             .overflow_hidden()
             // Edge-to-edge backdrop: the cover stretched across the whole page width, faded into the page.
-            .when_some(backdrop, |d, c| d.child(c.into_img().absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover).opacity(0.3)))
+            .when_some(backdrop, |d, c| d.child(c.into_full_img().absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover).opacity(0.3)))
             .child(div().absolute().top_0().left_0().size_full().bg(linear_gradient(90., linear_color_stop(base.alpha(0.8), 0.), linear_color_stop(base.alpha(0.2), 0.8))))
             .child(div().absolute().top_0().left_0().size_full().bg(linear_gradient(180., linear_color_stop(base.alpha(0.25), 0.), linear_color_stop(base, 1.))))
             .when_some(back_label(cx), |d, label| d.child(div().relative().flex().px(px(size::PAGE_X - 10.)).pt(px(14.)).child(back_pill(label))))

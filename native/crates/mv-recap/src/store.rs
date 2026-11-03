@@ -152,6 +152,7 @@ pub fn chapter_status(ch: &ChapterRef) -> PhaseStatus {
         transcript: dir.join("transcript.json").is_file(),
         story: dir.join("story.json").is_file(),
         audio_files,
+        timed: ch.output_dir.join("sync_map.json").is_file(),
         video: video.is_file().then_some(video),
         reels,
         music: ch.output_dir.join("score.wav").is_file(),

@@ -239,7 +239,7 @@ fn parse_length(s: &str) -> u64 {
 }
 
 /// Every object under `key` anywhere in `v`.
-fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+pub(crate) fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     match v {
         Value::Object(m) => {
             for (k, x) in m {
@@ -255,7 +255,7 @@ fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     }
 }
 
-fn video_from_renderer(r: &Value) -> Option<TrendVideo> {
+pub(crate) fn video_from_renderer(r: &Value) -> Option<TrendVideo> {
     let id = r.get("videoId")?.as_str()?.to_string();
     let views = r.get("viewCountText").map(text).and_then(|s| parse_count(&s)).unwrap_or(0);
     let age = r.get("publishedTimeText").map(text).and_then(|s| parse_age_hours(&s))?;
@@ -550,7 +550,7 @@ pub fn rank(videos: &[TrendVideo]) -> Vec<TrendManga> {
     out
 }
 
-fn median(mut v: Vec<u64>) -> u64 {
+pub(crate) fn median(mut v: Vec<u64>) -> u64 {
     if v.is_empty() {
         return 0;
     }

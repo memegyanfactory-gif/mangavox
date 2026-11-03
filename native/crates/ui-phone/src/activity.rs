@@ -157,6 +157,8 @@ pub struct Activity {
     pub manga: Vec<MangaCard>,
     /// Oldest first.
     pub events: Vec<Event>,
+    /// Private mode is on (read on every request, so the phone follows the PC's switch).
+    pub private: bool,
 }
 
 fn is_active(state: &str) -> bool {
@@ -664,7 +666,7 @@ impl Tracker {
         }
         out.sort_by(|a, b| rank(a.state).cmp(&rank(b.state)).then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase())).then_with(|| a.id.cmp(&b.id)));
         let busy = out.iter().filter(|c| is_active(c.state)).count();
-        Activity { now: wall_ms, busy, manga: out, events: self.events.iter().cloned().collect() }
+        Activity { now: wall_ms, busy, manga: out, events: self.events.iter().cloned().collect(), private: false }
     }
 }
 
@@ -794,10 +796,12 @@ fn ensure_ticker() {
 async fn activity() -> Json<Activity> {
     ensure_ticker();
     let cached = shared().last.as_ref().filter(|(t, _)| t.elapsed() < FRESH).map(|(_, a)| a.clone());
-    match cached {
-        Some(a) => Json(a),
-        None => Json(refresh().await),
-    }
+    let mut a = match cached {
+        Some(a) => a,
+        None => refresh().await,
+    };
+    a.private = mv_core::privacy::active();
+    Json(a)
 }
 
 // ---------------------------------------------------------------- tests

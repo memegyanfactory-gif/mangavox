@@ -18,8 +18,9 @@ use crate::backend;
 use crate::downloads::{downloads, ChapterDl, Downloads, Job};
 use crate::logic;
 use crate::store;
-use crate::ui::{search_box, spawn_cover_downloads, thumb, Load};
+use crate::ui::{search_box, spawn_cover_downloads, thumb, Load, Snapshot};
 
+#[derive(Clone)]
 struct Title {
     manga: Manga,
     chapters: Vec<Chapter>,
@@ -38,6 +39,9 @@ pub struct DownloadsPage {
 }
 
 type Loaded = (Vec<Title>, HashMap<String, PathBuf>, Vec<(String, Option<String>)>);
+
+/// What the page last showed (painted at once on the next open, then re-read).
+static LAST: Snapshot<(Vec<Title>, HashMap<String, PathBuf>)> = Snapshot::new();
 
 fn dir_size(dir: &str) -> u64 {
     std::fs::read_dir(dir).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0)
@@ -81,6 +85,11 @@ impl DownloadsPage {
             queue,
             _subs: vec![sub, watch],
         };
+        if let Some((items, covers)) = LAST.get() {
+            p.state = Load::Ready(items);
+            p.covers = covers;
+            mv_ui::perf::ready("Downloads (cached)");
+        }
         p.reload(cx);
         p
     }
@@ -92,9 +101,13 @@ impl DownloadsPage {
                 match res {
                     Ok((items, have, missing)) => {
                         this.covers.extend(have);
+                        LAST.put((items.clone(), this.covers.clone()));
                         this.state = Load::Ready(items);
+                        mv_ui::perf::ready("Downloads");
                         spawn_cover_downloads(cx, missing, |t: &mut Self| &mut t.covers);
                     }
+                    // A failed re-read keeps the shown list.
+                    Err(e) if matches!(this.state, Load::Ready(_)) => eprintln!("[manga] could not re-read downloads: {e:#}"),
                     Err(e) => this.state = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();

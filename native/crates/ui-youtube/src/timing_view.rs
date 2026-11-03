@@ -10,16 +10,19 @@ use mv_ui::{ph, size};
 use mv_youtube::timing::{next_at, Analysis, Window, DAYS};
 
 use crate::hub;
-use crate::page::{card, card_title, hint, YouTubePage};
+use crate::page::{yt_card as card, yt_card_title as card_title, yt_hint as hint, YouTubePage};
+use crate::yt;
 
-/// "18:00".
+const FULL_DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+/// "6 PM".
 fn hhmm(hour: usize) -> String {
-    format!("{:02}:00", hour % 24)
+    crate::when::hour(hour)
 }
 
-/// "18:00–20:00".
+/// "6–8 PM".
 fn span(w: &Window) -> String {
-    format!("{}–{}", hhmm(w.start_hour), hhmm(w.start_hour + w.hours))
+    crate::when::hour_span(w.start_hour, w.hours)
 }
 
 /// "UTC+5:30".
@@ -43,7 +46,7 @@ fn until(secs: i64) -> String {
     }
 }
 
-/// "Today 18:00", "Tomorrow 03:00", "Sat 18:00" for a time in local seconds.
+/// "Today 6 PM", "Tomorrow 3 AM", "Sat 6 PM" for a time in local seconds.
 fn day_label(at: i64, now: i64, offset: i32) -> String {
     let day = |t: i64| (t + offset as i64).div_euclid(86_400);
     let (d, h) = mv_youtube::timing::local_day_hour(at, offset);
@@ -70,47 +73,49 @@ pub(crate) fn next_golden(a: &Analysis) -> Option<(i64, &Window)> {
 }
 
 impl YouTubePage {
-    /// The rail's clock: the time here, and when the next golden time is.
+    /// The rail's clock: the time here (12-hour), and when the next golden time is.
     pub(crate) fn clock(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let h = self.hub.read(cx);
         let off = hub::utc_offset();
         let now = hub::now();
-        let local = chrono::DateTime::from_timestamp(now + off as i64, 0).map(|d| d.format("%H:%M").to_string()).unwrap_or_default();
+        let local = crate::when::clock(now);
         let (day, _) = mv_youtube::timing::local_day_hour(now, off);
         let a = h.timing_analysis();
         let next = next_golden(&a).map(|(t, _)| (t, day_label(t, now, off)));
+        let busy = h.timing_busy;
         div()
             .id("yt-clock")
             .flex()
             .flex_col()
             .gap(px(2.))
-            .mx(px(space::XS))
-            .mb(px(space::SM))
-            .p(px(space::SM))
-            .rounded(px(radius::LG))
-            .bg(Tokens::surface_2())
+            .min_w_0()
+            .mb(px(8.))
+            .px(px(12.))
+            .py(px(10.))
+            .rounded(px(12.))
+            .bg(yt::tone(0.05))
             .cursor_pointer()
-            .hover(|s| s.bg(Tokens::hover()))
+            .hover(|s| s.bg(yt::tone(0.1)))
             .tooltip(tip("Your local time and the next golden upload time (Schedule)"))
             .on_click(cx.listener(|this, _, _, cx| this.set_tab(crate::page::Tab::Schedule, cx)))
             .child(
                 div()
                     .flex()
                     .items_baseline()
-                    .gap(px(6.))
-                    .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(local))
-                    .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{} · {}", DAYS[day], zone_label(off)))),
+                    .gap(px(8.))
+                    .min_w_0()
+                    .child(yt::text(20., 26., FontWeight::BOLD, yt::TEXT).flex_none().whitespace_nowrap().child(local))
+                    .child(yt::line(12., FontWeight::NORMAL, yt::TEXT_2, format!("{} · {}", FULL_DAYS[day], crate::when::zone()))),
             )
             .child(match next {
                 Some((t, label)) => div()
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .text_size(px(size::XS))
-                    .text_color(Tokens::accent())
-                    .child(icon_ph(ph::CLOCK_COUNTDOWN, Tokens::accent(), icon_px::XS))
-                    .child(format!("Golden time {label} · {}", until(t - now))),
-                None => div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(if h.timing_busy { "Researching upload times…" } else { "Open Schedule for the golden time" }),
+                    .min_w_0()
+                    .child(yt::icon_of(ph::CLOCK_COUNTDOWN, 14., yt::LINK))
+                    .child(yt::line(12., FontWeight::MEDIUM, yt::LINK, format!("Golden time {label} · {}", until(t - now)))),
+                None => yt::line(12., FontWeight::NORMAL, yt::TEXT_2, if busy { "Researching upload times…" } else { "Open Schedule for the golden time" }),
             })
     }
 
@@ -255,7 +260,7 @@ impl YouTubePage {
     /// views, red = below it; stronger colour, stronger effect.
     fn heatmap(&self, a: &Analysis) -> Stateful<Div> {
         let cell_w = 22.;
-        let head = div().flex().gap(px(2.)).pl(px(36.)).children((0..24).map(|hh| div().w(px(cell_w)).text_size(px(9.)).text_color(Tokens::text_3()).child(if hh % 3 == 0 { format!("{hh:02}") } else { String::new() })));
+        let head = div().flex().gap(px(2.)).pl(px(36.)).children((0..24).map(|hh| div().w(px(cell_w)).text_size(px(9.)).text_color(Tokens::text_3()).child(if hh % 3 == 0 { crate::when::hour(hh).replace(" AM", "a").replace(" PM", "p") } else { String::new() })));
         let rows = (0..7).map(|d| {
             div().flex().items_center().gap(px(2.)).child(div().w(px(34.)).text_size(px(size::XS)).text_color(if a.best_days.contains(&d) { Tokens::accent() } else { Tokens::text_3() }).child(DAYS[d])).children((0..24).map(move |hh| {
                 let c = a.heat[d][hh];
@@ -299,6 +304,6 @@ mod tests {
         assert_eq!(until(3600 * 5 + 12 * 60), "in 5 h 12 min");
         assert_eq!(until(30), "in 1 min");
         let w = Window { start_hour: 23, hours: 2, cell: Default::default(), share: 0. };
-        assert_eq!(span(&w), "23:00–01:00");
+        assert_eq!(span(&w), "11 PM–1 AM");
     }
 }

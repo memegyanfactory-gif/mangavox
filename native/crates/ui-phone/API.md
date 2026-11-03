@@ -130,6 +130,11 @@ Known limits (design tradeoffs, not bugs):
   manga to the library, queues missing chapters for download and enqueues saved ones in Generate (until Video); a
   watcher enqueues each downloading chapter once it is saved. Shown in `/api/activity` as kind `studio`.
 - `/api/manga/<id>` also returns `"source"`, `"in_library"`, `"favorite"`.
+- `GET /api/privacy` -> `{ "private" }`; `POST /api/privacy` body `{ "on" }` -> `{ "private" }`: the desktop's private
+  mode (one switch for the PC and every phone). Turning it off opens the clean-up offer on the PC. While it is on,
+  nothing the phone reads or watches is recorded (no history, resume points, Continue Reading / Watching, taste),
+  exactly as on the desktop, and the phone keeps no reading places or last page of its own. `/api/activity` carries
+  `"private"` too, so a phone follows a switch made on the PC.
 
 ### Chapter media (api_chapter_media.rs)
 - `GET /api/chapter/<id>/media` -> `{ "listen": bool, "narration": url|null, "video": url|null, "thumbnail": url|null,
@@ -147,7 +152,7 @@ Known limits (design tradeoffs, not bugs):
 - Until `mv_recap::media::chapter_media` builds, the module reads these files itself with the same meaning.
 
 ### Activity (activity.rs)
-- `GET /api/activity` -> `{ "now": unix ms (PC clock), "busy": n, "manga": [card], "events": [event] }`, read-only,
+- `GET /api/activity` -> `{ "now": unix ms (PC clock), "busy": n, "manga": [card], "events": [event], "private" }`, read-only,
   `no-store`. One card per manga: `{ "id", "title", "cover": url|null, "state", "tasks": [task] }`; a task is
   `{ "key", "kind": "download"|"generate"|"voice"|"read"|"export", "label", "state":
   "running"|"limit"|"waiting"|"paused"|"failed"|"done", "line", "progress": 0..1, "at", "total" (chapters; 0 =
@@ -188,7 +193,14 @@ Known limits (design tradeoffs, not bugs):
    proxy for http links; NOT the desktop player), probes it with ffprobe, and answers
    `{ "id", "title", "duration": s|null, "mode": "direct"|"remux"|"transcode", "url": "/api/watch/<id>/stream",
       "resume": s|null, "subtitles": [{ "id","label","lang","url": "/api/watch/<id>/sub/<sid>.vtt" }],
-      "next": { "season","episode","title" }|null }`.
+      "next": { "season","episode","title" }|null }`,
+   plus, when `mode` is not `direct` (and ffmpeg and the duration are known), on-demand HLS:
+   `"hls": "/api/watch/<id>/hls/<quality>/index.m3u8"` (the default quality), `"hls_base": "/api/watch/<id>/hls/"`,
+   `"qualities": ["1080","720","480","360"]` (only those at or below the source; "360" always) and
+   `"quality": "720"` (or the best offered when the source is smaller). Phones should prefer `hls` (iPhone
+   Safari cannot play the `url` stream of a remux / transcode); `url` stays for older apps.
+   A source may also be a video file on the PC when the PC's own source list has one (never a phone-sent
+   path): played `direct` with Range or through HLS.
    Up to 3 sources are tried within 90 s (torrents wait for metadata). Errors: 400 bad ids, 404 no
    sources / no addons, 503 `"Install FFmpeg on your PC to watch this on your phone"`, 504 nothing
    started in time, 502 otherwise. Records a "play" event (Continue Watching on the PC).
@@ -205,11 +217,25 @@ Known limits (design tradeoffs, not bugs):
      veryfast CRF 23, at most 1280 wide): fragmented MP4 (H.264 + AAC stereo 160k) from ffmpeg starting
      at `start`, no Range or Content-Length. A newer stream request for the session, `stop`, or the
      phone disconnecting kills the previous ffmpeg.
+- `GET /api/watch/<id>/hls/<q>/index.m3u8` (q one of the session's `qualities`) -> VOD playlist
+   (`application/vnd.apple.mpegurl`, no-store): version 7, 4 s fMP4 segments `seg0.m4s`..`seg<n>.m4s` all listed up
+   front (the last one shorter; a tail under 0.5 s joins the one before), `#EXT-X-MAP:URI="init.mp4"`, ENDLIST.
+- `GET /api/watch/<id>/hls/<q>/init.mp4`, `GET /api/watch/<id>/hls/<q>/seg<n>.m4s` -> `video/mp4` with
+   Content-Length, no-store. H.264 8-bit (h264_nvenc when the PC's GPU has it, else libx264 veryfast) at most
+   1080 / 720 / 480 / 360 high (never upscaled; 6000k / 3000k / 1500k / 800k VBR), AAC stereo 160k from the
+   chosen audio track. Made on demand: a segment not made yet (a seek, a quality switch) restarts the session's
+   one encoder there; requests wait up to 30 s, then 503 (502 when ffmpeg cannot make it). Timestamps are the
+   source's, so the player's `currentTime` is the position in the video (resume and `progress` work unchanged).
+   The encoder pauses 5 minutes ahead of the phone. Segments live in `<data>/temp/phone-hls/<id>/` until the
+   session ends (`stop`, idle expiry, replaced); the folder is emptied at server start. Unknown `q` or file
+   name: 404. ffmpeg is found through `MANGAVOX_FFMPEG`, PATH, the registry's user / machine Path (installed
+   since the app started), winget, C:\ffmpeg\bin, Chocolatey, Scoop, or the app's folder.
 - `GET /api/watch/<id>/status` -> `{ "state": "ready"|"error", "peers": n|null, "down_bps": n|null,
    "progress": 0..1|null, "error": string|null }` (torrent stats; nulls for http sources).
 - `POST /api/watch/<id>/progress` body `{ "pos": s, "duration": s }` -> `{}` (same history / resume as the
    desktop player; past 90% counts as watched).
-- `POST /api/watch/<id>/stop` -> `{}` (kills ffmpeg, releases the torrent).
+- `POST /api/watch/<id>/stop` -> `{}` (kills ffmpeg and the HLS encoder, deletes the HLS segments, releases
+  the torrent).
 - `GET /api/watch/<id>/sub/<sid>.vtt` -> `text/vtt`: `e<n>` embedded text tracks (SRT/ASS/mov_text/WebVTT,
   extracted with ffmpeg; this reads the whole file, so on a torrent it can take minutes), `x<n>` online
   subtitles from the desktop's OpenSubtitles lookup (movies / series, English first), SRT converted.

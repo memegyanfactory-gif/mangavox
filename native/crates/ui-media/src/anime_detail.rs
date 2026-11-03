@@ -191,12 +191,21 @@ impl AnimeDetail {
                 }
                 Ok(d)
             },
-            |v: &mut Self, l| v.details = l,
+            // A failed load keeps the catalog data already shown (see below).
+            |v: &mut Self, l| {
+                if !(matches!(l, Load::Failed(_)) && v.details.ready().is_some()) {
+                    v.details = l;
+                }
+            },
         );
         if let Load::Ready(d) = &details {
             fetch(cx, record_open(media_title("anime", mal_id, d, title)), |_: &mut Self, _| {});
         }
-        details
+        // Not cached yet: open on the card's catalog data while the details load.
+        match details {
+            Load::Loading => crate::common::seen_title(mal_id).map_or(Load::Loading, Load::Ready),
+            d => d,
+        }
     }
 
     fn reload_details(&mut self, cx: &mut Context<Self>) {
@@ -875,6 +884,9 @@ impl AnimeDetail {
 
 impl Render for AnimeDetail {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.details.ready().is_some() {
+            mv_ui::perf::ready("Anime detail");
+        }
         let width = look::page_width(&self.scroll, window);
         let movie = self.is_movie();
         self.refresh_in_list(cx);

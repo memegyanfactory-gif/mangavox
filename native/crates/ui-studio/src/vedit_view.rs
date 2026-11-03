@@ -353,9 +353,10 @@ impl Default for Editor {
     }
 }
 
-/// A chapter with a finished video.
+/// A chapter on the timeline: its narration is timed into beats (Generate's Audio step), whether
+/// or not its video has been rendered yet; Export renders the ones that are not.
 fn made(statuses: &HashMap<String, mv_recap::PhaseStatus>, c: &ChapterItem) -> bool {
-    statuses.get(&c.id).and_then(|s| s.video.as_ref()).is_some_and(|p| p.is_file())
+    statuses.get(&c.id).is_some_and(|s| (s.timed && s.audio_files > 0) || s.video.as_ref().is_some_and(|p| p.is_file()))
 }
 
 impl StudioPage {

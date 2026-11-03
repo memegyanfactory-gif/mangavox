@@ -83,19 +83,15 @@ fn model_and_res() -> (&'static magnific::ImageModel, String, String) {
 /// both use this): the Thumbnails page's choice, with `aspect` given by the call over it.
 fn final_model(aspect: &str, uses_refs: bool) -> (&'static magnific::ImageModel, String, String) {
     let (model, res, aspect_pref) = model_and_res();
-    pick_model(model, res, if aspect.is_empty() { aspect_pref } else { aspect.to_string() }, uses_refs)
+    pick_model(model, &magnific::Keys::load(), res, if aspect.is_empty() { aspect_pref } else { aspect.to_string() }, uses_refs)
 }
 
-/// `model` unless it cannot do the job: character references (a prompt with @Name) need a model
-/// that takes them, and a model without aspect control only makes squares; then the first of
-/// the catalogue (Nano Banana 2.1 does both). The size falls back to the model's first.
-fn pick_model(mut model: &'static magnific::ImageModel, res: String, aspect: String, uses_refs: bool) -> (&'static magnific::ImageModel, String, String) {
-    if uses_refs && model.refs == 0 {
-        model = &magnific::CATALOG[0];
-    }
-    if !model.takes_aspect() && aspect != "1:1" {
-        model = &magnific::CATALOG[0];
-    }
+/// `model` unless it cannot do the job: it has no key, character references (a prompt with
+/// @Name) need a model that takes them, and a model without aspect control only makes squares;
+/// then another model with a key that can (`magnific::usable`). The size falls back to the
+/// model's first.
+fn pick_model(model: &'static magnific::ImageModel, keys: &magnific::Keys, res: String, aspect: String, uses_refs: bool) -> (&'static magnific::ImageModel, String, String) {
+    let model = magnific::usable(model, keys, uses_refs, &aspect);
     let res = if model.resolutions.contains(&res.as_str()) { res } else { model.resolutions.first().copied().unwrap_or("Auto").to_string() };
     (model, res, aspect)
 }
@@ -128,14 +124,15 @@ async fn thumbnails(a: Map<String, Value>) -> ToolResult {
         "aspect": aspect,
         "creditsPerImage": model.cost_at(&res),
         "magnificKey": magnific::key().is_some(),
+        "otherImageServicesWithKeys": magnific::Keys::load().services,
         "spentThisMonth": usage.month_spent(),
     })))
 }
 
 async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
-    let Some(key) = magnific::key() else {
-        return Err("No Magnific API key yet. The user adds it in Settings → Magnific (or on the Thumbnails page).".into());
-    };
+    if !magnific::Keys::load().any() {
+        return Err("No image service key yet. The user adds a Magnific key in Settings → Magnific (or on the Thumbnails page), or a Higgsfield, fal.ai, Replicate, Black Forest Labs or Recraft key in Settings → AI services.".into());
+    }
     let groups = mv_ui::bg::blocking(crate::data::load).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
     let g = crate::assist::find_manga(&groups, str_arg(&a, "manga"))?.clone();
     let gallery = super::thumbs::Gallery::load(&g.id);
@@ -160,6 +157,13 @@ async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
     let (resolved, order) = super::thumbs::resolve(&prompt, &just_cast, 0);
     // `resolve` only finds references at an @Name, so this is what the approval assumed.
     let (model, res, aspect) = final_model(str_arg(&a, "aspect"), !order.is_empty() || prompt.contains('@'));
+    let keys = magnific::Keys::load();
+    let Some(key) = magnific::key_for(model) else {
+        if keys.any() {
+            return Err(magnific::no_fit(&keys, !order.is_empty() || prompt.contains('@'), &aspect));
+        }
+        return Err(format!("{} needs a {} key. The user adds it in Settings → AI services.", model.name, model.service_label()));
+    };
     let mut refs: Vec<magnific::Reference> = vec![];
     let mut looks = vec![];
     for i in order.iter().take(model.refs) {
@@ -185,13 +189,20 @@ async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
     };
     mv_ui::bg::run(job).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))?;
     let cost = model.cost_at(&res);
-    let mut usage = magnific::Usage::load();
-    usage.add(cost);
-    usage.save();
+    magnific::record(model, cost);
     let mut gallery = super::thumbs::Gallery::load(&g.id);
     gallery.thumbs.insert(0, super::thumbs::Thumb { id: tid.clone(), prompt, label, parent: None, model: model.name.to_string(), resolution: res.clone(), cost, created: super::now() });
     gallery.save(&g.id);
-    ui_assistant::on_ui(|_, cx| super::thumb_page::notify_changed(cx)).await.ok();
+    super::video_thumb::learn_made(&gallery.thumbs[0].prompt, model.name, &aspect);
+    // The new thumbnail can be the one the manga's videos show: draw their posters again.
+    let mid = g.id.clone();
+    let changed = mv_ui::bg::blocking(move || super::video_thumb::redraw_blocking(&mid)).await.and_then(|r| r).unwrap_or_default();
+    ui_assistant::on_ui(move |_, cx| {
+        super::thumb_page::notify_changed(cx);
+        super::video_thumb::redrawn(changed, cx);
+    })
+    .await
+    .ok();
     Ok(ToolOutput::Value(json!({ "manga": g.title, "file": out.display().to_string(), "model": model.name, "resolution": res, "aspect": aspect, "credits": cost, "note": "Saved on the Thumbnails page (reopen it to see the new image)." })))
 }
 
@@ -283,6 +294,26 @@ mod tests {
 
     fn model(id: &str) -> &'static magnific::ImageModel {
         magnific::CATALOG.iter().find(|m| m.id == id).unwrap()
+    }
+
+    fn magnific_only() -> magnific::Keys {
+        magnific::Keys { magnific: true, services: vec![] }
+    }
+
+    fn pick_model(model: &'static magnific::ImageModel, res: String, aspect: String, uses_refs: bool) -> (&'static magnific::ImageModel, String, String) {
+        super::pick_model(model, &magnific_only(), res, aspect, uses_refs)
+    }
+
+    #[test]
+    fn a_model_without_a_key_gives_way_to_one_with_a_key() {
+        let fal_only = magnific::Keys { magnific: false, services: vec!["fal"] };
+        // The saved Magnific default, but only fal.ai has a key.
+        let (m, res, _) = super::pick_model(model("nano-banana-2-1"), &fal_only, "2K".into(), "16:9".into(), true);
+        assert_eq!((m.id, res.as_str()), ("fal-nano-banana", "Auto"));
+        assert_eq!(super::pick_model(model("fal-flux-pro"), &fal_only, "".into(), "16:9".into(), false).0.id, "fal-flux-pro");
+        // References on a fal.ai model without them stay on fal.ai.
+        assert_eq!(super::pick_model(model("fal-flux-pro"), &fal_only, "".into(), "16:9".into(), true).0.id, "fal-nano-banana");
+        assert_eq!(credits_note(&[m.cost_at(&res)]), "");
     }
 
     #[test]

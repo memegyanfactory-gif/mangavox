@@ -1,6 +1,7 @@
-//! Small looping animations for work in progress. Every frame re-renders the hosting view,
-//! so show them only while something is actually running. All of them hold still (or slow
-//! right down, for the spinner) when [`reduced`] is true.
+//! Small looping animations for work in progress. Every repaint re-renders the hosting view
+//! (and every view above it), so they repaint at most [`LOOP_FPS`] times a second rather than
+//! on every display frame, and show only while something is actually running. All of them hold
+//! still (or slow right down, for the spinner) when [`reduced`] is true.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -44,6 +45,17 @@ pub fn system_reduced() -> bool {
     false
 }
 
+/// How often a looping animation repaints. A spinner in Studio's Activity re-rendered the whole
+/// Studio page on every display frame for as long as Generate ran, which kept the UI thread busy
+/// and the app sluggish; at this rate the motion still reads as smooth for small loaders.
+pub const LOOP_FPS: f32 = 15.;
+
+/// A loop of `ms` on the shared clock (so loops shown together move in step), repainting at
+/// most [`LOOP_FPS`] times a second.
+pub fn looping(ms: u64) -> Animation {
+    Animation::new(Duration::from_millis(ms)).repeat_synced().with_max_fps(LOOP_FPS)
+}
+
 fn alpha(c: Rgba, a: f32) -> Rgba {
     Rgba { a: c.a * a.clamp(0., 1.), ..c }
 }
@@ -58,7 +70,7 @@ fn smooth(k: f32) -> f32 {
 pub fn spinner(id: impl Into<ElementId>, color: Rgba, px_size: f32) -> impl IntoElement {
     let period = if reduced() { 2400 } else { 800 };
     icon(IconSrc::Ph(ph::CIRCLE_NOTCH).for_size(px_size), color, px_size)
-        .with_animation(id, Animation::new(Duration::from_millis(period)).repeat(), |s, t| s.with_transformation(Transformation::rotate(percentage(t))))
+        .with_animation(id, looping(period), |s, t| s.with_transformation(Transformation::rotate(percentage(t))))
 }
 
 /// A row of dots, `lit` ones solid accent. While `running` a glow travels along the row,
@@ -70,7 +82,7 @@ pub fn dot_trail(id: impl Into<ElementId>, lit: Vec<bool>, running: bool, dot: f
         return row.children(lit.iter().map(|&on| cell(dot, if on { Tokens::accent() } else { Tokens::active() }))).into_any_element();
     }
     let n = lit.len() as f32;
-    row.with_animation(id, Animation::new(Duration::from_millis(1300)).repeat(), move |d, t| {
+    row.with_animation(id, looping(1300), move |d, t| {
         // The wave head runs from before the first dot to past the last one.
         let head = t * (n + 2.) - 1.;
         d.children(lit.iter().enumerate().map(|(i, &on)| {
@@ -94,9 +106,17 @@ pub enum StepMark {
 /// with a breathing glow and a sweep of light so it is plain that work is happening (static
 /// under reduced motion). `steps` are `(name, mark)`; each card's tooltip says its name.
 pub fn step_cards(id: impl Into<SharedString>, steps: Vec<(&'static str, StepMark)>) -> Div {
+    step_cards_sized(id, steps, (16., 10.), 3.)
+}
+
+/// [`step_cards`] at list-row size (12x8), for dense lists such as Studio's chapter list.
+pub fn step_cards_small(id: impl Into<SharedString>, steps: Vec<(&'static str, StepMark)>) -> Div {
+    step_cards_sized(id, steps, (12., 8.), 2.)
+}
+
+fn step_cards_sized(id: impl Into<SharedString>, steps: Vec<(&'static str, StepMark)>, (w, h): (f32, f32), gap: f32) -> Div {
     let id: SharedString = id.into();
-    let (w, h) = (16., 10.);
-    div().flex().items_center().gap(px(3.)).children(steps.into_iter().enumerate().map(move |(i, (name, mark))| {
+    div().flex().items_center().gap(px(gap)).children(steps.into_iter().enumerate().map(move |(i, (name, mark))| {
         let card = div()
             .id(SharedString::from(format!("{id}-{i}")))
             .relative()
@@ -119,12 +139,12 @@ pub fn step_cards(id: impl Into<SharedString>, steps: Vec<(&'static str, StepMar
             StepMark::Running => card
                 .child(div().absolute().inset_0().with_animation(
                     SharedString::from(format!("{id}-{i}-glow")),
-                    Animation::new(Duration::from_millis(1100)).repeat().with_easing(ease_in_out),
+                    looping(1100).with_easing(ease_in_out),
                     |d, t| d.bg(alpha(Tokens::accent(), 0.45 + 0.55 * (1. - (t * 2. - 1.).abs()))),
                 ))
                 .child(div().absolute().top_0().h_full().w(px(6.)).with_animation(
                     SharedString::from(format!("{id}-{i}-sweep")),
-                    Animation::new(Duration::from_millis(900)).repeat(),
+                    looping(900),
                     move |d, t| d.left(px(-6. + t * (w + 6.))).bg(linear_gradient(90., linear_color_stop(alpha(Tokens::text_1(), 0.), 0.), linear_color_stop(alpha(Tokens::text_1(), 0.6), 1.))),
                 ))
                 .into_any_element(),
@@ -141,7 +161,7 @@ pub fn progress_bar(id: impl Into<ElementId>, p: f32, active: bool) -> AnyElemen
     let comet = |color: Rgba| {
         div().absolute().top_0().h_full().w(relative(0.35)).with_animation(
             id,
-            Animation::new(Duration::from_millis(1700)).repeat().with_easing(ease_in_out),
+            looping(1700).with_easing(ease_in_out),
             move |d, t| d.left(relative(-0.35 + t * 1.35)).bg(linear_gradient(90., linear_color_stop(alpha(color, 0.), 0.), linear_color_stop(color, 1.))),
         )
     };
@@ -166,7 +186,7 @@ pub fn scan_overlay(id: impl Into<ElementId>) -> AnyElement {
     tint.child(
         div().absolute().left_0().w_full().h(relative(0.16)).border_b_2().border_color(alpha(accent, 0.9)).with_animation(
             id,
-            Animation::new(Duration::from_millis(2400)).repeat().with_easing(ease_in_out),
+            looping(2400).with_easing(ease_in_out),
             move |d, t| d.top(relative(-0.16 + t * 1.16)).bg(linear_gradient(180., linear_color_stop(alpha(accent, 0.), 0.), linear_color_stop(alpha(accent, 0.32), 1.))),
         ),
     )
@@ -191,7 +211,7 @@ pub fn shimmer() -> AnyElement {
         .flex()
         .child(half(alpha(light, 0.), light))
         .child(half(light, alpha(light, 0.)))
-        .with_animation("mv-shimmer", Animation::new(Duration::from_millis(1600)).repeat().with_easing(ease_in_out), |d, t| d.left(relative(-0.6 + t * 1.6)))
+        .with_animation("mv-shimmer", looping(1600).with_easing(ease_in_out), |d, t| d.left(relative(-0.6 + t * 1.6)))
         .into_any_element()
 }
 
@@ -211,6 +231,6 @@ pub fn pulse_dot(id: impl Into<ElementId>, color: Rgba, px_size: f32) -> AnyElem
     if reduced() {
         return dot.into_any_element();
     }
-    dot.with_animation(id, Animation::new(Duration::from_millis(1600)).repeat().with_easing(pulsating_between(0.35, 1.)), |d, a| d.opacity(a))
+    dot.with_animation(id, looping(1600).with_easing(pulsating_between(0.35, 1.)), |d, a| d.opacity(a))
         .into_any_element()
 }

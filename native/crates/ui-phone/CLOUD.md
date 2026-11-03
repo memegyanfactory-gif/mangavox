@@ -80,8 +80,10 @@ for the owner's phone.
    connect from anywhere?" with the verification code, waiting up to 2 minutes. The code is used up
    on the first valid `fin`. Only the phone leaving or its own sealed `{t:"cancel"}` ends the wait
    early: frames that do not open are ignored.
-4. The PC sends SEALED `{t:"ok", id, name, pc, version}`. The phone trusts the session only after
-   opening it.
+4. The PC sends SEALED `{t:"ok", id, name, pc, version}`. A pairing phone trusts the session only
+   after opening it. A resuming phone may send requests right after its `fin`: the PC sends `ok`
+   before it reads them, and only the PC holding `S` can open them (the connector starts loading
+   the app a round trip earlier this way).
 
 The PC drops a connection that has not finished the handshake in 20 s (plus the approval wait).
 
@@ -92,7 +94,7 @@ Nonce = 4-byte direction (`00 00 00 01` phone→PC, `00 00 00 02` PC→phone) �
 session. Plaintext byte 0:
 
 - `0` JSON message
-- `1` DATA `[stream: u32 BE][bytes]` (≤ 60 KiB)
+- `1` DATA `[stream: u32 BE][bytes]` (≤ 128 KiB; older PCs send ≤ 60 KiB)
 - `2` END `[stream: u32 BE]`
 
 JSON from the phone: `{t:"fin"}`, `{t:"req", s, m, p, h, b?}` (stream id, method, path + query
@@ -105,8 +107,10 @@ headers: `content-type`, `content-length`, `content-range`, `accept-ranges`, `ca
 `etag`, `last-modified`, `content-disposition`, `content-security-policy`, `x-frame-options`,
 `x-content-type-options`, `referrer-policy`. Never cookies.
 
-Flow control: each stream may have 1 MiB sent but not acked; the phone acks as the page reads.
-At most 32 open streams per phone (more get a 503 head).
+Flow control: each stream may have 1 MiB sent but not acked; the phone acks as the page reads,
+once 256 KiB of a stream are read (never for the tail of a finished stream), so a big response
+costs a few phone frames rather than one per chunk. At most 32 open streams per phone (more get
+a 503 head).
 
 ## On the PC
 
@@ -118,6 +122,15 @@ request can only enter through the authenticated session). Remote screen
 and touchpad (`/api/screen/*`, `/api/mouse`) answer 403 until "Allow control" is turned on for
 that phone on the Mobile page. Removing a phone ends its sessions at once.
 
+Sending: messages wait in two lanes in front of the relay socket and are sealed only as they
+leave, so counters stay in order. Handshake frames, JSON messages and whole responses of a known
+size up to 64 KiB (API answers, icons) take the control lane, which always goes first; bigger
+bodies (images, video) take the bulk lane one chunk at a time, and the socket's own queue holds
+two messages. So a tap never waits behind a chapter's worth of images, and one phone's download
+cannot hold up another phone's handshake. A stream keeps its whole body on one lane, after its
+head. The socket runs without Nagle's algorithm (it held the end of every frame for the relay's
+delayed ACK).
+
 ## On the phone (cloud/web)
 
 `index.html` + `connect.js` hold the relay WebSocket and the session; `sw.js` (scope
@@ -128,6 +141,18 @@ requests carrying it, and the worker tunnels navigations only into an iframe, so
 opens, frames or posts a form to `/mangavox/app/...` reaches nothing. So the app's HTML, script and
 data all come from the PC: the relay serves only the connector, and the phone app always matches
 the MangaVox version on the PC.
+
+The service worker keeps what the PC marks cacheable for an hour or more (`cache-control`
+max-age ≥ 3600, not `no-store`/`no-cache`, a known size up to 1 MiB, no range; never chapter
+pages) in the Cache API, at most 400 entries, oldest dropped first, and answers the app frame's
+requests for it while fresh. The PC names its script and styles by content hash
+(`/app.js?v=<hash>`, kept a year) while the page itself is `no-cache`, so a phone loads the new
+app right after a MangaVox update and otherwise only the page and the API go through the relay.
+The cache is cleared when the phone forgets its PC or pairs with one; the pairing in IndexedDB
+changes first, and the worker keeps an answer only while the pairing it came through is still the
+saved one (checked again after each write), so nothing stored in flight survives a forget. Every
+write drops the oldest entries beyond 400, and the first write after the worker starts also drops
+expired ones.
 
 ## Threat notes
 
@@ -141,6 +166,9 @@ the MangaVox version on the PC.
 - The PC's app runs on the connector's origin: a script injection bug in the app would reach the
   device key too. The app inserts all network text with `textContent` (app.js header).
 - A cloud phone with "Allow control" can see the Mobile page, so it could also allow new phones.
+- The phone's cache holds the app's script and styles, covers and artwork in the clear, like the
+  browser cache does on the Wi-Fi: someone holding the unlocked phone can see them. Only the
+  service worker writes it, from tunnelled answers, and only the app frame reads it.
 - Anyone who knows a room id (the relay, phones paired to it, someone who saw an old QR code) can
   hold up to 3 sockets from one address, or burn the cloud pairing rate limit (20 failures per 10
   minutes); paired phones' resume is not rate limited.

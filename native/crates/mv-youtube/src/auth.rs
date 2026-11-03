@@ -18,12 +18,27 @@ pub const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
 
-/// Upload, manage (titles, schedules, playlists) and read analytics.
+/// Upload, manage (titles, schedules, playlists), read analytics, and read and answer comments
+/// (`youtube.force-ssl`: `comments.insert` accepts no narrower scope).
 pub const SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
     "https://www.googleapis.com/auth/yt-analytics.readonly",
+    FORCE_SSL,
 ];
+
+/// Needed to reply to comments.
+pub const FORCE_SSL: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
+
+/// The scopes of [`SCOPES`] that `granted` (a token's space-separated `scope`) lacks. An empty
+/// `granted` (older saved tokens) is taken as the scopes before comments were added.
+pub fn missing_scopes(granted: &str) -> Vec<&'static str> {
+    if granted.trim().is_empty() {
+        return vec![FORCE_SSL];
+    }
+    let have: Vec<&str> = granted.split_whitespace().collect();
+    SCOPES.iter().copied().filter(|s| !have.contains(s)).collect()
+}
 
 /// How long to wait for the user to finish signing in.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -222,6 +237,14 @@ mod tests {
     fn pkce_challenge_matches_rfc7636_example() {
         assert_eq!(code_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
         assert_eq!(random_string(64).len(), 64);
+    }
+
+    #[test]
+    fn scopes_missing_from_old_tokens() {
+        assert_eq!(missing_scopes(""), vec![FORCE_SSL]);
+        let old = SCOPES[..3].join(" ");
+        assert_eq!(missing_scopes(&old), vec![FORCE_SSL]);
+        assert!(missing_scopes(&SCOPES.join(" ")).is_empty());
     }
 
     #[test]

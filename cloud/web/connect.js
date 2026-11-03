@@ -34,6 +34,8 @@ async function kv(mode, fn) {
 const loadPc = () => kv('readonly', s => s.get('pc')).catch(() => null);
 const savePc = pc => kv('readwrite', s => s.put(pc, 'pc'));
 const wipePc = () => kv('readwrite', s => s.delete('pc')).catch(() => {});
+/** The service worker's copy of what the PC let the phone keep (sw.js): it belongs to one PC. */
+const clearCache = () => caches.delete('mv-tunnel-1').catch(() => {});
 
 /* ---------------- screens */
 
@@ -122,7 +124,7 @@ function connect(target) {
   const ws = new WebSocket(WS_URL + rid);
   ws.binaryType = 'arraybuffer';
   const c = {
-    ws, target, session: null, ok: false, final: false, chain: Promise.resolve(), ping: null, device: null, state: null,
+    ws, target, session: null, ok: false, ready: false, final: false, chain: Promise.resolve(), ping: null, device: null, state: null,
     retire() { this.final = true; clearInterval(this.ping); try { ws.close(); } catch { /* closed */ } if (this.session) this.session.fail(new Error('closed')); },
   };
   conn = c;
@@ -147,6 +149,13 @@ function connect(target) {
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') return;
     const f = new Uint8Array(ev.data);
+    // Once the session exists, frames go straight to it: it keeps their order itself and opens
+    // several at once (tunnel.js). The PC seals nothing before the fin, so none can still wait
+    // in the chain then.
+    if (c.session && f[0] !== KIND.REFUSE) {
+      if (!c.final) c.session.receive(f);
+      return;
+    }
     c.chain = c.chain.then(() => onFrame(c, f)).catch(e => fail(c, e));
   };
   ws.onclose = ev => onClose(c, ev);
@@ -171,6 +180,12 @@ async function onFrame(c, f) {
   c.session.onJson = v => onControl(c, v);
   c.session.onFail = () => { try { c.ws.close(); } catch { /* closed */ } };
   await c.session.json({ t: 'fin', ua: navigator.userAgent });
+  // Resuming, the PC answers "ok" before anything sent after the fin (CLOUD.md, "Handshake"), and
+  // only it can open what this session seals: the app starts loading now, a round trip earlier.
+  if (t.mode === 'resume' && !c.final) {
+    c.ready = true;
+    openApp();
+  }
 }
 
 async function onControl(c, v) {
@@ -178,13 +193,17 @@ async function onControl(c, v) {
     show({ title: 'Confirm on your PC', lead: `Check that MangaVox on your PC shows the code ${c.keys.code}, then click Allow there.`, busy: true });
   } else if (v.t === 'ok' && !c.ok) {
     c.ok = true;
+    c.ready = true;
     retryMs = 1000;
     const pc = c.target.mode === 'pair'
       ? { rid: c.target.rid, id: v.id, spub: b64(c.keys.spub), dkey: c.device.privateKey, dpub: b64(c.device.publicRaw), pc: v.pc || '' }
       : { ...c.target.pc, pc: v.pc || c.target.pc.pc };
     if (c.target.mode === 'pair') closeApp();
     saved = pc;
+    // The new pairing first, then the old PC's cache: sw.js drops anything still being stored
+    // for a pairing that is no longer the saved one.
     await savePc(pc);
+    if (c.target.mode === 'pair') await clearCache();
     // Later reconnects resume with the stored key.
     c.target = { mode: 'resume', pc };
     await openApp();
@@ -248,8 +267,10 @@ async function forget() {
   if (conn) { conn.retire(); conn = null; }
   clearTimeout(retryTimer);
   saved = null;
-  await wipePc();
   closeApp();
+  // The pairing first, then the cache (see sw.js, store).
+  await wipePc();
+  await clearCache();
   show({ title: 'Connect your phone', lead: 'On your PC, open MangaVox → Mobile, turn on From anywhere, and scan the code with this phone.' });
 }
 
@@ -261,8 +282,10 @@ function onSwRequest(ev) {
   if (!d || d.type !== 'mv-req' || !port) return;
   // Only this page's own app frame (the token never leaves this page and its frame).
   if (!appOpen || d.tok !== appToken) { port.postMessage({ error: 'not this page' }); port.close(); return; }
-  const s = conn && conn.ok && conn.session && !conn.session.dead ? conn.session : null;
+  const s = conn && conn.ready && conn.session && !conn.session.dead ? conn.session : null;
   if (!s) { port.postMessage({ error: 'offline' }); port.close(); return; }
+  // The pairing this answer comes through: sw.js keeps it only while that is still the saved one.
+  const who = (conn.target.pc && conn.target.pc.id) || '';
   const queue = [];
   let pulls = 0, done = false, error = null, headSent = false, closed = false;
   const close = () => { closed = true; port.close(); };
@@ -279,7 +302,7 @@ function onSwRequest(ev) {
     }
   };
   const h = s.request({ method: d.m, path: d.p, headers: d.h, body: d.b }, {
-    onHead(status, headers) { headSent = true; port.postMessage({ head: { status, headers } }); },
+    onHead(status, headers) { headSent = true; port.postMessage({ head: { status, headers }, who }); },
     onData(bytes) { queue.push(bytes); flush(); },
     onEnd() { done = true; flush(); },
     onError(e) {

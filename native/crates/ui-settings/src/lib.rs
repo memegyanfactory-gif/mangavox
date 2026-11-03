@@ -4,6 +4,7 @@
 //! own sub-navigation and pages. Settings apply and save as they change; feedback is a toast.
 //! Config is read and written off the UI thread through `mv_ui::bg::blocking`.
 mod audio;
+mod brain;
 mod cli_tools;
 pub mod cli_updates;
 mod data;
@@ -72,6 +73,7 @@ pub enum Tab {
     System,
     Studio,
     Magnific,
+    Brain,
     About,
 }
 
@@ -85,7 +87,7 @@ const GROUPS: &[(&str, &[Tab])] = &[
 ];
 
 /// Shown only while Studio mode is on.
-const STUDIO_GROUP: (&str, &[Tab]) = ("Studio", &[Tab::Studio, Tab::Magnific]);
+const STUDIO_GROUP: (&str, &[Tab]) = ("Studio", &[Tab::Studio, Tab::Magnific, Tab::Brain]);
 
 const HELP_URL: &str = "https://github.com/memegyanfactory-gif/mangavox/issues";
 
@@ -114,6 +116,7 @@ impl Tab {
             "cli-tools" | "cli" => Tab::CliTools,
             "studio" => Tab::Studio,
             "magnific" | "thumbnails" => Tab::Magnific,
+            "brain" => Tab::Brain,
             "about" => Tab::About,
             _ => return None,
         })
@@ -136,6 +139,7 @@ impl Tab {
             Tab::CliTools => "cli-tools",
             Tab::Studio => "studio",
             Tab::Magnific => "magnific",
+            Tab::Brain => "brain",
             Tab::About => "about",
         }
     }
@@ -157,6 +161,7 @@ impl Tab {
             Tab::CliTools => "CLI tools",
             Tab::Studio => "Studio",
             Tab::Magnific => "Magnific",
+            Tab::Brain => "Brain",
             Tab::About => "About",
         }
     }
@@ -173,11 +178,12 @@ impl Tab {
             Tab::Addons => "Stremio-compatible addons that find streams for movies, series and anime.",
             Tab::Storage => "Where MangaVox keeps your data, what takes up space, and how to free it.",
             Tab::Providers => "Local and cloud AI models for the assistant and Studio, with keys and default models.",
-            Tab::Services => "API keys for image, video and voice services, each checked with a free test call.",
+            Tab::Services => "API keys for image, video and voice services, each checked with a free test call. Image services tagged Thumbnails make images in Studio.",
             Tab::Models => "Models on this PC and what MangaVox uses them for.",
             Tab::CliTools => "Installed coding-agent CLIs, their versions and updates.",
             Tab::Studio => "Defaults for narration and video output in Studio projects.",
             Tab::Magnific => "The Magnific API key for Studio's thumbnail generator, the default model and size, and the credits Studio has spent.",
+            Tab::Brain => "What the app has learned about YouTube, your thumbnails and your taste, kept on this PC. Read, edit or forget any of it.",
             Tab::About => "Version, data folder and links.",
         }
     }
@@ -201,6 +207,7 @@ impl Tab {
             Tab::CliTools => ph::TERMINAL_WINDOW,
             Tab::Studio => glyphs::STUDIO,
             Tab::Magnific => ph::IMAGES,
+            Tab::Brain => ph::BRAIN,
             Tab::About => ph::INFO,
         }
     }
@@ -223,6 +230,7 @@ impl Tab {
             Tab::System => Hue::Green,
             Tab::Studio => Hue::Violet,
             Tab::Magnific => Hue::Rose,
+            Tab::Brain => Hue::Green,
             Tab::About => Hue::Slate,
         }
     }
@@ -240,11 +248,12 @@ impl Tab {
             Tab::Addons => "stremio streams torrent movies series anime",
             Tab::Storage => "folder disk space delete reset cache downloads data move factory",
             Tab::Providers => "api key openai claude gemini ollama lm studio openrouter cloud together fireworks cerebras kimi moonshot qwen glm z.ai hugging face nvidia sambanova deepinfra azure bedrock",
-            Tab::Services => "api key keys higgsfield fal replicate runway luma kling stability ideogram leonardo flux bfl elevenlabs cartesia deepgram fish hume image video voice tts",
+            Tab::Services => "api key keys higgsfield fal replicate runway luma kling stability ideogram leonardo flux bfl elevenlabs cartesia deepgram fish hume recraft openai gpt image imagen gemini google image video voice tts thumbnails",
             Tab::Models => "gguf ollama whisper comfyui local models engines",
             Tab::CliTools => "claude code codex gemini cli update terminal grok antigravity mcp app tools",
             Tab::Studio => "resolution speed default voice video export",
             Tab::Magnific => "api key thumbnail thumbnails image generator magnific freepik nano banana credits",
+            Tab::Brain => "brain learned learning memory youtube niche titles channels trends thumbnails prompts taste picks hints reset forget",
             Tab::About => "version update licence github bug report",
         }
     }
@@ -257,7 +266,7 @@ impl Tab {
 
     /// Tabs whose body is an embedded panel from another crate.
     fn is_panel(self) -> bool {
-        matches!(self, Tab::Sources | Tab::Addons | Tab::Providers | Tab::Services | Tab::Magnific)
+        matches!(self, Tab::Sources | Tab::Addons | Tab::Providers | Tab::Services | Tab::Magnific | Tab::Brain)
     }
 }
 
@@ -568,6 +577,7 @@ impl SettingsView {
             Tab::Addons => ui_media::addons_panel(window, cx),
             Tab::Magnific => ui_studio::magnific_settings(window, cx),
             Tab::Services => services::create(window, cx),
+            Tab::Brain => brain::create(window, cx),
             _ => ui_assistant::providers_panel(window, cx),
         };
         self.panels.insert(tab, view);

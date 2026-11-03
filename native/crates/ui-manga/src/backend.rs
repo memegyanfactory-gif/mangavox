@@ -642,6 +642,8 @@ pub fn set_in_library(manga_id: &str, in_library: bool) {
 /// Deletes manga rows (their chapters go with them) and forgets them as browse-only. Used to
 /// clear titles a private session opened for the first time. Blocking.
 pub fn forget_titles(ids: &[String]) -> Result<()> {
+    // The pages' kept copies must not paint what was cleared.
+    crate::ui::drop_snapshots();
     if ids.is_empty() {
         return Ok(());
     }

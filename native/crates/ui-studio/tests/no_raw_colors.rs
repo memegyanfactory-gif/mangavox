@@ -22,8 +22,11 @@ fn colours_come_from_tokens_and_icons_from_phosphor() {
     rust_files(&root.join("src"), &mut files);
     rust_files(&root.join("examples"), &mut files);
     let patterns = [concat!("rgb", "(0x"), concat!("rgba", "(0x"), concat!("hsla", "("), concat!("black", "()"), concat!("white", "()"), concat!("\"icons", "/")];
+    // The YouTube videos preview copies YouTube's own palette on purpose (it must look like
+    // youtube.com whatever Appearance preset is on), so its colours stay literal.
+    let youtube_copy = root.join("src").join("ytpack").join("videos");
     let mut hits = Vec::new();
-    for file in &files {
+    for file in files.iter().filter(|f| !f.starts_with(&youtube_copy)) {
         let text = fs::read_to_string(file).expect("read source");
         for (n, line) in text.lines().enumerate() {
             if patterns.iter().any(|p| line.contains(p)) {

@@ -14,7 +14,7 @@ use mv_ui::{btn, confirm_dialog, empty_view, error_view, glyphs, icon_button, mu
 
 use crate::backend;
 use crate::logic;
-use crate::ui::{search_box, spawn_cover_downloads, thumb, Load};
+use crate::ui::{search_box, spawn_cover_downloads, thumb, Load, Snapshot};
 
 /// A removed entry stays in the database until its Undo toast has had its time.
 const UNDO_WINDOW: Duration = Duration::from_millis(6_500);
@@ -32,6 +32,9 @@ pub struct HistoryPage {
 }
 
 type Loaded = (Vec<ReadingHistory>, HashMap<String, PathBuf>, Vec<(String, Option<String>)>);
+
+/// What the page last showed (painted at once on the next open, then re-read).
+static LAST: Snapshot<(Vec<ReadingHistory>, HashMap<String, PathBuf>)> = Snapshot::new();
 
 fn load() -> anyhow::Result<Loaded> {
     let items = backend::with_db(|c| history::list(c, 200))?;
@@ -58,6 +61,11 @@ impl HistoryPage {
             seen_version: backend::data_version(),
             _sub: sub,
         };
+        if let Some((items, covers)) = LAST.get() {
+            p.state = Load::Ready(items);
+            p.covers = covers;
+            mv_ui::perf::ready("History (cached)");
+        }
         p.reload(cx);
         p
     }
@@ -70,9 +78,13 @@ impl HistoryPage {
                 match res {
                     Ok((items, have, missing)) => {
                         this.covers.extend(have);
+                        LAST.put((items.clone(), this.covers.clone()));
                         this.state = Load::Ready(items);
+                        mv_ui::perf::ready("History");
                         spawn_cover_downloads(cx, missing, |t: &mut Self| &mut t.covers);
                     }
+                    // A failed re-read keeps the shown list.
+                    Err(e) if matches!(this.state, Load::Ready(_)) => eprintln!("[manga] could not re-read history: {e:#}"),
                     Err(e) => this.state = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();
@@ -147,6 +159,7 @@ impl HistoryPage {
         .on_confirm(move |_, cx| {
             let _ = weak.update(cx, |t, cx| {
                 t.state = Load::Ready(vec![]);
+                LAST.put((vec![], HashMap::new()));
                 cx.notify();
                 cx.spawn(async move |_, _| {
                     let _ = mv_ui::bg::blocking(|| backend::with_db(|c| history::clear(c))).await;

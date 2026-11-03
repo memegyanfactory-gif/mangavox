@@ -8,6 +8,7 @@ use mv_ui::Route;
 mod assist;
 pub mod audio;
 pub use export::join_full_recap;
+pub use generate::queue_saved;
 pub mod data;
 mod dashboard;
 mod delete;
@@ -55,8 +56,15 @@ pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView>
     match route {
         Route::Studio => Some(cx.new(|cx| page::StudioPage::new(window, cx)).into()),
         Route::Thumbnails => Some(cx.new(ytpack::ThumbnailsPage::new).into()),
+        Route::YouTubeVideos => Some(cx.new(ytpack::VideosPage::new).into()),
         _ => None,
     }
+}
+
+/// Studio's image models (Magnific and the services in Settings › AI services), for other pages
+/// that make images (Creative).
+pub mod images {
+    pub use crate::ytpack::magnific::{generate, key, key_for, record, usable, ImageModel, Keys, Reference, Shape, Via, CATALOG, KEY_REJECTED};
 }
 
 /// Settings › Magnific: the API key, the thumbnail defaults and the credits spent.

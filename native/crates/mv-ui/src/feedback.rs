@@ -10,7 +10,7 @@ use gpui_kit::*;
 use crate::controls::{btn, ButtonKind, ClickHandler, FlagHandler, IndexHandler, WindowHandler};
 use crate::icons::{ph, Ph, Weight};
 use crate::interact::{element_builder, glyph, refine, render_once_element, tip, IconSrc, Interactive};
-use crate::motion::{appear, shimmer, spinner};
+use crate::motion::{appear, looping, shimmer, spinner};
 use crate::theme::{icon as icon_px, radius, ramp, size, RampExt, Tokens};
 
 fn name_id(prefix: &str, key: &str) -> ElementId {
@@ -232,10 +232,36 @@ pub fn skeleton(w: impl Into<Length> + Clone, h: impl Into<Length> + Clone, corn
     div().relative().flex_none().overflow_hidden().w(w).h(h).rounded(px(corner)).bg(Tokens::surface_2()).child(shimmer())
 }
 
-/// Text with a light sweeping across it, for "Thinking…" and "Reading pages…" while the length of
-/// the wait is unknown (gpui-component `ShimmerText`; still text under reduced motion).
-pub fn shimmer_text(text: impl Into<SharedString>) -> gpui_kit::component::shimmer::ShimmerText {
-    gpui_kit::component::shimmer::ShimmerText::new(text).highlight_color(Tokens::text_1())
+/// Text that gently breathes, for "Thinking…" and "Reading pages…" while the length of the wait
+/// is unknown (still text under reduced motion). Not gpui-component's `ShimmerText`: its sweep
+/// repaints on every display frame and cannot be slowed, and these lines stay up for minutes
+/// while their whole page re-renders under them; this one repaints at [`crate::motion::LOOP_FPS`].
+pub fn shimmer_text(text: impl Into<SharedString>) -> ShimmerLine {
+    ShimmerLine { text: text.into(), style: StyleRefinement::default() }
+}
+
+/// See [`shimmer_text`].
+pub struct ShimmerLine {
+    text: SharedString,
+    style: StyleRefinement,
+}
+
+impl Styled for ShimmerLine {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl IntoElement for ShimmerLine {
+    type Element = AnyElement;
+    fn into_element(self) -> AnyElement {
+        let line = refine(div(), &self.style).child(self.text.clone());
+        if crate::motion::reduced() {
+            return line.into_any_element();
+        }
+        let id = name_id("mv-shimmer-text", &self.text);
+        line.with_animation(id, looping(1600).with_easing(pulsating_between(0.45, 1.)), |d, a| d.opacity(a)).into_any_element()
+    }
 }
 
 /// One line of text (12px tall).

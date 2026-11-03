@@ -1,0 +1,16 @@
+[package]
+name = "ui-3d"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+mv-ui = { path = "../mv-ui" }
+mv-core = { path = "../mv-core" }
+mv-3d = { path = "../mv-3d" }
+mv-recap = { path = "../mv-recap" }
+mv-ai = { path = "../mv-ai" }
+ui-studio = { path = "../ui-studio" }
+ui-assistant = { path = "../ui-assistant" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

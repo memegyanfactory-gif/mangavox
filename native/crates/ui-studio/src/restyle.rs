@@ -401,6 +401,12 @@ impl StudioPage {
     pub(crate) fn made_videos(&self, g: &MangaGroup) -> Vec<(ChapterItem, PathBuf)> {
         g.chapters.iter().filter_map(|c| self.statuses.get(&c.id).and_then(|s| s.video.clone()).filter(|p| p.is_file()).map(|p| (c.clone(), p))).collect()
     }
+
+    /// The chapters of `g` on the Video editor's timeline: rendered, or narrated and timed and
+    /// still to render (what Play and Export gate on, rendering the ones that need it).
+    pub(crate) fn timeline_chapters(&self, g: &MangaGroup) -> Vec<ChapterItem> {
+        g.chapters.iter().filter(|c| self.statuses.get(&c.id).is_some_and(|s| (s.timed && s.audio_files > 0) || s.video.is_some())).cloned().collect()
+    }
 }
 
 /// A title usable as a file name.

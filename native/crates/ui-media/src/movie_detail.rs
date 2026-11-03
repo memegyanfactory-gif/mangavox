@@ -303,8 +303,9 @@ impl MovieDetail {
                     v.details = Load::Ready(d);
                     v.similar = s;
                 }
-                Load::Failed(e) => v.details = Load::Failed(e),
-                Load::Loading => {}
+                // A failed load keeps the catalog data already shown.
+                Load::Failed(e) if v.details.ready().is_none() => v.details = Load::Failed(e),
+                _ => {}
             },
         );
         match details {
@@ -312,7 +313,8 @@ impl MovieDetail {
                 fetch(cx, record_open(media_title(kind, imdb_id, &d, title)), |_: &mut Self, _| {});
                 (Load::Ready(d), s)
             }
-            _ => (Load::Loading, vec![]),
+            // Not cached yet: open on the card's catalog data while the details load.
+            _ => (crate::common::seen_title(imdb_id).map_or(Load::Loading, Load::Ready), vec![]),
         }
     }
 
@@ -916,6 +918,9 @@ impl MovieDetail {
 
 impl Render for MovieDetail {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.details.ready().is_some() {
+            mv_ui::perf::ready("Movie detail");
+        }
         let width = look::page_width(&self.scroll, window);
         let series = self.series();
         self.refresh_in_list(cx);

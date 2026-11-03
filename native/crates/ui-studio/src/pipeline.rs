@@ -2,9 +2,12 @@
 //! chapter, as one app-wide queue that keeps going when the Studio page is left and survives a
 //! restart (`studio/pipeline_queue.json`).
 //!
-//! Every chapter runs its steps in order and skips the ones already done. The AI steps and the
-//! audio / video steps run in two lanes, so the next chapter is read while one is rendered. A failed step marks
-//! that chapter failed and the queue moves on to the next chapter. Chapters (and the whole queue)
+//! Every chapter runs its steps in order and skips the ones already done. The AI steps, the
+//! audio / music steps and the video render run in three lanes: the next chapter is read while
+//! one is voiced, and a chapter lands on the Video editor's timeline as soon as its narration is
+//! timed (Audio writes the sync map), while its video renders in the background without holding
+//! up the narration of the next. A failed step marks that chapter failed and the queue moves on
+//! to the next chapter. Chapters (and the whole queue)
 //! can be paused, resumed, retried and cancelled; adding a chapter that is already waiting does
 //! nothing (or widens what it will make). The page polls [`version`] and re-reads a
 //! [`snapshot`], like `run` and `service`.
@@ -172,6 +175,11 @@ impl QueueItem {
         self.steps[..=self.until.min(STEPS - 1)].iter().filter(|s| matches!(s, StepState::Done | StepState::Skipped)).count()
     }
 
+    /// Only the video is asked for again (its narration is made): see [`Queue::claim_render`].
+    pub fn renders_only(&self) -> bool {
+        self.until == RENDER_STEP && self.force == Some(RENDER_STEP)
+    }
+
     /// 0..=1 over the steps this item makes.
     pub fn progress(&self) -> f32 {
         let n = self.until.min(STEPS - 1) + 1;
@@ -248,12 +256,23 @@ impl Queue {
         self.items.iter_mut().find(|i| i.id == id)
     }
 
-    /// The next waiting chapter, marked running (none while the queue is paused).
+    /// The next waiting chapter, marked running (none while the queue is paused). Render
+    /// requests are left to [`Queue::claim_render`].
     pub fn claim_next(&mut self) -> Option<u64> {
+        self.claim(|i| !i.renders_only())
+    }
+
+    /// The next waiting render request (Export's "Render them first", a re-edit), marked running:
+    /// it goes straight to the render lane instead of waiting behind other chapters' AI and voice.
+    pub fn claim_render(&mut self) -> Option<u64> {
+        self.claim(QueueItem::renders_only)
+    }
+
+    fn claim(&mut self, which: impl Fn(&QueueItem) -> bool) -> Option<u64> {
         if self.paused {
             return None;
         }
-        let it = self.items.iter_mut().find(|i| i.state == ItemState::Queued)?;
+        let it = self.items.iter_mut().find(|i| i.state == ItemState::Queued && which(i))?;
         it.state = ItemState::Running;
         it.note = None;
         Some(it.id)
@@ -592,6 +611,13 @@ fn ensure_runner() {
         mv_ui::bg::runtime().spawn(runner());
     }
     wake().notify_one();
+    render_wake().notify_one();
+}
+
+/// Wakes the render lane for a new render request ([`Queue::claim_render`]).
+fn render_wake() -> &'static tokio::sync::Notify {
+    static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
 }
 
 /// Adds chapters to the queue (each once; see [`Queue::add`]). Returns (new, widened, already).
@@ -696,16 +722,22 @@ pub fn dismiss(id: u64) {
 
 // ---------------------------------------------------------------- runner
 
-/// Read, Transcript and Story (the AI steps) run in one lane; Audio, Music and Video in another,
-/// so the AI reads and writes the next chapter while this one is voiced and rendered.
+/// Read, Transcript and Story (the AI steps) run in one lane; Audio and Music in a second, and the
+/// Video render in a third, so the AI reads and writes the next chapter while this one is voiced,
+/// and voicing never waits for a render. A request for the video alone goes straight to the render
+/// lane ([`Queue::claim_render`]).
 const AI_STEPS: usize = 3;
+/// Where the render lane starts (the Video step).
+const RENDER_STEP: usize = 5;
 /// How often a media step waiting for an export looks again.
 const EXPORT_WAIT: Duration = Duration::from_secs(2);
 
 async fn runner() {
-    // The AI lane reads every waiting chapter ahead; the media lane voices and renders them in
-    // order. While the AI waits for a usage limit, the media lane carries on with what is read.
+    // The AI lane reads every waiting chapter ahead; the media lane voices them in order and the
+    // render lane renders them in order. While the AI waits for a usage limit, the other lanes
+    // carry on with what is read.
     let (to_media, mut media) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
+    let (to_render, mut render) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
     let ai = async move {
         loop {
             let Some(id) = edit(Queue::claim_next) else {
@@ -713,26 +745,55 @@ async fn runner() {
                 continue;
             };
             let Some(dirty) = run_steps(id, 0..AI_STEPS, false).await else { continue };
-            if read(|q| q.get(id).is_some_and(|i| i.until >= AI_STEPS)) {
-                touch(|q| {
-                    if let Some(it) = q.get_mut(id) {
-                        it.current = None;
-                    }
-                });
-                let _ = to_media.send((id, dirty));
-            } else {
-                finish(id);
-            }
+            hand_on(id, dirty, AI_STEPS, &to_media);
         }
     };
     let media = async move {
         while let Some((id, dirty)) = media.recv().await {
-            if run_steps(id, AI_STEPS..STEPS, dirty).await.is_some() {
-                finish(id);
+            if let Some(dirty) = run_steps(id, AI_STEPS..RENDER_STEP, dirty).await {
+                hand_on(id, dirty, RENDER_STEP, &to_render);
+                render_wake().notify_one();
             }
         }
     };
-    tokio::join!(ai, media);
+    let render = async move {
+        loop {
+            // A render request comes first (someone waits on it) and skips the other lanes; the
+            // voice steps still run here if its narration turned out not to be made.
+            let (id, dirty, from) = if let Some(id) = edit(Queue::claim_render) {
+                (id, false, AI_STEPS)
+            } else if let Ok((id, dirty)) = render.try_recv() {
+                (id, dirty, RENDER_STEP)
+            } else {
+                render_wake().notified().await;
+                continue;
+            };
+            if run_steps(id, from..STEPS, dirty).await.is_some() {
+                finish(id);
+                // The export's watermark goes on now, beside the next render, so Export later only
+                // joins the chapters.
+                if let Some(ch) = read(|q| q.get(id).map(|i| i.chapter.clone())) {
+                    tokio::task::spawn_blocking(move || crate::export::prepare_segment(&ch));
+                }
+            }
+        }
+    };
+    tokio::join!(ai, media, render);
+}
+
+/// The steps of `id` before `next` are made: it goes on to the lane that starts at step `next`
+/// when it makes that step, else it is finished.
+fn hand_on(id: u64, dirty: bool, next: usize, lane: &tokio::sync::mpsc::UnboundedSender<(u64, bool)>) {
+    if read(|q| q.get(id).is_some_and(|i| i.until >= next)) {
+        touch(|q| {
+            if let Some(it) = q.get_mut(id) {
+                it.current = None;
+            }
+        });
+        let _ = lane.send((id, dirty));
+    } else {
+        finish(id);
+    }
 }
 
 /// The item is still meant to run (not paused, removed, or held with the queue).
@@ -884,8 +945,9 @@ async fn run_step(id: u64, item: &QueueItem, step: Step, facts: &Facts, dirty: b
             }
             let c = ctx.expect("ctx");
             // A story written in this run, a new narrator or a redo replaces every clip; otherwise
-            // only missing pages are voiced.
-            let req = request(&c, voice, &item.format, &["tts"], dirty || redo || facts.voice_changed);
+            // only missing pages are voiced. The sync map is timed right after, so the chapter is
+            // on the Video editor's timeline before its video is rendered.
+            let req = request(&c, voice, &item.format, &["tts", "sync_map"], dirty || redo || facts.voice_changed);
             job_step(id, item, &env, req, None, stop).await
         }
         Step::Music => {
@@ -1117,6 +1179,22 @@ mod tests {
         assert_eq!((q.items[1].state, q.items[1].steps[3], q.items[1].error.clone()), (ItemState::Queued, StepState::Pending, None));
         q.resume(a);
         assert_eq!(q.claim_next(), Some(a), "order is kept");
+    }
+
+    #[test]
+    fn render_requests_skip_the_chapters_waiting_for_the_ai() {
+        let mut q = Queue::default();
+        q.add(ch("a"), Step::Video, None, "landscape", None);
+        q.add(ch("b"), Step::Video, Some(Step::Video), "landscape", None);
+        assert_eq!(q.claim_render(), Some(q.items[1].id), "the render request goes straight to the render lane");
+        assert_eq!(q.claim_next(), Some(q.items[0].id));
+        assert_eq!(q.claim_next(), None, "the AI lane never takes a render request");
+        q.add(ch("c"), Step::Video, Some(Step::Video), "landscape", None);
+        q.add(ch("c"), Step::Video, Some(Step::Audio), "landscape", None);
+        assert_eq!(q.claim_render(), None, "a redo of the voice is no longer render-only");
+        q.paused = true;
+        q.items[1].state = ItemState::Queued;
+        assert_eq!(q.claim_render(), None, "nothing starts while paused");
     }
 
     #[test]

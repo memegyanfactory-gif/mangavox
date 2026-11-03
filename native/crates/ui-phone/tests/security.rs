@@ -87,6 +87,8 @@ const API_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/manga/m1/favorite"),
     ("POST", "/api/manga/m1/download"),
     ("POST", "/api/manga/m1/studio"),
+    ("GET", "/api/privacy"),
+    ("POST", "/api/privacy"),
     // Unknown routes and methods.
     ("GET", "/api/nope"),
     ("GET", "/api"),
@@ -114,6 +116,8 @@ fn body_for(path: &str) -> &'static str {
         "/api/mouse" => MOUSE,
         "/api/sources/mangadex/open" => r#"{"id":"x"}"#,
         "/api/manga/m1/library" | "/api/manga/m1/favorite" => r#"{"on":true}"#,
+        // Off while it is off: answered without the app window (there is none in the tests).
+        "/api/privacy" => r#"{"on":false}"#,
         "/api/manga/m1/download" | "/api/manga/m1/studio" => r#"{"chapters":["c1"]}"#,
         _ => "{}",
     }
@@ -251,7 +255,7 @@ async fn unpaired_devices_get_nothing_from_any_route() {
         assert_no_cors(&r, path);
         let body = text(r).await;
         assert!(!body.contains(&code) && !body.contains("pair?code"), "{path} leaks the pairing code");
-        assert!(body != INDEX_HTML && body != APP_JS && body != APP_CSS);
+        assert!(body != INDEX_HTML && !body.contains("src=\"/app.js") && body != APP_JS && body != APP_CSS);
     }
     let r = get("/locked", PEER).await;
     assert_eq!(r.headers()["x-frame-options"], "DENY");
@@ -425,7 +429,7 @@ async fn revoked_devices_are_locked_out_at_once() {
 async fn state_changes_need_the_csrf_header_and_same_origin() {
     let _g = setup();
     let cookie = pair().await;
-    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress", "/api/sources/mangadex/open", "/api/manga/m1/library", "/api/manga/m1/favorite", "/api/manga/m1/download", "/api/manga/m1/studio"];
+    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress", "/api/sources/mangadex/open", "/api/manga/m1/library", "/api/manga/m1/favorite", "/api/manga/m1/download", "/api/manga/m1/studio", "/api/privacy"];
     for path in paths {
         let body = body_for(path);
         let base = || req("POST", path, PEER).header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json");
@@ -562,7 +566,16 @@ async fn a_signed_in_phone_reopening_the_app_stays_signed_in() {
         let set = set_cookie(&r).unwrap_or_default();
         assert!(set.starts_with(&format!("{}={secret};", auth::COOKIE)), "{path}: {set}");
         assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict") && set.contains("Path=/") && set.contains("Max-Age=31536000"), "{set}");
-        assert_eq!(text(r).await, INDEX_HTML);
+        // The page, naming its script and styles by content hash.
+        let page = text(r).await;
+        assert!(page.contains("\"/app.js?v=") && page.contains("\"/app.css?v="), "{page}");
+        let (mut plain, mut rest) = (String::new(), page.as_str());
+        while let Some(i) = rest.find("?v=") {
+            plain.push_str(&rest[..i]);
+            rest = &rest[i + 3 + 12..];
+        }
+        plain.push_str(rest);
+        assert_eq!(plain, INDEX_HTML);
     }
     // API calls leave the cookie alone.
     assert!(set_cookie(&get_with("/api/me", &cookie).await).is_none());
@@ -1049,6 +1062,25 @@ async fn library_favorites_downloads_and_studio_from_the_phone() {
 }
 
 #[tokio::test]
+async fn private_mode_is_the_pcs_and_for_paired_phones_only() {
+    let _g = setup();
+    assert_eq!(get("/api/privacy", PEER).await.status(), StatusCode::UNAUTHORIZED);
+    let cookie = pair().await;
+    let r = get_with("/api/privacy", &cookie).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(json_of(&text(r).await)["private"], false);
+    // Turning off what is already off changes nothing (and needs no app window).
+    let set = |b: &'static str| send(post("/api/privacy", PEER).header(header::COOKIE, &cookie).body(Body::from(b)).unwrap());
+    let r = set(r#"{"on":false}"#).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(json_of(&text(r).await)["private"], false);
+    for bad in ["{}", r#"{"on":"yes"}"#, "["] {
+        assert!(set(bad).await.status().is_client_error(), "{bad}");
+    }
+    assert!(!mv_core::privacy::active());
+}
+
+#[tokio::test]
 async fn activity_and_the_service_worker_are_for_paired_phones_only() {
     let _g = setup();
     let r = get("/api/activity", PEER).await;
@@ -1067,6 +1099,7 @@ async fn activity_and_the_service_worker_are_for_paired_phones_only() {
     assert_eq!(v["busy"], 0, "{v}");
     assert!(v["manga"].as_array().is_some_and(Vec::is_empty), "nothing runs in the test data folder: {v}");
     assert!(v["events"].is_array(), "{v}");
+    assert_eq!(v["private"], false, "the PC's private mode, so the phone follows it: {v}");
     // A quick second poll gets the same answer (served from the last build).
     let again = json_of(&text(get_with("/api/activity", &cookie).await).await);
     assert_eq!(again["manga"], v["manga"]);

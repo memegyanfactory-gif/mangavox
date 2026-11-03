@@ -63,9 +63,65 @@ pub struct Hub {
     /// What the research is doing ("Reading upload times (40/280)").
     pub timing_step: Arc<std::sync::Mutex<String>>,
     pub timing_error: Option<String>,
-    /// What the automation changed, newest first ("Chapter 4 moved to Fri 18:00").
+    /// What the automation changed, newest first ("Chapter 4 moved to Fri 6:00 PM").
     pub moves: Vec<String>,
+    /// Comment threads on the channel's videos, newest first (cached in `comments.json`).
+    pub threads: Vec<mv_youtube::comments::Thread>,
+    pub threads_next: Option<String>,
+    pub comments_busy: bool,
+    pub comments_error: Option<String>,
+    pub comments_at: i64,
+    /// Thread ids with a reply being sent.
+    pub replying: Vec<String>,
+    /// The user pressed "Pause after this one": the automation does not start uploads either.
+    pub user_paused: bool,
+    /// YouTube refused an upload for quota: no upload starts on its own before this (the next
+    /// Pacific midnight); the user's own "Upload" click still tries.
+    pub uploads_blocked_until: i64,
+    /// The run uploads only these items (the automation's); None = every planned item.
+    only: Option<Vec<String>>,
+    /// Studio's own thumbnail next to each finished recap, by chapter id (found off the UI thread).
+    pub local_thumbs: HashMap<String, String>,
 }
+
+/// `youtube/cache.json`: the last channel read, shown at once when the app opens (a refresh only
+/// runs when it is older than [`FRESH_FOR`] or the user asks).
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Cache {
+    channel: Option<Channel>,
+    videos: Vec<Video>,
+    channel_daily: Vec<DayStat>,
+    video_daily: HashMap<String, Vec<DayStat>>,
+    refreshed_at: i64,
+}
+
+/// `youtube/comments.json`.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct CommentsCache {
+    threads: Vec<mv_youtube::comments::Thread>,
+    at: i64,
+}
+
+/// An automation upload this close to its release (or past it) waits for the same time next day.
+const OVERDUE_LEAD: i64 = 45 * 60;
+
+/// The queue at app start. An upload cut off when the app closed goes back to Planned (its saved
+/// session URL stays, so it resumes where it stopped).
+fn requeue_interrupted(s: &store::Store) -> Vec<UploadItem> {
+    let _ = s.update_queue(|q| {
+        for i in q.iter_mut().filter(|i| i.state == UploadState::Uploading) {
+            i.state = UploadState::Planned;
+            i.progress = 0.;
+        }
+    });
+    s.queue()
+}
+/// A refresh younger than this is not repeated when a page opens (the quota is precious).
+const FRESH_FOR: i64 = 20 * 60;
+/// Comments are read again after this when the Community tab opens.
+const COMMENTS_FRESH_FOR: i64 = 10 * 60;
 
 struct HubGlobal(Entity<Hub>);
 impl Global for HubGlobal {}
@@ -77,30 +133,46 @@ pub fn hub(cx: &mut App) -> Entity<Hub> {
     }
     let yt = YouTube::new(store::Store::default());
     let s = yt.store().clone();
+    let account = s.account();
+    // The last channel read, so the page opens with numbers (only for the account it belongs to).
+    let cache: Cache = if account.connected() { s.load_json("cache.json") } else { Cache::default() };
+    let cache_ok = cache.channel.as_ref().is_some_and(|c| Some(&c.id) == account.channel_id.as_ref());
+    let cache = if cache_ok { cache } else { Cache::default() };
+    let comments: CommentsCache = if cache_ok { s.load_json("comments.json") } else { CommentsCache::default() };
     let e = cx.new(|_| Hub {
-        account: s.account(),
+        account,
         settings: s.settings(),
-        queue: s.queue(),
+        queue: requeue_interrupted(&s),
         yt,
-        channel: None,
-        videos: vec![],
-        channel_daily: vec![],
-        video_daily: HashMap::new(),
+        loaded_once: cache.channel.is_some() && now() - cache.refreshed_at < FRESH_FOR,
+        refreshed_at: cache.channel.as_ref().map(|_| cache.refreshed_at),
+        channel: cache.channel,
+        videos: cache.videos,
+        channel_daily: cache.channel_daily,
+        video_daily: cache.video_daily,
         episodes: vec![],
         covers: HashMap::new(),
         loading: false,
-        loaded_once: false,
         error: None,
         signed_out: false,
         connecting: false,
         uploading: false,
         progress: Arc::new(AtomicU32::new(0)),
-        refreshed_at: None,
         moves: vec![],
         timing: s.timing(),
         timing_busy: false,
         timing_step: Arc::default(),
         timing_error: None,
+        threads: comments.threads,
+        threads_next: None,
+        comments_busy: false,
+        comments_error: None,
+        comments_at: comments.at,
+        replying: vec![],
+        user_paused: false,
+        uploads_blocked_until: 0,
+        only: None,
+        local_thumbs: HashMap::new(),
     });
     cx.set_global(HubGlobal(e.clone()));
     e
@@ -119,7 +191,13 @@ pub fn start(cx: &mut App) {
     });
     cx.spawn(async move |cx| loop {
         cx.background_executor().timer(REFRESH_EVERY).await;
-        h.update(cx, |h, cx| h.refresh(cx));
+        h.update(cx, |h, cx| {
+            // Background reads never eat into the next upload's quota.
+            if h.yt.can_spare(60) {
+                h.refresh_now(cx);
+                h.load_comments(true, cx);
+            }
+        });
     })
     .detach();
 }
@@ -169,11 +247,18 @@ impl Hub {
     pub fn reload_local(&mut self, cx: &mut Context<Self>) {
         self.queue = self.yt.store().queue();
         cx.spawn(async move |this, cx| {
-            let found = bg::blocking(load_episodes).await.ok();
+            let found = bg::blocking(|| {
+                let (eps, covers) = load_episodes();
+                let thumbs: HashMap<String, String> = eps.iter().filter_map(|e| local_thumb(&e.file).map(|t| (e.chapter_id.clone(), t))).collect();
+                (eps, covers, thumbs)
+            })
+            .await
+            .ok();
             let _ = this.update(cx, |h, cx| {
-                if let Some((eps, covers)) = found {
+                if let Some((eps, covers, thumbs)) = found {
                     h.episodes = eps;
                     h.covers = covers;
+                    h.local_thumbs = thumbs;
                 }
                 cx.notify();
             });
@@ -324,8 +409,18 @@ impl Hub {
 
     // ------------------------------------------------------------ refresh
 
-    /// Channel, videos, analytics; then the dip automation when it is on.
+    /// [`Self::refresh_now`] unless the last read is younger than [`FRESH_FOR`].
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.refreshed_at.is_some_and(|t| now() - t < FRESH_FOR) && self.channel.is_some() {
+            self.loaded_once = true;
+            return;
+        }
+        self.refresh_now(cx);
+    }
+
+    /// Channel, videos, analytics (about 4 quota units; analytics has its own quota); then the dip
+    /// automation when it is on. The answer is cached for the next start.
+    pub fn refresh_now(&mut self, cx: &mut Context<Self>) {
         if self.loading || !self.account.connected() {
             return;
         }
@@ -336,7 +431,7 @@ impl Hub {
         cx.spawn(async move |this, cx| {
             let r = bg::run(async move {
                 let channel = yt.channel().await?;
-                let videos = yt.videos(50).await?;
+                let videos = yt.videos_of(&channel.uploads_playlist, 50).await?;
                 let daily = yt.channel_daily(90).await.unwrap_or_default();
                 let mut per_video = HashMap::new();
                 // Live videos from the last few weeks: the dip window and the per-video charts.
@@ -361,6 +456,7 @@ impl Hub {
                         h.channel_daily = daily;
                         h.video_daily = per_video;
                         h.refreshed_at = Some(now());
+                        h.save_cache();
                         h.sync_published();
                         if h.settings.auto_reschedule {
                             h.automate(cx);
@@ -373,6 +469,146 @@ impl Hub {
             });
         })
         .detach();
+    }
+
+    fn save_cache(&self) {
+        let c = Cache { channel: self.channel.clone(), videos: self.videos.clone(), channel_daily: self.channel_daily.clone(), video_daily: self.video_daily.clone(), refreshed_at: self.refreshed_at.unwrap_or(0) };
+        let _ = self.yt.store().save_json("cache.json", &c);
+    }
+
+    // ------------------------------------------------------------ comments
+
+    /// Top-level comments nobody from the channel has answered.
+    pub fn comments_unanswered(&self) -> usize {
+        self.threads.iter().filter(|t| !t.top.mine && !t.answered()).count()
+    }
+
+    /// Reads the newest 100 threads of the channel (1 quota unit) unless they are fresh;
+    /// `force` reads again anyway. What viewers ask for goes to the automation's suggestions.
+    pub fn load_comments(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.comments_busy || !self.connected() || (!force && now() - self.comments_at < COMMENTS_FRESH_FOR) {
+            return;
+        }
+        self.comments_busy = true;
+        self.comments_error = None;
+        cx.notify();
+        let yt = self.yt.clone();
+        cx.spawn(async move |this, cx| {
+            let r = bg::run(async move { yt.comment_threads(None, None, 100).await }).await;
+            let _ = this.update(cx, |h, cx| {
+                h.comments_busy = false;
+                match r {
+                    Ok(Ok(page)) => {
+                        h.threads = page.threads;
+                        h.threads_next = page.next_page;
+                        h.comments_at = now();
+                        h.save_comments();
+                        crate::automation::learn_from_comments(&h.threads, cx);
+                    }
+                    Ok(Err(e)) => {
+                        h.fail(&e, "Could not read comments");
+                        h.comments_error = h.error.take();
+                    }
+                    Err(e) => h.comments_error = Some(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The next page of older threads.
+    pub fn more_comments(&mut self, cx: &mut Context<Self>) {
+        let Some(page) = self.threads_next.clone() else { return };
+        if self.comments_busy {
+            return;
+        }
+        self.comments_busy = true;
+        cx.notify();
+        let yt = self.yt.clone();
+        cx.spawn(async move |this, cx| {
+            let r = bg::run(async move { yt.comment_threads(None, Some(&page), 100).await }).await;
+            let _ = this.update(cx, |h, cx| {
+                h.comments_busy = false;
+                match r {
+                    Ok(Ok(p)) => {
+                        for t in p.threads {
+                            if !h.threads.iter().any(|x| x.id == t.id) {
+                                h.threads.push(t);
+                            }
+                        }
+                        h.threads_next = p.next_page;
+                        h.save_comments();
+                    }
+                    Ok(Err(e)) => h.comments_error = Some(format!("{e:#}")),
+                    Err(e) => h.comments_error = Some(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Every reply of a thread (when it has more than the five that come with it).
+    pub fn load_replies(&mut self, thread_id: String, cx: &mut Context<Self>) {
+        let yt = self.yt.clone();
+        let id = thread_id.clone();
+        cx.spawn(async move |this, cx| {
+            let r = bg::run(async move { yt.replies(&id).await }).await;
+            let _ = this.update(cx, |h, cx| {
+                if let Ok(Ok(replies)) = r {
+                    if let Some(t) = h.threads.iter_mut().find(|t| t.id == thread_id) {
+                        t.replies = replies;
+                    }
+                    h.save_comments();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Answers a thread as the channel (50 quota units). `done(true)` once it is on YouTube.
+    pub fn reply(&mut self, thread_id: String, text: String, cx: &mut Context<Self>, done: impl FnOnce(bool, &mut App) + 'static) {
+        if self.replying.contains(&thread_id) {
+            return;
+        }
+        self.replying.push(thread_id.clone());
+        cx.notify();
+        let yt = self.yt.clone();
+        let id = thread_id.clone();
+        cx.spawn(async move |this, cx| {
+            let r = bg::run(async move { yt.reply(&id, &text).await }).await;
+            let _ = this.update(cx, |h, cx| {
+                h.replying.retain(|x| x != &thread_id);
+                let ok = match r {
+                    Ok(Ok(c)) => {
+                        if let Some(t) = h.threads.iter_mut().find(|t| t.id == thread_id) {
+                            t.replies.push(c);
+                            t.reply_count += 1;
+                        }
+                        h.save_comments();
+                        toast::show(cx, Toast::success("Reply posted on YouTube").icon(ph::CHAT_CIRCLE));
+                        true
+                    }
+                    Ok(Err(e)) => {
+                        toast::show(cx, Toast::error(format!("Could not reply: {e:#}")));
+                        false
+                    }
+                    Err(e) => {
+                        toast::show(cx, Toast::error(format!("Could not reply: {e:#}")));
+                        false
+                    }
+                };
+                done(ok, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn save_comments(&self) {
+        let _ = self.yt.store().save_json("comments.json", &CommentsCache { threads: self.threads.clone(), at: self.comments_at });
     }
 
     /// Scheduled items whose video has gone public become Published.
@@ -474,6 +710,11 @@ impl Hub {
         id
     }
 
+    /// Adds a ready item (the automation's: release time and copy already set).
+    pub fn push_item(&mut self, item: UploadItem, cx: &mut Context<Self>) {
+        self.save_queue(cx, |q| q.push(item));
+    }
+
     pub fn update_item(&mut self, id: &str, cx: &mut Context<Self>, f: impl FnOnce(&mut UploadItem)) {
         let id = id.to_string();
         self.save_queue(cx, |q| {
@@ -536,8 +777,35 @@ impl Hub {
     // ------------------------------------------------------------ uploads
 
     /// Uploads planned items one by one in release order until none are left, the daily quota
-    /// runs out, or the user signs out.
+    /// runs out, or the user signs out (the user's "Upload N planned").
     pub fn start_uploads(&mut self, cx: &mut Context<Self>) {
+        self.user_paused = false;
+        self.only = None;
+        self.run_uploads(cx);
+    }
+
+    /// Uploads just these items (the automation's), never the user's own planned ones, and not
+    /// while the user has uploads paused.
+    pub fn upload_items(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        if self.user_paused || self.uploads_blocked_until > now() {
+            return;
+        }
+        if self.uploading {
+            // A full run takes them anyway; a run of chosen items takes them too.
+            if let Some(o) = self.only.as_mut() {
+                for id in ids {
+                    if !o.contains(&id) {
+                        o.push(id);
+                    }
+                }
+            }
+            return;
+        }
+        self.only = Some(ids);
+        self.run_uploads(cx);
+    }
+
+    fn run_uploads(&mut self, cx: &mut Context<Self>) {
         if self.uploading || !self.connected() {
             return;
         }
@@ -563,8 +831,11 @@ impl Hub {
         .detach();
     }
 
+    /// "Pause after this one": also holds the automation's uploads until the user starts again.
     pub fn stop_uploads(&mut self, cx: &mut Context<Self>) {
         self.uploading = false;
+        self.user_paused = true;
+        self.only = None;
         cx.notify();
     }
 
@@ -572,19 +843,41 @@ impl Hub {
         if !self.uploading {
             return;
         }
-        let mut planned: Vec<&UploadItem> = self.queue.iter().filter(|i| i.state == UploadState::Planned).collect();
+        let only = self.only.clone();
+        let mut planned: Vec<&UploadItem> = self.queue.iter().filter(|i| i.state == UploadState::Planned && only.as_ref().is_none_or(|o| o.contains(&i.id))).collect();
         // Release order; an item without a time goes out first (it publishes right away).
         planned.sort_by_key(|i| (i.publish_at.is_some(), i.publish_at, i.chapter.map(|c| (c * 100.) as i64)));
         let Some(mut item) = planned.first().map(|i| (*i).clone()) else {
             self.uploading = false;
-            toast::show(cx, Toast::success("All uploads finished").icon(ph::YOUTUBE_LOGO));
+            if self.only.take().is_none() {
+                toast::show(cx, Toast::success("All uploads finished").icon(ph::YOUTUBE_LOGO));
+            }
             cx.notify();
             return;
         };
+        // An automation upload whose release time passed (quota, the app was closed) keeps its
+        // good hour: same local time on the next day it can still make, never public right away.
+        if item.publish_public {
+            if let Some(at) = item.publish_at.filter(|t| *t <= now() + OVERDUE_LEAD) {
+                let next = mv_youtube::automation::roll_forward(at, now(), OVERDUE_LEAD, &chrono::Local);
+                item.publish_at = Some(next);
+                item.resume_url = None;
+                let (iid, title) = (item.id.clone(), item.title.clone());
+                self.update_item(&iid, cx, |i| {
+                    i.publish_at = Some(next);
+                    i.resume_url = None;
+                });
+                let line = format!("“{title}” missed its release time; it now goes public {}", fmt_when(next));
+                toast::show(cx, Toast::info(line.clone()).icon(ph::CALENDAR_CHECK));
+                self.moves.insert(0, line);
+            }
+        }
         // YouTube refuses a publishAt in the past: those go out now.
         if item.publish_at.is_some_and(|t| t <= now() + 120) {
             item.publish_at = None;
         }
+        // Only an upload with publishAt is scheduled on YouTube; a private one without stays private.
+        let scheduled = item.publish_at.is_some() && (item.publish_public || !matches!(self.settings.privacy.as_str(), "" | "private"));
         let id = item.id.clone();
         self.update_item(&id, cx, |i| {
             i.state = UploadState::Uploading;
@@ -612,6 +905,10 @@ impl Hub {
                         move |p| progress.store(p.to_bits(), Ordering::Relaxed),
                     )
                     .await?;
+                // Its own thumbnail (best effort: a channel needs phone verification for these).
+                if let Some(t) = item.thumbnail.as_ref().filter(|t| t.is_file()) {
+                    let _ = yt.set_thumbnail(&video, t).await;
+                }
                 // Series playlist: viewers find the next chapter in order.
                 if settings.series_playlists {
                     if let Some(m) = item.manga_title.as_ref().filter(|m| !m.is_empty()) {
@@ -628,8 +925,8 @@ impl Hub {
                     Ok(Ok((video, at))) => {
                         h.update_item(&id, cx, |i| {
                             i.video_id = Some(video);
-                            i.state = if at.is_some() { UploadState::Scheduled } else { UploadState::Published };
-                            i.publish_at = at.or(Some(now()));
+                            i.state = if scheduled { UploadState::Scheduled } else { UploadState::Published };
+                            i.publish_at = if scheduled { at } else { Some(now()) };
                             i.resume_url = None;
                             i.progress = 1.;
                         });
@@ -646,7 +943,13 @@ impl Hub {
                         match kind {
                             ApiErrorKind::Quota => {
                                 h.uploading = false;
-                                toast::show(cx, Toast::warning("YouTube's daily upload quota is used up. Start uploads again tomorrow; the queue keeps its order.").sticky());
+                                h.only = None;
+                                // Nothing uploads again before the quota day turns over; one notice a day.
+                                let first = h.uploads_blocked_until <= now();
+                                h.uploads_blocked_until = mv_youtube::quota::next_reset(now());
+                                if first {
+                                    toast::show(cx, Toast::warning(format!("YouTube's upload limit is used up. Uploads go on {}; the queue keeps its order.", fmt_when(h.uploads_blocked_until))).sticky());
+                                }
                             }
                             ApiErrorKind::SignedOut => {
                                 h.uploading = false;
@@ -673,6 +976,12 @@ impl Hub {
     }
 }
 
+/// The thumbnail Studio drew next to a video, if any.
+fn local_thumb(video: &std::path::Path) -> Option<String> {
+    let dir = video.parent()?;
+    ["thumbnail.jpg", "full_recap_thumbnail.jpg", "thumb.jpg"].iter().map(|n| dir.join(n)).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Studio's finished recaps: every chapter with a video, plus each manga's joined full recap.
 fn load_episodes() -> (Vec<LocalEpisode>, HashMap<String, PathBuf>) {
     let Ok(groups) = ui_studio::data::load() else { return (vec![], HashMap::new()) };
@@ -695,16 +1004,9 @@ fn load_episodes() -> (Vec<LocalEpisode>, HashMap<String, PathBuf>) {
     (eps, covers)
 }
 
-/// "Fri 18:00" this week, "Nov 3, 18:00" further out (local time).
+/// "Today, 6:30 PM", "Sat, 6:30 PM", "Nov 3, 6:30 PM" (local, 12-hour).
 pub fn fmt_when(t: i64) -> String {
-    let Some(d) = chrono::DateTime::from_timestamp(t, 0) else { return "—".into() };
-    let local = d.with_timezone(&chrono::Local);
-    let days = (t - now()) / 86_400;
-    if (0..6).contains(&days) {
-        local.format("%a %H:%M").to_string()
-    } else {
-        local.format("%b %-d, %H:%M").to_string()
-    }
+    crate::when::when(t)
 }
 
 /// "3 days ago", "in 2 hours".

@@ -10,6 +10,9 @@ use serde::Serialize;
 
 use crate::types::{Account, Settings, UploadItem};
 
+/// Serializes every read-modify-write of `quota.json` in this process.
+static QUOTA_LOCK: Mutex<()> = Mutex::new(());
+
 /// `<data>/youtube`
 pub fn dir() -> PathBuf {
     mv_core::paths::root().join("youtube")
@@ -68,6 +71,45 @@ impl Store {
 
     pub fn save_timing(&self, r: &crate::timing::Research) -> Result<()> {
         self.write("timing.json", r)
+    }
+
+    /// Today's Data API spending (`quota.json`).
+    pub fn quota(&self) -> crate::quota::Usage {
+        self.read("quota.json")
+    }
+
+    pub fn save_quota(&self, q: &crate::quota::Usage) -> Result<()> {
+        self.write("quota.json", q)
+    }
+
+    /// Today's spending, read fresh from disk (a new day starts a new count). Every `YouTube` in
+    /// the process sees the same numbers.
+    pub fn quota_today(&self, now: i64) -> crate::quota::Usage {
+        let _guard = QUOTA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut q = self.quota();
+        q.roll(now);
+        q
+    }
+
+    /// Load, change, save today's spending in one step, so concurrent callers never overwrite
+    /// each other's charges.
+    pub fn update_quota<T>(&self, now: i64, f: impl FnOnce(&mut crate::quota::Usage) -> T) -> Result<T> {
+        let _guard = QUOTA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut q = self.quota();
+        q.roll(now);
+        let out = f(&mut q);
+        self.save_quota(&q)?;
+        Ok(out)
+    }
+
+    /// Any other JSON file here (the automation's state, cached channel data); default when
+    /// missing or unreadable.
+    pub fn load_json<T: DeserializeOwned + Default>(&self, name: &str) -> T {
+        self.read(name)
+    }
+
+    pub fn save_json<T: Serialize + ?Sized>(&self, name: &str, value: &T) -> Result<()> {
+        self.write(name, value)
     }
 
     /// Load, change, save the queue in one step (the UI and the background runner both write it).

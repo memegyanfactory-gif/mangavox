@@ -1,9 +1,9 @@
 //! Small charts drawn with plain elements: a bar chart for daily numbers (hover shows the day
-//! and value), a sparkline for table rows, KPI tiles and the trend chip.
+//! and value), a sparkline for table rows and the trend chip.
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{icon as icon_px, radius, space};
-use mv_ui::{icon_ph, ph, size, tip, Ph, Tokens};
+use mv_ui::{icon_ph, ph, size, tip, Tokens};
 use mv_youtube::Trend;
 
 /// Daily bars, oldest left. `labels[i]` and `values[i]` go into the hover tip with `unit`.
@@ -49,27 +49,6 @@ pub fn sparkline(values: &[u64], color: Rgba) -> Div {
         let h = (*v as f32 / max * 20.).max(1.);
         div().flex_1().h(px(h)).rounded_t(px(1.)).bg(if *v > 0 { color } else { Tokens::track() })
     }))
-}
-
-/// A KPI tile: label, big number, and a small change line ("+12% vs previous 28 days").
-pub fn kpi(icon: Ph, label: &str, value: String, change: Option<f64>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .flex_1()
-        .min_w(px(150.))
-        .gap(px(space::XS))
-        .p(px(space::LG))
-        .rounded(px(radius::LG))
-        .bg(Tokens::surface())
-        .border_1()
-        .border_color(Tokens::border())
-        .child(div().flex().items_center().gap(px(space::XS)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(icon_ph(icon, Tokens::text_3(), icon_px::SM)).child(label.to_string()))
-        .child(div().text_size(px(size::XXL)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(value))
-        .children(change.map(|c| {
-            let (color, icon) = if c >= 0. { (Tokens::success(), ph::TREND_UP) } else { (Tokens::danger(), ph::TREND_DOWN) };
-            div().flex().items_center().gap(px(space::XS)).text_size(px(size::XS)).text_color(color).child(icon_ph(icon, color, icon_px::XS)).child(format!("{:+.0}% vs previous period", c * 100.))
-        }))
 }
 
 /// Rising / Steady / Dipping as a coloured chip with an icon (never colour alone).

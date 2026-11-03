@@ -11,6 +11,10 @@
 //! cover ([`BASE_LOCAL`]: blurred cover behind, the cover centred, the title), so there is always a
 //! thumbnail.
 //!
+//! A thumbnail made on Studio's Thumbnails page wins over both: the one picked for the manga (else
+//! the newest made) is copied in as [`BASE_PICKED`] by [`sync_picked`], and a video can have its
+//! own pick ([`Picks`]), drawn instead of the manga's base.
+//!
 //! The AI image itself is painted by Studio (which owns the Magnific client and key): it registers
 //! a [`Painter`] at startup and readers call [`paint_base`]. Nothing here talks to the network.
 use std::collections::HashSet;
@@ -29,6 +33,10 @@ pub const BASE_AI: &str = "cover_thumb_16x9.jpg";
 pub const BASE_LOCAL: &str = "cover_local_16x9.jpg";
 /// The continuous ("Play all" / full recap) video's thumbnail, in the manga's Studio folder.
 pub const FULL_THUMBNAIL: &str = "full_recap_thumbnail.jpg";
+/// The thumbnail made on Studio's Thumbnails page that the manga's videos use ([`sync_picked`]).
+pub const BASE_PICKED: &str = "video_thumb_16x9.jpg";
+/// Which made thumbnails the videos use ([`Picks`]), in the manga's Studio folder.
+pub const PICKS: &str = "video_thumbs.json";
 
 const BASE_W: u32 = 1920;
 const BASE_H: u32 = 1080;
@@ -71,6 +79,8 @@ pub fn badge_label(numbers: &[Option<f64>]) -> String {
 /// Which base a manga's thumbnails are drawn on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseKind {
+    /// Made or picked on Studio's Thumbnails page ([`BASE_PICKED`]).
+    Picked,
     Ai,
     Local,
 }
@@ -79,12 +89,15 @@ fn nonempty(p: &Path) -> bool {
     p.metadata().is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
-/// The base already made for the manga whose Studio folder is `manga_dir`: its AI image when it
-/// has one, else the local composition, else `None`.
+/// The base already made for the manga whose Studio folder is `manga_dir`: the thumbnail picked on
+/// the Thumbnails page, else its AI image, else the local composition, else `None`.
 pub fn pick_base(manga_dir: &Path) -> Option<(PathBuf, BaseKind)> {
+    let picked = manga_dir.join(BASE_PICKED);
     let ai = manga_dir.join(BASE_AI);
     let local = manga_dir.join(BASE_LOCAL);
-    if nonempty(&ai) {
+    if nonempty(&picked) {
+        Some((picked, BaseKind::Picked))
+    } else if nonempty(&ai) {
         Some((ai, BaseKind::Ai))
     } else if nonempty(&local) {
         Some((local, BaseKind::Local))
@@ -149,6 +162,7 @@ fn badge_key(base: &Path, label: &str) -> Value {
 /// `out` drawn from `base` with `label` in the top-right corner (1280×720 JPEG), reusing `out`
 /// when it was drawn from the same base file and label. Its key sits next to it (`.json`).
 pub fn badge(base: &Path, label: &str, out: &Path) -> Result<PathBuf> {
+    let _one = DRAW.lock().unwrap_or_else(|e| e.into_inner());
     let key = badge_key(base, label);
     let key_file = out.with_extension("json");
     let cached: Option<Value> = std::fs::read(&key_file).ok().and_then(|b| serde_json::from_slice(&b).ok());
@@ -167,18 +181,150 @@ pub fn badge(base: &Path, label: &str, out: &Path) -> Result<PathBuf> {
     Ok(out.to_path_buf())
 }
 
-/// A chapter video's thumbnail: the manga's base with `label`, saved as `thumbnail.jpg` in the
-/// chapter's Studio folder `output_dir`. Local and cheap; blocking.
+/// A chapter video's thumbnail: the manga's base (or the video's own pick) with `label`, saved as
+/// `thumbnail.jpg` in the chapter's Studio folder `output_dir`. Local and cheap; blocking.
 pub fn chapter_thumbnail(manga_dir: &Path, cover: Option<&Path>, title: &str, output_dir: &Path, label: &str) -> Result<PathBuf> {
-    let (base, _) = ensure_base(manga_dir, cover, title)?;
+    let base = video_base(manga_dir, &output_dir.join(crate::media::VIDEO), cover, title)?;
     badge(&base, label, &output_dir.join(crate::media::THUMBNAIL))
 }
 
 /// The continuous video's thumbnail ([`FULL_THUMBNAIL`] in the manga's Studio folder): the same
-/// base with the range of chapters in it. Local and cheap; blocking.
+/// base (or the video's own pick) with the range of chapters in it. Local and cheap; blocking.
 pub fn full_thumbnail(manga_dir: &Path, cover: Option<&Path>, title: &str, label: &str) -> Result<PathBuf> {
-    let (base, _) = ensure_base(manga_dir, cover, title)?;
+    let base = video_base(manga_dir, &manga_dir.join(crate::media::FULL_RECAP), cover, title)?;
     badge(&base, label, &manga_dir.join(FULL_THUMBNAIL))
+}
+
+fn video_base(manga_dir: &Path, video: &Path, cover: Option<&Path>, title: &str) -> Result<PathBuf> {
+    match Picks::load(manga_dir).for_video(manga_dir, video) {
+        Some(p) => Ok(p),
+        None => ensure_base(manga_dir, cover, title).map(|b| b.0),
+    }
+}
+
+// ------------------------------------------------------------------ thumbnails made in Studio
+
+/// Which of the thumbnails made on Studio's Thumbnails page the manga's videos use ([`PICKS`]).
+/// Paths are image files in the manga's gallery; one that is gone counts as no pick.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Picks {
+    /// For every video of the manga (else the newest made thumbnail).
+    pub manga: Option<PathBuf>,
+    /// One video's own: [`video_key`] -> image.
+    pub videos: std::collections::BTreeMap<String, PathBuf>,
+}
+
+impl Picks {
+    pub fn load(manga_dir: &Path) -> Picks {
+        std::fs::read(manga_dir.join(PICKS)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self, manga_dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(manga_dir)?;
+        std::fs::write(manga_dir.join(PICKS), serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
+
+    /// The image picked for `video` itself, when it still exists.
+    pub fn for_video(&self, manga_dir: &Path, video: &Path) -> Option<PathBuf> {
+        self.videos.get(&video_key(manga_dir, video)).filter(|p| nonempty(p)).cloned()
+    }
+}
+
+/// A video's key in [`Picks::videos`]: its path inside the manga's Studio folder
+/// (`<chapter>/video_final.mp4`, `full_recap.mp4`), else the whole path.
+pub fn video_key(manga_dir: &Path, video: &Path) -> String {
+    video.strip_prefix(manga_dir).unwrap_or(video).to_string_lossy().replace('\\', "/")
+}
+
+/// The manga's gallery of thumbnails made on Studio's Thumbnails page (`<studio>/<manga>/thumbnails`;
+/// `gallery.json` lists them newest first, each `<id>.png`).
+pub fn gallery_dir(manga_id: &str) -> PathBuf {
+    crate::Brain::dir(manga_id).join("thumbnails")
+}
+
+/// The made thumbnails that still exist, newest first.
+pub fn gallery_images(manga_id: &str) -> Vec<PathBuf> {
+    let dir = gallery_dir(manga_id);
+    let g: Value = std::fs::read(dir.join("gallery.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    g.get("thumbs")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|t| t.get("id")?.as_str()).map(|id| dir.join(format!("{id}.png"))).filter(|p| nonempty(p)).collect())
+        .unwrap_or_default()
+}
+
+/// A landscape image close to 16:9 (a Shorts or square thumbnail would be cut down to a strip).
+pub fn is_wide(p: &Path) -> bool {
+    image::image_dimensions(p).is_ok_and(|(w, h)| h > 0 && (1.6..=1.95).contains(&(w as f32 / h as f32)))
+}
+
+/// The made thumbnail every video of the manga uses: the picked one, else the newest 16:9 one.
+pub fn manga_pick(manga_id: &str) -> Option<PathBuf> {
+    let picked = Picks::load(&crate::media::manga_dir(manga_id)).manga.filter(|p| nonempty(p));
+    picked.or_else(|| gallery_images(manga_id).into_iter().find(|p| is_wide(p)))
+}
+
+/// One drawing at a time: the same base and badge files are written from several places (the
+/// Thumbnails page, the manga page, the reader), and Windows lets two writers mix their bytes.
+static DRAW: Mutex<()> = Mutex::new(());
+
+/// Copies [`manga_pick`] in as the manga's [`BASE_PICKED`] (or removes it when nothing was made),
+/// skipping the work when it is already that image. True when the base changed. Blocking.
+pub fn sync_picked(manga_id: &str) -> Result<bool> {
+    sync_picked_in(&crate::media::manga_dir(manga_id), manga_pick(manga_id).as_deref())
+}
+
+fn sync_picked_in(manga_dir: &Path, src: Option<&Path>) -> Result<bool> {
+    let _one = DRAW.lock().unwrap_or_else(|e| e.into_inner());
+    let out = manga_dir.join(BASE_PICKED);
+    let key_file = out.with_extension("json");
+    let Some(src) = src else {
+        let had = out.exists();
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&key_file);
+        return Ok(had);
+    };
+    let key = json!({ "src": src.to_string_lossy(), "mtime": mtime_ns(src).to_string() });
+    let cached: Option<Value> = std::fs::read(&key_file).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if cached.as_ref() == Some(&key) && nonempty(&out) {
+        return Ok(false);
+    }
+    let img = image::open(src).with_context(|| format!("could not read {}", src.display()))?;
+    save_jpeg(&img.resize_to_fill(BASE_W, BASE_H, imageops::FilterType::Lanczos3).to_rgb8(), &out, 92)?;
+    std::fs::write(&key_file, serde_json::to_vec(&key)?)?;
+    Ok(true)
+}
+
+/// Draws the manga's existing video thumbnails again on their current base (after a pick or a new
+/// thumbnail), each with the label it had. Returns the files that changed. Blocking.
+pub fn refresh_badges(manga_id: &str) -> Vec<PathBuf> {
+    refresh_badges_in(&crate::media::manga_dir(manga_id))
+}
+
+fn refresh_badges_in(manga_dir: &Path) -> Vec<PathBuf> {
+    let label_of = |thumb: &Path| -> Option<String> {
+        let key: Value = serde_json::from_slice(&std::fs::read(thumb.with_extension("json")).ok()?).ok()?;
+        key.get("label")?.as_str().map(str::to_string)
+    };
+    let mut changed = vec![];
+    let full = manga_dir.join(FULL_THUMBNAIL);
+    if let Some(label) = label_of(&full) {
+        let was = mtime_ns(&full);
+        if full_thumbnail(manga_dir, None, "", &label).is_ok() && mtime_ns(&full) != was {
+            changed.push(full);
+        }
+    }
+    for e in std::fs::read_dir(manga_dir).into_iter().flatten().flatten() {
+        let dir = e.path();
+        let t = dir.join(crate::media::THUMBNAIL);
+        let Some(label) = label_of(&t) else { continue };
+        let was = mtime_ns(&t);
+        if chapter_thumbnail(manga_dir, None, "", &dir, &label).is_ok() && mtime_ns(&t) != was {
+            changed.push(t);
+        }
+    }
+    changed
 }
 
 // ------------------------------------------------------------------ the AI image
@@ -237,7 +383,7 @@ fn set_put(set: &Mutex<Option<HashSet<PathBuf>>>, k: &Path, on: bool) -> bool {
 /// The automatic request (a chapter video shown for the first time) should paint: no AI image
 /// yet, painting works, and it was not tried this session (a failure is never retried in a loop).
 pub fn should_auto_paint(manga_dir: &Path) -> bool {
-    can_paint() && !nonempty(&manga_dir.join(BASE_AI)) && !set_has(&TRIED, manga_dir) && !set_has(&IN_FLIGHT, manga_dir)
+    can_paint() && !nonempty(&manga_dir.join(BASE_AI)) && !nonempty(&manga_dir.join(BASE_PICKED)) && !set_has(&TRIED, manga_dir) && !set_has(&IN_FLIGHT, manga_dir)
 }
 
 /// Paints the manga's one AI image from `cover` with the registered painter. Without `force` it
@@ -514,6 +660,53 @@ mod tests {
         solid(&m.join(BASE_AI), 64, 36, [0, 0, 255]);
         assert_eq!(pick_base(&m), Some((m.join(BASE_AI), BaseKind::Ai)));
         assert_eq!(ensure_base(&m, None, "x").unwrap().1, BaseKind::Ai);
+    }
+
+    #[test]
+    fn only_landscape_thumbnails_become_the_poster_on_their_own() {
+        let t = tempfile::tempdir().unwrap();
+        let (wide, tall, square) = (t.path().join("w.png"), t.path().join("t.png"), t.path().join("s.png"));
+        solid(&wide, 1280, 720, [0, 0, 0]);
+        solid(&tall, 720, 1280, [0, 0, 0]);
+        solid(&square, 800, 800, [0, 0, 0]);
+        assert!(is_wide(&wide) && !is_wide(&tall) && !is_wide(&square) && !is_wide(&t.path().join("missing.png")));
+    }
+
+    #[test]
+    fn a_thumbnail_made_in_studio_is_what_the_videos_show() {
+        let t = tempfile::tempdir().unwrap();
+        let m = t.path().join("manga");
+        let ch = m.join("c1");
+        std::fs::create_dir_all(&ch).unwrap();
+        solid(&m.join(BASE_AI), 64, 36, [0, 0, 255]);
+        let thumb = chapter_thumbnail(&m, None, "Solo", &ch, "Chapter 1").unwrap();
+        assert!(image::open(&thumb).unwrap().to_rgb8().get_pixel(20, OUT_H - 20).0[2] > 200, "drawn on the AI image");
+
+        // A made thumbnail becomes the base, and the existing video thumbnail is drawn again on it.
+        let made = t.path().join("gallery").join("a.png");
+        std::fs::create_dir_all(made.parent().unwrap()).unwrap();
+        solid(&made, 160, 90, [0, 255, 0]);
+        assert!(sync_picked_in(&m, Some(&made)).unwrap());
+        assert_eq!(pick_base(&m), Some((m.join(BASE_PICKED), BaseKind::Picked)));
+        assert!(!sync_picked_in(&m, Some(&made)).unwrap(), "same image: nothing to do");
+        assert_eq!(refresh_badges_in(&m), vec![thumb.clone()]);
+        let px = image::open(&thumb).unwrap().to_rgb8().get_pixel(20, OUT_H - 20).0;
+        assert!(px[1] > 200 && px[2] < 60, "drawn on the made thumbnail: {px:?}");
+        assert!(refresh_badges_in(&m).is_empty(), "already current");
+
+        // A video's own pick wins over the manga's.
+        let own = t.path().join("gallery").join("b.png");
+        solid(&own, 160, 90, [255, 0, 0]);
+        let mut picks = Picks::default();
+        picks.videos.insert(video_key(&m, &ch.join(crate::media::VIDEO)), own.clone());
+        picks.save(&m).unwrap();
+        assert_eq!(video_key(&m, &ch.join(crate::media::VIDEO)), "c1/video_final.mp4");
+        assert_eq!(refresh_badges_in(&m), vec![thumb.clone()]);
+        assert!(image::open(&thumb).unwrap().to_rgb8().get_pixel(20, OUT_H - 20).0[0] > 200);
+
+        // Nothing made any more: back to the AI image.
+        assert!(sync_picked_in(&m, None).unwrap());
+        assert_eq!(pick_base(&m).unwrap().1, BaseKind::Ai);
     }
 
     #[test]

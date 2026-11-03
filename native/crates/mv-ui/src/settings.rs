@@ -297,3 +297,13 @@ impl IntoElement for SettingsNote {
         self.build()
     }
 }
+
+/// Bumped when a key in Settings › AI services is saved or removed, so pages that use those
+/// services (Studio's Thumbnails generator) can look again without depending on Settings.
+pub struct ServiceKeysChanged(pub u64);
+impl Global for ServiceKeysChanged {}
+
+pub fn notify_service_keys(cx: &mut App) {
+    let n = cx.try_global::<ServiceKeysChanged>().map(|g| g.0).unwrap_or(0);
+    cx.set_global(ServiceKeysChanged(n + 1));
+}

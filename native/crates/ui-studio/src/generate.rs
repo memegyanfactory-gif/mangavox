@@ -758,6 +758,15 @@ pub(crate) fn queue_generate(chapters: &[ChapterItem], a: &Answers, redo: Option
     (n, errors)
 }
 
+/// [`queue_generate`] with the saved Generate answers (voice, format, subtitles, music), for
+/// callers without the page (the headless `generate` example). The pipeline context must be set
+/// first.
+pub fn queue_saved(chapters: &[ChapterItem], start: bool) -> ((usize, usize, usize), Vec<String>) {
+    let prefs = Prefs::load();
+    let default = prefs.voice.clone().unwrap_or_default();
+    queue_generate(chapters, &Answers::load(&prefs), None, start, &default, |c| c.video.is_some())
+}
+
 fn apply_subtitles(chapters: &[ChapterItem], a: &Answers) {
     let mut d = crate::video::default_setting();
     let style = a.subtitle_style.clone();

@@ -331,7 +331,8 @@ impl StudioPage {
     /// asking, exactly the chapters that do not match the style, then runs `then`. Unlocked: asks
     /// about changed chapters as before (`data::fresh`).
     pub(crate) fn style_gate(&mut self, g: &MangaGroup, goal: Goal, then: super::QueuedExport, window: &mut Window, cx: &mut Context<Self>) {
-        let chapters = self.made_chapters_of(g);
+        // The whole timeline: chapters not rendered yet are rendered first, like changed ones.
+        let chapters = self.timeline_chapters(g);
         if !self.style.prefs.locked {
             let page = cx.entity().downgrade();
             let after = if goal == Goal::Play { fresh::After::Offer("Play") } else { fresh::After::Auto };

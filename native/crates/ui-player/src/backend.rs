@@ -164,12 +164,24 @@ pub fn ident(req: &PlayRequest) -> Ident {
     }
 }
 
+/// The user's database, migrated once per run. Not `open_default` per call: that also resets the
+/// manga download queue, a write that waits on any other writer (up to 5 s) and every progress save.
+fn db() -> Result<rusqlite::Connection> {
+    static MIGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut conn = mv_core::db::open(&mv_core::paths::database())?;
+    if !MIGRATED.load(std::sync::atomic::Ordering::Relaxed) {
+        mv_core::db::migrate(&mut conn)?;
+        MIGRATED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(conn)
+}
+
 /// Saved resume position for this title/episode, if worth resuming.
 pub fn load_resume(ident: &Ident) -> Option<f64> {
     if !ident.tracked {
         return None;
     }
-    let conn = mv_core::db::open_default().ok()?;
+    let conn = db().ok()?;
     let rows = media::list_history(&conn, Some(ident.kind), None, 1000).ok()?;
     let row = rows.into_iter().find(|r| r.media_id == ident.id)?;
     if row.episode_number != ident.episode || (row.season_number.is_some() && ident.season.is_some() && row.season_number != ident.season) {
@@ -189,7 +201,7 @@ pub fn save_event(ident: &Ident, kind: &str, pos: f64, duration: f64) -> Result<
     if !records_watch(ident, mv_core::privacy::active()) {
         return Ok(());
     }
-    let conn = mv_core::db::open_default()?;
+    let conn = db()?;
     // Never overwrite catalog metadata (genres, cover) with our sparse title.
     let title = match media::get_title(&conn, &ident.id)? {
         Some(_) => None,

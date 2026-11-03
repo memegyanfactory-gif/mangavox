@@ -30,6 +30,8 @@ mod videos;
 pub use backend::set_source_ctx;
 pub use discover::request_search;
 pub use downloads::{cards as download_cards, downloads};
+/// Forget the manga pages' kept copies (call after clearing their data elsewhere).
+pub use ui::drop_snapshots;
 
 /// Gives the assistant the manga tools (search, chapters, downloads, reader). Called once at startup.
 pub fn register_assistant_tools() {

@@ -1,0 +1,21 @@
+[package]
+name = "mv-3d"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mv-ai = { path = "../mv-ai" }
+mv-core = { path = "../mv-core" }
+mv-recap = { path = "../mv-recap" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rusqlite = { workspace = true }

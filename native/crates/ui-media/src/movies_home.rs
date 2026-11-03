@@ -1213,6 +1213,9 @@ fn set_offset(v: &mut MoviesHome, id: &'static str, n: usize) {
 impl Render for MoviesHome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_personal(cx);
+        if self.rows.iter().any(|r| r.load.ready().is_some()) {
+            mv_ui::perf::ready("Movies home");
+        }
         let width = look::page_width(&self.scroll, window);
         // The hover card is placed from last frame's card bounds; this frame's probes refill them.
         let hover = if matches!(self.streams, StreamState::Idle) && self.detail.is_none() { self.hover_card(cx) } else { None };

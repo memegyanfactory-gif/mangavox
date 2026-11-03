@@ -259,7 +259,7 @@ fn story_sfx_cues_are_validated() {
         ]}"#,
     )
     .unwrap();
-    let segs = crate::story::parse_segments(&v, &[0, 1, 2], &read, false);
+    let segs = crate::story::parse_segments(&v, &[0, 1, 2], &read);
     let cues: Vec<Option<(String, u8)>> = segs.iter().map(|s| s.sfx.clone().map(|c| (c.name, c.strength))).collect();
     assert_eq!(cues, vec![None, Some(("impact".into(), 3)), None, Some(("boom".into(), 2))]);
     // Saved stories keep the cue; segments without one write no key (old readers unaffected).
@@ -349,7 +349,7 @@ async fn story_chunks_and_saves() {
     save_transcript(&ch, &Transcript { pages: vec![TranscriptPage { index: 0, text: "Ruko: EDITED LINE".into(), edited: true }] }).unwrap();
 
     let story = Fake::new(&[r#"{"title":"Duel","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":2,"panel":null,"text":"Kaito speaks."},{"page":9,"text":"stray"}]}"#]);
-    let out = write_story_with(&story, &model(), std::slice::from_ref(&ch), &["Hard".to_string()], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    let out = write_story_with(&story, &model(), std::slice::from_ref(&ch), &[], &["Hard".to_string()], &brain, &silent(), &CancellationToken::new()).await.unwrap();
     assert_eq!(out.len(), 1);
     let s = &out[0].1;
     assert_eq!(s.title, "Duel");
@@ -448,30 +448,39 @@ async fn story_sees_the_whole_chapter_and_remembers_it() {
     let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
     read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
     let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"Ruko meets Kaito.","segments":[{"page":2,"panel":1,"text":"Kaito speaks."}]}"#]);
-    write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
     let seen = llm.seen.lock().unwrap();
     assert_eq!(seen.len(), 1, "one call for the whole chapter");
-    assert!(seen[0].messages[1].content.contains("the whole chapter"));
-    assert!(seen[0].messages[1].content.contains("IN MEDIAS RES"));
+    let (sys, user) = (&seen[0].messages[0].content, &seen[0].messages[1].content);
+    assert!(user.contains("the whole chapter"));
+    // The first chapter just begins the story: no in-medias-res hook, no rewind, no outro.
+    assert!(user.contains("these pages begin the story"), "{user}");
+    assert!(!user.contains("hook") && !user.contains("IN MEDIAS RES") && !user.contains("go back"), "{user}");
+    assert!(user.contains("No wrap-up") && !user.contains("next chapter"), "{user}");
+    assert!(!user.contains("CALL TO ACTION"), "minute 0 is no reminder mark");
+    assert!(!sys.contains("\"hook\""));
+    assert!(sys.contains("ONE CONTINUOUS STORY") && sys.contains("\"previously\"") && sys.contains("\"end of chapter\"") && sys.contains("sign-offs"), "{sys}");
+    assert!(sys.contains("One or two per chapter at most") && sys.contains("never in serious, sad or tense scenes"), "{sys}");
     let b = brain.lock().unwrap();
     assert_eq!(b.recaps[0].summary, "Ruko meets Kaito.");
     assert_eq!(b.recap_before("Chapter 2"), Some("Ruko meets Kaito."));
 }
 
 #[tokio::test]
-async fn story_opens_in_medias_res_and_finishes_what_it_skipped() {
+async fn story_ignores_hooks_and_finishes_what_it_skipped() {
     let dir = tempfile::tempdir().unwrap();
     let ch = chapter(dir.path(), 2);
     let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
     read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
-    // The first answer opens on page 2's twist, then stops after page 1: the rest is asked for.
+    // The first answer stops after page 1: the rest is asked for. A "hook" key is ignored, and a
+    // segment outside the pages asked for is dropped.
     let llm = Fake::new(&[
-        r#"{"title":"T","summary_so_far":"s","segments":[{"page":2,"panel":1,"hook":true,"text":"Kaito names himself."},{"page":1,"panel":1,"text":"Ruko meets a stranger."}]}"#,
-        r#"{"summary_so_far":"s2","segments":[{"page":2,"panel":1,"hook":true,"text":"Only the opening is a hook."},{"page":2,"panel":1,"text":"The stranger is Kaito."}]}"#,
+        r#"{"title":"T","summary_so_far":"s","segments":[{"page":1,"panel":1,"hook":true,"text":"Ruko meets a stranger."}]}"#,
+        r#"{"summary_so_far":"s2","segments":[{"page":1,"panel":1,"hook":true,"text":"Not on these pages."},{"page":2,"panel":1,"text":"The stranger is Kaito."}]}"#,
     ]);
-    let out = write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
     let segs: Vec<(usize, bool, &str)> = out[0].1.segments.iter().map(|s| (s.page, s.hook, s.text.as_str())).collect();
-    assert_eq!(segs, vec![(1, true, "Kaito names himself."), (0, false, "Ruko meets a stranger."), (1, false, "Only the opening is a hook."), (1, false, "The stranger is Kaito.")]);
+    assert_eq!(segs, vec![(0, false, "Ruko meets a stranger."), (1, false, "The stranger is Kaito.")]);
     {
         let seen = llm.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -479,17 +488,107 @@ async fn story_opens_in_medias_res_and_finishes_what_it_skipped() {
         let again = &seen[1].messages[1].content;
         assert!(again.contains("pages 2-2") && again.contains("LAST LINES ALREADY SPOKEN") && again.contains("Ruko meets a stranger."), "{again}");
     }
+}
+
+#[tokio::test]
+async fn old_stories_with_hook_segments_still_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 2);
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
+    let seg = |page: usize, hook: bool, text: &str| StorySegment { page, panel: Some(0), text: text.into(), delivery: None, sfx: None, hook };
+    let saved = r#"{"title":"T","segments":[{"page":1,"panel":0,"text":"Kaito names himself.","hook":true},{"page":0,"panel":0,"text":"Ruko meets a stranger."},{"page":1,"panel":0,"text":"The stranger is Kaito."}]}"#;
+    std::fs::write(chapter_dir(&ch).join("story.json"), saved).unwrap();
+    let story = load_story(&ch).unwrap();
+    assert_eq!(story.segments, vec![seg(1, true, "Kaito names himself."), seg(0, false, "Ruko meets a stranger."), seg(1, false, "The stranger is Kaito.")]);
+    let out = vec![("c1".to_string(), story)];
 
     // The hook is voiced first, on the first narrated page, showing page 2.
     export_for_pipeline(&ch, &out[0].1).unwrap();
     let script: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("script_edited.json")).unwrap()).unwrap();
     assert_eq!(script[0]["text"], "Kaito names himself. Ruko meets a stranger.");
-    assert_eq!(script[1]["text"], "Only the opening is a hook. The stranger is Kaito.");
+    assert_eq!(script[1]["text"], "The stranger is Kaito.");
     let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
     let first = &beats["beats"][0];
     assert_eq!(first["page"], 0);
     let img = first["panel_image"].as_str().unwrap();
     assert!(img.contains("p0001_") || img.ends_with("page2.png"), "{img}");
+}
+
+#[test]
+fn subscribe_reminders_fall_on_the_manga_running_time() {
+    use crate::story::reminder_at;
+    assert_eq!(reminder_at(0.0, 20.0), None, "nothing before minute 27");
+    assert_eq!(reminder_at(25.0, 4.0), Some(0.5));
+    assert_eq!(reminder_at(27.0, 3.0), Some(0.0), "a mark at the very start belongs to this chapter");
+    assert_eq!(reminder_at(24.0, 3.0), None, "... not to the one ending on it");
+    assert_eq!(reminder_at(30.0, 70.0), None, "the next mark is at 107");
+    assert_eq!(reminder_at(105.0, 4.0), Some(0.5));
+    assert_eq!(reminder_at(186.0, 2.0), Some(0.5));
+    assert_eq!(reminder_at(10.0, 0.0), None);
+    assert_eq!(reminder_at(f64::NAN, 3.0), None);
+    // A range of chapters played from the start: ~3.5 minutes each.
+    let count = |minutes: f64| (0..).map(|i| i as f64 * 3.5).take_while(|s| *s < minutes).filter(|s| reminder_at(*s, 3.5).is_some()).count();
+    assert_eq!(count(60.0), 1);
+    assert_eq!(count(120.0), 2);
+    assert_eq!(count(480.0), 6);
+    assert_eq!(count(1200.0), 15);
+}
+
+#[test]
+fn words_before_estimates_chapters_without_a_story() {
+    use crate::story::words_before;
+    // Saved stories count as they are.
+    assert_eq!(words_before(&[(Some(600), 40), (Some(800), 60)], &[(600, 40), (800, 60)], (500, 50)), 1400.0);
+    // One without a story: from its pages at the samples' words per page (1400 / 100 = 14).
+    assert_eq!(words_before(&[(Some(600), 40), (None, 50)], &[(600, 40), (800, 60)], (500, 50)), 600.0 + 700.0);
+    // No page count: the average chapter.
+    assert_eq!(words_before(&[(None, 0), (None, 0)], &[(600, 40), (800, 60)], (500, 50)), 1400.0);
+    // Nothing known yet: this chapter's own estimate.
+    assert_eq!(words_before(&[(None, 0), (None, 20)], &[], (500, 50)), 500.0 + 200.0);
+    assert_eq!(words_before(&[], &[(600, 40)], (500, 50)), 0.0);
+}
+
+#[tokio::test]
+async fn later_chapters_continue_the_story_and_carry_planned_reminders() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ch = chapter(dir.path(), 2);
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
+    brain.lock().unwrap().set_recap("Chapter 0", "Ruko trains alone.");
+    let words = |n: usize| Story { segments: vec![StorySegment { text: vec!["word"; n].join(" "), ..Default::default() }], ..Default::default() };
+    let earlier = ChapterRef { chapter_id: "c0".into(), label: "Chapter 0".into(), pages_dir: dir.path().join("c0").join("pages"), output_dir: dir.path().join("c0"), ..ch.clone() };
+    let answer = r#"{"title":"T","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko meets a stranger."},{"page":2,"panel":1,"text":"Kaito names himself."}]}"#;
+    let brain = &brain;
+    let prompt_with = move |manga: Vec<ChapterRef>, ch: ChapterRef| {
+        async move {
+            let llm = Fake::new(&[answer]);
+            write_story_with(&llm, &model(), std::slice::from_ref(&ch), &manga, &[], brain, &silent(), &CancellationToken::new()).await.unwrap();
+            let seen = llm.seen.lock().unwrap();
+            seen[0].messages[1].content.clone()
+        }
+    };
+
+    // 5000 words (26.3 min) before this ~1 minute chapter: the 27-minute mark falls midway.
+    save_story(&earlier, &words(5000)).unwrap();
+    let user = prompt_with(vec![earlier.clone(), ch.clone()], ch.clone()).await;
+    assert!(user.contains("STORY SO FAR:\nRuko trains alone."), "{user}");
+    assert!(user.contains("continue it seamlessly") && user.contains("No recap of earlier events"), "{user}");
+    assert!(!user.contains("left off") && !user.contains("next chapter") && !user.contains("hook"), "{user}");
+    assert!(user.contains("No wrap-up"), "{user}");
+    assert!(user.contains("CALL TO ACTION: around the middle of these pages") && user.contains("subscribe"), "{user}");
+
+    // 3000 words (15.8 min) before it: no mark in this chapter.
+    save_story(&earlier, &words(3000)).unwrap();
+    assert!(!prompt_with(vec![earlier.clone(), ch.clone()], ch.clone()).await.contains("CALL TO ACTION"));
+
+    // Without the manga's order: "Chapter 9" has 8 chapters before it, each as long as the average
+    // story saved next to it (630 words): 26.5 minutes.
+    ch.label = "Chapter 9".into();
+    save_story(&ChapterRef { output_dir: dir.path().join("ch").join("other"), ..Default::default() }, &words(630)).unwrap();
+    assert!(prompt_with(vec![], ch.clone()).await.contains("CALL TO ACTION: in the first part of these pages"));
+    ch.label = "Chapter 3".into();
+    assert!(!prompt_with(vec![], ch.clone()).await.contains("CALL TO ACTION"));
 }
 
 #[test]

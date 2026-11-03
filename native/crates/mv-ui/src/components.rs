@@ -339,7 +339,16 @@ pub enum CoverSource {
 }
 
 impl CoverSource {
+    /// Poster-size image: local files load as a cached ~400 px thumbnail (see [`crate::thumbs`]).
     pub fn into_img(self) -> Img {
+        match self {
+            CoverSource::File(p) => img(crate::thumbs::cover_source(p)),
+            CoverSource::Url(u) => img(u),
+        }
+    }
+
+    /// Full-resolution image, for art shown much larger than a card.
+    pub fn into_full_img(self) -> Img {
         match self {
             CoverSource::File(p) => img(p),
             CoverSource::Url(u) => img(u),

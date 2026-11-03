@@ -22,10 +22,10 @@ fn num(n: f64) -> String {
     }
 }
 
-/// "Fri 18:00" in the local zone.
+/// "Fri 6:00 PM" in the local zone (12-hour).
 fn fmt_local(ts: i64, utc_offset_secs: i32) -> String {
     let tz = FixedOffset::east_opt(utc_offset_secs).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-    DateTime::<Utc>::from_timestamp(ts, 0).map(|d| d.with_timezone(&tz).format("%a %H:%M").to_string()).unwrap_or_default()
+    DateTime::<Utc>::from_timestamp(ts, 0).map(|d| d.with_timezone(&tz).format("%a %-I:%M %p").to_string()).unwrap_or_default()
 }
 
 fn movable(i: &UploadItem) -> bool {
@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(first.severity, Severity::Urgent);
         assert_eq!(first.title, "“Solo Leveling Ch. 3” is losing views");
         assert!(first.body.starts_with("Views fell 70% from its best day on day 3."), "{}", first.body);
-        assert!(first.body.contains("Chapter 4") && first.body.contains("Mon 18:00"), "{}", first.body);
+        assert!(first.body.contains("Chapter 4") && first.body.contains("Mon 6:00 PM"), "{}", first.body);
         assert_eq!(first.action, Some(Action::PublishSooner { item_id: "c4".into(), at: ts(2025, 1, 6, 18) }));
         assert!(s.iter().any(|x| x.action == Some(Action::RefreshMetadata { video_id: "v1".into() })));
     }
@@ -562,7 +562,7 @@ mod tests {
         assert!(s.iter().any(|x| x.title.contains("before Chapter 1") && x.action == Some(Action::QueueNext { chapter_id: "m-1".into() })));
         let rhythm = s.iter().find(|x| x.title == "Keep the rhythm going").unwrap();
         assert_eq!(rhythm.action, Some(Action::QueueNext { chapter_id: "m-1".into() }));
-        assert!(rhythm.body.contains("Mon 18:00"), "{}", rhythm.body);
+        assert!(rhythm.body.contains("Mon 6:00 PM"), "{}", rhythm.body);
         assert!(s.windows(2).all(|w| w[0].severity >= w[1].severity));
     }
 

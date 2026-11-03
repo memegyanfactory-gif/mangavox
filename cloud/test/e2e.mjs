@@ -66,18 +66,19 @@ async function connect(mode, device, pc) {
 function request(session, method, path, body, csrf = true) {
   return new Promise((resolve, reject) => {
     let status = 0;
+    let head = {};
     const parts = [];
     const headers = {};
     if (body) headers['content-type'] = 'application/json';
     if (csrf && method !== 'GET') headers['x-mangavox'] = '1';
     const h = session.request({ method, path, headers, body: body ? new TextEncoder().encode(JSON.stringify(body)) : null }, {
-      onHead(st) { status = st; },
+      onHead(st, hd) { status = st; head = hd; },
       onData(b) { parts.push(b); h.ack(b.byteLength); },
       onEnd() {
         const all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
         let i = 0;
         for (const p of parts) { all.set(p, i); i += p.length; }
-        resolve({ status, bytes: all, text: new TextDecoder().decode(all) });
+        resolve({ status, headers: head, bytes: all, text: new TextDecoder().decode(all) });
       },
       onError: reject,
     });
@@ -103,6 +104,10 @@ const shell = await request(a.session, 'GET', '/');
 check(shell.status === 200 && shell.text.includes('/app.js'), `app shell: ${shell.status}, ${shell.bytes.length} bytes`);
 const js = await request(a.session, 'GET', '/app.js');
 check(js.status === 200 && js.bytes.length > 100_000 && js.text.trimEnd().endsWith('boot();'), `app.js in chunks with flow control: ${js.bytes.length} bytes intact`);
+// The page names its script by content hash, and that address may be kept on the phone (sw.js).
+const jsPath = (/src="(\/app\.js\?v=[0-9a-f]+)"/.exec(shell.text) || [])[1];
+const hashed = jsPath ? await request(a.session, 'GET', jsPath) : { status: 0, headers: {} };
+check(hashed.status === 200 && /immutable/.test(hashed.headers['cache-control'] || '') && hashed.bytes.length === js.bytes.length, `the script is cacheable by its hash: ${jsPath}`);
 const mouse = await request(a.session, 'POST', '/api/mouse', { t: 'move', dx: 1, dy: 1 });
 check(mouse.status === 403, `remote control refused without Allow control: ${mouse.status}`);
 const forged = await request(a.session, 'POST', '/api/logout', {}, false);

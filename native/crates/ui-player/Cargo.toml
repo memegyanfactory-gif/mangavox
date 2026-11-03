@@ -10,6 +10,7 @@ mv-torrent = { path = "../mv-torrent" }
 mv-media = { path = "../mv-media" }
 mv-core = { path = "../mv-core" }
 anyhow = { workspace = true }
+rusqlite = { workspace = true }
 serde_json = { workspace = true }
 libloading = "0.8"
 raw-window-handle = "0.6"

@@ -3,7 +3,7 @@
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use mv_ui::{icon_tag, segmented, settings_group, settings_note, settings_row, AlertKind, Route, SettingsGroup};
 
-use super::magnific::{self, Usage, CATALOG};
+use super::magnific::{self, Usage, Via, CATALOG};
 use super::thumb_page::notify_changed;
 use super::*;
 
@@ -201,7 +201,7 @@ impl MagnificSettings {
             .child(cell(SIZES_W).child("Sizes"))
             .child(cell(CREDITS_W).flex().justify_end().child("Credits"));
         let mut list = div().flex().flex_col().gap(px(2.)).w_full().min_w_0().child(head);
-        for (i, mm) in CATALOG.iter().enumerate() {
+        for (i, mm) in CATALOG.iter().enumerate().filter(|(_, m)| m.via == Via::Magnific) {
             let on = i == model;
             list = list.child(
                 div()
@@ -263,14 +263,16 @@ impl MagnificSettings {
     }
 
     fn defaults_section(&self, cx: &mut Context<Self>) -> SettingsGroup {
-        let model = CATALOG.iter().position(|m| m.id == self.prefs.model).unwrap_or(0);
-        let m = &CATALOG[model];
+        // The Thumbnails page may default to another service's model; then no row is ticked here.
+        let picked = CATALOG.iter().position(|m| m.id == self.prefs.model && m.via == Via::Magnific).or(self.prefs.model.is_empty().then_some(0));
+        let model = picked.unwrap_or(usize::MAX);
+        let m = &CATALOG[picked.unwrap_or(0)];
         let aspect = ASPECTS.iter().position(|a| *a == self.prefs.aspect).unwrap_or(0);
         let this = cx.entity().downgrade();
         let this2 = this.clone();
         let res_items: Vec<&'static str> = m.resolutions.to_vec();
         let res_ix = res_items.iter().position(|r| *r == self.prefs.resolution).unwrap_or(0);
-        settings_group("Defaults", Some("What the Thumbnails page starts with. Every model here is offered by the Magnific API; the ones shown only in the web app are left out.".into()))
+        settings_group("Defaults", Some("What the Thumbnails page starts with. Every model here is offered by the Magnific API; the ones shown only in the web app are left out. Higgsfield, fal.ai, Replicate, Black Forest Labs and Recraft models are picked on the Thumbnails page, with their keys in Settings › AI services.".into()))
             .child(settings_row(
                 "Aspect",
                 "16:9 for YouTube; 9:16 for Shorts.",

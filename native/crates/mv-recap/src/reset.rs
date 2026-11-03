@@ -719,6 +719,7 @@ mod tests {
             transcript: from >= Step::Transcript,
             story: from > Step::Story,
             audio_files: if from > Step::Audio { 2 } else { 0 },
+            timed: from > Step::Audio,
             video: None,
             reels: vec![],
             music: from > Step::Music,

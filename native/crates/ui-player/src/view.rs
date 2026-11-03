@@ -32,6 +32,8 @@ const TICK: Duration = Duration::from_millis(33);
 const POLL_EVERY: u32 = 4; // ticks (~130 ms)
 const TRACKS_EVERY: u32 = 8; // polls (~1 s)
 const SAVE_EVERY: Duration = Duration::from_secs(10);
+/// How long a full-screen switch may take before the window's own state counts again.
+const FS_SETTLE: Duration = Duration::from_secs(1);
 /// Controls fade in / out (the kit's slow transition).
 const FADE: Duration = duration::SLOW;
 /// Scrubber grows on hover.
@@ -153,6 +155,8 @@ pub struct PlayerView {
     overlay: Option<AnyWindowHandle>,
     follower: Option<Follower>,
     fullscreen: bool,
+    /// Full screen as last asked for, until the window has switched (it does so after this update).
+    fs_wanted: Option<(bool, Instant)>,
     /// Overlay size (window pixels), written by a canvas each layout.
     ov_bounds: Rc<Cell<Bounds<Pixels>>>,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -281,6 +285,13 @@ pub fn open_view(req: PlayRequest, window: &mut Window, cx: &mut App) -> AnyView
     cx.new(|cx| PlayerView::new(req, window, cx)).into()
 }
 
+/// Updates the player in the app window. `update_in` would use whichever window drew the player last,
+/// and the overlay draws it too: there `is_fullscreen()` is always false, so the per-frame check
+/// flipped full screen off and on (the title bar's buttons and the full-screen icon flickered).
+fn in_main<R>(this: &WeakEntity<PlayerView>, main: AnyWindowHandle, cx: &mut AsyncWindowContext, f: impl FnOnce(&mut PlayerView, &mut Window, &mut Context<PlayerView>) -> R) -> anyhow::Result<R> {
+    main.update(cx, |_, window, cx| this.update(cx, |this, cx| f(this, window, cx)))?
+}
+
 impl PlayerView {
     fn new(req: PlayRequest, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
@@ -298,6 +309,7 @@ impl PlayerView {
             overlay: None,
             follower: None,
             fullscreen: window.is_fullscreen(),
+            fs_wanted: None,
             ov_bounds: Rc::new(Cell::new(Bounds::default())),
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -371,9 +383,10 @@ impl PlayerView {
             }
         })
         .detach();
+        let main = this.main;
         cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
-            if this.update_in(cx, |this, window, cx| this.tick(window, cx)).is_err() {
+            if in_main(&this, main, cx, |this, window, cx| this.tick(window, cx)).is_err() {
                 break;
             }
         })
@@ -468,10 +481,14 @@ impl PlayerView {
         let attempt = self.attempt;
         let req = self.req.clone();
         let ident = self.ident.clone();
+        let main = self.main;
         cx.spawn_in(window, async move |this, cx| {
-            let (resume, prefs) = bg::blocking(move || (backend::load_resume(&ident), backend::load_prefs())).await.unwrap_or_default();
-            let resolved = bg::run(async move { backend::resolve(&req).await }).await.and_then(|r| r);
-            let _ = this.update_in(cx, |this, window, cx| {
+            // Both start now (bg tasks run eagerly): resolving does not wait on the resume read.
+            let prior = bg::blocking(move || (backend::load_resume(&ident), backend::load_prefs()));
+            let resolved = bg::run(async move { backend::resolve(&req).await });
+            let (resume, prefs) = prior.await.unwrap_or_default();
+            let resolved = resolved.await.and_then(|r| r);
+            let _ = in_main(&this, main, cx, |this, window, cx| {
                 if this.attempt == attempt {
                     this.on_resolved(resolved, resume, prefs, window, cx);
                 }
@@ -551,9 +568,10 @@ impl PlayerView {
         let (Some(h), Some(engine)) = (self.info_hash.clone().or_else(|| self.pending_hash.clone()), backend::engine_if_started()) else { return };
         self.stats_busy = true;
         let attempt = self.attempt;
+        let main = self.main;
         cx.spawn_in(window, async move |this, cx| {
             let stats = bg::blocking(move || engine.stats(&h).ok()).await.ok().flatten().map(TorrentStats::from_engine);
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = in_main(&this, main, cx, |this, window, cx| {
                 this.stats_busy = false;
                 if this.attempt == attempt {
                     this.on_stats(stats, window, cx);
@@ -825,7 +843,12 @@ impl PlayerView {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ticks = self.ticks.wrapping_add(1);
         let fs = window.is_fullscreen();
-        if fs != self.fullscreen {
+        if let Some((want, at)) = self.fs_wanted {
+            if fs == want || at.elapsed() > FS_SETTLE {
+                self.fs_wanted = None;
+            }
+        }
+        if self.fs_wanted.is_none() && fs != self.fullscreen {
             self.fullscreen = fs;
             cx.notify();
         }
@@ -1229,9 +1252,10 @@ impl PlayerView {
         self.next = NextState::Looking;
         self.next_warm |= warm;
         let req = self.req.clone();
+        let main = self.main;
         cx.spawn_in(window, async move |this, cx| {
             let res = bg::run(backend::next_episode(req)).await.and_then(|r| r);
-            let _ = this.update_in(cx, |this, window, cx| this.on_next(res, window, cx));
+            let _ = in_main(&this, main, cx, |this, window, cx| this.on_next(res, window, cx));
         })
         .detach();
     }
@@ -1447,6 +1471,7 @@ impl PlayerView {
     fn toggle_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.toggle_fullscreen();
         self.fullscreen = !self.fullscreen;
+        self.fs_wanted = Some((self.fullscreen, Instant::now()));
         cx.notify();
     }
 
@@ -1995,6 +2020,9 @@ impl PlayerView {
         let label = if on { "Private on" } else { "Private" };
         ui::ctl_shell("private", ui::ctl_box(BAR_PX), "Private mode: nothing you watch is recorded (Ctrl+Shift+N)", None, false)
             .w_auto()
+            // Room for either label, so turning it on never moves the bar.
+            .min_w(px(128.))
+            .justify_center()
             .px(px(14.))
             .gap(px(8.))
             .bg(if on { Tokens::accent_soft() } else { Tokens::glass() })
@@ -2030,6 +2058,8 @@ impl PlayerView {
             .items_start()
             .pl(px(18.))
             .pt(px(14.))
+            // Full screen has no caption buttons at the right edge to keep the pill off it.
+            .when(!windowed, |d| d.pr(px(18.)))
             .gap(px(12.))
             .bg(linear_gradient(180., linear_color_stop(shade(0.7), 0.), linear_color_stop(shade(0.), 1.)))
             // Empty top-bar space moves the window (drag) / maximizes it (double-click).

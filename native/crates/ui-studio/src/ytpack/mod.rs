@@ -6,17 +6,21 @@
 mod assist;
 mod click;
 mod cover_thumb;
+mod image_api;
 mod logic;
-mod magnific;
+pub(crate) mod magnific;
 mod magnific_settings;
 mod scrape;
 mod thumb_page;
 mod thumb_view;
 mod thumbs;
+mod video_thumb;
+mod videos;
 
 pub(crate) use assist::{has_title, register_tools};
 pub(crate) use magnific_settings::create as magnific_settings;
 pub(crate) use thumb_page::ThumbnailsPage;
+pub(crate) use videos::VideosPage;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -43,7 +47,7 @@ const CAST_FOR_MATCH: usize = 8;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-struct Saved {
+pub(crate) struct Saved {
     /// Every title the manga goes by (AniList), the library's first.
     names: Vec<String>,
     /// Search results, scored.
@@ -282,9 +286,29 @@ async fn research(title: String, others: Vec<String>, cast_names: Vec<String>) -
         v.score = score;
     }
     videos.sort_by(|a, b| b.score.total_cmp(&a.score).then(b.views.cmp(&a.views)));
+    learn(&videos, "YouTube package research");
+    learn(&reference_recent, "Reference channel");
     let mut saved = Saved { names, videos, reference_name, reference_subs, reference_recent, researched_at: now(), ..Default::default() };
     saved.prediction = Some(logic::predict(&saved.comparable(), &saved.reference_recent, &saved.reference_name));
     Ok(saved)
+}
+
+/// Teaches the Brain what does well among these videos.
+fn learn(videos: &[Video], source: &str) {
+    let secs = |l: &str| l.split(':').filter_map(|p| p.trim().parse::<u64>().ok()).fold(0, |a, p| a * 60 + p);
+    let seen: Vec<mv_core::brain::SeenVideo> = videos.iter().map(|v| mv_core::brain::SeenVideo { title: &v.title, channel: &v.channel, views: v.views, age_days: v.age_days, length_secs: secs(&v.length) }).collect();
+    mv_core::brain::learn_from_videos(&seen, source);
+}
+
+/// Searches YouTube again for a manga (each visit to a YouTube page), keeping the AI's saved
+/// suggestion, and saves the result.
+pub(crate) async fn research_again(manga_id: String, title: String, others: Vec<String>) -> Result<Saved> {
+    let brain = crate::run::brain_snapshot(&manga_id, &title);
+    let cast_names = logic::lead_cast(&brain, CAST_FOR_MATCH).into_iter().flat_map(|(c, _)| std::iter::once(c.name.clone()).chain(c.aliases)).collect();
+    let mut s = research(title, others, cast_names).await?;
+    s.suggestion = Saved::load(&manga_id).suggestion;
+    s.save(&manga_id);
+    Ok(s)
 }
 
 async fn ask(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiProviderId, model: String, system: String, user: String) -> Result<Suggestion> {

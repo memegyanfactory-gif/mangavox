@@ -217,6 +217,8 @@ pub enum LookState {
     Current,
     /// Made with another look, captions, music or edit, or before videos were stamped.
     Old,
+    /// On the timeline (its narration is timed) but not rendered yet: Export renders it.
+    Unrendered,
 }
 
 /// A key of what decides how a chapter's video looks: the Studio look (`look::video_config`),

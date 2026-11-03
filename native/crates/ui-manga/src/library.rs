@@ -19,7 +19,7 @@ use crate::categories;
 use crate::logic::{self, LibStats, LibraryFilter, SortMode};
 use crate::ops;
 use crate::store;
-use crate::ui::{cover_src, manga_card, search_box, skeleton_rows, spawn_cover_downloads, tab, width_probe, CardInfo, Grid, Load, CARD_GROUP};
+use crate::ui::{cover_src, manga_card, search_box, skeleton_rows, spawn_cover_downloads, tab, width_probe, CardInfo, Grid, Load, Snapshot, CARD_GROUP};
 
 type Missing = Vec<(String, Option<String>)>;
 
@@ -29,6 +29,7 @@ const REVERSE_KEY: &str = "librarySortReverse";
 /// Titles refreshed at the same time during a library update.
 const UPDATE_PARALLEL: usize = 3;
 
+#[derive(Clone)]
 struct Data {
     items: Vec<Manga>,
     stats: HashMap<String, LibStats>,
@@ -55,6 +56,9 @@ pub struct LibraryPage {
     updating: Option<(usize, usize)>,
     _sub: Subscription,
 }
+
+/// What the page last showed (painted at once on the next open, then re-read).
+static LAST: Snapshot<(Data, HashMap<String, PathBuf>)> = Snapshot::new();
 
 fn load() -> anyhow::Result<(Data, HashMap<String, PathBuf>, Missing)> {
     let lang = backend::preferred_language();
@@ -114,6 +118,11 @@ impl LibraryPage {
             updating: None,
             _sub: sub,
         };
+        if let Some((data, covers)) = LAST.get() {
+            page.state = Load::Ready(data);
+            page.covers = covers;
+            mv_ui::perf::ready("Library (cached)");
+        }
         page.reload(cx);
         page
     }
@@ -130,9 +139,13 @@ impl LibraryPage {
                         if this.category.as_ref().is_some_and(|c| !data.categories.iter().any(|x| &x.id == c)) {
                             this.category = None;
                         }
+                        LAST.put((data.clone(), this.covers.clone()));
                         this.state = Load::Ready(data);
+                        mv_ui::perf::ready("Library");
                         spawn_cover_downloads(cx, missing, |t: &mut Self| &mut t.covers);
                     }
+                    // A failed re-read keeps the shown library.
+                    Err(e) if matches!(this.state, Load::Ready(_)) => eprintln!("[manga] could not re-read the library: {e:#}"),
                     Err(e) => this.state = Load::Failed(format!("{e:#}")),
                 }
                 cx.notify();

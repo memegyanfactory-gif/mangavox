@@ -94,6 +94,9 @@ impl Discover {
 
 impl Render for Discover {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.results.ready().is_some() {
+            mv_ui::perf::ready("Discover");
+        }
         let kind_ix = KINDS.iter().position(|k| k.0 == self.kind).unwrap_or(0);
         let picks = format!(
             "{} for \"{}\"",

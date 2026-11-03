@@ -36,6 +36,19 @@ pub enum Shape {
     Ideogram,
     /// Z-Image: `image_size` "landscape_16_9".
     ZImage,
+    // The shapes below are other services' (`super::image_api`).
+    /// Higgsfield Soul: `aspect_ratio`, `resolution` "720p" / "1080p", `image_reference_url`.
+    Higgsfield,
+    /// fal.ai Nano Banana: `aspect_ratio`; with references `<path>/edit` and `image_urls`.
+    FalBanana,
+    /// fal.ai FLUX: `image_size` "landscape_16_9".
+    FalFlux,
+    /// Replicate: `input.aspect_ratio`, references as `input.image_input`.
+    Replicate,
+    /// Black Forest Labs: `width` / `height`, `input_image`, `input_image_2`…
+    Bfl,
+    /// Recraft: `size` "1820x1024", answered at once.
+    Recraft,
 }
 
 /// One image model as the API offers it, with the web app's speed and price for the picker.
@@ -60,32 +73,54 @@ pub struct ImageModel {
     pub new: bool,
     /// Edits keep the source's aspect with "auto".
     pub auto_aspect: bool,
+    /// Who runs it: Magnific, or another service whose key is in Settings › AI services.
+    pub via: Via,
 }
+
+/// The service a model runs on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Via {
+    Magnific,
+    /// A service id from `mv_ai::SERVICES` (its key, auth and label come from there).
+    Service(&'static str),
+}
+
+const MG: Via = Via::Magnific;
 
 const NONE: &[&str] = &[];
 const K124: &[&str] = &["1K", "2K", "4K"];
 const K12: &[&str] = &["1K", "2K"];
+const HF_RES: &[&str] = &["720p", "1080p"];
 
 /// Nano Banana 2.1 first: it is the default, and the fallback when references are attached to
 /// a model that takes none.
 pub static CATALOG: &[ImageModel] = &[
-    ImageModel { id: "nano-banana-2-1", name: "Google Nano Banana 2.1", provider: "Google", path: "text-to-image/nano-banana-2-1", shape: Shape::Banana, refs: 14, speed: "~42s", resolutions: K124, credits: Some((50., 145.)), web_unlimited: None, featured: true, new: true, auto_aspect: true },
-    ImageModel { id: "nano-banana-pro", name: "Google Nano Banana Pro", provider: "Google", path: "text-to-image/nano-banana-pro", shape: Shape::Banana, refs: 0, speed: "~41s", resolutions: K124, credits: Some((75., 150.)), web_unlimited: None, featured: false, new: false, auto_aspect: true },
-    ImageModel { id: "nano-banana-pro-flash", name: "Google Nano Banana Pro Flash", provider: "Google", path: "text-to-image/nano-banana-pro-flash", shape: Shape::Banana, refs: 0, speed: "~20s", resolutions: K124, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: true },
-    ImageModel { id: "nano-banana", name: "Google Nano Banana", provider: "Google", path: "gemini-2-5-flash-image-preview", shape: Shape::Gemini, refs: 3, speed: "~13s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "gpt-image-2-5", name: "GPT 2.5", provider: "GPT", path: "text-to-image/gpt-image-2-5", shape: Shape::Named, refs: 16, speed: "~37s", resolutions: K124, credits: Some((15., 940.)), web_unlimited: None, featured: true, new: false, auto_aspect: false },
-    ImageModel { id: "gpt-image-2", name: "GPT 2", provider: "GPT", path: "text-to-image/gpt-image-2", shape: Shape::Named, refs: 16, speed: "~33s", resolutions: K124, credits: Some((15., 690.)), web_unlimited: None, featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "seedream-v5-pro", name: "Seedream 5 Pro", provider: "Seedream", path: "text-to-image/seedream-v5-pro", shape: Shape::Named, refs: 10, speed: "~1m 6s", resolutions: &["1.5K", "2K"], credits: Some((75., 100.)), web_unlimited: None, featured: true, new: false, auto_aspect: false },
-    ImageModel { id: "seedream-v5-lite", name: "Seedream 5 Lite", provider: "Seedream", path: "text-to-image/seedream-v5-lite", shape: Shape::Named, refs: 5, speed: "~1m 6s", resolutions: NONE, credits: None, web_unlimited: Some("2K"), featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "seedream-v4-5", name: "Seedream 4.5", provider: "Seedream", path: "text-to-image/seedream-v4-5", shape: Shape::Named, refs: 5, speed: "~57s", resolutions: NONE, credits: None, web_unlimited: Some("2K"), featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "seedream-v4", name: "Seedream 4", provider: "Seedream", path: "text-to-image/seedream-v4", shape: Shape::Named, refs: 0, speed: "~26s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "flux-2-pro", name: "Flux.2 Pro", provider: "Flux", path: "text-to-image/flux-2-pro", shape: Shape::FluxSize, refs: 4, speed: "~17s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "flux-2-flex", name: "Flux.2 Flex", provider: "Flux", path: "text-to-image/flux-2-flex", shape: Shape::FluxSize, refs: 4, speed: "~17s", resolutions: NONE, credits: Some((80., 280.)), web_unlimited: None, featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "flux-2-klein", name: "Flux.2 Klein", provider: "Flux", path: "text-to-image/flux-2-klein", shape: Shape::FluxNamed, refs: 4, speed: "~7s", resolutions: K12, credits: None, web_unlimited: Some("1K"), featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "mystic", name: "Mystic", provider: "Mystic", path: "mystic", shape: Shape::Named, refs: 0, speed: "~30s", resolutions: K124, credits: None, web_unlimited: Some("1K"), featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "ideogram-4-5", name: "Ideogram 4.5", provider: "Ideogram", path: "text-to-image/ideogram-4-5", shape: Shape::Ideogram, refs: 5, speed: "~20s", resolutions: NONE, credits: Some((80., 270.)), web_unlimited: None, featured: false, new: false, auto_aspect: true },
-    ImageModel { id: "ideogram-4", name: "Ideogram 4", provider: "Ideogram", path: "text-to-image/ideogram-4", shape: Shape::Ideogram, refs: 0, speed: "~16s", resolutions: NONE, credits: Some((120., 200.)), web_unlimited: None, featured: false, new: false, auto_aspect: false },
-    ImageModel { id: "z-image", name: "Z-Image", provider: "Z-Image", path: "text-to-image/z-image", shape: Shape::ZImage, refs: 0, speed: "~9s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false },
+    ImageModel { id: "nano-banana-2-1", name: "Google Nano Banana 2.1", provider: "Google", path: "text-to-image/nano-banana-2-1", shape: Shape::Banana, refs: 14, speed: "~42s", resolutions: K124, credits: Some((50., 145.)), web_unlimited: None, featured: true, new: true, auto_aspect: true, via: MG },
+    ImageModel { id: "nano-banana-pro", name: "Google Nano Banana Pro", provider: "Google", path: "text-to-image/nano-banana-pro", shape: Shape::Banana, refs: 0, speed: "~41s", resolutions: K124, credits: Some((75., 150.)), web_unlimited: None, featured: false, new: false, auto_aspect: true, via: MG },
+    ImageModel { id: "nano-banana-pro-flash", name: "Google Nano Banana Pro Flash", provider: "Google", path: "text-to-image/nano-banana-pro-flash", shape: Shape::Banana, refs: 0, speed: "~20s", resolutions: K124, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: true, via: MG },
+    ImageModel { id: "nano-banana", name: "Google Nano Banana", provider: "Google", path: "gemini-2-5-flash-image-preview", shape: Shape::Gemini, refs: 3, speed: "~13s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "gpt-image-2-5", name: "GPT 2.5", provider: "GPT", path: "text-to-image/gpt-image-2-5", shape: Shape::Named, refs: 16, speed: "~37s", resolutions: K124, credits: Some((15., 940.)), web_unlimited: None, featured: true, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "gpt-image-2", name: "GPT 2", provider: "GPT", path: "text-to-image/gpt-image-2", shape: Shape::Named, refs: 16, speed: "~33s", resolutions: K124, credits: Some((15., 690.)), web_unlimited: None, featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "seedream-v5-pro", name: "Seedream 5 Pro", provider: "Seedream", path: "text-to-image/seedream-v5-pro", shape: Shape::Named, refs: 10, speed: "~1m 6s", resolutions: &["1.5K", "2K"], credits: Some((75., 100.)), web_unlimited: None, featured: true, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "seedream-v5-lite", name: "Seedream 5 Lite", provider: "Seedream", path: "text-to-image/seedream-v5-lite", shape: Shape::Named, refs: 5, speed: "~1m 6s", resolutions: NONE, credits: None, web_unlimited: Some("2K"), featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "seedream-v4-5", name: "Seedream 4.5", provider: "Seedream", path: "text-to-image/seedream-v4-5", shape: Shape::Named, refs: 5, speed: "~57s", resolutions: NONE, credits: None, web_unlimited: Some("2K"), featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "seedream-v4", name: "Seedream 4", provider: "Seedream", path: "text-to-image/seedream-v4", shape: Shape::Named, refs: 0, speed: "~26s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "flux-2-pro", name: "Flux.2 Pro", provider: "Flux", path: "text-to-image/flux-2-pro", shape: Shape::FluxSize, refs: 4, speed: "~17s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "flux-2-flex", name: "Flux.2 Flex", provider: "Flux", path: "text-to-image/flux-2-flex", shape: Shape::FluxSize, refs: 4, speed: "~17s", resolutions: NONE, credits: Some((80., 280.)), web_unlimited: None, featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "flux-2-klein", name: "Flux.2 Klein", provider: "Flux", path: "text-to-image/flux-2-klein", shape: Shape::FluxNamed, refs: 4, speed: "~7s", resolutions: K12, credits: None, web_unlimited: Some("1K"), featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "mystic", name: "Mystic", provider: "Mystic", path: "mystic", shape: Shape::Named, refs: 0, speed: "~30s", resolutions: K124, credits: None, web_unlimited: Some("1K"), featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "ideogram-4-5", name: "Ideogram 4.5", provider: "Ideogram", path: "text-to-image/ideogram-4-5", shape: Shape::Ideogram, refs: 5, speed: "~20s", resolutions: NONE, credits: Some((80., 270.)), web_unlimited: None, featured: false, new: false, auto_aspect: true, via: MG },
+    ImageModel { id: "ideogram-4", name: "Ideogram 4", provider: "Ideogram", path: "text-to-image/ideogram-4", shape: Shape::Ideogram, refs: 0, speed: "~16s", resolutions: NONE, credits: Some((120., 200.)), web_unlimited: None, featured: false, new: false, auto_aspect: false, via: MG },
+    ImageModel { id: "z-image", name: "Z-Image", provider: "Z-Image", path: "text-to-image/z-image", shape: Shape::ZImage, refs: 0, speed: "~9s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false, via: MG },
+    // Other services: keys in Settings › AI services, billed by that service.
+    ImageModel { id: "hf-soul-2", name: "Higgsfield Soul 2", provider: "Higgsfield", path: "higgsfield-ai/soul/v2/standard", shape: Shape::Higgsfield, refs: 0, speed: "~30s", resolutions: HF_RES, credits: None, web_unlimited: None, featured: false, new: true, auto_aspect: false, via: Via::Service("higgsfield") },
+    ImageModel { id: "hf-soul", name: "Higgsfield Soul", provider: "Higgsfield", path: "higgsfield-ai/soul/standard", shape: Shape::Higgsfield, refs: 1, speed: "~30s", resolutions: HF_RES, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: false, via: Via::Service("higgsfield") },
+    ImageModel { id: "fal-nano-banana", name: "Nano Banana · fal.ai", provider: "fal.ai", path: "fal-ai/nano-banana", shape: Shape::FalBanana, refs: 4, speed: "~15s", resolutions: NONE, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: true, via: Via::Service("fal") },
+    ImageModel { id: "fal-flux-pro", name: "FLUX1.1 [pro] · fal.ai", provider: "fal.ai", path: "fal-ai/flux-pro/v1.1", shape: Shape::FalFlux, refs: 0, speed: "~10s", resolutions: NONE, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: false, via: Via::Service("fal") },
+    ImageModel { id: "rep-nano-banana", name: "Nano Banana · Replicate", provider: "Replicate", path: "google/nano-banana", shape: Shape::Replicate, refs: 4, speed: "~15s", resolutions: NONE, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: false, via: Via::Service("replicate") },
+    ImageModel { id: "rep-flux-1-1-pro", name: "FLUX1.1 [pro] · Replicate", provider: "Replicate", path: "black-forest-labs/flux-1.1-pro", shape: Shape::Replicate, refs: 0, speed: "~10s", resolutions: NONE, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: false, via: Via::Service("replicate") },
+    ImageModel { id: "bfl-flux-2-pro", name: "FLUX.2 [pro] · BFL", provider: "Black Forest Labs", path: "flux-2-pro", shape: Shape::Bfl, refs: 4, speed: "~15s", resolutions: NONE, credits: None, web_unlimited: None, featured: false, new: true, auto_aspect: false, via: Via::Service("bfl") },
+    ImageModel { id: "recraft-v3", name: "Recraft V3", provider: "Recraft", path: "recraftv3", shape: Shape::Recraft, refs: 0, speed: "~10s", resolutions: NONE, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: false, via: Via::Service("recraft") },
 ];
 
 impl ImageModel {
@@ -97,7 +132,19 @@ impl ImageModel {
             "Flux" => ph::LIGHTNING,
             "Mystic" => ph::SPARKLE,
             "Ideogram" => ph::TEXT_AA,
+            "Higgsfield" => ph::FILM_SLATE,
+            "fal.ai" | "Replicate" => ph::CUBE,
+            "Black Forest Labs" => ph::LIGHTNING,
+            "Recraft" => ph::PAINT_BRUSH,
             _ => ph::IMAGE,
+        }
+    }
+
+    /// "Magnific", or the other service's name ("fal.ai").
+    pub fn service_label(&self) -> &'static str {
+        match self.via {
+            Via::Magnific => "Magnific",
+            Via::Service(id) => mv_ai::service_def(id).map(|d| d.label).unwrap_or(id),
         }
     }
 
@@ -150,6 +197,91 @@ fn key_file() -> PathBuf {
 pub fn key() -> Option<String> {
     let saved = std::fs::read(key_file()).ok().and_then(|d| serde_json::from_slice::<Value>(&d).ok()).and_then(|v| v.get("api_key")?.as_str().map(str::to_string));
     saved.or_else(|| std::env::var("MAGNIFIC_API_KEY").ok()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+}
+
+/// The key for `m`'s service: Magnific's, or the one saved in Settings › AI services.
+pub fn key_for(m: &ImageModel) -> Option<String> {
+    match m.via {
+        Via::Magnific => key(),
+        Via::Service(id) => mv_ai::service_key(mv_core::paths::config(), id),
+    }
+}
+
+/// Which image services have a key, read once (for menus and checks while drawing).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Keys {
+    pub magnific: bool,
+    /// Ids of the catalog's other services that have a key.
+    pub services: Vec<&'static str>,
+}
+
+impl Keys {
+    pub fn load() -> Keys {
+        let mut services: Vec<&'static str> = vec![];
+        for m in CATALOG {
+            if let Via::Service(id) = m.via {
+                if !services.contains(&id) && mv_ai::service_key(mv_core::paths::config(), id).is_some() {
+                    services.push(id);
+                }
+            }
+        }
+        Keys { magnific: key().is_some(), services }
+    }
+
+    pub fn has(&self, m: &ImageModel) -> bool {
+        match m.via {
+            Via::Magnific => self.magnific,
+            Via::Service(id) => self.services.contains(&id),
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.magnific || !self.services.is_empty()
+    }
+}
+
+/// `m` when it has a key and can do the job, else the first model that can: one with a key that
+/// takes references when `needs_refs`, and the aspect unless it is square. A model of `m`'s own
+/// service first, then any; Nano Banana 2.1 (first in the catalog) when none fits.
+pub fn usable(m: &'static ImageModel, keys: &Keys, needs_refs: bool, aspect: &str) -> &'static ImageModel {
+    let fits = |m: &ImageModel| (!needs_refs || m.refs > 0) && (m.takes_aspect() || aspect == "1:1");
+    if keys.has(m) && fits(m) {
+        return m;
+    }
+    CATALOG
+        .iter()
+        .find(|c| c.via == m.via && keys.has(c) && fits(c))
+        .or_else(|| CATALOG.iter().find(|c| keys.has(c) && fits(c)))
+        .unwrap_or(if fits(m) { m } else { &CATALOG[0] })
+}
+
+/// Why no model with a key can do the job `usable` was asked for (it then hands back one
+/// without a key): Recraft takes no reference images, and some models only make squares.
+pub fn no_fit(keys: &Keys, needs_refs: bool, aspect: &str) -> String {
+    let label = |m: &ImageModel| m.service_label();
+    let mut have: Vec<&str> = vec![];
+    let mut could: Vec<&str> = vec![];
+    for m in CATALOG {
+        let fits = (!needs_refs || m.refs > 0) && (m.takes_aspect() || aspect == "1:1");
+        let list = if keys.has(m) { &mut have } else if fits { &mut could } else { continue };
+        if !list.contains(&label(m)) {
+            list.push(label(m));
+        }
+    }
+    let have = have.join(" and ");
+    let could = could.join(", ");
+    if needs_refs && !CATALOG.iter().any(|m| keys.has(m) && m.refs > 0) {
+        format!("{have} can't use reference images (the picked faces, @ mentions or the image being edited). Untick the faces, or add a key for a service that takes them: {could}.")
+    } else {
+        format!("{have} can't make {aspect} images. Pick 1:1, or add a key for a service that can: {could}.")
+    }
+}
+
+/// Counts a made image in Studio's Magnific credits; other services bill their own accounts.
+pub fn record(m: &ImageModel, credits: f64) {
+    if m.via == Via::Magnific {
+        Usage::load().add(credits);
+    }
 }
 
 /// Saves the key, or forgets it when `None`.
@@ -260,14 +392,19 @@ pub struct Reference {
     pub caption: String,
 }
 
-/// An image as base64 JPEG, at most 1536 px on the long side (a previous 4K thumbnail would be
-/// a needlessly large request).
-fn encode(file: &Path) -> Result<String> {
+/// An image as JPEG, at most 1536 px on the long side (a previous 4K thumbnail would be a
+/// needlessly large request).
+pub(super) fn jpeg(file: &Path) -> Result<Vec<u8>> {
     let img = image::open(file).with_context(|| format!("could not read {}", file.display()))?;
     let img = if img.width().max(img.height()) > 1536 { img.resize(1536, 1536, image::imageops::FilterType::Lanczos3) } else { img };
     let mut out = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(img.to_rgb8()).write_to(&mut out, image::ImageFormat::Jpeg)?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(out.into_inner()))
+    Ok(out.into_inner())
+}
+
+/// `jpeg` as base64.
+fn encode(file: &Path) -> Result<String> {
+    Ok(base64::engine::general_purpose::STANDARD.encode(jpeg(file)?))
 }
 
 /// "16:9" → "widescreen_16_9".
@@ -336,6 +473,8 @@ pub fn request(m: &ImageModel, prompt: &str, images: &[(String, String)], aspect
                 body["images"] = json!(images.iter().map(|(d, _)| d).collect::<Vec<_>>());
             }
         }
+        // Other services build their own requests (`super::image_api`).
+        Shape::Higgsfield | Shape::FalBanana | Shape::FalFlux | Shape::Replicate | Shape::Bfl | Shape::Recraft => {}
         Shape::ZImage => {
             body["image_size"] = json!(match aspect {
                 "9:16" => "portrait_9_16",
@@ -348,7 +487,7 @@ pub fn request(m: &ImageModel, prompt: &str, images: &[(String, String)], aspect
     (path, body)
 }
 
-fn client() -> Result<reqwest::Client> {
+pub(super) fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder().timeout(Duration::from_secs(120)).build()?)
 }
 
@@ -398,8 +537,27 @@ pub fn fit_aspect(img: image::DynamicImage, aspect: &str) -> image::DynamicImage
     img.crop_imm(((w - cw) / 2.) as u32, ((h - ch) / 2.) as u32, cw as u32, ch as u32)
 }
 
-/// Makes one image with `m` and saves it as PNG at `out`. `on_status` hears the progress.
+/// Decodes a downloaded image, cuts it to `aspect` and saves it as PNG at `out`.
+pub(super) async fn save_png(bytes: Vec<u8>, aspect: &str, out: &Path, who: &'static str) -> Result<()> {
+    let out = out.to_path_buf();
+    let aspect = aspect.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let img = fit_aspect(image::load_from_memory(&bytes).with_context(|| format!("{who} sent an unreadable image"))?, &aspect);
+        if let Some(d) = out.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        img.save_with_format(&out, image::ImageFormat::Png)?;
+        Ok(())
+    })
+    .await?
+}
+
+/// Makes one image with `m` and saves it as PNG at `out`. `key` is the key of `m`'s service
+/// (`key_for`). `on_status` hears the progress.
 pub async fn generate(m: &'static ImageModel, key: &str, prompt: &str, refs: &[Reference], aspect: &str, res: &str, out: &Path, on_status: impl Fn(&str)) -> Result<()> {
+    if let Via::Service(id) = m.via {
+        return super::image_api::generate(id, m, key, prompt, refs, aspect, res, out, on_status).await;
+    }
     let mut images = vec![];
     for r in refs.iter().take(m.refs) {
         let file = r.file.clone();
@@ -426,17 +584,7 @@ pub async fn generate(m: &'static ImageModel, key: &str, prompt: &str, refs: &[R
                 let src = d.get("generated").and_then(|g| g.get(0)).and_then(|g| g.as_str().or_else(|| g.get("url").and_then(Value::as_str))).ok_or_else(|| anyhow!("Magnific finished without an image"))?;
                 on_status("Downloading");
                 let bytes = http.get(src).send().await?.error_for_status()?.bytes().await?;
-                let out = out.to_path_buf();
-                let aspect = aspect.to_string();
-                return tokio::task::spawn_blocking(move || -> Result<()> {
-                    let img = fit_aspect(image::load_from_memory(&bytes).context("Magnific sent an unreadable image")?, &aspect);
-                    if let Some(d) = out.parent() {
-                        std::fs::create_dir_all(d)?;
-                    }
-                    img.save_with_format(&out, image::ImageFormat::Png)?;
-                    Ok(())
-                })
-                .await?;
+                return save_png(bytes.to_vec(), aspect, out, "Magnific").await;
             }
             "FAILED" => bail!("Magnific could not make this image (its content filter may have blocked it). Change the prompt and try again."),
             _ => {}

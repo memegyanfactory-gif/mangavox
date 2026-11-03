@@ -312,6 +312,9 @@ impl Render for MediaHistory {
         if self.watch_seen != ui_player::watch_epoch() && self.items.ready().is_some() {
             self.load(cx);
         }
+        if !matches!(self.items, Load::Loading) {
+            mv_ui::perf::ready("History");
+        }
         let n = self.count();
         let body = match &self.items {
             Load::Loading => loading_grid().into_any_element(),
@@ -557,6 +560,9 @@ impl Render for Favorites {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.list_seen != list_epoch() && self.items.ready().is_some() {
             self.load(cx);
+        }
+        if !matches!(self.items, Load::Loading) {
+            mv_ui::perf::ready("My List");
         }
         let status = self.status;
         let all = self.items.ready().map_or(0, Vec::len);

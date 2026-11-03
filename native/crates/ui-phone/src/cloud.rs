@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody as _};
 use axum::http::{header, HeaderValue, Method, Request, Uri};
 use axum::Router;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -44,8 +44,13 @@ const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
 /// How long a new phone waits for "Allow" on the Mobile page.
 pub const APPROVAL_WAIT: Duration = Duration::from_secs(120);
 /// Largest DATA chunk, and bytes a stream may have sent but not acked.
-const CHUNK: usize = 60 * 1024;
+const CHUNK: usize = 128 * 1024;
 const WINDOW: usize = 1 << 20;
+/// A response this small (known size) goes out with the control messages, ahead of bulk data.
+const SMALL: u64 = 64 * 1024;
+/// Relay messages waiting for the socket. Kept tiny so a control message or a small response
+/// never waits behind more than a couple of chunks (CLOUD.md, "On the PC").
+const OUTBOX: usize = 2;
 const MAX_STREAMS: usize = 32;
 const MAX_PHONES: usize = 8;
 /// Largest frame a phone may send (a request with a 256 KiB body, base64).
@@ -353,7 +358,9 @@ async fn connect_and_serve(stop: &mut watch::Receiver<bool>, generation: u64) ->
         false => None,
     };
     let cfg = WebSocketConfig::default().max_message_size(Some(2 << 20)).max_frame_size(Some(2 << 20));
-    let connect = tokio_tungstenite::connect_async_tls_with_config(req, Some(cfg), false, connector);
+    // Nagle off: with it, the last partial packet of every frame waits for the relay's delayed
+    // ACK (up to 200 ms), which capped a tunnelled download at a few hundred KB/s.
+    let connect = tokio_tungstenite::connect_async_tls_with_config(req, Some(cfg), true, connector);
     let (ws, _) = tokio::time::timeout(Duration::from_secs(20), connect).await.map_err(|_| "Timed out reaching the relay".to_string())?.map_err(describe)?;
     if !is_current(generation) {
         return Ok(());
@@ -363,7 +370,7 @@ async fn connect_and_serve(stop: &mut watch::Receiver<bool>, generation: u64) ->
 
     let (mut sink, mut stream) = ws.split();
     let (in_tx, in_rx) = mpsc::channel(1024);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::channel(OUTBOX);
     let serving = tokio::spawn(serve(in_rx, out_tx, crate::server::router()));
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await;
@@ -428,10 +435,55 @@ struct Conn {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// A message waiting for the relay socket. Sealed messages are sealed only when they leave, so
+/// they get their counters in the order they are sent whichever lane they waited in.
+enum Item {
+    Msg(Msg),
+    Seal { c: u32, seal: Arc<Mutex<Sealer>>, plain: Vec<u8> },
+}
+
+impl Item {
+    fn into_msg(self) -> Msg {
+        match self {
+            Item::Msg(m) => m,
+            Item::Seal { c, seal, plain } => {
+                let frame = seal.lock().unwrap_or_else(|e| e.into_inner()).seal(&plain);
+                let mut v = Vec::with_capacity(4 + frame.len());
+                v.extend_from_slice(&c.to_be_bytes());
+                v.extend_from_slice(&frame);
+                Msg::Bin(v)
+            }
+        }
+    }
+}
+
+/// The two lanes to the relay: control messages and small responses (never wait), and bulk data
+/// (one chunk at a time, so it never piles up in front of them).
+#[derive(Clone)]
+struct Lanes {
+    ctl: mpsc::UnboundedSender<Item>,
+    bulk: mpsc::Sender<Item>,
+}
+
+/// Feeds the relay socket, control lane first.
+async fn writer(mut ctl: mpsc::UnboundedReceiver<Item>, mut bulk: mpsc::Receiver<Item>, tx: mpsc::Sender<Msg>) {
+    loop {
+        let item = tokio::select! {
+            biased;
+            Some(i) = ctl.recv() => i,
+            Some(i) = bulk.recv() => i,
+            else => return,
+        };
+        if tx.send(item.into_msg()).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Sends to one phone through the relay.
 #[derive(Clone)]
 struct Out {
-    tx: mpsc::UnboundedSender<Msg>,
+    lanes: Lanes,
     c: u32,
 }
 
@@ -441,15 +493,7 @@ impl Out {
         v.extend_from_slice(&self.c.to_be_bytes());
         v.push(kind);
         v.extend_from_slice(body);
-        let _ = self.tx.send(Msg::Bin(v));
-    }
-
-    /// A sealed frame (already carrying its kind byte).
-    fn sealed(&self, frame: &[u8]) {
-        let mut v = Vec::with_capacity(4 + frame.len());
-        v.extend_from_slice(&self.c.to_be_bytes());
-        v.extend_from_slice(frame);
-        let _ = self.tx.send(Msg::Bin(v));
+        let _ = self.lanes.ctl.send(Item::Msg(Msg::Bin(v)));
     }
 
     fn refuse(&self, code: &str, error: &str) {
@@ -458,12 +502,17 @@ impl Out {
     }
 
     fn close(&self) {
-        let _ = self.tx.send(Msg::Text(json!({ "t": "close", "c": self.c }).to_string()));
+        let _ = self.lanes.ctl.send(Item::Msg(Msg::Text(json!({ "t": "close", "c": self.c }).to_string())));
     }
 }
 
-/// Runs until the relay connection ends: one session task per connected phone.
-pub(crate) async fn serve(mut rx: mpsc::Receiver<Msg>, tx: mpsc::UnboundedSender<Msg>, router: Router) {
+/// Runs until the relay connection ends: one session task per connected phone. `tx` is the relay
+/// socket's (short) queue.
+pub(crate) async fn serve(mut rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>, router: Router) {
+    let (ctl, ctl_rx) = mpsc::unbounded_channel();
+    let (bulk, bulk_rx) = mpsc::channel(1);
+    let lanes = Lanes { ctl, bulk };
+    let writing = tokio::spawn(writer(ctl_rx, bulk_rx, tx));
     let mut conns: HashMap<u32, Conn> = HashMap::new();
     while let Some(m) = rx.recv().await {
         conns.retain(|_, c| !c.task.is_finished());
@@ -476,7 +525,7 @@ pub(crate) async fn serve(mut rx: mpsc::Receiver<Msg>, tx: mpsc::UnboundedSender
                         if let Some(old) = conns.remove(&c) {
                             old.task.abort();
                         }
-                        let out = Out { tx: tx.clone(), c };
+                        let out = Out { lanes: lanes.clone(), c };
                         if conns.len() >= MAX_PHONES {
                             out.refuse("busy", "Too many phones are connected to this PC right now.");
                             continue;
@@ -501,7 +550,7 @@ pub(crate) async fn serve(mut rx: mpsc::Receiver<Msg>, tx: mpsc::UnboundedSender
                 let Some(conn) = conns.get(&c) else { continue };
                 // Too big, or a phone sending faster than its session reads: cut it off.
                 if b.len() - 4 > MAX_FRAME || conn.inbox.try_send(b[4..].to_vec()).is_err() {
-                    Out { tx: tx.clone(), c }.close();
+                    Out { lanes: lanes.clone(), c }.close();
                     if let Some(old) = conns.remove(&c) {
                         old.task.abort();
                     }
@@ -512,43 +561,66 @@ pub(crate) async fn serve(mut rx: mpsc::Receiver<Msg>, tx: mpsc::UnboundedSender
     for (_, c) in conns {
         c.task.abort();
     }
+    writing.abort();
 }
 
 // ---------------------------------------------------------------- sessions
 
-/// Sends sealed messages; sealing and queueing happen under one lock, so frames leave in
-/// counter order whichever task sends them.
+/// Sends sealed messages to one phone. They are sealed as they leave (see [`Item`]); each lane
+/// keeps its order, so a stream sends all its body on one lane and its head before its body.
 #[derive(Clone)]
 struct Tx {
     out: Out,
     seal: Arc<Mutex<Sealer>>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Lane {
+    Ctl,
+    Bulk,
+}
+
+fn data_msg(s: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5 + bytes.len());
+    p.push(cc::MSG_DATA);
+    p.extend_from_slice(&s.to_be_bytes());
+    p.extend_from_slice(bytes);
+    p
+}
+
+fn end_msg(s: u32) -> Vec<u8> {
+    let mut p = vec![cc::MSG_END];
+    p.extend_from_slice(&s.to_be_bytes());
+    p
+}
+
+fn json_msg(v: Value) -> Vec<u8> {
+    let mut p = vec![cc::MSG_JSON];
+    p.extend_from_slice(v.to_string().as_bytes());
+    p
+}
+
 impl Tx {
-    fn send(&self, plain: &[u8]) {
-        let mut s = self.seal.lock().unwrap_or_else(|e| e.into_inner());
-        let frame = s.seal(plain);
-        self.out.sealed(&frame);
+    fn item(&self, plain: Vec<u8>) -> Item {
+        Item::Seal { c: self.out.c, seal: self.seal.clone(), plain }
+    }
+
+    /// On the control lane: never waits.
+    fn ctl(&self, plain: Vec<u8>) {
+        let _ = self.out.lanes.ctl.send(self.item(plain));
+    }
+
+    async fn send(&self, lane: Lane, plain: Vec<u8>) {
+        match lane {
+            Lane::Ctl => self.ctl(plain),
+            Lane::Bulk => {
+                let _ = self.out.lanes.bulk.send(self.item(plain)).await;
+            }
+        }
     }
 
     fn json(&self, v: Value) {
-        let mut p = vec![cc::MSG_JSON];
-        p.extend_from_slice(v.to_string().as_bytes());
-        self.send(&p);
-    }
-
-    fn data(&self, s: u32, bytes: &[u8]) {
-        let mut p = Vec::with_capacity(5 + bytes.len());
-        p.push(cc::MSG_DATA);
-        p.extend_from_slice(&s.to_be_bytes());
-        p.extend_from_slice(bytes);
-        self.send(&p);
-    }
-
-    fn end(&self, s: u32) {
-        let mut p = vec![cc::MSG_END];
-        p.extend_from_slice(&s.to_be_bytes());
-        self.send(&p);
+        self.ctl(json_msg(v));
     }
 }
 
@@ -729,8 +801,8 @@ async fn requests(mut inbox: mpsc::Receiver<Vec<u8>>, tx: Tx, mut opener: Opener
                         let Some(Some(req)) = req else {
                             let st = if streams.len() >= MAX_STREAMS { 503 } else { 400 };
                             tx.json(json!({ "t": "head", "s": s, "st": st, "h": { "content-type": "application/json" } }));
-                            tx.data(s, json!({ "error": if st == 503 { "busy" } else { "bad request" } }).to_string().as_bytes());
-                            tx.end(s);
+                            tx.ctl(data_msg(s, json!({ "error": if st == 503 { "busy" } else { "bad request" } }).to_string().as_bytes()));
+                            tx.ctl(end_msg(s));
                             continue;
                         };
                         let credit = Arc::new(Semaphore::new(WINDOW));
@@ -817,6 +889,8 @@ async fn stream(s: u32, req: Request<Body>, router: Router, tx: Tx, credit: Arc<
         }
     }
     tx.json(json!({ "t": "head", "s": s, "st": parts.status.as_u16(), "h": h }));
+    // An API answer or an icon jumps the queue; images and video wait their turn behind it.
+    let lane = if body.size_hint().exact().is_some_and(|n| n <= SMALL) { Lane::Ctl } else { Lane::Bulk };
     while let Some(frame) = body.frame().await {
         match frame {
             Ok(f) => {
@@ -826,16 +900,16 @@ async fn stream(s: u32, req: Request<Body>, router: Router, tx: Tx, credit: Arc<
                         Ok(p) => p.forget(),
                         Err(_) => return s,
                     }
-                    tx.data(s, chunk);
+                    tx.send(lane, data_msg(s, chunk)).await;
                 }
             }
             Err(e) => {
-                tx.json(json!({ "t": "err", "s": s, "error": e.to_string() }));
+                tx.send(lane, json_msg(json!({ "t": "err", "s": s, "error": e.to_string() }))).await;
                 return s;
             }
         }
     }
-    tx.end(s);
+    tx.send(lane, end_msg(s)).await;
     s
 }
 
@@ -846,13 +920,13 @@ mod tests {
 
     struct Relay {
         to_pc: mpsc::Sender<Msg>,
-        from_pc: mpsc::UnboundedReceiver<Msg>,
+        from_pc: mpsc::Receiver<Msg>,
         task: tokio::task::JoinHandle<()>,
     }
 
     fn relay() -> Relay {
         let (to_pc, rx) = mpsc::channel(64);
-        let (tx, from_pc) = mpsc::unbounded_channel();
+        let (tx, from_pc) = mpsc::channel(OUTBOX);
         let task = tokio::spawn(serve(rx, tx, crate::server::router()));
         Relay { to_pc, from_pc, task }
     }

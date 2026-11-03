@@ -17,11 +17,11 @@ fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder().user_agent(UA).timeout(Duration::from_secs(20)).build()?)
 }
 
-fn enc(s: &str) -> String {
+pub(super) fn enc(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-async fn page(url: &str) -> Result<String> {
+pub(super) async fn page(url: &str) -> Result<String> {
     let r = client()?
         .get(url)
         .header("Accept-Language", "en-US,en;q=0.9")
@@ -44,7 +44,7 @@ pub fn initial_data(html: &str) -> Option<Value> {
     serde_json::Deserializer::from_str(&html[at..]).into_iter::<Value>().next()?.ok()
 }
 
-fn collect<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+pub(super) fn collect<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     match v {
         Value::Object(m) => {
             for (k, x) in m {
@@ -61,7 +61,7 @@ fn collect<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
 }
 
 /// `{"simpleText": …}` or `{"runs": [{"text": …}]}` as one string.
-fn text(v: &Value) -> String {
+pub(super) fn text(v: &Value) -> String {
     if let Some(s) = v.get("simpleText").and_then(Value::as_str) {
         return s.to_string();
     }

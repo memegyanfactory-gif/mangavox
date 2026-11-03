@@ -445,7 +445,19 @@ Reply with JSON only: {\"title\":\"\",\"alt_titles\":[\"\",\"\",\"\"],\"descript
         }
     }
     u.push_str(&format!("\nExpected views for a new recap: {}–{}.\n", short_count(b.prediction.low), short_count(b.prediction.high)));
+    u.push_str(&brain_notes(&[mv_core::brain::Area::Niche, mv_core::brain::Area::Taste]));
     (system, u)
+}
+
+/// What the Brain learned (Settings › Brain) for these areas, as a prompt section; empty when
+/// it knows nothing yet.
+pub fn brain_notes(areas: &[mv_core::brain::Area]) -> String {
+    let h: Vec<String> = areas.iter().map(|a| mv_core::brain::hints(*a)).filter(|h| !h.is_empty()).collect();
+    if h.is_empty() {
+        String::new()
+    } else {
+        format!("\nWhat this app has learned from the user's niche and habits (use it where it fits):\n{}\n", h.join("\n"))
+    }
 }
 
 fn strings(v: &Value, k: &str) -> Vec<String> {

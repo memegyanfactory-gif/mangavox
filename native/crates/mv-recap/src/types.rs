@@ -233,13 +233,17 @@ pub struct ReadOptions {
     pub pages: Option<Vec<usize>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PhaseStatus {
     pub read_pages: usize,
     pub total_pages: usize,
     pub transcript: bool,
     pub story: bool,
     pub audio_files: usize,
+    /// `sync_map.json` exists: the narration is timed into beats, so the chapter's pieces (panels,
+    /// narration, captions) can sit on the Video editor's timeline before any video is rendered.
+    pub timed: bool,
     pub video: Option<PathBuf>,
     /// `pipeline/reels/reel_NN.mp4` in order, when the last render was in the Reels format.
     pub reels: Vec<PathBuf>,

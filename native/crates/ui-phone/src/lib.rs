@@ -27,6 +27,7 @@ pub mod api_manga;
 pub mod api_media;
 pub mod api_studio;
 pub mod api_watch;
+mod watch_hls;
 mod activity;
 mod studio_chain;
 pub mod auth;

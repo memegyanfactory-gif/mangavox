@@ -12,7 +12,7 @@ pub mod fresh;
 pub const VIDEO_FILE: &str = "video_final.mp4";
 const TEXT_FILES: [&str; 2] = ["script_edited.json", "ocr_results.json"];
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChapterItem {
     pub id: String,
     pub manga_id: String,
@@ -42,7 +42,7 @@ impl ChapterItem {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MangaGroup {
     pub id: String,
     pub title: String,
@@ -160,7 +160,7 @@ static DB: Mutex<Option<Connection>> = Mutex::new(None);
 
 /// Runs `f` on Studio's connection to the shared database (opened and migrated on first use).
 /// Blocking: call from `mv_ui::bg::blocking`.
-fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+pub(crate) fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     let mut g = DB.lock().unwrap_or_else(|e| e.into_inner());
     if g.is_none() {
         let mut conn = mv_core::db::open(&mv_core::paths::database())?;
@@ -235,6 +235,29 @@ pub fn load() -> Result<Vec<MangaGroup>> {
         hide_duplicates(&mut g.chapters);
     }
     Ok(groups)
+}
+
+/// The library and chapter statuses as last loaded, in one file, so Studio shows them at once
+/// on open (a full [`load`] reads hundreds of small files, slow on a busy hard disk).
+pub type Snapshot = (Vec<MangaGroup>, std::collections::HashMap<String, mv_recap::PhaseStatus>);
+
+fn snapshot_file() -> PathBuf {
+    mv_recap::studio_root().join("cache").join("library.json")
+}
+
+pub fn read_snapshot() -> Option<Snapshot> {
+    serde_json::from_slice(&std::fs::read(snapshot_file()).ok()?).ok()
+}
+
+pub fn write_snapshot(s: &Snapshot) {
+    let path = snapshot_file();
+    let tmp = path.with_extension("json.tmp");
+    let ok = std::fs::create_dir_all(path.parent().unwrap_or(&path)).is_ok()
+        && serde_json::to_vec(s).is_ok_and(|b| std::fs::write(&tmp, b).is_ok())
+        && std::fs::rename(&tmp, &path).is_ok();
+    if !ok {
+        eprintln!("[studio] could not save the library snapshot to {}", path.display());
+    }
 }
 
 /// A manga can hold the same chapter twice (two groups uploaded it), which would be read and

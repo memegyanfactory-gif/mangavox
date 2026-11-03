@@ -3,6 +3,8 @@
 //! parts), keeps only what matters to the story, and anchors each passage to the panel shown while it
 //! is spoken; pages it leaves out are cut from the video. The story so far is carried between parts and
 //! chapters, and kept in the brain so a chapter written on its own still knows what came before.
+//! Chapters play back to back in an export, so each one continues the same telling (no per-chapter
+//! intro, recap or outro); subscribe reminders are planned on the manga's whole running time.
 
 use std::sync::{Arc, Mutex};
 
@@ -85,6 +87,15 @@ HOW A GREAT RECAP SOUNDS
 - Time jumps and flashbacks are signposted: "One month passes." "Years earlier..." "Back in the present..."
 - First-person narration boxes and inner monologue ("I", "me", "my") are the thoughts of the character they belong to, usually the protagonist: retell them in third person with that character's name. Never say "the narrator".
 - Call characters by name: the CAST, or a name heard in the dialogue anywhere in the chapter (read ahead: a stranger introduced on page 30 is still named when they first appear). The first time someone matters, add a few words on who they are ("Liam Karavan, the legendary founder of the house"). Never call a named character by their looks ("a silver-haired man", "the blond youth"); a nameless extra gets a role ("a bandit", "the old butler"). Cast entries marked "known only by looks" are descriptions, not names: when the dialogue names that person ("Master Hyejeong!"), use the name; otherwise use their role ("the instructor"). A name may be spelled differently in earlier chapters (Mugung / Mugyeong): use the spelling this chapter's dialogue uses.
+- Tell it with feeling, not as a dry summary: the narrator reacts the way a fan telling a friend would (a beat of awe at a big move, sympathy at a loss, dry amusement at an arrogant villain), then the story moves on.
+- A little humour, sparingly: where it truly fits, ONE light joke or wry remark that comes from the characters and the situation (a hero's bluntness, a villain's ego, an absurd misunderstanding). One or two per chapter at most, many chapters need none, and never in serious, sad or tense scenes. It never mocks the story and never breaks it; the narrator stays the same sober, consistent voice.
+
+ONE CONTINUOUS STORY
+- The chapters play back to back as ONE long video, often hours long. Your voice-over must sound like one story told in one go by one storyteller, never like a series of episodes.
+- Never mention chapters or episodes: no chapter numbers, no "chapter", "episode", "in this chapter", "previously", "last time", "this time", "end of chapter", "to be continued", "stay tuned", "see you next time".
+- No greetings, introductions or sign-offs ("welcome back", "hey guys", "today we", "that's it for", "thanks for watching"), and no recap of what the viewer has already heard: pick up exactly where the story stands and keep going.
+- Never wrap up or tease at the end of the pages: stop on the last beat they tell, so what comes next flows straight on.
+- Never ask the viewer to like, subscribe or comment, unless the instructions for these pages ask for a CALL TO ACTION.
 
 WHAT TO LEAVE OUT
 - Never describe the artwork: no colours, lighting, clothes, hair, camera angles, backgrounds or effects ("darkness fills the screen", "blue light glows", "in this panel", "the page shows", "we see" are all forbidden). The viewer already sees the picture; you tell what it MEANS for the story.
@@ -109,7 +120,7 @@ OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
     {{"page": 3, "panel": 2, "text": "For one year, Arhan has hunted a single name: Karlos, the man who slaughtered his family."}},
     {{"page": 7, "panel": 1, "text": "...", "sfx": "impact", "sfx_strength": 2}}
   ]}}
-"page" and "panel" use the numbers shown in the reading (both start at 1). Segments must be in story order. Only the opening of the very first chapter may mark segments "hook": true (see its instructions)."##,
+"page" and "panel" use the numbers shown in the reading (both start at 1). Segments must be in story order."##,
         sfx = SFX_NAMES.join(", "),
     )
 }
@@ -223,31 +234,148 @@ pub(crate) fn length_target(lines: usize) -> usize {
     ((lines as f64 * 3.0 / 50.).round() as usize * 50).clamp(200, 1400)
 }
 
-/// Segments of an answer on `chunk_pages`. Hook segments (`allow_hook`: the very first opening)
-/// come first and may show any page; the rest follow in page order.
-pub(crate) fn parse_segments(v: &Value, chunk_pages: &[usize], read: &ChapterRead, allow_hook: bool) -> Vec<StorySegment> {
+/// Segments of an answer on `chunk_pages`, in page order. The writer no longer makes hook
+/// segments (the export makes one hook for the whole video); a `"hook"` key in an answer is ignored.
+pub(crate) fn parse_segments(v: &Value, chunk_pages: &[usize], read: &ChapterRead) -> Vec<StorySegment> {
     let mut out: Vec<StorySegment> = vec![];
     for sv in v.get("segments").and_then(Value::as_array).into_iter().flatten() {
         let text = str_of(sv, "text");
         let Some(page) = num_of(sv, "page").filter(|n| *n >= 1.0).map(|n| n as usize - 1) else { continue };
-        let hook = allow_hook && sv.get("hook").and_then(Value::as_bool).unwrap_or(false);
-        if text.is_empty() || !chunk_pages.contains(&page) && !(hook && read.pages.iter().any(|p| p.index == page)) {
+        if text.is_empty() || !chunk_pages.contains(&page) {
             continue;
         }
         let panels = read.pages.iter().find(|p| p.index == page).map(|p| p.panels.len()).unwrap_or(0);
         let panel = num_of(sv, "panel").filter(|n| *n >= 1.0).map(|n| n as usize - 1).filter(|n| *n < panels);
         let sfx = SfxCue::parse(&str_of(sv, "sfx"), num_of(sv, "sfx_strength"));
-        out.push(StorySegment { page, panel, text, delivery: None, sfx, hook });
+        out.push(StorySegment { page, panel, text, delivery: None, sfx, hook: false });
     }
-    // Stable: keeps the model's order of the hook, and of the panels within a page.
-    out.sort_by_key(|s| (!s.hook, if s.hook { 0 } else { s.page }));
+    // Stable: keeps the model's order of the panels within a page.
+    out.sort_by_key(|s| s.page);
     out
+}
+
+/// Narration speed the subscribe reminders are planned at.
+const WORDS_PER_MINUTE: f64 = 190.0;
+/// The first subscribe reminder, in minutes into the manga's whole narration.
+const FIRST_REMINDER_MIN: f64 = 27.0;
+/// Then one every so many minutes.
+const REMINDER_EVERY_MIN: f64 = 80.0;
+
+/// Where a reminder mark falls in a chapter whose narration runs from minute `start` to
+/// `start + len` of the manga's whole narration: the share of the chapter (0..1) at the first
+/// mark in `[start, start + len)`, or `None` when none does. Marks sit at minute 27, then every 80
+/// minutes (107, 187, 267 ...), so every chapter has one at most and a range played from the start
+/// gets one in its first hour, about six in eight hours.
+pub(crate) fn reminder_at(start: f64, len: f64) -> Option<f64> {
+    if !(start.is_finite() && len.is_finite() && len > 0.0) {
+        return None;
+    }
+    let k = ((start - FIRST_REMINDER_MIN) / REMINDER_EVERY_MIN).ceil().max(0.0);
+    let mark = FIRST_REMINDER_MIN + k * REMINDER_EVERY_MIN;
+    (mark < start + len).then(|| ((mark - start) / len).clamp(0.0, 1.0))
+}
+
+/// Narration words before a chapter: the sum over `earlier` chapters (saved story words, page
+/// count) of their words, estimated for one without a story from its pages at the words per
+/// page of `samples` (chapters with a story: words, pages), else as their average chapter. With
+/// no samples, this chapter's own estimate (`this`: words, pages) stands in.
+pub(crate) fn words_before(earlier: &[(Option<usize>, usize)], samples: &[(usize, usize)], this: (usize, usize)) -> f64 {
+    let avg = if samples.is_empty() { this.0 as f64 } else { samples.iter().map(|s| s.0).sum::<usize>() as f64 / samples.len() as f64 };
+    let paged: Vec<&(usize, usize)> = samples.iter().filter(|s| s.1 > 0).collect();
+    let per_page = if !paged.is_empty() {
+        Some(paged.iter().map(|s| s.0).sum::<usize>() as f64 / paged.iter().map(|s| s.1).sum::<usize>() as f64)
+    } else if samples.is_empty() && this.1 > 0 {
+        Some(this.0 as f64 / this.1 as f64)
+    } else {
+        None
+    };
+    earlier
+        .iter()
+        .map(|&(words, pages)| match (words, per_page) {
+            (Some(w), _) => w as f64,
+            (None, Some(r)) if pages > 0 => pages as f64 * r,
+            _ => avg,
+        })
+        .sum()
+}
+
+fn story_words(s: &Story) -> usize {
+    s.segments.iter().map(|g| g.text.split_whitespace().count()).sum()
+}
+
+/// The manga's chapters the reminders are planned on: (chapter id, output dir, saved story
+/// words, page count). `ordered` when they are the manga's chapters in reading order; else they
+/// are the chapter folders next to the one being written, used only for an average chapter.
+struct Timeline {
+    chapters: Vec<(String, std::path::PathBuf, Option<usize>, usize)>,
+    ordered: bool,
+}
+
+impl Timeline {
+    fn load(manga: &[ChapterRef], run: &[ChapterRef]) -> Timeline {
+        if !manga.is_empty() {
+            let chapters = manga.iter().map(|c| (c.chapter_id.clone(), c.output_dir.clone(), load_story(c).map(|s| story_words(&s)), list_pages(&c.pages_dir).len())).collect();
+            return Timeline { chapters, ordered: true };
+        }
+        // No order given: the other chapter folders of the manga (`<studio>/projects/<manga>/<chapter>`).
+        let mut chapters = vec![];
+        let parents: std::collections::BTreeSet<std::path::PathBuf> = run.iter().filter_map(|c| c.output_dir.parent().map(|p| p.to_path_buf())).collect();
+        for dir in parents.iter().flat_map(|p| std::fs::read_dir(p).into_iter().flatten().flatten()).map(|e| e.path()).filter(|p| p.is_dir()) {
+            let r = ChapterRef { output_dir: dir.clone(), ..Default::default() };
+            if let Some(s) = load_story(&r) {
+                chapters.push((String::new(), dir, Some(story_words(&s)), 0));
+            }
+        }
+        Timeline { chapters, ordered: false }
+    }
+
+    fn is(c: &(String, std::path::PathBuf, Option<usize>, usize), ch: &ChapterRef) -> bool {
+        !c.0.is_empty() && c.0 == ch.chapter_id || c.1 == ch.output_dir
+    }
+
+    fn set_words(&mut self, ch: &ChapterRef, words: usize) {
+        match self.chapters.iter_mut().find(|c| Self::is(c, ch)) {
+            Some(c) => c.2 = Some(words),
+            None if !self.ordered => self.chapters.push((ch.chapter_id.clone(), ch.output_dir.clone(), Some(words), 0)),
+            None => {}
+        }
+    }
+
+    /// Minutes of narration the manga has before `ch`, whose own estimate is `this` (words, pages).
+    /// Without the manga's order, the chapters before it are counted from its number ("Chapter 12":
+    /// 11), each an average chapter.
+    fn minutes_before(&self, ch: &ChapterRef, this: (usize, usize)) -> f64 {
+        let samples: Vec<(usize, usize)> = self.chapters.iter().filter(|c| !Self::is(c, ch)).filter_map(|c| c.2.map(|w| (w, c.3))).collect();
+        let pos = self.chapters.iter().position(|c| Self::is(c, ch)).filter(|_| self.ordered);
+        let earlier: Vec<(Option<usize>, usize)> = match pos {
+            Some(i) => self.chapters[..i].iter().map(|c| (c.2, c.3)).collect(),
+            None => {
+                let n = crate::brain::chapter_number(&ch.label).unwrap_or(0.0);
+                vec![(None, 0); (n.ceil() as i64 - 1).max(0) as usize]
+            }
+        };
+        words_before(&earlier, &samples, this) / WORDS_PER_MINUTE
+    }
+}
+
+/// The instruction for the subscribe reminder, at `share` (0..1) of the pages it is asked on.
+fn call_to_action(share: f64) -> String {
+    let at = if share < 0.34 {
+        "in the first part of these pages"
+    } else if share < 0.67 {
+        "around the middle of these pages"
+    } else {
+        "in the last part of these pages"
+    };
+    format!(
+        "CALL TO ACTION: {at}, at a natural break in the story (a scene change, or a quiet moment after a beat has landed; never in the middle of a fight, a reveal or a sad moment), add ONE short segment in which the narrator, in their own voice, asks the viewer to subscribe and turn on the bell, in the spirit of: \"If you're enjoying this, subscribe to the channel. It really helps, because we love making these. And if you love it, hit the bell for more manga like this.\" Say it in fresh words of your own (never copy that example), two or three short sentences, anchored to the panel of the beat just before it, then go straight back into the story. "
+    )
 }
 
 /// The pages of `chunk` after the last one the answer narrated, when a real share of what the
 /// chunk says (over 15% of its lines) is still untold: the writer stopped early.
 fn untold(read: &ChapterRead, transcript: Option<&Transcript>, chunk: &[usize], segs: &[StorySegment]) -> Option<Vec<usize>> {
-    let reached = segs.iter().filter(|s| !s.hook).map(|s| s.page).max()?;
+    let reached = segs.iter().map(|s| s.page).max()?;
     let rest: Vec<usize> = chunk.iter().copied().filter(|p| *p > reached).collect();
     let (all, left) = (spoken_lines(read, transcript, chunk), spoken_lines(read, transcript, &rest));
     (!rest.is_empty() && left * 100 > all * 15).then_some(rest)
@@ -262,14 +390,33 @@ pub async fn write_story(
     progress: ProgressFn,
     cancel: CancellationToken,
 ) -> Result<Vec<(String, Story)>> {
-    let llm = Patient::new(reg, progress.clone());
-    write_story_with(&llm, &model, &chapters, &styles, &brain, &progress, &cancel).await
+    write_story_for_manga(reg, model, chapters, vec![], styles, brain, progress, cancel).await
 }
 
+/// [`write_story`] with `manga`: all the manga's chapters in reading order (by chapter number),
+/// so the subscribe reminders are planned on the manga's whole running time. Without it they are
+/// planned from the chapter numbers in the labels.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_story_for_manga(
+    reg: Arc<Registry>,
+    model: ModelChoice,
+    chapters: Vec<ChapterRef>,
+    manga: Vec<ChapterRef>,
+    styles: Vec<String>,
+    brain: Arc<Mutex<Brain>>,
+    progress: ProgressFn,
+    cancel: CancellationToken,
+) -> Result<Vec<(String, Story)>> {
+    let llm = Patient::new(reg, progress.clone());
+    write_story_with(&llm, &model, &chapters, &manga, &styles, &brain, &progress, &cancel).await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_story_with(
     llm: &dyn Llm,
     model: &ModelChoice,
     chapters: &[ChapterRef],
+    manga: &[ChapterRef],
     styles: &[String],
     brain: &Mutex<Brain>,
     progress: &ProgressFn,
@@ -279,6 +426,7 @@ pub(crate) async fn write_story_with(
     let label = format!("{}/{}", model.provider.as_str(), model.model);
     let mut results: Vec<(String, Story)> = vec![];
     let mut so_far = String::new();
+    let mut timeline = Timeline::load(manga, chapters);
 
     for ch in chapters {
         let Some(read) = load_read(ch).filter(|r| !r.pages.is_empty()) else {
@@ -299,6 +447,11 @@ pub(crate) async fn write_story_with(
             so_far = snapshot.recap_before(&ch.label).unwrap_or_default().to_string();
         }
         let very_start = so_far.is_empty();
+        // The subscribe reminder this chapter carries, if a mark of the manga's running time falls
+        // in it: at that share of its content pages, asked of the part that holds it.
+        let this_words: usize = parts.iter().map(|(p, _)| length_target(spoken_lines(&read, transcript.as_ref(), p))).sum();
+        let start = timeline.minutes_before(ch, (this_words, read.pages.len()));
+        let mut reminder = reminder_at(start, this_words as f64 / WORDS_PER_MINUTE).map(|s| ((s * content.len() as f64) as usize).min(content.len().saturating_sub(1)));
 
         while let Some((chunk, carry_on)) = parts.pop_front() {
             if cancel.is_cancelled() {
@@ -314,7 +467,7 @@ pub(crate) async fn write_story_with(
             };
             let lines = spoken_lines(&read, transcript.as_ref(), chunk);
             let mut prompt = format!(
-                "MANGA: {}\nCHAPTER: {} ({span})\nSTYLES: {}\nLENGTH TARGET: about {} words ({lines} lines of dialogue and narration on these pages)\n",
+                "MANGA: {}\nCHAPTER: {} ({span}; for your reference only, never say it)\nSTYLES: {}\nLENGTH TARGET: about {} words ({lines} lines of dialogue and narration on these pages)\n",
                 snapshot.manga_title,
                 ch.label,
                 if styles.is_empty() { "Normal narration".to_string() } else { styles.join(", ") },
@@ -335,12 +488,16 @@ pub(crate) async fn write_story_with(
             }
             prompt += &format!("\nREADING OF {}:\n\n{}", if n_parts == 1 && !carry_on { "THE CHAPTER" } else { "THESE PAGES" }, digest(&read, transcript.as_ref(), &snapshot, chunk));
             prompt += match (first, very_start) {
-                (true, true) => "This is the very start of the recap. Open IN MEDIAS RES, like the best recap channels: 2-4 segments marked \"hook\": true that drop the viewer straight into the chapter's most gripping moment, clash or twist (anchored to that moment's own panels, from any page), told so the viewer instantly needs to know how it came to this. Then rewind with one line (\"But to understand how ..., we have to go back.\") and tell the chapter from its start, in order, without retelling the hook word for word. Keep slow setup (an ordinary life, a backstory) brisk. Include a good \"title\". ",
-                (true, false) => "Open with ONE short sentence that reminds the viewer where the story left off, then go straight on; do not re-introduce what the viewer already knows. Include a good \"title\". ",
+                (true, true) => "Nothing has been told yet: these pages begin the story. Open it the way a great storyteller would, with one strong, story-driven first line (who the hero is, or what is at stake), then tell the pages in order. Do not jump ahead to later events, do not introduce the video or the manga, and keep slow setup (an ordinary life, a backstory) brisk. Include a good \"title\". ",
+                (true, false) => "The viewer has just heard the story so far, with no break: continue it seamlessly from where it stands, as the same telling. No recap of earlier events, no re-introducing what the viewer already knows, no \"previously\" or \"now, in chapter ...\". Include a good \"title\". ",
                 _ => "Carry straight on from the last lines already spoken. Keep the \"title\" the same as before or leave it empty. ",
             };
             if last {
-                prompt += "End on the chapter's last turn with a line that makes the viewer need the next chapter. ";
+                prompt += "The story goes on after these pages: tell them through to the last page and end on its last beat, so what comes next flows straight on. No wrap-up, no cliffhanger line, no \"end of chapter\", \"to be continued\" or sign-off. ";
+            }
+            if let Some(at) = reminder.filter(|at| !carry_on && (done..done + chunk.len()).contains(at)) {
+                prompt += &call_to_action((at - done) as f64 / chunk.len() as f64);
+                reminder = None;
             }
             prompt += "First list for yourself the scenes of these pages, then write the voice-over through to the last page. Reply with the JSON object only.";
 
@@ -361,7 +518,7 @@ pub(crate) async fn write_story_with(
                     if story.title.is_empty() {
                         story.title = str_of(&v, "title");
                     }
-                    let seg = parse_segments(&v, chunk, &read, first && very_start);
+                    let seg = parse_segments(&v, chunk, &read);
                     if seg.is_empty() {
                         progress(Progress::Log(format!("{}: pages {}-{} came back without usable segments.", ch.label, chunk[0] + 1, chunk[chunk.len() - 1] + 1)));
                     }
@@ -398,6 +555,7 @@ pub(crate) async fn write_story_with(
             story.title = ch.label.clone();
         }
         save_story(ch, &story)?;
+        timeline.set_words(ch, story_words(&story));
         if !so_far.is_empty() {
             let mut b = brain.lock().unwrap();
             b.set_recap(&ch.label, &so_far);

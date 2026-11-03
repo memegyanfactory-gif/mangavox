@@ -508,6 +508,9 @@ pub(crate) struct Joined {
     pub solo: bool,
     /// Chapters whose music is still on that track (their narration could not be rebuilt).
     pub music_kept: usize,
+    /// The chapter videos it was joined from, in order (an export bakes its watermark into each
+    /// of them once, see [`chapter_segment`], and joins those without re-encoding).
+    pub files: Vec<PathBuf>,
 }
 
 /// Where a manga's joined video is kept (the one file the manga section's Play all plays too,
@@ -614,6 +617,7 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
                 boundaries: m["boundaries"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default(),
                 solo: m["solo"].as_bool().unwrap_or(false),
                 music_kept: m["music_kept"].as_u64().unwrap_or(0) as usize,
+                files: files.to_vec(),
             });
         }
     }
@@ -639,7 +643,7 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
     let _ = std::fs::remove_dir_all(&work);
     let (solo, music_kept) = res?;
     let _ = std::fs::write(&meta, serde_json::to_string(&json!({"v": JOIN_VERSION, "sources": key, "total": total, "boundaries": boundaries, "solo": solo, "music_kept": music_kept}))?);
-    Ok(Joined { path: out.to_path_buf(), total, boundaries, solo, music_kept })
+    Ok(Joined { path: out.to_path_buf(), total, boundaries, solo, music_kept, files: files.to_vec() })
 }
 
 /// [`join`]'s work in `work`. Returns whether the second, music-free track was made, and how
@@ -871,8 +875,10 @@ impl Mark {
         }
         let mut mark = Mark { wm, dir: None };
         if let (Some((text, ..)), Some(font)) = (&mark.wm.text, font) {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!("mangavox-mark-{}-{stamp}", std::process::id()));
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("mangavox-mark-{}-{stamp}-{seq}", std::process::id()));
             std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             mark.dir = Some(dir.clone());
             std::fs::copy(font, dir.join(MARK_FONT)).context("copy the watermark font")?;
@@ -891,6 +897,258 @@ impl Drop for Mark {
     fn drop(&mut self) {
         if let Some(d) = &self.dir {
             let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+// ------------------------------------------------------------------ export segments
+
+/// Chapter segments made at once (`MANGAVOX_SEGMENT_JOBS` overrides). Two: one ffmpeg decodes and
+/// draws while the other encodes. Measured on an RTX 3080 (two 1440p chapters, 4.4 min): 63 s,
+/// one at a time 66 s, one pass over the joined video (the old export) 75-89 s. The GPU has one
+/// encoder, so more do not help.
+fn segment_jobs() -> usize {
+    std::env::var("MANGAVOX_SEGMENT_JOBS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(2)
+}
+/// Bumped when a segment's makeup changes, so older ones are made again.
+const SEGMENT_VERSION: u64 = 1;
+
+/// What a chapter's export segment is made with: the watermark (its text only when the font is
+/// there), the export's short side and the video encoder's arguments. Equal specs, equal segments.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SegmentSpec {
+    pub watermark: Option<Watermark>,
+    pub font: Option<PathBuf>,
+    pub short: Option<u32>,
+    pub codec: Vec<String>,
+}
+
+impl SegmentSpec {
+    /// The segments a whole-video export with `extras` joins; `None` when it re-encodes nothing
+    /// (the chapters are copied as they are) or has a hook (joined in with the picture re-encoded).
+    pub(crate) fn of(extras: &Extras) -> Option<SegmentSpec> {
+        let font = extras.font.clone().filter(|f| f.is_file());
+        let watermark = extras.watermark.clone().map(|mut w| {
+            if font.is_none() {
+                w.text = None;
+            }
+            w
+        });
+        let watermark = watermark.filter(|w| w.logo.is_some() || w.text.is_some());
+        let short = extras.quality.short_side();
+        let work = watermark.is_some() || short.is_some() || extras.codec.is_some();
+        (work && extras.hook.is_none()).then(|| SegmentSpec { watermark, font, short, codec: extras.video_args() })
+    }
+}
+
+/// Where the export segments of the manga whose joined video is `joined` are kept.
+pub(crate) fn segment_dir(joined: &Path) -> PathBuf {
+    joined.with_extension("segments")
+}
+
+fn modified_secs(m: &std::fs::Metadata) -> u64 {
+    m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// The file `video`'s segment for `spec` is kept in (named by everything it is made from).
+/// `<spec>-<video>.mp4`, so pruning can tell one export setting's segments from another's.
+pub(crate) fn segment_path(dir: &Path, video: &Path, spec: &SegmentSpec) -> Result<PathBuf> {
+    let m = video.metadata().with_context(|| format!("read {}", video.display()))?;
+    let key = crate::vedit::render_key(&json!({ "video": video, "len": m.len(), "modified": modified_secs(&m) }));
+    Ok(dir.join(format!("{}-{key:016x}.mp4", spec_tag(spec))))
+}
+
+/// The part of a segment's name that says which settings it was made with.
+fn spec_tag(spec: &SegmentSpec) -> String {
+    let logo = spec.watermark.as_ref().and_then(|w| w.logo.as_ref()).and_then(|(p, ..)| p.metadata().ok()).map(|m| (m.len(), modified_secs(&m)));
+    format!("{:016x}", crate::vedit::render_key(&json!({ "v": SEGMENT_VERSION, "spec": format!("{spec:?}"), "logo": logo })))
+}
+
+/// The size and encoder of the last export that joined segments (`last_export.json` beside them):
+/// the background makes its segments the same way, whichever of the two exports it was.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct LastExport {
+    short: Option<u32>,
+    codec: Vec<String>,
+}
+
+impl LastExport {
+    fn path(dir: &Path) -> PathBuf {
+        dir.join("last_export.json")
+    }
+
+    fn load(dir: &Path) -> Option<LastExport> {
+        serde_json::from_slice(&std::fs::read(Self::path(dir)).ok()?).ok()
+    }
+
+    fn save(spec: &SegmentSpec, dir: &Path) {
+        let last = LastExport { short: spec.short, codec: spec.codec.clone() };
+        if let Ok(b) = serde_json::to_vec(&last) {
+            let _ = std::fs::write(Self::path(dir), b);
+        }
+    }
+}
+
+/// `video` (a chapter video) as an export segment: its picture with the spec's watermark and size
+/// baked in, its sound copied, so the export joins the segments without re-encoding anything.
+/// Made once per video and spec and kept in `dir` (blocking).
+pub(crate) fn chapter_segment(dir: &Path, video: &Path, spec: &SegmentSpec, r: &Reporter) -> Result<PathBuf> {
+    let out = segment_path(dir, video, spec)?;
+    if out.is_file() {
+        return Ok(out);
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let mark = Mark::prepare(spec.watermark.clone(), spec.font.as_deref())?;
+    let size = probe(video)?.size;
+    let (size, scale) = match spec.short {
+        Some(s) => {
+            let to = scaled_size(size, s);
+            (to, Some(scale_filter(to.0, to.1)))
+        }
+        None => (size, None),
+    };
+    let mut args: Vec<String> = vec!["-i".into(), video.to_string_lossy().into()];
+    let graph = match (&mark, &scale) {
+        (Some(m), Some(sc)) => format!("[0:v:0]{sc}[sc];{}", watermark_graph(&m.wm, "sc", "v", size.0, size.1, 1)),
+        (Some(m), None) => watermark_graph(&m.wm, "0:v:0", "v", size.0, size.1, 1),
+        (None, Some(sc)) => format!("[0:v:0]{sc}[v]"),
+        (None, None) => "[0:v:0]null[v]".into(),
+    };
+    if let Some(m) = &mark {
+        args.extend(m.inputs());
+    }
+    // The main sound only: every segment then has the same tracks, which joining needs.
+    args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), "0:a:0".into()]);
+    args.extend(spec.codec.iter().cloned());
+    // Its own part file: the background (`prepare_segment`) and an export may make the same one.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = out.with_extension(format!("{}-{}.part.mp4", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    args.extend(["-c:a".into(), "copy".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
+    let made = ffmpeg(&args, 0., r, mark.as_ref().and_then(|m| m.dir.as_deref()), &mut |_| {});
+    if let Err(e) = made {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &out) {
+        let _ = std::fs::remove_file(&tmp);
+        if !out.is_file() {
+            return Err(e).with_context(|| format!("save {}", out.display()));
+        }
+    }
+    Ok(out)
+}
+
+/// The segments of `files`, in order, [`segment_jobs`] made at a time (the ones kept from an
+/// earlier export or made in the background are reused at once); progress goes 0..`share`.
+fn segments(dir: &Path, files: &[PathBuf], spec: &SegmentSpec, r: &Reporter, share: f32) -> Result<Vec<PathBuf>> {
+    use std::sync::atomic::AtomicUsize;
+    let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let out: Mutex<Vec<Option<Result<PathBuf>>>> = Mutex::new((0..files.len()).map(|_| None).collect());
+    let failed = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..segment_jobs().min(files.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= files.len() || r.cancelled() || failed.load(Ordering::SeqCst) {
+                    break;
+                }
+                let res = chapter_segment(dir, &files[i], spec, r);
+                failed.fetch_or(res.is_err(), Ordering::SeqCst);
+                let n = done.fetch_add(1, Ordering::SeqCst) + 1;
+                r.set(share * n as f32 / files.len() as f32, &format!("Drawing the watermark on the chapters ({n} of {})", files.len()));
+                out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(res);
+            });
+        }
+    });
+    if r.cancelled() {
+        bail!(CANCELLED);
+    }
+    let made: Vec<Option<Result<PathBuf>>> = out.into_inner().unwrap_or_else(|e| e.into_inner());
+    // The first failure says why (a chapter left out after it only stopped).
+    if let Some(e) = made.iter().position(|m| matches!(m, Some(Err(_)))) {
+        return Err(made.into_iter().nth(e).flatten().and_then(Result::err).unwrap_or_else(|| anyhow!("a chapter failed")));
+    }
+    made.into_iter().map(|m| m.unwrap_or_else(|| Err(anyhow!("a chapter was skipped")))).collect()
+}
+
+/// The process making the half-made segment `name` (`<key>.<pid>-<seq>.part.mp4`), if it is one.
+fn part_owner(name: &str) -> Option<u32> {
+    let stem = name.strip_suffix(".part.mp4")?;
+    let (_, tail) = stem.rsplit_once('.')?;
+    tail.split_once('-')?.0.parse().ok()
+}
+
+/// The chapter videos share one picture size and rate and one main sound, so their segments
+/// join without re-encoding (else the export draws over the joined video, as it always did).
+fn uniform(files: &[PathBuf]) -> bool {
+    let probes: Vec<Probe> = files.iter().filter_map(|f| probe(f).ok()).collect();
+    probes.len() == files.len() && !probes.is_empty() && probes.iter().all(|p| p.video == probes[0].video && p.audio[0].0 == probes[0].audio[0].0)
+}
+
+/// Makes `chapter`'s export segment in the background as soon as its video is rendered, with the
+/// dashboard's export settings and the Look's watermark, so the export later only joins. Does
+/// nothing when that export would re-encode nothing, or the video is missing. Blocking; one at a
+/// time (the GPU encoder is shared), beside the next chapter's render (which is mostly CPU work).
+pub(crate) fn prepare_segment(chapter: &crate::pipeline::QChapter) {
+    let video = chapter.output_dir.join(crate::data::VIDEO_FILE);
+    if !video.is_file() {
+        return;
+    }
+    let dir = segment_dir(&joined_path(&chapter.manga_id));
+    let env = crate::setup::latest().map(|c| c.env);
+    let extras = Extras { watermark: load_watermark(&video_look_path()), font: mark_font(env.as_ref()), ..Extras::default() };
+    // Made like the last export that joined segments (the Video mode's or the dashboard's);
+    // before the first one, like the dashboard's export would.
+    let spec = match LastExport::load(&dir) {
+        Some(last) => SegmentSpec::of(&Extras { codec: Some(last.codec), ..extras }).map(|s| SegmentSpec { short: last.short, ..s }),
+        None => {
+            let prefs = style::PanelPrefs::load().export;
+            if prefs.mode() != Mode::Whole || prefs.hook || !prefs.music {
+                return;
+            }
+            SegmentSpec::of(&Extras { quality: prefs.quality, ..extras })
+        }
+    };
+    let Some(spec) = spec else { return };
+    // One at a time; the next ones wait here.
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let r = Reporter { state: Default::default(), cancel: Default::default(), turn: Default::default() };
+    let started = Instant::now();
+    match chapter_segment(&dir, &video, &spec, &r) {
+        Ok(_) => eprintln!("[studio] export segment of {} ready in {:.1}s", chapter.label(), started.elapsed().as_secs_f32()),
+        // The export makes it then.
+        Err(e) => eprintln!("[studio] could not make the export segment of {}: {e:#}", chapter.label()),
+    }
+}
+
+/// How long segments of other export settings stay unused before they go.
+const OTHER_SPEC_KEPT: Duration = Duration::from_secs(3 * 24 * 3600);
+
+/// After an export that joined `keep` (made with `spec`, starting at `since`): removes the older
+/// segments of `spec` (re-rendered chapters; one the background finished meanwhile stays), the
+/// segments of other settings not used for [`OTHER_SPEC_KEPT`], and the half-made ones a closed or
+/// crashed MangaVox left (one this process is making stays).
+fn prune_segments(dir: &Path, keep: &[PathBuf], spec: &SegmentSpec, since: std::time::SystemTime) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let tag = format!("{}-", spec_tag(spec));
+    let now = std::time::SystemTime::now();
+    // What this export used is fresh again, whenever it was made.
+    for p in keep {
+        let _ = std::fs::File::options().write(true).open(p).and_then(|f| f.set_modified(now));
+    }
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let made = e.metadata().and_then(|m| m.modified()).unwrap_or(now);
+        let gone = match part_owner(&name) {
+            Some(pid) => pid != std::process::id(),
+            None if !p.extension().is_some_and(|x| x == "mp4") || keep.contains(&p) => false,
+            None if name.starts_with(&tag) => made < since,
+            None => now.duration_since(made).unwrap_or_default() > OTHER_SPEC_KEPT,
+        };
+        if gone {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
@@ -1027,6 +1285,27 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
     if mode == Mode::Whole {
         let out = out_dir.join(part_name(name, mode, 1, 1));
         let tmp = out.with_extension("part.mp4");
+        // The watermark (and the size) baked into each chapter once, then the chapters joined
+        // without re-encoding: seconds when the segments were made in the background after each
+        // render (`prepare_segment`) or by an earlier export, instead of the whole recap again.
+        if let Some(spec) = SegmentSpec::of(extras).filter(|_| hook.is_none() && track == 0 && uniform(&j.files)) {
+            let since = std::time::SystemTime::now();
+            let dir = segment_dir(&j.path);
+            let segs = segments(&dir, &j.files, &spec, r, 0.9)?;
+            let list = dir.join("export_list.txt");
+            std::fs::write(&list, concat_list(&segs))?;
+            let mut args: Vec<String> = ["-f", "concat", "-safe", "0", "-i"].map(String::from).to_vec();
+            args.extend([list.to_string_lossy().into(), "-map".into(), "0:v:0".into(), "-map".into(), "0:a:0".into(), "-c:v".into(), "copy".into()]);
+            args.extend(extras.audio_args(true));
+            args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
+            ffmpeg(&args, j.total, r, None, &mut |f| r.set(0.9 + 0.1 * f, "Saving the video"))?;
+            let _ = std::fs::remove_file(&out);
+            std::fs::rename(&tmp, &out)?;
+            let _ = std::fs::remove_file(&list);
+            prune_segments(&dir, &segs, &spec, since);
+            LastExport::save(&spec, &dir);
+            return Ok(vec![out]);
+        }
         let (w, h) = size;
         let mut total = j.total;
         let mut args: Vec<String>;
@@ -1438,6 +1717,11 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
     // A hook that could not be made leaves the video without it (said in the result).
     let mut hook_note = String::new();
     let mut hook_path = None;
+    // Only the chapters in the video (unrendered ones may have been left out).
+    let hook = hook.map(|mut h| {
+        h.chapters.retain(|c| j.files.contains(&c.output_dir.join(crate::data::VIDEO_FILE)));
+        h
+    });
     let res = match hook {
         Some(job) => match make_hook(job, &j, &r, &ex).await {
             Ok((path, why)) => {
@@ -1478,6 +1762,13 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
         }
     };
     (res, hook_note)
+}
+
+/// The export's name from the chapters `j` actually joined, when that is not every chapter on the
+/// timeline (some were left out without a video), so the name never claims chapters it lacks.
+fn joined_name(g: &MangaGroup, j: &Joined) -> Option<String> {
+    let made: Vec<crate::data::ChapterItem> = g.chapters.iter().filter(|c| j.files.contains(&c.output_dir.join(crate::data::VIDEO_FILE))).cloned().collect();
+    (!made.is_empty() && made.len() < g.chapters.len()).then(|| export_name(&g.title, &made))
 }
 
 /// "Solo Leveling - Ch. 1 to Ch. 12": the export's file name for these made chapters (in order).
@@ -1632,8 +1923,7 @@ impl StudioPage {
             toast::show(cx, Toast::info("Export queued: it starts when the current one is done"));
             return;
         }
-        let files: Vec<PathBuf> = self.made_videos(g).into_iter().map(|(_, p)| p).collect();
-        if files.is_empty() {
+        if self.timeline_chapters(g).is_empty() {
             toast::show(cx, Toast::info("Make a chapter video first"));
             return;
         }
@@ -1644,8 +1934,16 @@ impl StudioPage {
         cx.notify();
         let out = joined_path(&g.id);
         let rr = r.clone();
+        let chapters = g.chapters.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let res = mv_ui::bg::blocking(move || join(&files, &out, &rr)).await.and_then(|r| r);
+            // The videos as they are on disk now (off the UI thread): chapters rendered just
+            // before (data::fresh) are in, before the library is read again.
+            let res = mv_ui::bg::blocking(move || {
+                let files: Vec<PathBuf> = chapters.iter().map(|c| c.output_dir.join(crate::data::VIDEO_FILE)).filter(|p| p.is_file()).collect();
+                join(&files, &out, &rr)
+            })
+            .await
+            .and_then(|r| r);
             let _ = this.update_in(cx, |this, window, cx| match res {
                 Ok(j) => then(this, j, &r, window, cx),
                 Err(e) => {
@@ -1736,11 +2034,12 @@ impl StudioPage {
 
     /// Asks for a folder, then exports with the section's choices.
     fn start_export(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
-        let videos = self.made_videos(g);
+        // Every chapter on the timeline; the ones not rendered yet are rendered first (style_gate).
+        let videos = self.timeline_chapters(g);
         if videos.is_empty() {
             return;
         }
-        let name = export_name(&g.title, &videos.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>());
+        let name = export_name(&g.title, &videos);
         let prefs = self.export_prefs;
         let group = g.clone();
         let env = self.setup.read(cx).env.clone();
@@ -1754,7 +2053,7 @@ impl StudioPage {
                 manga_id: g.id.clone(),
                 manga_title: g.title.clone(),
                 cover: g.cover.clone().filter(|p| p.is_file()),
-                chapters: videos.iter().map(|(c, _)| c.clone()).collect(),
+                chapters: videos.clone(),
                 seconds: prefs.hook_secs,
                 model: self.model(cx).map(|m| m.0),
                 reg: ui_assistant::registry(cx),
@@ -1781,11 +2080,13 @@ impl StudioPage {
     /// [`Self::start_export`] once the folder is picked and the chapters are as they will be.
     #[allow(clippy::too_many_arguments)]
     fn export_now(&mut self, group: MangaGroup, prefs: ExportPrefs, dir: PathBuf, name: String, font: Option<PathBuf>, hook: Option<HookJob>, window: &mut Window, cx: &mut Context<Self>) {
+        let g = group.clone();
         self.with_joined(
             &group,
             "Joining the chapters",
             move |_, j, r, window, cx| {
                 let r = r.clone();
+                let name = joined_name(&g, &j).unwrap_or(name);
                 // Chapters whose music could not be taken out (said in the result).
                 let kept = if prefs.music { 0 } else { j.music_kept };
                 let ex = cx.background_executor().clone();
@@ -1826,15 +2127,15 @@ impl StudioPage {
     /// `p`'s preset (GPU encoder when one works and `p.gpu`, loudness when asked), with the Look's
     /// watermark like every export. Progress, time left and Cancel are `export_job`.
     pub(crate) fn start_preset_export(&mut self, g: &MangaGroup, p: PresetExport, window: &mut Window, cx: &mut Context<Self>) {
-        let videos = self.made_videos(g);
-        if videos.is_empty() {
+        // Every chapter on the timeline; the ones not rendered yet are rendered first (fresh::guard).
+        let chapters = self.timeline_chapters(g);
+        if chapters.is_empty() {
             return;
         }
-        let name = format!("{} ({})", export_name(&g.title, &videos.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>()), p.tag());
+        let name = format!("{} ({})", export_name(&g.title, &chapters), p.tag());
         let group = g.clone();
         let font = mark_font(self.setup.read(cx).env.as_ref());
         let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Export here".into()) });
-        let chapters: Vec<crate::data::ChapterItem> = videos.into_iter().map(|(c, _)| c).collect();
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else { return };
             let Some(dir) = paths.into_iter().next() else { return };
@@ -1859,11 +2160,13 @@ impl StudioPage {
     /// [`Self::start_preset_export`] once the folder is picked and the chapters are as they will be.
     #[allow(clippy::too_many_arguments)]
     fn preset_export_now(&mut self, group: MangaGroup, p: PresetExport, dir: PathBuf, name: String, font: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let g = group.clone();
         self.with_joined(
             &group,
             "Joining the chapters",
             move |_, j, r, window, cx| {
                 let r = r.clone();
+                let name = joined_name(&g, &j).map(|n| format!("{n} ({})", p.tag())).unwrap_or(name);
                 cx.spawn_in(window, async move |this, cx| {
                     let res = mv_ui::bg::blocking(move || {
                         let enc = crate::encode::usable(p.gpu);
@@ -1920,7 +2223,9 @@ impl StudioPage {
     /// The manga's Video card: the made chapters as one video, to play or export.
     pub(crate) fn video_section(&mut self, g: &MangaGroup, cx: &mut Context<Self>) -> AnyElement {
         let videos = self.made_videos(g);
-        let n = videos.len();
+        // Chapters on the timeline count (Play and Export render the ones not rendered yet); the
+        // length is the rendered ones'.
+        let n = self.timeline_chapters(g).len();
         let total: f64 = videos.iter().filter_map(|(_, p)| video_seconds(p)).sum();
         let job = self.export_job.as_ref().map(|j| (j.manga_id == g.id, j.snapshot()));
         let busy = job.is_some();
@@ -2051,6 +2356,56 @@ mod tests {
     };
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn segments_bake_only_what_the_export_changes() {
+        use super::{segment_path, SegmentSpec};
+        let d = tempfile::tempdir().unwrap();
+        let font = d.path().join("font.ttf");
+        std::fs::write(&font, b"font").unwrap();
+        let text = Watermark { logo: None, text: Some(("MangaVox".into(), "tl".into(), 0.05, 0.6)) };
+        // A plain source export copies the chapters: nothing to bake.
+        assert_eq!(SegmentSpec::of(&Extras::default()), None);
+        // Text without its font is not drawn, so it bakes nothing either.
+        assert_eq!(SegmentSpec::of(&Extras { watermark: Some(text.clone()), ..Extras::default() }), None);
+        let spec = SegmentSpec::of(&Extras { watermark: Some(text.clone()), font: Some(font.clone()), ..Extras::default() }).unwrap();
+        assert_eq!((spec.watermark.as_ref(), spec.short), (Some(&text), None));
+        assert_eq!(spec.codec, Quality::Source.video_args(), "the export's own encoder");
+        // A new size is baked in too; a hook re-encodes the joined picture, so no segments.
+        assert_eq!(SegmentSpec::of(&Extras { quality: Quality::P1080, ..Extras::default() }).map(|s| s.short), Some(Some(1080)));
+        assert_eq!(SegmentSpec::of(&Extras { watermark: Some(text), font: Some(font), hook: Some(d.path().join("hook.mp4")), ..Extras::default() }), None);
+        // A segment is named by its video and spec: a re-rendered video or new settings make a new one.
+        let video = d.path().join("video_final.mp4");
+        std::fs::write(&video, b"one").unwrap();
+        let a = segment_path(d.path(), &video, &spec).unwrap();
+        assert_eq!(a, segment_path(d.path(), &video, &spec).unwrap());
+        assert_ne!(a, segment_path(d.path(), &video, &SegmentSpec { short: Some(720), ..spec.clone() }).unwrap());
+        std::fs::write(&video, b"longer").unwrap();
+        assert_ne!(a, segment_path(d.path(), &video, &spec).unwrap());
+        // Pruning keeps what this export joined, a segment still being made here, and the other
+        // export settings' recent segments; it drops this setting's older segments and ones a
+        // closed MangaVox left half made.
+        let (me, tag) = (std::process::id(), super::spec_tag(&spec));
+        let other = super::spec_tag(&SegmentSpec { short: Some(720), ..spec.clone() });
+        let names = [format!("{tag}-11.mp4"), format!("{tag}-22.mp4"), format!("{other}-33.mp4"), format!("{tag}-44.{me}-0.part.mp4"), format!("{tag}-55.1-0.part.mp4")];
+        for n in &names {
+            std::fs::write(d.path().join(n), b"x").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        super::prune_segments(d.path(), &[d.path().join(&names[0])], &spec, std::time::SystemTime::now());
+        let left: Vec<bool> = names.iter().map(|n| d.path().join(n).is_file()).collect();
+        assert_eq!(left, [true, false, true, true, false]);
+        // A segment the background finished during the export stays.
+        std::fs::write(d.path().join(&names[1]), b"x").unwrap();
+        super::prune_segments(d.path(), &[d.path().join(&names[0])], &spec, std::time::SystemTime::now() - std::time::Duration::from_secs(60));
+        assert!(d.path().join(&names[1]).is_file());
+        // The background makes its segments like the last export that joined them.
+        assert_eq!(super::LastExport::load(d.path()), None);
+        super::LastExport::save(&spec, d.path());
+        assert_eq!(super::LastExport::load(d.path()), Some(super::LastExport { short: spec.short, codec: spec.codec.clone() }));
+        assert_eq!(super::part_owner("abc.123-4.part.mp4"), Some(123));
+        assert_eq!(super::part_owner("abc.mp4"), None);
+    }
 
     #[test]
     fn the_preview_draws_the_picture_as_the_export_does() {
@@ -2378,8 +2733,13 @@ mod tests {
             ..Extras::default()
         };
         println!("watermark: {:?}", extras.watermark);
+        // MV_EXPORT_MUSIC=1: the sound with the music (the default export; whole videos then join
+        // watermarked chapter segments instead of drawing over the joined video).
+        let music = std::env::var("MV_EXPORT_MUSIC").is_ok();
         for mode in modes {
-            let files = export(&j, mode, false, &out, "Test", &extras, &r).unwrap();
+            let started = std::time::Instant::now();
+            let files = export(&j, mode, music, &out, "Test", &extras, &r).unwrap();
+            println!("{mode:?}: {:.1}s", started.elapsed().as_secs_f32());
             println!("{mode:?}: {} file(s)", files.len());
         }
     }

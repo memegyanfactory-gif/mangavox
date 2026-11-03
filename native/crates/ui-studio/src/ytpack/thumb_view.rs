@@ -10,7 +10,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use mv_ui::{appear, glyphs, icon_ph, popup_surface, progress_bar, progress_ring_sized, spinner, Route};
 
 use super::click::{self, Score};
-use super::magnific::{self, ImageModel, Usage, CATALOG};
+use super::magnific::{self, ImageModel, Keys, Usage, Via, CATALOG};
 use super::thumbs::{self, Concept, Gallery, Thumb};
 use super::*;
 
@@ -65,13 +65,21 @@ impl ThumbGen {
         ThumbGen { manga_id: g.id.clone(), title: g.title.clone(), story: logic::story_so_far(&brain.notes, 6), saved: Saved::load(&g.id), th: ThumbState::new(&g.id, cast) }
     }
 
-    /// The key or the settings changed elsewhere (Settings › Magnific).
+    /// Newer YouTube research arrived (searched again on this visit).
+    pub(crate) fn set_research(&mut self, s: Saved) {
+        self.saved = s;
+    }
+
+    /// A key or the settings changed elsewhere (Settings › Magnific or AI services).
     pub(crate) fn refresh_settings(&mut self) {
-        self.th.has_key = magnific::key().is_some();
+        self.th.keys = Keys::load();
+        self.th.has_key = self.th.keys.any();
         self.th.usage = Usage::load();
         let prefs = magnific::Prefs::load();
-        if let Some(i) = CATALOG.iter().position(|m| m.id == prefs.model) {
-            self.th.model = i;
+        // A model picked here stays, even without a key (its warning asks for one); a default
+        // changed elsewhere is followed.
+        if !(self.th.chose_model && prefs.model == self.th.model().id) {
+            self.th.model = model_index(&prefs.model, &self.th.keys);
         }
         if self.th.has_key && self.th.key_rejected && magnific::key().as_deref() != self.th.rejected_key.as_deref() {
             self.th.key_rejected = false;
@@ -99,6 +107,8 @@ pub(super) struct ThumbState {
     /// Images the user added as references.
     extra: Vec<PathBuf>,
     model: usize,
+    /// The user picked `model` on this page (a refresh then keeps it).
+    chose_model: bool,
     aspect: &'static str,
     res: &'static str,
     count: usize,
@@ -113,7 +123,9 @@ pub(super) struct ThumbState {
     scoring: bool,
     /// Creations by score instead of newest first.
     best_first: bool,
+    /// Some image service has a key (Magnific or one in AI services).
     has_key: bool,
+    keys: Keys,
     usage: Usage,
     error: Option<String>,
     prompt: Option<Entity<TextareaState>>,
@@ -128,6 +140,8 @@ impl ThumbState {
     pub(super) fn new(manga_id: &str, cast: Vec<(Cast, Option<PathBuf>)>) -> Self {
         let cast: Vec<(Cast, PathBuf)> = cast.into_iter().filter_map(|(c, f)| Some((c, f?))).collect();
         let prefs = magnific::Prefs::load();
+        let keys = Keys::load();
+        let model = model_index(&prefs.model, &keys);
         ThumbState {
             gallery: Gallery::load(manga_id),
             key_rejected: false,
@@ -136,9 +150,10 @@ impl ThumbState {
             picked: if cast.is_empty() { vec![] } else { vec![0] },
             cast,
             extra: vec![],
-            model: CATALOG.iter().position(|m| m.id == prefs.model).unwrap_or(0),
+            model,
+            chose_model: false,
             aspect: ASPECTS.iter().copied().find(|a| *a == prefs.aspect).unwrap_or("16:9"),
-            res: magnific::RESOLUTIONS.iter().copied().find(|r| *r == prefs.resolution).unwrap_or("1K"),
+            res: CATALOG[model].resolutions.iter().chain(magnific::RESOLUTIONS.iter()).copied().find(|r| *r == prefs.resolution).unwrap_or("1K"),
             count: 1,
             tab: Tab::Creations,
             menu: None,
@@ -148,7 +163,8 @@ impl ThumbState {
             scores: HashMap::new(),
             scoring: false,
             best_first: false,
-            has_key: magnific::key().is_some(),
+            has_key: keys.any(),
+            keys,
             usage: Usage::load(),
             error: None,
             prompt: None,
@@ -173,6 +189,16 @@ impl ThumbState {
     }
 }
 
+/// The saved model, unless it has no key while another service's model has one: then the first
+/// model with a key, so a fal.ai key alone opens on a fal.ai model.
+fn model_index(saved: &str, keys: &Keys) -> usize {
+    let saved = CATALOG.iter().position(|m| m.id == saved);
+    match saved {
+        Some(i) if keys.has(&CATALOG[i]) || !keys.any() => i,
+        _ => CATALOG.iter().position(|m| keys.has(m)).or(saved).unwrap_or(0),
+    }
+}
+
 fn now_id() -> String {
     format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0))
 }
@@ -190,6 +216,9 @@ fn spec(text: impl Into<SharedString>) -> Div {
 /// web plan makes it unlimited (the API still charges credits).
 fn price(m: &ImageModel) -> Div {
     let d = div().flex().flex_none().items_center().justify_end().gap(px(8.)).w(px(150.)).text_size(px(size::XS)).text_color(Tokens::text_2());
+    if m.via != Via::Magnific {
+        return d.child(div().text_color(Tokens::text_3()).child(format!("Billed by {}", m.service_label())));
+    }
     let d = match m.web_unlimited {
         Some(res) => d.child(div().id(SharedString::from(format!("thg-unl-{}", m.id))).flex().items_center().gap(px(3.)).tooltip(tip(format!("Unlimited at {res} in the Magnific web app on your plan. API calls are always billed in credits."))).child(icon_ph(ph::INFINITY, Tokens::info(), icon_px::XS)).child(div().text_color(Tokens::info()).child(format!("Web · {res}")))),
         None => d,
@@ -301,6 +330,7 @@ impl ThumbGen {
         }
         input.update(cx, |s, cx| s.set_value("", window, cx));
         self.th.has_key = true;
+        self.th.keys.magnific = true;
         self.th.key_rejected = false;
         self.th.error = None;
         // Check it right away, so a wrong key shows here and not on the first Generate.
@@ -377,21 +407,23 @@ impl ThumbGen {
     /// Generates `prompt` (its `@` mentions attach the face cards); `base` is the thumbnail being
     /// re-edited, sent as Image 1.
     fn start(&mut self, prompt: String, label: String, base: Option<String>, cx: &mut Context<Self>) {
-        let Some(key) = magnific::key() else {
-            self.th.error = Some("Connect Magnific first: paste your API key on the left.".into());
+        // References need a model that takes them, and a square-only model cannot make a 16:9
+        // thumbnail: then another model with a key that can (Nano Banana 2.1 when none).
+        // A picked model without a key asks for one (the warning under the picker says so too)
+        // rather than quietly running on another service.
+        let needs_refs = base.is_some() || !self.th.picked.is_empty() || prompt.contains('@');
+        let picked = self.th.model();
+        let model = if self.th.keys.has(picked) { magnific::usable(picked, &self.th.keys, needs_refs, self.th.aspect) } else { picked };
+        let Some(key) = magnific::key_for(model) else {
+            self.th.error = Some(match model.via {
+                _ if self.th.keys.has(picked) => magnific::no_fit(&self.th.keys, needs_refs, self.th.aspect),
+                Via::Magnific => "Connect Magnific first: paste your API key on the left.".to_string(),
+                Via::Service(_) => format!("{} needs a {} key: add it in Settings › AI services.", model.name, model.service_label()),
+            });
             cx.notify();
             return;
         };
         let t = &mut self.th;
-        let mut model = t.model();
-        if (base.is_some() || !t.picked.is_empty() || prompt.contains('@')) && model.refs == 0 {
-            // References need a model that takes them; Nano Banana 2.1 does.
-            model = &CATALOG[0];
-        }
-        if !model.takes_aspect() && t.aspect != "1:1" {
-            // A square-only model cannot make a 16:9 thumbnail; Nano Banana 2.1 takes the size.
-            model = &CATALOG[0];
-        }
         let first = usize::from(base.is_some());
         let just_cast: Vec<Cast> = t.cast.iter().map(|(c, _)| c.clone()).collect();
         let (resolved, mut order) = thumbs::resolve(&prompt, &just_cast, first);
@@ -438,13 +470,17 @@ impl ThumbGen {
                 this.th.jobs.retain(|j| j.id != id);
                 match res {
                     Ok(()) => {
-                        this.th.usage.add(thumb.cost);
+                        if model.via == Via::Magnific {
+                            this.th.usage.add(thumb.cost);
+                        }
+                        super::video_thumb::learn_made(&thumb.prompt, &thumb.model, aspect);
                         this.th.gallery.thumbs.insert(0, thumb);
                         this.th.gallery.save(&this.manga_id);
+                        super::video_thumb::apply(&this.manga_id, cx);
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        if msg.starts_with(magnific::KEY_REJECTED) {
+                        if model.via == Via::Magnific && msg.starts_with(magnific::KEY_REJECTED) {
                             this.th.key_rejected = true;
                             this.th.rejected_key = Some(used_key.clone());
                         }
@@ -490,8 +526,12 @@ impl ThumbGen {
 
     fn delete_thumb(&mut self, id: &str, cx: &mut Context<Self>) {
         let _ = std::fs::remove_file(Gallery::image(&self.manga_id, id));
+        if let Some(t) = self.th.gallery.thumbs.iter().find(|t| t.id == id) {
+            super::video_thumb::learn_deleted(&t.prompt);
+        }
         self.th.gallery.thumbs.retain(|t| t.id != id);
         self.th.gallery.save(&self.manga_id);
+        super::video_thumb::apply(&self.manga_id, cx);
         if self.th.open.as_deref() == Some(id) {
             self.th.open = None;
         }
@@ -633,11 +673,12 @@ impl ThumbGen {
                     .flex_col()
                     .flex_1()
                     .gap(px(2.))
-                    .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("Studio · Magnific"))
+                    .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("Studio · {}", self.th.model().service_label())))
                     .child(div().text_size(px(size::MD)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child("Thumbnail Generator")),
             )
             .child(self.usage_button(cx));
-        if !self.th.has_key || self.th.key_rejected {
+        // A rejected Magnific key only blocks the page when no other service has a key.
+        if !self.th.has_key || (self.th.key_rejected && self.th.keys.services.is_empty()) {
             return panel.child(head).child(self.connect_card(cx));
         }
         panel.child(head).child(self.model_field(cx)).child(self.references(cx)).child(self.prompt_field(window, cx)).child(self.size_row(cx)).child(self.generate_block(cx))
@@ -658,6 +699,8 @@ impl ThumbGen {
             .child(Input::new(&key).mask_toggle())
             .child(btn("thg-connect", "Connect", ButtonKind::Primary).icon(ph::PLUGS_CONNECTED).full_width().on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_key(window, cx))))
             .child(div().flex().flex_wrap().gap(px(space::XS)).child(settings_btn("thg-open-settings", "Magnific settings")).child(btn("thg-getkey", "Get a key", ButtonKind::Ghost).small().icon(ph::ARROW_SQUARE_OUT).on_click(|_, _, cx| cx.open_url("https://www.magnific.com/developers/dashboard/api-key"))))
+            .child(div().pt(px(space::SM)).text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().child("Or make thumbnails with Higgsfield, fal.ai, Replicate, Black Forest Labs or Recraft: add that service's key in Settings › AI services."))
+            .child(services_btn("thg-open-services", "AI services"))
     }
 
     fn model_field(&self, cx: &mut Context<Self>) -> Div {
@@ -681,18 +724,39 @@ impl ThumbGen {
             .child(icon_ph(m.icon(), Tokens::text_1(), icon_px::SM))
             .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(m.name))
             .child(icon_ph(ph::CARET_DOWN, Tokens::text_2(), icon_px::XS));
-        let row = div().relative().flex().items_center().gap(px(space::XS)).child(button).child(
-            icon_button("thg-key", ph::GEAR_SIX, "Magnific settings: key, default model, credits").on_click(|_, window, cx| open_settings(window, cx)),
-        );
+        let gear = match m.via {
+            Via::Magnific => icon_button("thg-key", ph::GEAR_SIX, "Magnific settings: key, default model, credits").on_click(|_, window, cx| open_settings(window, cx)),
+            Via::Service(_) => icon_button("thg-key", ph::GEAR_SIX, "AI services: the keys for Higgsfield, fal.ai, Replicate and more").on_click(|_, window, cx| open_services(window, cx)),
+        };
+        let row = div().relative().flex().items_center().gap(px(space::XS)).child(button).child(gear);
         let row = if open { row.child(self.model_menu(cx)) } else { row };
         let square_only = !m.takes_aspect() && self.th.aspect != "1:1";
-        div().flex().flex_col().gap(px(space::SM)).child(label_caps("Model")).child(row).when(square_only, |d| {
+        let no_key = !self.th.keys.has(m);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::SM))
+            .child(label_caps("Model"))
+            .child(row)
+            .when(no_key, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap(px(space::XS))
+                        .child(div().text_size(px(size::XS)).text_color(Tokens::warning()).whitespace_normal().child(format!("No {} key yet. Add it in {} to make images with {}.", m.service_label(), if m.via == Via::Magnific { "Settings › Magnific" } else { "Settings › AI services" }, m.name)))
+                        .child(if m.via == Via::Magnific { settings_btn("thg-nokey", "Magnific settings") } else { services_btn("thg-nokey", "AI services") }),
+                )
+            })
+            .when(square_only, |d| {
             d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).whitespace_normal().child(format!("{} only makes square images, so {} thumbnails are made with {} ({}).", m.name, self.th.aspect, CATALOG[0].name, CATALOG[0].cost_label(self.th.res).trim_start_matches(" · "))))
         })
     }
 
     fn model_row(&self, i: usize, m: &'static ImageModel, cx: &mut Context<Self>) -> Stateful<Div> {
         let current = i == self.th.model;
+        let has_key = self.th.keys.has(m);
         div()
             .id(("thg-model-row", i))
             .flex()
@@ -706,6 +770,7 @@ impl ThumbGen {
             .hover(|s| s.bg(Tokens::hover()))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.th.model = i;
+                this.th.chose_model = true;
                 if !m.resolutions.contains(&this.th.res) {
                     this.th.res = m.resolutions.first().copied().unwrap_or("1K");
                 }
@@ -713,8 +778,8 @@ impl ThumbGen {
                 this.th.save_prefs();
                 cx.notify();
             }))
-            .child(div().w(px(240.)).flex().items_center().gap(px(6.)).child(icon_ph(m.icon(), Tokens::text_2(), icon_px::XS)).child(div().truncate().text_size(px(size::SM)).text_color(Tokens::text_1()).child(m.name)).when(m.new, |d| d.child(badge("New", Tone::Accent))))
-            .child(div().flex().flex_1().gap(px(4.)).when(m.refs > 0, |d| d.child(spec("Refs"))).child(spec(m.speed)).child(spec(if m.takes_aspect() { m.res_label() } else { "1:1 only".into() })))
+            .child(div().w(px(240.)).flex().items_center().gap(px(6.)).child(icon_ph(m.icon(), Tokens::text_2(), icon_px::XS)).child(div().truncate().text_size(px(size::SM)).text_color(if has_key { Tokens::text_1() } else { Tokens::text_3() }).child(m.name)).when(m.new, |d| d.child(badge("New", Tone::Accent))))
+            .child(div().flex().flex_1().gap(px(4.)).when(!has_key, |d| d.child(spec("No key"))).when(m.refs > 0, |d| d.child(spec("Refs"))).child(spec(m.speed)).child(spec(if m.takes_aspect() { m.res_label() } else { "1:1 only".into() })))
             .child(price(m))
     }
 
@@ -767,7 +832,7 @@ impl ThumbGen {
                 cx.notify();
             }))
             .child(Input::new(&search).prefix(icon_ph(glyphs::SEARCH, Tokens::text_3(), icon_px::SM)))
-            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().child("Only models the Magnific API offers. Prices are credits per image (low to high resolution). ∞ Web marks what your plan makes unlimited in the Magnific web app; API calls are always billed in credits."))
+            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().child("Magnific prices are credits per image (low to high resolution); ∞ Web marks what your plan makes unlimited in the Magnific web app, while API calls are always billed in credits. Higgsfield, fal.ai, Replicate, Black Forest Labs and Recraft models bill your account there and use the keys in Settings › AI services."))
             .child(list);
         div().absolute().top_full().left_0().child(deferred(anchored().anchor(Anchor::TopLeft).offset(point(px(0.), px(6.))).snap_to_window_with_margin(px(8.)).child(appear("thg-model-pop", pop))).with_priority(3))
     }
@@ -995,7 +1060,11 @@ impl ThumbGen {
         let line = |icon: Ph, color: Rgba, bg: Rgba, text: String| {
             div().flex().items_center().gap(px(6.)).px(px(space::MD)).py(px(6.)).rounded(px(radius::MD)).bg(bg).child(icon_ph(icon, color, icon_px::XS)).child(div().flex_1().text_size(px(size::XS)).text_color(color).whitespace_normal().child(text))
         };
-        let price = if cost > 0. { format!("About {} credits × {} from your API balance", cost.round(), self.th.count) } else { format!("Billed in API credits × {} (Magnific lists no price for it)", self.th.count) };
+        let price = match m.via {
+            Via::Service(_) => format!("Billed to your {} account × {}", m.service_label(), self.th.count),
+            Via::Magnific if cost > 0. => format!("About {} credits × {} from your API balance", cost.round(), self.th.count),
+            Via::Magnific => format!("Billed in API credits × {} (Magnific lists no price for it)", self.th.count),
+        };
         div()
             .flex()
             .flex_col()
@@ -1206,6 +1275,7 @@ impl ThumbGen {
 
     fn thumb_tile(&self, k: usize, t: &Thumb, cx: &mut Context<Self>) -> Div {
         let path = Gallery::image(&self.manga_id, &t.id);
+        let in_use = super::video_thumb::in_use(&self.manga_id).as_deref() == Some(path.as_path());
         let id = t.id.clone();
         let (id2, id3, prompt) = (t.id.clone(), t.id.clone(), t.prompt.clone());
         let hover_id = SharedString::from(format!("thg-tile-{}", t.id));
@@ -1218,6 +1288,10 @@ impl ThumbGen {
             .invisible()
             .group_hover(hover_id.clone(), |s| s.visible())
             .child(icon_button(("thg-use", k), ph::TEXT_T, "Use this prompt").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_prompt(prompt.clone(), window, cx))))
+            .child(icon_button(("thg-video", k), ph::MONITOR_PLAY, "Use for this manga's videos").on_click({
+                let (mid, path) = (self.manga_id.clone(), path.clone());
+                move |_, _, cx| super::video_thumb::pick_for_manga(&mid, Some(path.clone()), cx)
+            }))
             .child(icon_button(("thg-show", k), ph::FOLDER_OPEN, "Show in folder").on_click({
                 let path = path.clone();
                 move |_, _, cx| cx.reveal_path(&path)
@@ -1245,7 +1319,7 @@ impl ThumbGen {
                     }))
                     .child(img(path).size_full().object_fit(ObjectFit::Cover))
                     .child(actions)
-                    .child(div().absolute().left(px(6.)).bottom(px(6.)).child(badge(t.resolution.clone(), Tone::Neutral)))
+                    .child(div().absolute().left(px(6.)).bottom(px(6.)).flex().gap(px(4.)).child(badge(t.resolution.clone(), Tone::Neutral)).when(in_use, |d| d.child(badge("Video thumbnail", Tone::Accent))))
                     .when_some(self.th.scores.get(&t.id), |d, s| d.child(div().absolute().left(px(6.)).top(px(6.)).child(score_badge(("thg-tile-score", k), s)))),
             )
             .child(
@@ -1290,6 +1364,16 @@ impl ThumbGen {
                             }
                             cx.notify();
                         })))
+                    })
+                    .child({
+                        let (mid, path) = (self.manga_id.clone(), path.clone());
+                        let in_use = super::video_thumb::in_use(&self.manga_id).as_deref() == Some(path.as_path());
+                        btn("thg-video-open", if in_use { "Video thumbnail" } else { "Use for videos" }, if in_use { ButtonKind::Secondary } else { ButtonKind::Primary })
+                            .small()
+                            .icon(ph::MONITOR_PLAY)
+                            .selected(in_use)
+                            .tooltip("Every video of this manga shows this thumbnail (manga page, reader, phone, Studio › YouTube videos)")
+                            .on_click(move |_, _, cx| super::video_thumb::pick_for_manga(&mid, Some(path.clone()), cx))
                     })
                     .child(btn("thg-open-file", "Open", ButtonKind::Secondary).small().icon(ph::ARROW_SQUARE_OUT).on_click({
                         let path = path.clone();
@@ -1474,6 +1558,15 @@ async fn ask_concepts(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiP
 /// Opens Settings › Magnific.
 fn open_settings(window: &mut Window, cx: &mut App) {
     mv_ui::navigate(Route::Settings { tab: Some("magnific".into()) }, window, cx);
+}
+
+/// Opens Settings › AI services (the other image services' keys).
+fn open_services(window: &mut Window, cx: &mut App) {
+    mv_ui::navigate(Route::Settings { tab: Some("services".into()) }, window, cx);
+}
+
+fn services_btn(id: &'static str, label: &'static str) -> Btn {
+    btn(id, label, ButtonKind::Secondary).small().icon(ph::KEY).on_click(|_, window, cx| open_services(window, cx))
 }
 
 fn settings_btn(id: &'static str, label: &'static str) -> Btn {

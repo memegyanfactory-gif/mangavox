@@ -35,6 +35,50 @@ pub enum Load<T> {
     Failed(String),
 }
 
+/// The last data a page showed, kept for the session so reopening the page paints it at once
+/// while it re-reads in the background (stale-while-revalidate). Nothing is kept while private
+/// mode is on, and [`drop_snapshots`] forgets every page's copy (cleared data must not reappear).
+pub struct Snapshot<T>(std::sync::Mutex<Option<(u64, T)>>);
+
+static SNAPSHOT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Forget every page's kept copy (history cleared, titles forgotten).
+pub fn drop_snapshots() {
+    SNAPSHOT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn epoch() -> u64 {
+    SNAPSHOT_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl<T: Clone> Snapshot<T> {
+    pub const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+    pub fn get(&self) -> Option<T> {
+        self.read(T::clone)
+    }
+    /// Look into the kept copy without cloning all of it.
+    pub fn read<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(e, _)| *e == epoch()).map(|(_, v)| f(v))
+    }
+    pub fn put(&self, v: T) {
+        self.update(|slot| *slot = Some(v));
+    }
+    /// Change the kept copy in place (`None` when there is none).
+    pub fn update(&self, f: impl FnOnce(&mut Option<T>)) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if mv_core::privacy::active() {
+            *g = None;
+            return;
+        }
+        let now = epoch();
+        let mut slot = g.take().filter(|(e, _)| *e == now).map(|(_, v)| v);
+        f(&mut slot);
+        *g = slot.map(|v| (now, v));
+    }
+}
+
 pub fn cover_src(map: &HashMap<String, PathBuf>, url: Option<&str>) -> Option<CoverSource> {
     url.and_then(|u| map.get(u)).cloned().map(CoverSource::File)
 }

@@ -106,8 +106,16 @@ function nonce(dir, ctr) {
 }
 
 /**
+ * Consumed bytes of a stream are acked once this many have piled up (and never more than the PC's
+ * window, 1 MiB), so a big response costs a handful of phone frames instead of one per chunk.
+ */
+const ACK_EVERY = 256 * 1024;
+
+/**
  * An established session over a relay WebSocket: requests become streams, responses come back
- * in order. Sealing and opening are chained so frames keep their counter order.
+ * in order. Each frame's counter is taken when it is sent or arrives, its sealing or opening
+ * starts at once, and only handing the results on is chained, so frames keep their counter order
+ * while WebCrypto works on several at a time.
  */
 export class Session {
   constructor(keys, sendFrame) {
@@ -126,15 +134,16 @@ export class Session {
 
   send(plain) {
     if (this.dead) return Promise.resolve();
+    const ctr = this.sendCtr++;
+    const sealing = subtle.encrypt({ name: 'AES-GCM', iv: nonce(DIR_PHONE_TO_PC, ctr) }, this.keys.send, plain);
     this.out = this.out.then(async () => {
+      const ct = new Uint8Array(await sealing);
       if (this.dead) return;
-      const ctr = this.sendCtr++;
-      const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: nonce(DIR_PHONE_TO_PC, ctr) }, this.keys.send, plain));
       const head = new Uint8Array(9);
       head[0] = KIND.SEALED;
       new DataView(head.buffer).setBigUint64(1, BigInt(ctr));
       this.sendFrame(concat([head, ct]));
-    });
+    }).catch(e => this.fail(e));
     return this.out;
   }
 
@@ -144,15 +153,22 @@ export class Session {
 
   /** A sealed frame from the PC; anything that does not open ends the session. */
   receive(frame) {
+    if (this.dead) return this.in;
+    let opening;
+    if (frame[0] !== KIND.SEALED || frame.length < 25) opening = Promise.reject(new Error('bad frame'));
+    else {
+      const ctr = Number(new DataView(frame.buffer, frame.byteOffset + 1, 8).getBigUint64(0));
+      if (ctr !== this.recvCtr) opening = Promise.reject(new Error('out of order'));
+      else {
+        this.recvCtr++;
+        opening = subtle.decrypt({ name: 'AES-GCM', iv: nonce(DIR_PC_TO_PHONE, ctr) }, this.keys.recv, frame.subarray(9));
+      }
+    }
+    opening.catch(() => {}); // handled in order below
     this.in = this.in.then(async () => {
       if (this.dead) return;
       try {
-        if (frame[0] !== KIND.SEALED || frame.length < 25) throw new Error('bad frame');
-        const ctr = Number(new DataView(frame.buffer, frame.byteOffset + 1, 8).getBigUint64(0));
-        if (ctr !== this.recvCtr) throw new Error('out of order');
-        const plain = new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv: nonce(DIR_PC_TO_PHONE, ctr) }, this.keys.recv, frame.subarray(9)));
-        this.recvCtr++;
-        this.dispatch(plain);
+        this.dispatch(new Uint8Array(await opening));
       } catch (e) {
         this.fail(e);
       }
@@ -178,7 +194,8 @@ export class Session {
 
   /**
    * Starts a request. `handlers` get onHead(status, headers), onData(Uint8Array), onEnd(),
-   * onError(err). Call `ack(n)` after consuming n bytes (flow control) and `cancel()` to stop.
+   * onError(err). Call `ack(n)` after consuming n bytes (flow control; sent in batches of
+   * ACK_EVERY) and `cancel()` to stop.
    */
   request({ method, path, headers, body }, handlers) {
     const s = this.nextStream++;
@@ -186,8 +203,13 @@ export class Session {
     const req = { t: 'req', s, m: method, p: path, h: headers || {} };
     if (body && body.byteLength) req.b = b64std(new Uint8Array(body));
     this.json(req);
+    let owed = 0;
     return {
-      ack: n => this.json({ t: 'ack', s, n }),
+      ack: n => {
+        owed += n;
+        // A finished stream needs no more credit.
+        if (owed >= ACK_EVERY && this.streams.has(s)) { this.json({ t: 'ack', s, n: owed }); owed = 0; }
+      },
       cancel: () => { if (this.streams.delete(s)) this.json({ t: 'cancel', s }); },
     };
   }

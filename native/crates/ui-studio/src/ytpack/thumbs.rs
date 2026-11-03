@@ -203,6 +203,7 @@ Reply with JSON only: {{\"analysis\":\"2-3 sentences: what this manga's thumbnai
     if !b.hook.trim().is_empty() {
         u.push_str(&format!("\nThe planned thumbnail text: \"{}\"\n", b.hook.trim()));
     }
+    u.push_str(&super::logic::brain_notes(&[mv_core::brain::Area::Thumbnails, mv_core::brain::Area::Niche]));
     (system, u)
 }
 

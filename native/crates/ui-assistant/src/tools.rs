@@ -218,6 +218,9 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::YouTube => "youtube",
         Route::Suggestions => "suggestions",
         Route::Thumbnails => "thumbnails",
+        Route::YouTubeVideos => "youtube-videos",
+        Route::Automation => "automation",
+        Route::Creative => "creative",
         Route::Settings { .. } => "settings",
         Route::Welcome => "welcome",
         Route::Back => "back",
@@ -234,7 +237,7 @@ pub fn section_name(route: &Route) -> &'static str {
 
 // ── Tool table ───────────────────────────────────────────────────────────────────
 
-pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "youtube", "mobile", "settings"];
+pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "youtube", "suggestions", "thumbnails", "youtube-videos", "automation", "creative", "mobile", "settings"];
 pub const SETTINGS_TABS: &[&str] = &["providers", "models", "profile", "playback", "sources", "extensions", "addons", "streaming", "storage", "themes", "mode", "about"];
 
 fn obj(properties: Value, required: &[&str]) -> Value {
@@ -555,9 +558,9 @@ pub fn group_of(name: &str) -> Group {
 pub fn page_groups(route: Option<&Route>) -> &'static [Group] {
     match route {
         Some(Route::Studio) => &[Group::Studio, Group::Video],
-        Some(Route::YouTube) => &[Group::Youtube, Group::Studio],
+        Some(Route::YouTube | Route::Automation) => &[Group::Youtube, Group::Studio],
         Some(Route::Suggestions) => &[Group::Studio, Group::Manga],
-        Some(Route::Thumbnails) => &[Group::Studio],
+        Some(Route::Thumbnails | Route::YouTubeVideos) => &[Group::Studio],
         Some(Route::Settings { .. } | Route::Welcome | Route::Mobile) => &[],
         Some(r) if section_name(r) != "manga" => &[Group::Media],
         _ => &[Group::Manga],
@@ -949,6 +952,9 @@ pub fn route_for_page(page: &str) -> Option<Route> {
         "youtube" => Route::YouTube,
         "suggestions" => Route::Suggestions,
         "thumbnails" => Route::Thumbnails,
+        "youtube-videos" => Route::YouTubeVideos,
+        "automation" => Route::Automation,
+        "creative" => Route::Creative,
         "settings" => Route::Settings { tab: None },
         _ => return None,
     })

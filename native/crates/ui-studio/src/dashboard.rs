@@ -193,8 +193,11 @@ impl StudioPage {
                 match open {
                     Some(g) => self.picker(&g, cx),
                     None => {
-                        let groups = groups.clone();
-                        self.manga_grid(&groups, cx)
+                        // Borrowed out and put back, not cloned: this runs every frame.
+                        let Load::Ready(groups) = std::mem::replace(&mut self.library, Load::Loading) else { unreachable!() };
+                        let grid = self.manga_grid(&groups, cx);
+                        self.library = Load::Ready(groups);
+                        grid
                     }
                 }
             }

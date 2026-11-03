@@ -42,6 +42,12 @@ impl Account {
     pub fn connected(&self) -> bool {
         self.tokens.as_ref().is_some_and(|t| !t.refresh_token.is_empty())
     }
+
+    /// The sign-in allows replying to comments (channels connected before replies existed must
+    /// connect again once).
+    pub fn can_write_comments(&self) -> bool {
+        self.tokens.as_ref().is_some_and(|t| !crate::auth::missing_scopes(&t.scope).contains(&crate::auth::FORCE_SSL))
+    }
 }
 
 /// `youtube/settings.json`: how the scheduler plans and what uploads default to.
@@ -146,6 +152,11 @@ pub struct UploadItem {
     pub rescheduled_from: Option<i64>,
     /// Resumable session URL of an upload that stopped half-way.
     pub resume_url: Option<String>,
+    /// Goes public at `publish_at` whatever the default visibility is (the automation's uploads):
+    /// uploaded private with `status.publishAt`, so YouTube publishes it with the PC off.
+    pub publish_public: bool,
+    /// Custom thumbnail set right after the upload.
+    pub thumbnail: Option<PathBuf>,
 }
 
 impl UploadItem {

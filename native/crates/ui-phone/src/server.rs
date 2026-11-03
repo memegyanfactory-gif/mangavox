@@ -187,16 +187,44 @@ fn asset(body: impl Into<axum::body::Body>, mime: &'static str, no_cache: bool) 
     r
 }
 
+fn short_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
 /// `/sw.js` with its cache version: a hash of the shell it caches, so every change to the app
 /// installs a new worker that drops the old cache.
 fn service_worker() -> &'static str {
     static SW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SW.get_or_init(|| {
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest([INDEX_HTML, APP_JS, APP_CSS, MANIFEST, SW_JS].concat().as_bytes());
-        let v: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
-        SW_JS.replace("__MV_VERSION__", &v)
-    })
+    SW.get_or_init(|| SW_JS.replace("__MV_VERSION__", &short_hash(&[INDEX_HTML, APP_JS, APP_CSS, MANIFEST, SW_JS].concat())))
+}
+
+/// The page, naming the script and styles with a hash of their contents (`/app.js?v=<hash>`):
+/// those addresses never change content, so phones keep them until the next MangaVox update
+/// (over the cloud, the connector caches them: CLOUD.md, "On the phone").
+fn index_html() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| INDEX_HTML.replace("\"/app.js\"", &format!("\"/app.js?v={}\"", js_hash())).replace("\"/app.css\"", &format!("\"/app.css?v={}\"", css_hash())))
+}
+
+fn js_hash() -> &'static str {
+    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    H.get_or_init(|| short_hash(APP_JS))
+}
+
+fn css_hash() -> &'static str {
+    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    H.get_or_init(|| short_hash(APP_CSS))
+}
+
+/// The script or styles: kept for a year when asked for by their current hash.
+fn versioned(body: &'static str, hash: &str, mime: &'static str, uri: &axum::http::Uri) -> Response {
+    let current = uri.query().and_then(|q| q.strip_prefix("v=")).is_some_and(|v| v == hash);
+    let mut r = asset(body, mime, !current);
+    if current {
+        r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
+    }
+    r
 }
 
 /// `/locked`: the locked page, or the app for a phone that is signed in after all (a tab left on
@@ -226,12 +254,12 @@ async fn not_found(req: Request) -> Response {
 /// Every route: the web app, then each module's `/api` routes, behind the guard.
 pub(crate) fn router() -> Router {
     Router::new()
-        .route("/", get(|| async { asset(INDEX_HTML, "text/html; charset=utf-8", true) }))
-        .route("/index.html", get(|| async { asset(INDEX_HTML, "text/html; charset=utf-8", true) }))
+        .route("/", get(|| async { asset(index_html(), "text/html; charset=utf-8", true) }))
+        .route("/index.html", get(|| async { asset(index_html(), "text/html; charset=utf-8", true) }))
         .route("/locked", get(locked_route))
         .route("/locked.js", get(|| async { asset(LOCKED_JS, "text/javascript; charset=utf-8", true) }))
-        .route("/app.js", get(|| async { asset(APP_JS, "text/javascript; charset=utf-8", true) }))
-        .route("/app.css", get(|| async { asset(APP_CSS, "text/css; charset=utf-8", true) }))
+        .route("/app.js", get(|uri: axum::http::Uri| async move { versioned(APP_JS, js_hash(), "text/javascript; charset=utf-8", &uri) }))
+        .route("/app.css", get(|uri: axum::http::Uri| async move { versioned(APP_CSS, css_hash(), "text/css; charset=utf-8", &uri) }))
         .route("/manifest.webmanifest", get(|| async { asset(MANIFEST, "application/manifest+json", true) }))
         // Behind the guard like the app itself: only a paired phone installs the worker.
         .route("/sw.js", get(|| async { asset(service_worker(), "text/javascript; charset=utf-8", true) }))
@@ -408,7 +436,15 @@ mod tests {
         let me = body(r).await;
         assert!(me.contains("iPhone · Safari"), "{me}");
         let r = send(req("GET", "/", peer, host).header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;
-        assert_eq!(body(r).await, INDEX_HTML);
+        let page = body(r).await;
+        assert_eq!(page, index_html());
+        // The script and styles go by their content hash, and only that address is kept for long.
+        let js = page.split("src=\"").nth(1).and_then(|s| s.split('"').next()).unwrap().to_string();
+        assert!(js.starts_with("/app.js?v=") && page.contains("href=\"/app.css?v="), "{page}");
+        let r = send(req("GET", &js, peer, host).header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;
+        assert!(r.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("immutable"));
+        let r = send(req("GET", "/app.js?v=old", peer, host).header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache");
 
         // POST without the CSRF header, or from another origin: 403.
         let r = send(req("POST", "/api/logout", peer, host).header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;

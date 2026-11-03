@@ -11,7 +11,11 @@
 pub mod ai;
 pub mod api;
 pub mod auth;
+pub mod automation;
+pub mod comments;
+pub mod competitors;
 pub mod planner;
+pub mod quota;
 pub mod seo;
 pub mod store;
 pub mod timing;

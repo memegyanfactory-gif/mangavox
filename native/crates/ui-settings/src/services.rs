@@ -1,6 +1,7 @@
 //! Settings › AI services: keys for image / video and voice services that are not chat models
 //! (those live in AI providers). Each key is saved to config.json, checked with a free call to
 //! its service, and can be removed. Keys are never shown again after saving, only masked.
+//! Image services Studio's Thumbnails generator runs say so; the others say "coming soon".
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use gpui_kit::*;
 use mv_ai::{KeySource, ServiceDef, ServiceKind, Services, TestResult, SERVICES};
 use mv_ui::toast::{self, Toast};
 use mv_ui::settings::SETTINGS_GROUP_GAP;
-use mv_ui::{badge, btn, external_link, ph, settings_group, settings_note, settings_row, size, AlertKind, ButtonKind, SettingsGroup, SettingsRow, Tokens, Tone};
+use mv_ui::{badge, btn, external_link, icon_tag, ph, settings_group, settings_note, settings_row, size, AlertKind, ButtonKind, SettingsGroup, SettingsRow, Tokens, Tone};
 
 #[derive(Clone)]
 enum Check {
@@ -70,6 +71,7 @@ impl ServicesPanel {
         }
         input.update(cx, |s, cx| s.set_value("", window, cx));
         toast::show(cx, Toast::success("Key saved"));
+        mv_ui::settings::notify_service_keys(cx);
         self.test(id, cx);
     }
 
@@ -94,6 +96,7 @@ impl ServicesPanel {
         }
         self.checks.remove(id);
         toast::show(cx, Toast::info("Key removed"));
+        mv_ui::settings::notify_service_keys(cx);
         cx.notify();
     }
 
@@ -117,7 +120,10 @@ impl ServicesPanel {
             .items_center()
             .gap(px(8.))
             .when_some(key.as_deref().map(masked), |d, m| d.child(div().font_family(mv_ui::MONO_FONT).text_size(px(size::SM)).text_color(Tokens::text_2()).child(m)))
-            .child(badge(text, tone));
+            .child(badge(text, tone))
+            .when(def.kind == ServiceKind::Image, |d| {
+                d.child(if def.studio_images { icon_tag(ph::IMAGES, "Thumbnails", Tone::Success) } else { icon_tag(ph::HOURGLASS, "Coming soon", Tone::Neutral) })
+            });
         let key_line = div()
             .flex()
             .flex_wrap()
@@ -154,7 +160,15 @@ impl ServicesPanel {
             ),
             _ => None,
         };
-        settings_row(def.label, hint, status).below(key_line).when_some(result, |r, el| r.below(el))
+        // Said plainly, so a saved key is never mistaken for a working generator.
+        let soon = (def.kind == ServiceKind::Image && !def.studio_images).then(|| {
+            div()
+                .text_size(px(size::SM))
+                .line_height(px(18.))
+                .text_color(Tokens::text_3())
+                .child(format!("Studio can't make images with {} yet. The key is kept and tested, ready for when it can.", def.label))
+        });
+        settings_row(def.label, hint, status).below(key_line).when_some(result, |r, el| r.below(el)).when_some(soon, |r, el| r.below(el))
     }
 
     fn section(&self, kind: ServiceKind, title: &str, desc: &str, cx: &mut Context<Self>) -> SettingsGroup {
@@ -177,9 +191,9 @@ impl Render for ServicesPanel {
             .min_w_0()
             .child(settings_note(
                 AlertKind::Info,
-                "Each key stays in this PC's config file and is only sent to its own service. Chat models (OpenAI, Together, Kimi…) are under AI providers; the Thumbnails generator uses Magnific (Settings › Magnific).",
+                "Each key stays in this PC's config file and is only sent to its own service. Chat models (OpenAI, Together, Kimi…) are under AI providers; keys for OpenAI Images and Google Imagen go here. Studio's Thumbnails generator makes images with Magnific (Settings › Magnific) and with every service here tagged Thumbnails; each bills its own account.",
             ))
-            .child(self.section(ServiceKind::Image, "Images and video", "Text-to-image and video generation.", cx))
+            .child(self.section(ServiceKind::Image, "Images and video", "Text-to-image and video generation. Services tagged Thumbnails show up in the Thumbnails generator's model list once their key is saved.", cx))
             .child(self.section(ServiceKind::Voice, "Voices", "Cloud text-to-speech.", cx))
     }
 }

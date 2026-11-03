@@ -27,14 +27,19 @@ impl ThumbnailsPage {
         if !cx.has_global::<MagnificChanged>() {
             cx.set_global(MagnificChanged(0));
         }
-        let sub = cx.observe_global::<MagnificChanged>(|this, cx| {
+        if !cx.has_global::<mv_ui::settings::ServiceKeysChanged>() {
+            cx.set_global(mv_ui::settings::ServiceKeysChanged(0));
+        }
+        let refresh = |this: &mut Self, cx: &mut Context<Self>| {
             for g in this.gens.values() {
                 g.update(cx, |g, cx| {
                     g.refresh_settings();
                     cx.notify();
                 });
             }
-        });
+        };
+        // Magnific's settings, or another image service's key in Settings › AI services.
+        let subs = vec![cx.observe_global::<MagnificChanged>(refresh), cx.observe_global::<mv_ui::settings::ServiceKeysChanged>(refresh)];
         cx.spawn(async move |this, cx| {
             let res = mv_ui::bg::blocking(crate::data::load).await.and_then(|r| r);
             let _ = this.update(cx, |this, cx| {
@@ -50,7 +55,7 @@ impl ThumbnailsPage {
             });
         })
         .detach();
-        ThumbnailsPage { library: Load::Loading, selected: None, gens: HashMap::new(), scroll: ScrollHandle::new(), _subs: vec![sub] }
+        ThumbnailsPage { library: Load::Loading, selected: None, gens: HashMap::new(), scroll: ScrollHandle::new(), _subs: subs }
     }
 
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
@@ -67,6 +72,21 @@ impl ThumbnailsPage {
         }
         let e = cx.new(|_| ThumbGen::new(g));
         self.gens.insert(g.id.clone(), e.clone());
+        // The YouTube references are searched again on every visit (the saved ones show meanwhile).
+        let others: Vec<String> = match &self.library {
+            Load::Ready(gs) => gs.iter().filter(|o| o.id != g.id).map(|o| o.title.clone()).collect(),
+            _ => vec![],
+        };
+        let (id, title, weak) = (g.id.clone(), g.title.clone(), e.downgrade());
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(s)) = mv_ui::bg::run(super::research_again(id, title, others)).await {
+                let _ = weak.update(cx, |t, cx| {
+                    t.set_research(s);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         e
     }
 

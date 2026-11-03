@@ -22,8 +22,6 @@ use crate::page::{card, card_title, column};
 
 /// The channel the meter scores (`@handle`, link or channel id).
 const CHANNEL_KEY: &str = "studio.suggestChannel";
-/// A crawl older than this is redone when the page opens.
-const STALE_SECS: i64 = 6 * 3600;
 /// Best picks looked up in the sources straight away (the rest on request).
 const AUTO_MATCH: usize = 10;
 /// When the niche median is not known yet (no crawl), what a typical recap gets.
@@ -31,6 +29,22 @@ const DEFAULT_NICHE_VIEWS: u64 = 100_000;
 
 fn cache_file() -> PathBuf {
     mv_core::paths::cache().join("studio-suggestions.json")
+}
+
+/// Teaches the Brain what the crawl saw: what does well in the niche, and the trending manga.
+fn learn(t: &Trends) {
+    use mv_core::brain::{observe, Kind, SeenVideo};
+    let seen: Vec<SeenVideo> = t.videos.iter().map(|v| SeenVideo { title: &v.title, channel: &v.channel, views: v.views, age_days: Some((v.age_hours / 24.) as u32), length_secs: v.length_secs }).collect();
+    mv_core::brain::learn_from_videos(&seen, "Suggestions crawl");
+    for m in t.manga.iter().take(15) {
+        observe(Kind::Trend, &m.name, &format!("{} channels recapping it, opportunity {}/100", m.channels, m.score), m.score as f32 / 50. - 1., "Suggestions crawl");
+    }
+}
+
+/// Manga the user picked before rise a little, ones they passed over sink (Settings › Brain).
+fn by_taste(t: &mut Trends) {
+    let key = |m: &TrendManga| m.score as f32 + 15. * mv_core::brain::taste(&m.name);
+    t.manga.sort_by(|a, b| key(b).total_cmp(&key(a)));
 }
 
 fn load_cache() -> Option<Trends> {
@@ -170,17 +184,13 @@ impl SuggestionsPage {
             scroll: ScrollHandle::new(),
             _sub: sub,
         };
-        match load_cache() {
-            Some(t) => {
-                let stale = now() - t.fetched_at > STALE_SECS;
-                p.trends = Some(Ok(t));
-                p.match_top(cx);
-                if stale {
-                    p.crawl(cx);
-                }
-            }
-            None => p.crawl(cx),
+        // The saved crawl shows at once; YouTube is searched again on every visit.
+        if let Some(mut t) = load_cache() {
+            by_taste(&mut t);
+            p.trends = Some(Ok(t));
+            p.match_top(cx);
         }
+        p.crawl(cx);
         if !start.is_empty() {
             p.analyze(cx);
         }
@@ -207,8 +217,10 @@ impl SuggestionsPage {
             let _ = this.update(cx, |this, cx| {
                 this.crawling = false;
                 match res {
-                    Ok(t) => {
+                    Ok(mut t) => {
                         save_cache(&t);
+                        learn(&t);
+                        by_taste(&mut t);
                         this.trends = Some(Ok(t));
                         this.match_top(cx);
                     }
@@ -288,6 +300,7 @@ impl SuggestionsPage {
             return;
         }
         self.opening = Some(hit.result.source_id.clone());
+        mv_core::brain::observe(mv_core::brain::Kind::Pick, &hit.result.title, "Opened from Suggestions", 1., "Suggestions");
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let title = hit.result.title.clone();
@@ -361,7 +374,7 @@ impl SuggestionsPage {
                     .flex()
                     .items_center()
                     .gap(px(space::LG))
-                    .child(crate::page::avatar(&page.avatar, 56.))
+                    .child(crate::yt::avatar(&page.avatar, 56.))
                     .child(
                         div()
                             .flex()

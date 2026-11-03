@@ -51,7 +51,7 @@ pub struct Candidate {
 }
 
 /// A ranked suggestion.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Suggestion {
     /// Source the title opens from.
     pub source: String,
@@ -418,8 +418,33 @@ pub async fn for_title(t: TitleCtx) -> Result<Vec<Suggestion>> {
     cands.retain(|c| adult || !c.item.adult);
     let mut out = rank(cands, &profile, &t.title, MAX_FOR_TITLE);
     out.retain(|s| !(s.source == t.source && s.item.source_id == t.source_id));
+    // Nothing is kept from a private session.
+    if !mv_core::privacy::active() {
+        mv_core::cache::DataCache::shared().put(&title_key(&t.source, &t.source_id), &out);
+    }
     Ok(out)
 }
+
+fn title_key(source: &str, id: &str) -> String {
+    format!("manga.recs\u{1}{source}\u{1}{id}")
+}
+
+/// Suggestions turned down since they were kept are left out of a kept list.
+fn drop_rejected(mut list: Vec<Suggestion>) -> Vec<Suggestion> {
+    let f = taste::file();
+    list.retain(|s| f.verdict(&s.item.title) != Some(taste::FeedbackKind::NotInterested));
+    list
+}
+
+/// [`for_title`]'s last answer for a title (kept on disk) and its age, shown while a stale one
+/// is looked up again. Blocking.
+pub fn for_title_kept(source: &str, id: &str) -> Option<(Vec<Suggestion>, Duration)> {
+    let (list, age) = mv_core::cache::DataCache::shared().get::<Vec<Suggestion>>(&title_key(source, id))?;
+    Some((drop_rejected(list), age))
+}
+
+/// Kept suggestions are looked up again after this long.
+pub const KEPT_TTL: Duration = CACHE_TTL;
 
 /// "For you" and the profile it came from.
 #[derive(Clone, Debug, Default)]
@@ -470,16 +495,78 @@ pub async fn for_you() -> Result<ForYou> {
     cands.extend(genres);
     cands.retain(|c| !c.item.adult);
     let items = rank(cands, &profile, "", MAX_FOR_YOU);
+    write_kept(next_write(), unix_now(), items.clone());
     let fy = ForYou { items, profile };
     *FOR_YOU.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), version, fy.clone()));
     Ok(fy)
 }
 
+const FOR_YOU_KEY: &str = "manga.forYou";
+
+/// "For you" as kept on disk: when it was built (unix seconds) and its titles.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeptForYou {
+    at: u64,
+    items: Vec<Suggestion>,
+}
+
+/// One writer at a time for the kept "For you", and the newest write done (an older one that
+/// comes late is dropped).
+static KEPT_WRITE: Mutex<u64> = Mutex::new(0);
+static KEPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_write() -> u64 {
+    KEPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Write the kept "For you" built at `at` (write number `seq`). Nothing is kept from a private
+/// session. Blocking.
+fn write_kept(seq: u64, at: u64, items: Vec<Suggestion>) {
+    if mv_core::privacy::active() {
+        return;
+    }
+    let mut last = KEPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    if seq < *last {
+        return;
+    }
+    *last = seq;
+    mv_core::cache::DataCache::shared().put(FOR_YOU_KEY, &KeptForYou { at, items });
+}
+
+/// The "For you" kept on disk by the last run, with today's profile, and whether it is still
+/// fresh (it is then also kept in memory, like a new one). Shown at once on the first open
+/// while a stale one is rebuilt. Blocking.
+pub fn for_you_kept() -> Option<(ForYou, bool)> {
+    let (kept, _) = mv_core::cache::DataCache::shared().get::<KeptForYou>(FOR_YOU_KEY)?;
+    let age = Duration::from_secs(unix_now().saturating_sub(kept.at));
+    let version = taste::version();
+    let profile = load_profile().ok()?;
+    let items = drop_rejected(kept.items).into_iter().filter(|s| !profile.seen.contains(&norm(&s.item.title))).collect();
+    let fy = ForYou { items, profile };
+    let fresh = age < FOR_YOU_TTL && !fy.items.is_empty();
+    if fresh {
+        let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        FOR_YOU.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert((at, version, fy.clone()));
+    }
+    Some((fy, fresh))
+}
+
+/// Keep the edited "For you" on disk too, with the age it had (off the UI thread).
+fn save_kept(built: Instant, items: Vec<Suggestion>) {
+    let (seq, at) = (next_write(), unix_now().saturating_sub(built.elapsed().as_secs()));
+    let _ = mv_ui::bg::blocking(move || write_kept(seq, at, items));
+}
+
 /// Drop one title from the kept "For you" (after "Not interested") without rebuilding it.
 pub fn forget_cached(source: &str, source_id: &str) {
-    if let Some((_, v, fy)) = FOR_YOU.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some((at, v, fy)) = FOR_YOU.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         fy.items.retain(|s| !(s.source == source && s.item.source_id == source_id));
         *v = taste::version();
+        save_kept(*at, fy.items.clone());
     }
 }
 
@@ -492,7 +579,8 @@ pub fn keep_cached() {
 
 /// Replace the kept "For you" (an undone "Not interested"), keeping its age.
 pub fn put_cached(fy: ForYou) {
-    if let Some((_, v, kept)) = FOR_YOU.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some((at, v, kept)) = FOR_YOU.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        save_kept(*at, fy.items.clone());
         *kept = fy;
         *v = taste::version();
     }

@@ -234,7 +234,18 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
 
 struct Inner {
     queue: JobQueue,
+    /// Video renders, in a queue of their own: a render (mostly CPU work, minutes long) runs
+    /// beside narration (the GPU's voice model) instead of holding up the next chapter's voice.
+    render: JobQueue,
     jobs: Mutex<Vec<JobInfo>>,
+}
+
+/// Render jobs' ids are their queue's own ids plus this, so they never meet the other queue's.
+const RENDER_IDS: u64 = 1 << 40;
+
+/// A job that only renders (its narration is made): it goes to [`Inner::render`].
+fn renders_only(stages: &[String]) -> bool {
+    stages.iter().any(|s| s == "video") && !stages.iter().any(|s| s == "tts" || s == "ocr")
 }
 
 static SERVICE: Mutex<Option<Arc<Inner>>> = Mutex::new(None);
@@ -269,23 +280,25 @@ fn ensure(python: &PythonInterpreter, layout: &PythonLayout) -> Arc<Inner> {
         }
     }
     let rt = mv_ui::bg::runtime();
-    let queue = {
+    let (queue, render) = {
         let _guard = rt.enter();
-        JobQueue::new(python.clone(), layout.clone())
+        (JobQueue::new(python.clone(), layout.clone()), JobQueue::new(python.clone(), layout.clone()))
     };
     let history = slot.as_ref().map(|i| lock_jobs(i).clone()).unwrap_or_default();
-    let inner = Arc::new(Inner { queue, jobs: Mutex::new(history) });
-    rt.spawn(pump(inner.clone()));
+    let inner = Arc::new(Inner { queue, render, jobs: Mutex::new(history) });
+    rt.spawn(pump(inner.clone(), false));
+    rt.spawn(pump(inner.clone(), true));
     *slot = Some(inner.clone());
     inner
 }
 
-async fn pump(inner: Arc<Inner>) {
-    let mut rx = inner.queue.subscribe();
+/// Follows one of the two queues (`render`: [`Inner::render`]).
+async fn pump(inner: Arc<Inner>, render: bool) {
+    let (mut rx, offset) = if render { (inner.render.subscribe(), RENDER_IDS) } else { (inner.queue.subscribe(), 0) };
     loop {
         match rx.recv().await {
             Ok(ev) => {
-                let stage_done = apply(&inner, ev);
+                let stage_done = apply(&inner, ev, offset);
                 if let Some((chapter, stage, dir)) = stage_done {
                     let _ = tokio::task::spawn_blocking(move || {
                         if stage == "video" {
@@ -303,13 +316,14 @@ async fn pump(inner: Arc<Inner>) {
     }
 }
 
-/// Folds one queue event into the job list. Returns `(chapter, stage, output folder)` when a
-/// stage completed.
-fn apply(inner: &Inner, ev: JobEvent) -> Option<(String, String, PathBuf)> {
+/// Folds one queue event into the job list (its queue's ids start at `offset`). Returns
+/// `(chapter, stage, output folder)` when a stage completed.
+fn apply(inner: &Inner, ev: JobEvent, offset: u64) -> Option<(String, String, PathBuf)> {
     let mut jobs = lock_jobs(inner);
-    let id = match &ev {
-        JobEvent::Started { id, .. } | JobEvent::Message { id, .. } | JobEvent::Log { id, .. } | JobEvent::Finished { id, .. } => *id,
-    };
+    let id = offset
+        + match &ev {
+            JobEvent::Started { id, .. } | JobEvent::Message { id, .. } | JobEvent::Log { id, .. } | JobEvent::Finished { id, .. } => *id,
+        };
     let job = jobs.iter_mut().find(|j| j.id == id)?;
     let dir = job.output_dir.clone();
     apply_to(job, ev).map(|(c, s)| (c, s, dir))
@@ -419,7 +433,11 @@ pub fn enqueue_with(env: &Env, req: &NarrationRequest, chapters: &[ChapterItem],
         }
         // Hold the lock across enqueue so the pump cannot see events before the record exists.
         let mut jobs = lock_jobs(&inner);
-        let id = inner.queue.enqueue(ch.id.clone(), JobPayload::Pipeline(job));
+        let id = if renders_only(&stages) {
+            RENDER_IDS + inner.render.enqueue(ch.id.clone(), JobPayload::Pipeline(job))
+        } else {
+            inner.queue.enqueue(ch.id.clone(), JobPayload::Pipeline(job))
+        };
         jobs.push(JobInfo {
             id,
             chapter_id: ch.id.clone(),
@@ -448,7 +466,7 @@ pub fn job(id: u64) -> Option<JobInfo> {
 }
 
 pub fn cancel(id: u64) -> bool {
-    current().map(|i| i.queue.cancel(id)).unwrap_or(false)
+    current().map(|i| if id >= RENDER_IDS { i.render.cancel(id - RENDER_IDS) } else { i.queue.cancel(id) }).unwrap_or(false)
 }
 
 /// Drops finished jobs from the list.
@@ -471,6 +489,17 @@ mod tests {
     use super::*;
     use mv_studio::{ProviderConfig, WorkerMessage};
     use std::collections::HashMap;
+
+    #[test]
+    fn renders_go_to_their_own_queue() {
+        let st = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(renders_only(&st(&["sync_map", "video"])));
+        assert!(renders_only(&st(&["video"])));
+        // Anything that voices (or reads) waits its turn in the main queue.
+        assert!(!renders_only(&st(&["tts", "sync_map", "video"])));
+        assert!(!renders_only(&st(&["ocr", "tts", "sync_map", "video"])));
+        assert!(!renders_only(&st(&["tts", "sync_map"])));
+    }
 
     fn env(ocr: OcrProvider) -> Env {
         Env {

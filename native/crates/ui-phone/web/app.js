@@ -99,6 +99,7 @@ const ICONS = {
   pulse: 'M3 12h4l3-8 4 16 3-8h4',
   bell: 'M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0',
   clock: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 7v5l3 2',
+  eyeoff: 'M3 3l18 18M10.6 6.1A9.8 9.8 0 0 1 12 6c5.5 0 9 6 9 6a16.6 16.6 0 0 1-2.9 3.6M6.6 6.6C4.3 8.2 3 12 3 12s3.5 6 9 6a9.3 9.3 0 0 0 4.3-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2',
 };
 const SVGNS = 'http://www.w3.org/2000/svg';
 function icon(name, cls) {
@@ -551,6 +552,67 @@ const Act = (() => {
   };
 })();
 
+/* Private mode is the PC's (one switch for the PC and every phone): while it is on, nothing read
+   or watched is recorded there, and this phone keeps no reading places or last page of its own.
+   Offered where the PC offers it: Manga (Library, Browse, reader), Movies and Anime. */
+const PRIVATE_ROUTES = new Set(['library', 'browse', 'manga', 'reader', 'movies', 'anime', 'watch']);
+const Priv = (() => {
+  // `seq` counts toggles: a state read that started before one is stale. Activity polls carry no
+  // start time, so they are trusted only once a toggle's reply is a few seconds old.
+  let on = false, busy = false, seq = 0, quietUntil = 0;
+  const btns = new Set();
+  const label = () => on ? 'Private mode is on: nothing you read or watch is recorded. Tap to turn it off' : 'Private mode: nothing you read or watch is recorded';
+  function paintBtn(b) {
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+    b.setAttribute('aria-label', label());
+    b.title = label();
+  }
+  function paint() {
+    document.body.classList.toggle('private', on);
+    for (const b of btns) {
+      // A page's own button goes with its page (it may not be on the page yet when made).
+      if (b.isConnected) b.dataset.live = '1';
+      else if (b.dataset.live) { btns.delete(b); continue; }
+      paintBtn(b);
+    }
+    const top = document.getElementById('priv');
+    if (top) top.hidden = !PRIVATE_ROUTES.has(document.body.dataset.route);
+  }
+  function set(v) {
+    v = !!v;
+    if (v !== on) { on = v; paint(); }
+  }
+  async function toggle() {
+    if (busy) return;
+    busy = true; seq++;
+    try {
+      const d = await post('/api/privacy', { on: !on });
+      set(d && d.private);
+      quietUntil = Date.now() + 6000;
+      toast(on ? 'Private mode is on. Nothing you read or watch is recorded.' : 'Private mode is off. If the session saved anything, your PC offers to clear it.', 'info', 3600);
+    } catch (e) { if (e.status !== 401) toast(e.message, 'err'); }
+    busy = false;
+  }
+  /** A toggle button for a page's own bar (the reader, the video player). */
+  function button(cls) {
+    const b = h('button', { class: 'icon-btn priv' + (cls ? ' ' + cls : ''), type: 'button', onclick: () => toggle() }, icon('eyeoff'), h('span', null, 'Private'));
+    btns.add(b);
+    paintBtn(b);
+    return b;
+  }
+  function start() {
+    const top = document.getElementById('priv');
+    if (top) { top.append(icon('eyeoff'), h('span', null, 'Private')); top.addEventListener('click', () => toggle()); btns.add(top); }
+    // A failed poll hands back the last good data: not news about private mode.
+    Act.sub((d, e) => { if (d && !e && !busy && Date.now() >= quietUntil) set(d.private); });
+    const s = seq;
+    api('/api/privacy').then(d => { if (s === seq) set(d && d.private); }).catch(() => {});
+    paint();
+  }
+  return { start, paint, button, active: () => on };
+})();
+
 /** Forgetting this phone: drop the cached app shell and the notifications too. */
 async function forgetOffline() {
   try {
@@ -615,13 +677,14 @@ function route() {
   navCount++;
   document.body.dataset.route = match.name;
   document.body.dataset.tab = match.tab;
-  if (match.tab && match.name !== 'reader') { tabLast[match.tab] = raw; LS.set('mv.last', raw); }
+  if (match.tab && match.name !== 'reader') { tabLast[match.tab] = raw; if (!Priv.active()) LS.set('mv.last', raw); }
   for (const a of tabs) {
     const on = a.dataset.tab === match.tab;
     a.classList.toggle('active', on);
     if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   setActions();
+  Priv.paint();
   setBack(null);
   view.replaceChildren();
   scrollTo(0, 0);
@@ -1160,6 +1223,7 @@ async function viewReader(ctx, chId, q) {
     aloudBtn,
     watchBtn,
     ch.manga_id != null && iconBtn('list', 'Chapters', () => chaptersSheet()),
+    Priv.button('icon-only'),
     iconBtn('settings', 'Reading settings', () => settingsSheet()));
   const bot = h('div', { class: 'r-ov r-bot' }, prevBtn, slider, pgLbl, autoBtn, nextBtn);
   const end = h('div', { class: 'r-end' },
@@ -1586,7 +1650,8 @@ async function viewReader(ctx, chId, q) {
     }
     function save(force) {
       const now = Date.now();
-      if (!force && now - lastSave < 5000) return;
+      // Private mode: no listening place is kept for the chapter either.
+      if (Priv.active() || (!force && now - lastSave < 5000)) return;
       lastSave = now;
       const ms = pos();
       if (done || ms < 3000 || ms > total - 3000) LS.del(key); else LS.set(key, Math.floor(ms));
@@ -2537,6 +2602,170 @@ function openAnime(it) {
 }
 
 /* ======================================================================
+   Built-in HLS player (Media Source Extensions)
+   ====================================================================== */
+// Sources a phone can't play as they are, the PC serves as on-demand fMP4 HLS: one init segment
+// (EXT-X-MAP) plus ~4 s .m4s segments with absolute timestamps, so currentTime is media time.
+// Through the cloud every request must pass the connector's service worker, which the browser's
+// own HLS player bypasses, so the app fetches the segments itself and feeds (Managed)MediaSource.
+// Written here on purpose: the app stays dependency-free.
+const HLS_TYPES = ['video/mp4; codecs="avc1.640028, mp4a.40.2"', 'video/mp4; codecs="avc1.4d401f, mp4a.40.2"'];
+const mseClass = () => window.ManagedMediaSource || window.MediaSource || null;
+function mseType() {
+  const M = mseClass();
+  return (M && HLS_TYPES.find(t => { try { return M.isTypeSupported(t); } catch { return false; } })) || '';
+}
+function parseM3u8(text, base) {
+  const out = { init: '', segs: [], dur: 0 };
+  let len = null;
+  for (const raw of String(text).split('\n')) {
+    const l = raw.trim();
+    if (l.startsWith('#EXT-X-MAP:')) { const m = l.match(/URI="([^"]+)"/); if (m) out.init = new URL(m[1], base).href; }
+    else if (l.startsWith('#EXTINF:')) len = parseFloat(l.slice(8)) || 0;
+    else if (l && l[0] !== '#' && len != null) { out.segs.push({ url: new URL(l, base).href, t: out.dur, d: len }); out.dur += len; len = null; }
+  }
+  return out;
+}
+/** Plays the HLS playlist `src` in `video` from `from` seconds. onFatal(err) runs once when the
+ *  stream can't go on. Returns null when this browser can't do it (try another engine). */
+function mseHls(video, src, from, onFatal) {
+  const M = mseClass(), type = mseType();
+  if (!M || !type) return null;
+  const AHEAD = 30, BEHIND = 60;
+  const managed = M === window.ManagedMediaSource;
+  const ms = new M(), life = new AbortController();
+  let sb = null, pl = null, next = 0, gen = 0, loading = -1, busy = false, dead = false, ctl = null;
+  // ManagedMediaSource (iPhone) needs AirPlay off to attach, and says when it wants data.
+  let streaming = !managed;
+  if (managed) {
+    video.disableRemotePlayback = true;
+    ms.addEventListener('startstreaming', () => { streaming = true; pump(); });
+    ms.addEventListener('endstreaming', () => { streaming = false; });
+  }
+  const objUrl = URL.createObjectURL(ms);
+  video.src = objUrl;
+
+  const wait = t => new Promise(r => setTimeout(r, t));
+  // One retry for "not ready yet" (503), server errors and dropped connections; 4xx is final.
+  async function get(u, signal, bin) {
+    for (let i = 0; ; i++) {
+      try { const r = await api(u, { raw: true, signal }); return bin ? await r.arrayBuffer() : await r.text(); }
+      catch (e) {
+        if (i || dead || (e && e.name === 'AbortError') || (e && e.status >= 400 && e.status < 500)) throw e;
+        await wait(1000);
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      }
+    }
+  }
+  // One SourceBuffer operation at a time; settles on updateend / error.
+  const op = f => new Promise((ok, no) => {
+    const off = () => { sb.removeEventListener('updateend', end); sb.removeEventListener('error', err); };
+    const end = () => { off(); ok(); };
+    const err = () => { off(); no(new Error('This phone couldn’t decode the video stream.')); };
+    sb.addEventListener('updateend', end); sb.addEventListener('error', err);
+    try { f(); } catch (e) { off(); no(e); }
+  });
+  const ranges = () => {
+    const out = [];
+    try { const b = video.buffered; for (let i = 0; i < b.length; i++) out.push([b.start(i), b.end(i)]); } catch { /* detached */ }
+    return out;
+  };
+  const endAt = t => { for (const [a, z] of ranges()) if (a <= t + 0.3 && z > t) return z; return t; };
+  const has = s => ranges().some(([a, z]) => a <= s.t + 0.3 && z >= s.t + s.d - 0.3);
+  const segAt = t => { const s = pl.segs; let i = 0; while (i + 1 < s.length && s[i + 1].t <= t + 0.05) i++; return i; };
+  async function append(data) {
+    try { await op(() => sb.appendBuffer(data)); }
+    catch (e) {
+      if (!e || e.name !== 'QuotaExceededError') throw e;
+      // Full: drop what is more than 10 s behind and try once more.
+      const t = video.currentTime;
+      if (t > 12) await op(() => sb.remove(0, t - 10));
+      await op(() => sb.appendBuffer(data));
+    }
+  }
+
+  // Keeps ~AHEAD s buffered past the playhead, one segment at a time, in order.
+  async function pump() {
+    if (busy || dead || !sb) return;
+    busy = true;
+    try {
+      while (!dead) {
+        while (next < pl.segs.length && has(pl.segs[next])) next++;
+        if (next >= pl.segs.length) break;
+        const t = video.currentTime, ahead = endAt(t) - t;
+        // Enough buffered: timeupdate (or startstreaming on iPhone) calls back in.
+        if (ahead >= AHEAD || (ahead > 2 && !streaming)) return;
+        const g = gen, i = next;
+        loading = i; ctl = new AbortController();
+        let data;
+        try { data = await get(pl.segs[i].url, ctl.signal, true); }
+        catch (e) { if (e && e.name === 'AbortError') { if (dead) return; continue; } throw e; }
+        finally { loading = -1; }
+        if (dead) return;
+        if (g !== gen) continue; // seeked elsewhere meanwhile
+        // Old data only costs memory (iPhone evicts it on its own, but not soon enough).
+        const r = ranges();
+        if (r.length && r[0][0] < video.currentTime - BEHIND - 10) await op(() => sb.remove(0, video.currentTime - BEHIND));
+        await append(data);
+        if (g === gen) next = i + 1;
+      }
+      // Everything is in: end the stream so the video ends instead of waiting for more.
+      if (!dead && ms.readyState === 'open' && !sb.updating) ms.endOfStream();
+    } catch (e) { fatal(e); }
+    finally { busy = false; }
+  }
+  function onSeeking() {
+    if (!pl || dead) return;
+    const t = video.currentTime;
+    if (endAt(t) <= t + 0.5) {
+      // Not buffered: drop the fetch in flight and start at the segment holding the target.
+      const i = segAt(t);
+      if (i !== loading) { gen++; next = i; if (ctl) ctl.abort(); }
+    }
+    pump();
+  }
+  // Segment starts can sit a hair after the previous end: step over tiny gaps instead of stalling.
+  function onWaiting() {
+    const t = video.currentTime;
+    for (const [a] of ranges()) if (a > t && a - t < 1.5) { video.currentTime = a + 0.05; break; }
+    pump();
+  }
+  const onTime = () => pump();
+  video.addEventListener('seeking', onSeeking);
+  video.addEventListener('waiting', onWaiting);
+  video.addEventListener('timeupdate', onTime);
+
+  ms.addEventListener('sourceopen', async () => {
+    URL.revokeObjectURL(objUrl);
+    try {
+      const base = new URL(src, location.href);
+      pl = parseM3u8(await get(base.href, life.signal, false), base);
+      if (dead) return;
+      if (!pl.init || !pl.segs.length) throw new Error('Your PC sent an empty video playlist.');
+      ms.duration = pl.dur;
+      sb = ms.addSourceBuffer(type);
+      const init = await get(pl.init, life.signal, true);
+      if (dead) return;
+      await append(init);
+      next = segAt(from || 0);
+      pump();
+    } catch (e) { if (!(e && e.name === 'AbortError')) fatal(e); }
+  }, { once: true });
+
+  function destroy() {
+    if (dead) return;
+    dead = true;
+    life.abort(); if (ctl) ctl.abort();
+    video.removeEventListener('seeking', onSeeking);
+    video.removeEventListener('waiting', onWaiting);
+    video.removeEventListener('timeupdate', onTime);
+    if (managed) video.disableRemotePlayback = false;
+  }
+  function fatal(e) { if (dead) return; destroy(); onFatal(e); }
+  return { destroy, fail: fatal };
+}
+
+/* ======================================================================
    Watch on this phone: full-screen player
    ====================================================================== */
 function viewWatch(ctx, q) {
@@ -2570,17 +2799,19 @@ function viewWatch(ctx, q) {
   const pipBtn = iconBtn('pip', 'Picture in picture', () => togglePip());
   const ccBtn = iconBtn('cc', 'Subtitles and speed', () => optionsSheet());
   const nextBtn = h('button', { class: 'wp-pill', type: 'button', hidden: true, onclick: () => goNext() }, icon('next'), 'Next episode');
+  const qBtn = h('button', { class: 'wp-pill wp-q', type: 'button', hidden: true, 'aria-label': 'Video quality', onclick: () => optionsSheet() });
   const ttl = h('div', { class: 'wp-ttl' }, h('b', null, P.title || 'Video'), h('span', null, [epLabel, P.ept].filter(Boolean).join(' · ')));
   const upNext = h('div', { class: 'wp-next', hidden: true });
   const bg = h('div', { class: 'wp-bg', 'aria-hidden': 'true' }, P.bg ? art(P.bg, W.hero, '', null, true) : null);
   const root = h('div', { class: 'wp ui loading', role: 'region', 'aria-label': 'Video player' },
     bg, v, subsEl, gest, fxL, fxR,
     h('div', { class: 'wp-ui' },
-      h('div', { class: 'wp-top' }, iconBtn('back', 'Close player', () => leave()), ttl, ccBtn, pipBtn, !recap && iconBtn('pc', 'Play on PC instead', () => fallbackPc())),
+      // A Studio recap is never recorded, so it has no private toggle (as on the PC).
+      h('div', { class: 'wp-top' }, iconBtn('back', 'Close player', () => leave()), ttl, !recap && Priv.button('icon-only'), ccBtn, pipBtn, !recap && iconBtn('pc', 'Play on PC instead', () => fallbackPc())),
       h('div', { class: 'wp-mid' }, skipBtn(-10, () => skip(-10)), playBig, skipBtn(10, () => skip(10))),
       h('div', { class: 'wp-bot' },
         h('div', { class: 'wp-scrub' }, scrub),
-        h('div', { class: 'wp-row' }, curT, h('span', { class: 'wp-time', 'aria-hidden': 'true' }, '/'), durT, h('span', { class: 'sp' }), nextBtn, fsBtn))),
+        h('div', { class: 'wp-row' }, curT, h('span', { class: 'wp-time', 'aria-hidden': 'true' }, '/'), durT, h('span', { class: 'sp' }), qBtn, nextBtn, fsBtn))),
     loader, upNext, msg);
   view.append(root);
   const pipOk = !!(document.pictureInPictureEnabled || (v.webkitSupportsPresentationMode && typeof v.webkitSetPresentationMode === 'function'));
@@ -2589,7 +2820,11 @@ function viewWatch(ctx, q) {
   let sess = null, stopped = false, offset = 0, startAt = 0, started = false, rate = 1;
   let subList = [], subIdx = -1, cues = null, subSeq = 0;
   let lastRep = 0, statT = null, loadSince = 0, zeroSince = 0, scrubbing = false;
-  const direct = () => !sess || sess.mode === 'direct';
+  // Ways to play this session, best first (pickEngines); with HLS currentTime is media time, so
+  // it seeks and reports like a direct stream.
+  let engs = ['prog'], engI = 0, hlsPlayer = null, hlsQ = '';
+  const eng = () => engs[engI];
+  const direct = () => !sess || sess.mode === 'direct' || eng() !== 'prog';
   const pos = () => (direct() ? v.currentTime : offset + v.currentTime) || 0;
   const dur = () => (sess && +sess.duration) || (direct() && isFinite(v.duration) ? v.duration : 0);
   const leave = () => goBack(fallback);
@@ -2676,6 +2911,7 @@ function viewWatch(ctx, q) {
     if (!ctx.alive) { if (s && s.id) post('/api/watch/' + enc(s.id) + '/stop', {}, { keepalive: true }).catch(() => {}); return; }
     if (!s || !s.id || !s.url) { fail('Couldn’t start playback', 'Your PC sent an unexpected answer.', true, begin); return; }
     sess = s; stopped = false;
+    engs = pickEngines(s); engI = 0; hlsQ = pickQ();
     if (s.title) ttl.firstChild.textContent = P.title || s.title;
     subList = arr(s.subtitles).filter(t => t && t.url);
     const pref = LS.get('mv.sub', null);
@@ -2700,12 +2936,71 @@ function viewWatch(ctx, q) {
     const u = String(sess.url);
     return t > 0 ? u + (u.includes('?') ? '&' : '?') + 'start=' + Math.floor(t) : u;
   }
-  function play(t) {
+  // ----- HLS engines and quality -----
+  // MSE first through the cloud (the service worker sees its requests) or when the browser has no
+  // HLS of its own; native HLS (Safari) otherwise; the progressive stream as the last resort.
+  function pickEngines(s) {
+    if (!s.hls) return ['prog'];
+    const nat = !!v.canPlayType('application/vnd.apple.mpegurl');
+    const mse = !!(mseClass() && mseType());
+    const order = CLOUD || !nat ? ['mse', 'native'] : ['native', 'mse'];
+    return [...order.filter(e => (e === 'mse' ? mse : nat)), 'prog'];
+  }
+  const qualities = () => arr(sess && sess.qualities).map(String);
+  const qPref = () => String(LS.get('mv.watch.q', 'auto'));
+  // Auto: 1080p on the same Wi-Fi, 720p through the relay; never above what the source allows.
+  function pickQ() {
+    const qs = qualities();
+    if (!qs.length) return '';
+    const want = +qPref() || (CLOUD ? 720 : 1080);
+    return qs.find(x => +x <= want) || qs[qs.length - 1];
+  }
+  const hlsUrl = () => (hlsQ && sess.hls_base ? sess.hls_base + hlsQ + '/index.m3u8' : sess.hls);
+  function drawQ() {
+    qBtn.hidden = eng() === 'prog' || !hlsQ;
+    qBtn.textContent = hlsQ ? hlsQ + 'p' : '';
+  }
+  function setQuality(x) {
+    LS.set('mv.watch.q', x);
+    const q2 = pickQ();
+    if (q2 === hlsQ) return;
+    hlsQ = q2;
+    drawQ();
+    if (eng() !== 'prog' && v.getAttribute('src')) play(pos(), v.paused && started);
+  }
+  function stopHls() { if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; } }
+  /** Before playback has started, moves to the next engine; false when there is none left. */
+  function nextEngine(at) {
+    if (started || engI + 1 >= engs.length) return false;
+    engI++;
+    play(at);
+    return true;
+  }
+  const retryAt = at => () => { errCount = 0; if (!started) engI = 0; play(at); };
+  function streamFail(e) {
+    if (!ctx.alive) return;
+    const at = pos();
+    if (nextEngine(at)) return;
+    if (e && e.status === 401) return; // goLocked() took over
+    fail('Couldn’t load the video stream', e && e.offline ? REACH_PC : (e && e.message) || 'Part of the video didn’t arrive from your PC.', true, retryAt(at));
+  }
+
+  function play(t, keepPaused) {
     msg.hidden = true;
     setLoading(true, t > 0 ? 'Resuming…' : 'Starting…');
-    if (direct()) { startAt = t; v.src = sess.url; }
+    stopHls();
+    const e = eng();
+    if (e === 'mse') {
+      startAt = t;
+      hlsPlayer = mseHls(v, hlsUrl(), t, streamFail);
+      if (!hlsPlayer) { streamFail(new Error('This browser can’t play the video stream.')); return; }
+    } else if (e === 'native') { startAt = t; v.src = hlsUrl(); }
+    else if (direct()) { startAt = t; v.src = sess.url; }
     else { offset = Math.floor(t); v.src = srcAt(offset); }
+    drawQ();
     v.playbackRate = rate;
+    // A quality switch while paused stays paused at the same spot.
+    if (keepPaused) { v.addEventListener('loadeddata', () => setLoading(false), { once: true }); return; }
     v.play().catch(e => {
       if (e && e.name === 'NotAllowedError') { setLoading(false); showUi(true); }
     });
@@ -2922,6 +3217,8 @@ function viewWatch(ctx, q) {
       p.append(h('div', { class: 'grip', 'aria-hidden': 'true' }),
         h('h2', { class: 'sheet-h' }, 'Subtitles'),
         subList.length ? h('div', { role: 'menu' }, subs) : h('p', { class: 'muted small' }, 'No subtitles were found for this video.'),
+        !qBtn.hidden && h('h3', { class: 'sheet-h2' }, 'Quality'),
+        !qBtn.hidden && segmented([['auto', 'Auto'], ...qualities().map(x => [x, x + 'p'])], qualities().includes(qPref()) ? qPref() : 'auto', x => setQuality(x), 'Video quality'),
         h('h3', { class: 'sheet-h2' }, 'Speed'),
         segmented([['0.75', '0.75×'], ['1', '1×'], ['1.25', '1.25×'], ['1.5', '1.5×'], ['2', '2×']], String(rate), x => { rate = +x; v.playbackRate = rate; }, 'Playback speed'));
       s.onClose.push(() => showUi());
@@ -3010,12 +3307,18 @@ function viewWatch(ctx, q) {
     if (sess && sess.next) { upShown = false; showUpNext(true); }
   });
   v.addEventListener('error', () => {
-    if (!ctx.alive || !v.getAttribute('src')) return;
-    const code = v.error && v.error.code;
+    // No v.error: a stale event from an engine that was already replaced.
+    if (!ctx.alive || !v.getAttribute('src') || !v.error) return;
+    const code = v.error.code;
     const at = pos();
-    if (code === 2 && errCount++ < 2) { setTimeout(() => { if (ctx.alive) seekTo(at); }, 800); return; }
-    if (code === 4) fail('This video can’t play on this phone', 'Its format isn’t supported by this browser.', true, () => { errCount = 0; play(at); });
-    else fail('Playback failed', code === 2 ? 'Lost the connection to your PC.' : 'Something went wrong while playing.', true, () => { errCount = 0; play(at); });
+    // The MSE player reports through streamFail (once, even when its SourceBuffer errors too).
+    if (eng() === 'mse' && hlsPlayer) { hlsPlayer.fail(new Error(code === 2 ? 'Lost the connection to your PC.' : 'This phone couldn’t decode the video stream.')); return; }
+    // Not playing yet: try the next way to play it before giving up.
+    if (nextEngine(at)) return;
+    if (code === 2 && errCount++ < 2) { setTimeout(() => { if (ctx.alive) { if (eng() === 'prog') seekTo(at); else play(at); } }, 800); return; }
+    if (eng() !== 'prog') fail('Couldn’t load the video stream', code === 2 ? 'Lost the connection to your PC.' : 'Your PC’s video stream couldn’t be played here.', true, retryAt(at));
+    else if (code === 4) fail('This video can’t play on this phone', 'Its format isn’t supported by this browser.', true, retryAt(at));
+    else fail('Playback failed', code === 2 ? 'Lost the connection to your PC.' : 'Something went wrong while playing.', true, retryAt(at));
   });
 
   // ----- media session -----
@@ -3071,6 +3374,7 @@ function viewWatch(ctx, q) {
     wl.dispose();
     try { if (document.pictureInPictureElement === v) document.exitPictureInPicture().catch(() => {}); } catch { /* ignore */ }
     try { if (fsEl()) (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch { /* ignore */ }
+    stopHls();
     v.pause(); v.removeAttribute('src'); v.load();
     if (Player) Player.bindSession();
   });
@@ -3695,6 +3999,7 @@ function boot() {
   Player = createPlayer();
   getMe().catch(() => {});
   Act.start();
+  Priv.start();
   // The app shell cached for instant, offline-tolerant starts, and system notifications: only in a
   // secure context (see canNotify), so not over the plain-HTTP Wi-Fi address today.
   if (!CLOUD && window.isSecureContext && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});

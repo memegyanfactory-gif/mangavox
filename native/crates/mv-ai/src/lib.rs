@@ -20,7 +20,7 @@ pub use gguf::{group_gguf_files, parse_quant, QuantInfo};
 pub use limit::AiLimit;
 pub use hub::{HubConfigPatch, HubConfigPublic, HubSort, ImportResult, ModelHub, ProgressFn, SearchOpts};
 pub use registry::{friendly_error, provider_def, ProviderDef, Registry, TestResult, PROVIDERS};
-pub use services::{service_def, KeySource, ServiceDef, ServiceKind, Services, SERVICES};
+pub use services::{service_def, service_key, KeySource, ServiceDef, ServiceKind, Services, SERVICES};
 pub use stream::{AiError, Result};
 pub use tokio_util::sync::CancellationToken;
 pub use transcript::build_transcript;

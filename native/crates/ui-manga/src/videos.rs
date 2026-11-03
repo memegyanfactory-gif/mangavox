@@ -58,8 +58,11 @@ pub(crate) struct Thumbs {
     pub chapters: HashMap<String, PathBuf>,
     /// The continuous video's ("Ch. 1–12"), when there are several videos.
     pub full: Option<PathBuf>,
-    /// They are drawn on the manga's AI image (else on the local composition of the cover).
+    /// The manga has its AI image from the cover.
     pub ai: bool,
+    /// They are drawn on a thumbnail made on Studio's Thumbnails page (which wins over the AI
+    /// image).
+    pub picked: bool,
 }
 
 impl Thumbs {
@@ -73,6 +76,10 @@ impl Thumbs {
 /// credits; blocking.
 pub(crate) fn make_thumbs(manga_id: &str, title: &str, cover: Option<&Path>, videos: &[ChapterVideo]) -> Result<Thumbs> {
     let dir = media::manga_dir(manga_id);
+    // A thumbnail made or picked on Studio's Thumbnails page is the base when there is one.
+    if let Err(e) = thumb::sync_picked(manga_id) {
+        eprintln!("[manga] picked thumbnail: {e:#}");
+    }
     let mut chapters = HashMap::new();
     for v in videos {
         let Some(out) = v.video.parent() else { continue };
@@ -84,7 +91,8 @@ pub(crate) fn make_thumbs(manga_id: &str, title: &str, cover: Option<&Path>, vid
     } else {
         None
     };
-    Ok(Thumbs { chapters, full, ai: thumb::pick_base(&dir).is_some_and(|b| b.1 == BaseKind::Ai) })
+    let ai = dir.join(thumb::BASE_AI).metadata().is_ok_and(|m| m.len() > 0);
+    Ok(Thumbs { chapters, full, ai, picked: thumb::pick_base(&dir).is_some_and(|b| b.1 == BaseKind::Picked) })
 }
 
 /// Paints the manga's one AI image (Magnific, spends credits): `force` replaces it (Regenerate).
@@ -205,7 +213,7 @@ mod tests {
         std::fs::write(t.path().join("c2").join(media::THUMBNAIL), "jpg").unwrap();
         assert_eq!(chapter_videos(&chapters, &recaps)[1].thumbnail, Some(t.path().join("c2").join(media::THUMBNAIL)));
         // The shared picture: the continuous video's, else the first chapter's.
-        let th = Thumbs { chapters: HashMap::from([("c1.5".to_string(), PathBuf::from("a.jpg"))]), full: None, ai: false };
+        let th = Thumbs { chapters: HashMap::from([("c1.5".to_string(), PathBuf::from("a.jpg"))]), full: None, ai: false, picked: false };
         assert_eq!(th.shared(&v), Some(PathBuf::from("a.jpg")));
         assert_eq!(Thumbs { full: Some(PathBuf::from("f.jpg")), ..th }.shared(&v), Some(PathBuf::from("f.jpg")));
     }

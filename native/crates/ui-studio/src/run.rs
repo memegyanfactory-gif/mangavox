@@ -349,6 +349,26 @@ pub async fn read_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch:
     out
 }
 
+/// The downloaded chapters of a manga in reading order (each number once), so the story writer
+/// plans the subscribe reminders on the manga's whole running time. Empty when the library cannot
+/// be read (the writer then plans from the chapter numbers).
+async fn manga_chapters(manga_id: &str) -> Vec<ChapterRef> {
+    let id = manga_id.to_string();
+    mv_ui::bg::blocking(move || {
+        let groups = crate::data::with_db(crate::data::query_chapters).ok()?;
+        let mut chapters = groups.into_iter().find(|g| g.id == id)?.chapters;
+        chapters.dedup_by(|a, b| a.number.is_some() && a.number == b.number);
+        Some(chapters.into_iter().map(|mut c| {
+            c.output_dir = crate::data::output_dir_for(&c.manga_id, &c.id, &c.pages_dir);
+            crate::page::chref(&c)
+        }).collect::<Vec<_>>())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
 /// Generate's Story step: writes and exports one chapter's narration.
 pub async fn story_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch: ChapterRef, styles: Vec<String>, stop: impl Fn() -> bool) -> Outcome {
     let Some(cancel) = claim(RunKind::Story, &label, &stop).await else { return Outcome::Cancelled };
@@ -359,7 +379,8 @@ pub async fn story_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch
         r.log(format!("Generate · writing the story of {} with {label}", ch.label));
     });
     let brain = brain(&ch.manga_id, &ch.manga_title);
-    let res = match mv_recap::write_story(reg, model, vec![ch.clone()], styles, brain, progress_fn(), cancel.clone()).await {
+    let manga = manga_chapters(&ch.manga_id).await;
+    let res = match mv_recap::write_story_for_manga(reg, model, vec![ch.clone()], manga, styles, brain, progress_fn(), cancel.clone()).await {
         Ok(stories) => match stories.into_iter().find(|(id, _)| *id == ch.chapter_id) {
             Some((_, story)) => mv_recap::export_for_pipeline(&ch, &story),
             None => Err(anyhow::anyhow!("The AI wrote no story for {}", ch.label)),
@@ -416,7 +437,8 @@ pub fn start_story(reg: Arc<Registry>, model: ModelChoice, label: String, chapte
                 r.chapter_pos = (pos, n);
             });
             let brain = brain(&manga_id, &title);
-            match mv_recap::write_story(reg.clone(), model.clone(), chs.clone(), styles.clone(), brain, progress_fn(), cancel.clone()).await {
+            let manga = manga_chapters(&manga_id).await;
+            match mv_recap::write_story_for_manga(reg.clone(), model.clone(), chs.clone(), manga, styles.clone(), brain, progress_fn(), cancel.clone()).await {
                 Ok(stories) => {
                     for (id, story) in stories {
                         if let Some(ch) = chs.iter().find(|c| c.chapter_id == id) {

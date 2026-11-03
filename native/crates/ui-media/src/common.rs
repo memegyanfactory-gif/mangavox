@@ -55,6 +55,9 @@ pub fn fetch<V: 'static, T: Send + 'static>(
             Ok(r) => r,
             Err(e) => Err(e.to_string()),
         };
+        if let Ok(v) = &res {
+            remember(v);
+        }
         let _ = this.update(cx, |v, cx| {
             apply(v, res.into());
             cx.notify();
@@ -104,7 +107,40 @@ pub fn fetch_cached<V: 'static, T: serde::Serialize + serde::de::DeserializeOwne
             }
         });
     }
-    hit.map_or(Load::Loading, |(v, _)| Load::Ready(v))
+    hit.map_or(Load::Loading, |(v, _)| {
+        remember(&v);
+        Load::Ready(v)
+    })
+}
+
+/// Catalog titles shown this run, by id (and IMDb id): a detail page opens on the card's data
+/// while its own details load, instead of a skeleton.
+fn seen() -> &'static std::sync::Mutex<std::collections::HashMap<String, AnimeSearchResult>> {
+    static M: OnceLock<std::sync::Mutex<std::collections::HashMap<String, AnimeSearchResult>>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn remember<T: 'static>(v: &T) {
+    // Private mode: nothing is kept about what was browsed.
+    if mv_core::privacy::active() {
+        return;
+    }
+    let Some(items) = (v as &dyn std::any::Any).downcast_ref::<Vec<AnimeSearchResult>>() else { return };
+    let mut m = seen().lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() > 20_000 {
+        m.clear();
+    }
+    for r in items.iter().filter(|r| !r.id.is_empty()) {
+        if let Some(imdb) = r.imdb_id.as_ref().filter(|i| **i != r.id) {
+            m.insert(imdb.clone(), r.clone());
+        }
+        m.insert(r.id.clone(), r.clone());
+    }
+}
+
+/// The catalog entry for `id` seen this run (see [`remember`]).
+pub fn seen_title(id: &str) -> Option<AnimeSearchResult> {
+    seen().lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
 }
 
 /// Shared artwork cache (`~/.mangavox/cache/images`).
@@ -144,9 +180,16 @@ pub fn image_source(url: &str) -> ImageSource {
 }
 
 /// Blocking SQLite work against the user's database, off the UI thread.
+/// Migrates once per run, not per call: `open_default` also resets the manga download queue (a
+/// write that waits up to 5 s on any other writer, and broke downloads running meanwhile).
 pub fn db<T: Send + 'static>(f: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static) -> impl Future<Output = Result<T, String>> + Send {
+    static MIGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let fut = bg::blocking(move || {
-        let conn = mv_core::db::open_default()?;
+        let mut conn = mv_core::db::open(&mv_core::paths::database())?;
+        if !MIGRATED.load(Ordering::Relaxed) {
+            mv_core::db::migrate(&mut conn)?;
+            MIGRATED.store(true, Ordering::Relaxed);
+        }
         f(&conn)
     });
     async move { fut.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string()) }

@@ -619,6 +619,9 @@ fn set_offset(v: &mut AnimeHome, id: &'static str, n: usize) {
 impl Render for AnimeHome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_cont(cx);
+        if self.rows.iter().any(|r| r.3.ready().is_some()) {
+            mv_ui::perf::ready("Anime home");
+        }
         let width = look::page_width(&self.scroll, window);
         let content = if let Some(e) = &self.expanded {
             div().pb(px(40.)).child(self.expanded_view(e, width, cx))

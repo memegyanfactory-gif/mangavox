@@ -61,6 +61,9 @@ pub struct ServiceDef {
     /// Headers every request needs besides the key (API version pins).
     pub extra: &'static [(&'static str, &'static str)],
     pub probes: &'static [Probe],
+    /// Studio's Thumbnails generator makes images with it (its models are in `ui-studio`'s
+    /// image catalog); for the others the key is stored and tested only, for now.
+    pub studio_images: bool,
 }
 
 const fn probe(url: &'static str) -> Probe {
@@ -87,6 +90,7 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Scheme("Key"),
         extra: NO_EXTRA,
         probes: &[Probe { url: "https://api.higgsfield.ai/requests/00000000-0000-0000-0000-000000000000/status", accept: &[404], show: None }],
+        studio_images: true,
     },
     ServiceDef {
         id: "fal",
@@ -100,6 +104,7 @@ pub static SERVICES: &[ServiceDef] = &[
         extra: NO_EXTRA,
         // 403: a key without the billing scope; it still generates.
         probes: &[Probe { url: "https://api.fal.ai/v1/account/billing?expand=credits", accept: &[403], show: Some(("Credits", "/credits/current_balance")) }],
+        studio_images: true,
     },
     ServiceDef {
         id: "replicate",
@@ -112,6 +117,7 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Bearer,
         extra: NO_EXTRA,
         probes: &[showing("https://api.replicate.com/v1/account", "Account", "/username")],
+        studio_images: true,
     },
     ServiceDef {
         id: "runway",
@@ -124,6 +130,7 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Bearer,
         extra: &[("X-Runway-Version", "2024-11-06")],
         probes: &[showing("https://api.dev.runwayml.com/v1/organization", "Credits", "/creditBalance")],
+        studio_images: false,
     },
     ServiceDef {
         id: "luma",
@@ -140,6 +147,7 @@ pub static SERVICES: &[ServiceDef] = &[
             showing("https://api.lumalabs.ai/dream-machine/v1/credits", "Credits", "/credit_balance"),
             showing("https://agents.lumalabs.ai/v1/credits", "Credits", "/balance_credits"),
         ],
+        studio_images: false,
     },
     ServiceDef {
         id: "kling",
@@ -153,6 +161,7 @@ pub static SERVICES: &[ServiceDef] = &[
         extra: NO_EXTRA,
         // "This API is free to call."
         probes: &[probe("https://api-singapore.klingai.com/account/costs?start_time={day_ago_ms}&end_time={now_ms}")],
+        studio_images: false,
     },
     ServiceDef {
         id: "stability",
@@ -165,6 +174,7 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Bearer,
         extra: NO_EXTRA,
         probes: &[showing("https://api.stability.ai/v1/user/balance", "Credits", "/credits")],
+        studio_images: false,
     },
     ServiceDef {
         id: "ideogram",
@@ -178,6 +188,7 @@ pub static SERVICES: &[ServiceDef] = &[
         extra: NO_EXTRA,
         // 404: a good key whose owner is not an organisation admin.
         probes: &[Probe { url: "https://api.ideogram.ai/v2/account/usage?start_time={day_ago_rfc3339}", accept: &[404], show: None }],
+        studio_images: false,
     },
     ServiceDef {
         id: "leonardo",
@@ -190,6 +201,7 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Bearer,
         extra: NO_EXTRA,
         probes: &[probe("https://cloud.leonardo.ai/api/rest/v1/me")],
+        studio_images: false,
     },
     ServiceDef {
         id: "bfl",
@@ -202,6 +214,46 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Header("x-key"),
         extra: NO_EXTRA,
         probes: &[showing("https://api.bfl.ai/v1/credits", "Credits", "/credits")],
+        studio_images: true,
+    },
+    ServiceDef {
+        id: "recraft",
+        label: "Recraft",
+        kind: ServiceKind::Image,
+        description: "Recraft V3 images, illustrations and vector art",
+        key_url: "https://www.recraft.ai/profile/api",
+        key_env: &["RECRAFT_API_TOKEN"],
+        placeholder: "Paste your Recraft token",
+        auth: Auth::Bearer,
+        extra: NO_EXTRA,
+        probes: &[showing("https://external.api.recraft.ai/v1/users/me", "Credits", "/credits")],
+        studio_images: true,
+    },
+    ServiceDef {
+        id: "openai-images",
+        label: "OpenAI Images",
+        kind: ServiceKind::Image,
+        description: "GPT Image, straight from OpenAI",
+        key_url: "https://platform.openai.com/api-keys",
+        key_env: &["OPENAI_API_KEY"],
+        placeholder: "sk-...",
+        auth: Auth::Bearer,
+        extra: NO_EXTRA,
+        probes: &[probe("https://api.openai.com/v1/models")],
+        studio_images: false,
+    },
+    ServiceDef {
+        id: "imagen",
+        label: "Google Imagen",
+        kind: ServiceKind::Image,
+        description: "Imagen and Gemini images through the Gemini API",
+        key_url: "https://aistudio.google.com/apikey",
+        key_env: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        placeholder: "Paste your Gemini API key",
+        auth: Auth::Header("x-goog-api-key"),
+        extra: NO_EXTRA,
+        probes: &[probe("https://generativelanguage.googleapis.com/v1beta/models")],
+        studio_images: false,
     },
     // ── Voices ──────────────────────────────────────────────────────────────────────────
     ServiceDef {
@@ -216,6 +268,7 @@ pub static SERVICES: &[ServiceDef] = &[
         extra: NO_EXTRA,
         // A restricted key may not read the account (403); the voice list proves it too.
         probes: &[showing("https://api.elevenlabs.io/v1/user", "Plan", "/subscription/tier"), probe("https://api.elevenlabs.io/v2/voices?page_size=1")],
+        studio_images: false,
     },
     ServiceDef {
         id: "cartesia",
@@ -228,6 +281,7 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Bearer,
         extra: &[("Cartesia-Version", "2026-08-14")],
         probes: &[probe("https://api.cartesia.ai/voices")],
+        studio_images: false,
     },
     ServiceDef {
         id: "deepgram",
@@ -240,6 +294,7 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Scheme("Token"),
         extra: NO_EXTRA,
         probes: &[probe("https://api.deepgram.com/v1/projects")],
+        studio_images: false,
     },
     ServiceDef {
         id: "fish",
@@ -252,6 +307,7 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Bearer,
         extra: NO_EXTRA,
         probes: &[showing("https://api.fish.audio/wallet/self/api-credit", "Credit", "/credit")],
+        studio_images: false,
     },
     ServiceDef {
         id: "hume",
@@ -264,11 +320,32 @@ pub static SERVICES: &[ServiceDef] = &[
         auth: Auth::Header("X-Hume-Api-Key"),
         extra: NO_EXTRA,
         probes: &[probe("https://api.hume.ai/v0/tts/voices?provider=HUME_AI&page_size=1")],
+        studio_images: false,
     },
 ];
 
 pub fn service_def(id: &str) -> Option<&'static ServiceDef> {
     SERVICES.iter().find(|s| s.id == id)
+}
+
+/// The key for service `id` from config.json at `config_path`, else its environment variable,
+/// without building an HTTP client (cheap enough to check while drawing).
+pub fn service_key(config_path: impl Into<PathBuf>, id: &str) -> Option<String> {
+    saved_key(&ConfigStore::new(config_path), id).or_else(|| env_key(service_def(id)?, &|k| std::env::var(k).ok()))
+}
+
+fn saved_key(config: &ConfigStore, id: &str) -> Option<String> {
+    let cfg = config.read();
+    cfg.get("aiServices")?.get(id)?.get("apiKey")?.as_str().map(str::trim).filter(|k| !k.is_empty()).map(String::from)
+}
+
+fn env_key(def: &ServiceDef, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let get = |k: &str| env(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    // Higgsfield's SDKs read the two halves from two variables.
+    if def.id == "higgsfield" {
+        return Some(format!("{}:{}", get("HF_API_KEY_ID")?, get("HF_API_KEY_SECRET")?));
+    }
+    def.key_env.iter().find_map(|k| get(k))
 }
 
 /// Where a service's key comes from.
@@ -371,17 +448,11 @@ impl Services {
     }
 
     fn saved(&self, id: &str) -> Option<String> {
-        let cfg = self.config.read();
-        cfg.get("aiServices")?.get(id)?.get("apiKey")?.as_str().map(str::trim).filter(|k| !k.is_empty()).map(String::from)
+        saved_key(&self.config, id)
     }
 
     fn from_env(&self, def: &ServiceDef) -> Option<String> {
-        let get = |k: &str| (self.env)(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        // Higgsfield's SDKs read the two halves from two variables.
-        if def.id == "higgsfield" {
-            return Some(format!("{}:{}", get("HF_API_KEY_ID")?, get("HF_API_KEY_SECRET")?));
-        }
-        def.key_env.iter().find_map(|k| get(k))
+        env_key(def, &*self.env)
     }
 
     /// The saved key, else the environment's.

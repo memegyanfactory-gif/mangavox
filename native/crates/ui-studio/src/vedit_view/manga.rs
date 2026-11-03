@@ -30,6 +30,8 @@ use crate::video::{self, SubtitleSetting};
 
 /// The chapter track's height.
 const CH_H: f32 = 30.;
+/// A chapter on the timeline whose video is not rendered yet.
+const UNRENDERED: &str = "not rendered yet — Export renders it";
 
 /// One chapter on the manga timeline.
 pub(crate) struct MChapter {
@@ -479,7 +481,8 @@ impl StudioPage {
                     Some((beats, edit, subs)) => vm::look_key(&look, vm::music_on(c), &vedit::render_extra(beats, edit, subs)),
                     None => vm::current_key(c),
                 };
-                cache.insert(c.id.clone(), vm::look_state(vm::stamp(&c.output_dir), key));
+                let rendered = self.statuses.get(&c.id).is_some_and(|s| s.video.is_some());
+                cache.insert(c.id.clone(), if rendered { vm::look_state(vm::stamp(&c.output_dir), key) } else { LookState::Unrendered });
             }
         }
         self.vedit.whole.looks.borrow().clone()
@@ -682,6 +685,7 @@ impl StudioPage {
                 (Some(r), _) if r.failed => (Tokens::danger(), r.label.clone()),
                 (Some(r), _) => (Tokens::accent(), r.label.clone()),
                 (None, Some(LookState::Current)) => (Tokens::success(), "current look".to_string()),
+                (None, Some(LookState::Unrendered)) => (Tokens::text_3(), UNRENDERED.to_string()),
                 (None, _) => (Tokens::warning(), "old look — re-edit to update".to_string()),
             };
             let on = !all_on && open.as_deref() == Some(c.id.as_str());
@@ -746,6 +750,7 @@ impl StudioPage {
         let (state, colour) = match (&remake, looks.get(&seq.item.id)) {
             (Some(r), _) => (r.label.clone(), if r.failed { Tokens::danger() } else { Tokens::accent() }),
             (None, Some(LookState::Current)) => ("current look".to_string(), Tokens::text_3()),
+            (None, Some(LookState::Unrendered)) => (UNRENDERED.to_string(), Tokens::text_3()),
             (None, _) => ("old look — re-edit to update".to_string(), Tokens::warning()),
         };
         let video = seq.item.video.clone().or_else(|| self.statuses.get(&seq.item.id).and_then(|s| s.video.clone()));
@@ -895,6 +900,7 @@ impl StudioPage {
                 (Some(r), _) if r.failed => (Tokens::danger(), r.label.clone()),
                 (Some(r), _) => (Tokens::accent(), r.label.clone()),
                 (None, Some(LookState::Current)) => (Tokens::info(), "current look".to_string()),
+                (None, Some(LookState::Unrendered)) => (Tokens::text_3(), UNRENDERED.to_string()),
                 (None, _) => (Tokens::warning(), "old look — re-edit to update".to_string()),
             };
             let label = format!("{} · {note}", short_label(c.item.number, c.item.title.as_deref()));

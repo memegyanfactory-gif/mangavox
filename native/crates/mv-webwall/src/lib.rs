@@ -74,6 +74,25 @@ pub struct WebWall {
 impl WebWall {
     /// Spawn the WebView thread and wait (up to 15 s) for WebView2 to come up and report its UA.
     pub fn start(cfg: WallConfig) -> Result<Arc<WebWall>, SourceError> {
+        let (wall, ready) = Self::launch(cfg)?;
+        Self::wait_ready(ready)?;
+        Ok(wall)
+    }
+
+    /// [`start`](Self::start) without waiting for WebView2 (it takes from a few hundred ms to
+    /// seconds): returns once the thread runs; requests queue until WebView2 is up.
+    /// `on_ready` gets the outcome on a helper thread.
+    pub fn spawn(cfg: WallConfig, on_ready: impl FnOnce(Result<Arc<WebWall>, SourceError>) + Send + 'static) -> Result<Arc<WebWall>, SourceError> {
+        let (wall, ready) = Self::launch(cfg)?;
+        let w = wall.clone();
+        std::thread::Builder::new()
+            .name("mv-webwall-ready".into())
+            .spawn(move || on_ready(Self::wait_ready(ready).map(|_| w)))
+            .map_err(|e| SourceError::Solver(format!("cannot spawn webview thread: {e}")))?;
+        Ok(wall)
+    }
+
+    fn launch(cfg: WallConfig) -> Result<(Arc<WebWall>, std::sync::mpsc::Receiver<Result<(), String>>), SourceError> {
         let shared = Arc::new(Shared { ua: Mutex::new(None) });
         let (ptx, prx) = std::sync::mpsc::channel();
         let (rtx, rrx) = std::sync::mpsc::channel();
@@ -83,12 +102,15 @@ impl WebWall {
             .spawn(move || runner::run(c, s, ptx, rtx))
             .map_err(|e| SourceError::Solver(format!("cannot spawn webview thread: {e}")))?;
         let proxy = prx.recv_timeout(Duration::from_secs(5)).map_err(|_| SourceError::Solver("webview thread did not start".into()))?;
-        match rrx.recv_timeout(Duration::from_secs(15)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(SourceError::Solver(format!("WebView2 unavailable: {e}"))),
-            Err(_) => return Err(SourceError::Solver("WebView2 did not initialise in time".into())),
+        Ok((Arc::new(WebWall { cfg, proxy: Mutex::new(proxy), shared }), rrx))
+    }
+
+    fn wait_ready(ready: std::sync::mpsc::Receiver<Result<(), String>>) -> Result<(), SourceError> {
+        match ready.recv_timeout(Duration::from_secs(15)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(SourceError::Solver(format!("WebView2 unavailable: {e}"))),
+            Err(_) => Err(SourceError::Solver("WebView2 did not initialise in time".into())),
         }
-        Ok(Arc::new(WebWall { cfg, proxy: Mutex::new(proxy), shared }))
     }
 
     pub fn config(&self) -> &WallConfig {

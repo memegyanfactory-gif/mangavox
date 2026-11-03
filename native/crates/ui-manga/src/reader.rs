@@ -1774,6 +1774,23 @@ impl ReaderPage {
         }
     }
 
+    /// Private mode, the same switch as the player's (the app's toggle, with its clean-up offer).
+    /// Labelled, so it is found at a glance like a browser's incognito.
+    fn private_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = mv_core::privacy::active();
+        btn("reader-private", if on { "Private on" } else { "Private" }, if on { ButtonKind::Secondary } else { ButtonKind::Ghost })
+            .small()
+            .icon(ph::EYE_SLASH.on(on))
+            .selected(on)
+            .tooltip(if on { "Turn off private mode" } else { "Private mode: nothing you read is recorded" })
+            .kbd("ctrl-shift-n")
+            .on_click(cx.listener(|this, _, w, cx| {
+                this.refocus(w, cx);
+                mv_ui::nav::toggle_private(w, cx);
+                cx.notify();
+            }))
+    }
+
     fn top_bar(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let label = self.chapter.as_ref().map(logic::chapter_label).unwrap_or_default();
         let full = window.is_fullscreen();
@@ -1811,6 +1828,7 @@ impl ReaderPage {
             .children(self.recap_buttons(cx))
             .when(!self.chapters.is_empty(), |d| d.child(self.chapter_menu(cx)))
             .child(self.download_button(cx))
+            .child(self.private_button(cx))
             .child(icon_button("reader-keys", ph::KEYBOARD, "Keyboard shortcuts").kbd("?").selected(self.show_keys).on_click(cx.listener(|this, _, w, cx| {
                 this.refocus(w, cx);
                 this.toggle_keys(cx);

@@ -25,9 +25,11 @@ pub fn in_scope(route: &Route) -> bool {
     }
 }
 
-/// The toggle (and, while on, the "Private" pill) for the right side of the title bar.
+/// The toggle (and, while on, the "Private" pill) for the right side of the title bar. The reader
+/// and the player carry the same toggle in their own bars, where the eye is (the player's covers
+/// the title bar), so it is never shown twice.
 pub fn title_controls(route: &Route) -> Option<Div> {
-    if !in_scope(route) {
+    if !in_scope(route) || matches!(route, Route::Reader { .. } | Route::Player { .. }) {
         return None;
     }
     let on = privacy::active();
@@ -371,7 +373,7 @@ impl Probe for DiskProbe {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that would bring in gpui's `test` macro, which shadows the built-in one.
-    use super::in_scope;
+    use super::{in_scope, title_controls};
     use mv_ui::Route;
 
     #[test]
@@ -380,11 +382,22 @@ mod tests {
             assert!(in_scope(&r), "{r:?}");
         }
         assert!(in_scope(&Route::Reader { manga_id: "m".into(), chapter_id: "c".into() }));
-        for r in [Route::Studio, Route::Thumbnails, Route::YouTube, Route::Suggestions, Route::Settings { tab: None }, Route::Mobile, Route::Welcome] {
+        for r in [Route::Studio, Route::Thumbnails, Route::YouTubeVideos, Route::YouTube, Route::Suggestions, Route::Settings { tab: None }, Route::Mobile, Route::Welcome] {
             assert!(!in_scope(&r), "{r:?}");
         }
         let play = |mal: Option<&str>| Route::Player { request: mv_ui::nav::PlayRequest { title: "x".into(), source: "x".into(), file_idx: None, imdb_id: None, mal_id: mal.map(Into::into), season: None, episode: None } };
         assert!(in_scope(&play(Some("21"))), "an anime episode");
         assert!(!in_scope(&play(None)), "a Studio recap video");
+    }
+
+    #[test]
+    fn title_bar_toggle_is_never_shown_twice() {
+        for r in [Route::Library, Route::Browse, Route::AnimeHome, Route::MoviesHome] {
+            assert!(title_controls(&r).is_some(), "{r:?}");
+        }
+        // The reader and the player have it in their own bars.
+        assert!(title_controls(&Route::Reader { manga_id: "m".into(), chapter_id: "c".into() }).is_none());
+        let play = Route::Player { request: mv_ui::nav::PlayRequest { title: "x".into(), source: "x".into(), file_idx: None, imdb_id: None, mal_id: Some("21".into()), season: None, episode: None } };
+        assert!(title_controls(&play).is_none());
     }
 }
