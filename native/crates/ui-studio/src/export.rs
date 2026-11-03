@@ -211,10 +211,10 @@ pub(crate) struct Job {
 }
 
 impl Job {
-    pub(crate) fn new(manga_id: &str, label: &str) -> Job {
+    pub(crate) fn new(manga_id: &str, manga_title: &str, label: &str) -> Job {
         let job = Job { manga_id: manga_id.to_string(), state: Arc::new(Mutex::new((0., label.to_string()))), cancel: Arc::new(AtomicBool::new(false)), phase: Mutex::new((label.to_string(), Instant::now())), turn: Arc::new(Mutex::new(None)) };
-        // Shown as activity outside the page (the phone companion).
-        crate::pipeline::track_export(manga_id, &job.state);
+        // Shown as activity outside the page (the Activity panel, the phone companion).
+        crate::pipeline::track_export(manga_id, manga_title, &job.state, &job.cancel);
         job
     }
 
@@ -1927,7 +1927,7 @@ impl StudioPage {
             toast::show(cx, Toast::info("Make a chapter video first"));
             return;
         }
-        let job = Job::new(&g.id, label);
+        let job = Job::new(&g.id, &g.title, label);
         let r = job.reporter();
         self.export_job = Some(job);
         self.follow_export(cx);
@@ -2621,7 +2621,7 @@ mod tests {
     fn exports_take_turns() {
         use std::sync::atomic::Ordering;
         // Other tests join too (and take the turn): only what holds whatever they do is checked.
-        let (a, b) = (Job::new("a", "Joining"), Job::new("b", "Joining"));
+        let (a, b) = (Job::new("a", "A", "Joining"), Job::new("b", "B", "Joining"));
         let (ra, rb) = (a.reporter(), b.reporter());
         ra.take_turn().unwrap();
         assert!(super::exporting());
@@ -2662,7 +2662,7 @@ mod tests {
 
     #[test]
     fn eta_waits_for_progress_and_restarts_each_step() {
-        let job = Job::new("m", "Joining");
+        let job = Job::new("m", "M", "Joining");
         assert_eq!(job.eta(), None);
         job.reporter().set(0.5, "Saving");
         assert_eq!(job.eta(), None, "a new step restarts the clock");
@@ -2717,7 +2717,7 @@ mod tests {
         let spec = std::env::var("MV_EXPORT").expect("MV_EXPORT");
         let mut parts: Vec<PathBuf> = spec.split(';').map(PathBuf::from).collect();
         let out = parts.pop().unwrap();
-        let job = Job::new("test", "test");
+        let job = Job::new("test", "Test", "test");
         let r = job.reporter();
         let j = join(&parts, &out.join("joined.mp4"), &r).unwrap();
         println!("joined {:.1}s solo={} boundaries={}", j.total, j.solo, j.boundaries.len());

@@ -610,7 +610,7 @@ async fn export_tool(a: Map<String, Value>) -> ToolResult {
     let stale: Vec<String> = mv_ui::bg::blocking(move || crate::data::fresh::stale_of(&check)).await.unwrap_or_default().iter().map(|s| s.item.label()).collect();
     let env = studio_env().await;
     let font = export::mark_font(env.as_ref());
-    let job = export::Job::new(&g.id, "Joining the chapters");
+    let job = export::Job::new(&g.id, &g.title, "Joining the chapters");
     let r = job.reporter();
     {
         let mut slot = EXPORT.lock().unwrap_or_else(|e| e.into_inner());

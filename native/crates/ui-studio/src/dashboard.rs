@@ -679,8 +679,9 @@ impl StudioPage {
             if secs > 0. {
                 s += &format!(" · {}", crate::export::fmt_duration(secs));
             }
-            if self.export_job.as_ref().is_some_and(|j| j.manga_id == g.id) {
-                s += " · working…";
+            if let Some(j) = self.export_job.as_ref().filter(|j| j.manga_id == g.id) {
+                let (p, label) = j.snapshot();
+                s += &format!(" · {label} {}%", (p * 100.).round() as u32);
             }
             s
         };

@@ -966,7 +966,7 @@ mod tests {
         let mut src = Sources {
             ai: Some(ai("c9", false)),
             jobs: vec![job(7, "c8", JobView::Running), job(8, "c8", JobView::Queued), job(6, "c8", JobView::Cancelled)],
-            exports: vec![ExportActivity { manga_id: "m".into(), progress: 0.5, label: "Rendering part 2".into() }],
+            exports: vec![ExportActivity { id: 1, manga_id: "m".into(), manga_title: "M".into(), progress: 0.5, label: "Rendering part 2".into() }],
             joins: vec![Join { id: "r1".into(), manga_id: "m".into(), title: "Solo".into(), state: "queued", progress: 0., line: "Waiting for the chapter videos".into(), error: None }],
             ..Default::default()
         };

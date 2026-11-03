@@ -1,13 +1,14 @@
 //! Studio's Generate runs as activity cards in the shell's corner, next to the download cards:
-//! one card per manga with chapters in the Generate queue (`ui_studio::pipeline`). The queue
-//! lives outside GPUI, so this polls its version like the Studio page does.
-use std::collections::HashMap;
+//! one card per manga with chapters in the Generate queue (`ui_studio::pipeline`), and one per
+//! full-video export or join running (`pipeline::exports`). The queue lives outside GPUI, so this
+//! polls its version like the Studio page does.
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use gpui_kit::*;
 use mv_ui::activity::{self, Card, Lead};
 use mv_ui::{btn, icon_button, ph, ButtonKind, Route};
-use ui_studio::pipeline::{self, ItemState, QueueItem};
+use ui_studio::pipeline::{self, ExportActivity, ItemState, QueueItem};
 
 const POLL: Duration = Duration::from_millis(500);
 /// A run that made every chapter closes its card after this long.
@@ -152,6 +153,10 @@ pub struct StudioRuns {
     seen: Option<(u64, u64)>,
     /// A queue read is running in the background.
     reading: bool,
+    /// Exports running, each card's place in the stack, and the ones closed from their card.
+    exports: Vec<ExportActivity>,
+    export_orders: HashMap<u64, u64>,
+    hidden_exports: HashSet<u64>,
     _poll: Task<()>,
 }
 
@@ -163,10 +168,22 @@ impl StudioRuns {
                 break;
             }
         });
-        StudioRuns { items: vec![], held: false, interrupted: false, runs: HashMap::new(), seen: None, reading: false, _poll: poll }
+        StudioRuns { items: vec![], held: false, interrupted: false, runs: HashMap::new(), seen: None, reading: false, exports: vec![], export_orders: HashMap::new(), hidden_exports: HashSet::new(), _poll: poll }
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
+        // Exports report through a shared state (a lock held only to copy it): read every time.
+        let exports = pipeline::exports();
+        if exports != self.exports {
+            let live: HashSet<u64> = exports.iter().map(|e| e.id).collect();
+            self.export_orders.retain(|id, _| live.contains(id));
+            self.hidden_exports.retain(|id| live.contains(id));
+            for e in &exports {
+                self.export_orders.entry(e.id).or_insert_with(activity::next_order);
+            }
+            self.exports = exports;
+            cx.notify();
+        }
         let seen = Some((pipeline::version(), ui_studio::service::version()));
         if seen != self.seen {
             // Read off the UI thread: the queue's lock is also held while the pipeline saves
@@ -224,16 +241,38 @@ impl StudioRuns {
         cx.notify();
     }
 
-    /// One card per Generate run to show.
+    /// One card per Generate run and per export to show.
     pub fn cards(&self, this: &Entity<Self>) -> Vec<Card> {
-        self.runs
-            .iter()
-            .filter_map(|(m, r)| {
-                let t = tally(&self.items, m, r.from);
-                let hidden = r.hidden_upto.is_some_and(|h| t.newest <= h);
-                (t.total > 0 && !hidden).then(|| self.card(this, m, r, t))
-            })
-            .collect()
+        let runs = self.runs.iter().filter_map(|(m, r)| {
+            let t = tally(&self.items, m, r.from);
+            let hidden = r.hidden_upto.is_some_and(|h| t.newest <= h);
+            (t.total > 0 && !hidden).then(|| self.card(this, m, r, t))
+        });
+        let exports = self.exports.iter().filter(|e| !self.hidden_exports.contains(&e.id)).map(|e| self.export_card(this, e));
+        runs.chain(exports).collect()
+    }
+
+    /// An export's card: its manga, the step and its progress; Cancel, and Open Studio (where its
+    /// result is shown when it ends). Closing the card leaves the export running.
+    fn export_card(&self, this: &Entity<Self>, e: &ExportActivity) -> Card {
+        let id = e.id;
+        let order = self.export_orders.get(&id).copied().unwrap_or(0);
+        let close = {
+            let this = this.clone();
+            move |_: &mut Window, cx: &mut App| {
+                this.update(cx, |s, cx| {
+                    s.hidden_exports.insert(id);
+                    cx.notify();
+                })
+            }
+        };
+        let title = if e.manga_title.is_empty() { "Full video".to_string() } else { format!("{} · full video", e.manga_title) };
+        Card::new(format!("export-{id}"), order, Lead::Progress(e.progress), title, e.label.clone())
+            .progress(e.progress, true)
+            .count(format!("{}%", (e.progress * 100.).round() as u32))
+            .action(btn("cancel", "Cancel", ButtonKind::Ghost).small().icon(ph::X).tooltip("Stop this export").on_click(move |_, _, _| pipeline::cancel_export(id)))
+            .action(btn("open", "Open Studio", ButtonKind::Ghost).small().trailing_icon(ph::ARROW_RIGHT).on_click(|_, w, cx| mv_ui::navigate(Route::Studio, w, cx)))
+            .on_close(close)
     }
 
     fn card(&self, this: &Entity<Self>, manga_id: &str, r: &Run, t: Tally) -> Card {

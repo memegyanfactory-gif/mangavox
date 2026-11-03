@@ -6,8 +6,8 @@ import tempfile
 import unittest
 
 from python.video_generator import (
-    ACCENT_GAP, EDGE_COLORS, IMPACT_GAP, PANEL_TRIM,
-    apply_edit_clips, crop_region, crop_to_region, duo_geometry, edge_segments, focus_region, frame_clip,
+    ACCENT_GAP, EDGE_COLORS, EDGE_LAP, IMPACT_GAP, PANEL_TRIM,
+    apply_edit_clips, crop_region, crop_to_region, duo_geometry, edge_atlas_layout, edge_geometry, edge_glow_graph, edge_pieces, edge_segments, focus_region, frame_clip,
     framing_worst, load_panels, load_scenes, look_filters, mood_transition, particle_kind, plan_clip_fx,
     plan_impacts, plan_moods, plan_transitions, punch_ok, resolve_look, scene_mood, smooth_moods,
 )
@@ -141,22 +141,64 @@ class AtmosphereTests(unittest.TestCase):
 
 class EdgeGlowTests(unittest.TestCase):
     def test_glow_only_with_its_switch(self):
-        on = look_filters({"edge_glow": True}, 1920, 1080, "a", "b")
-        off = look_filters({"edge_glow": False}, 1920, 1080, "a", "b")
-        self.assertIn("drawbox", on)
+        edge = [(0.0, 10.0, "7:v")]
+        on = look_filters({"edge_glow": True}, 1920, 1080, "a", "b", edge=edge)
+        off = look_filters({"edge_glow": False}, 1920, 1080, "a", "b", edge=edge)
         self.assertEqual(off, "[a]null[b]")
         self.assertTrue(on.startswith("[a]") and on.endswith("[b]"))
-        # Filled boxes only (an outline drawbox walks every pixel of the frame).
-        self.assertNotIn(":t=1", on)
-        self.assertEqual(on.count("drawbox"), on.count("t=fill"))
+        # The line's four strips and the light's four sprites, laid on the borders from one still.
+        self.assertEqual(on.count("overlay="), 8)
+        self.assertEqual(on.count("[7:v]"), 1)
+        self.assertNotIn("drawbox", on)
+        self.assertEqual(look_filters({"edge_glow": True}, 1920, 1080, "a", "b"), "[a]null[b]")
 
-    def test_glow_sits_inside_letterbox_bars_and_takes_the_mood_colour(self):
+    def test_glow_sits_inside_letterbox_bars_and_turns_with_the_mood(self):
+        segs = edge_segments([(0.0, EDGE_COLORS["action"]), (6.0, EDGE_COLORS["sad"])], 0, 10)
         graph = look_filters({"edge_glow": True, "letterbox": True}, 1920, 1080, "a", "b",
-                             edge=edge_segments([(0.0, EDGE_COLORS["action"]), (6.0, EDGE_COLORS["sad"])], 0, 10))
-        self.assertIn("y=138:", graph)
-        self.assertIn("0xff7a34", graph)  # action orange
-        self.assertIn("0x70a2ff", graph)  # sad blue
-        self.assertIn("between(t,6.000", graph)
+                             edge=[(s0, s1, f"{7 + n}:v") for n, (s0, s1, _) in enumerate(segs)])
+        th, side, _, _ = edge_geometry(1920, 1080 - 2 * 138)
+        self.assertIn("overlay=x='0':y='138'", graph)
+        self.assertIn(f"overlay=x='0':y='{1080 - 138 - th}'", graph)
+        self.assertIn(f"overlay=x='{1920 - th}':y='{138 + th}'", graph)
+        # The colours split the time with no gap: half a frame before the change, on each side.
+        self.assertIn("lt(t,5.983333)", graph)
+        self.assertIn("gte(t,5.983333)", graph)
+        self.assertEqual(graph.count("overlay="), 16)
+        # The bars are drawn after the glow, so a light running past a corner never shows on them.
+        self.assertGreater(graph.rindex("color=black"), graph.rindex("overlay="))
+
+    def test_the_light_points_the_way_it_travels_and_stays_quiet(self):
+        w, ih = 640, 360
+        th, side, length, ahead = edge_geometry(w, ih)
+        p = edge_pieces(w, ih, EDGE_COLORS["action"])
+        self.assertEqual(p["top"].shape, (th, w, 4))
+        self.assertEqual(p["left"].shape, (side, th, 4))
+        self.assertEqual(p["light_top"].shape, (th, length, 4))
+        self.assertEqual(p["light_right"].shape, (length, th, 4))
+        row = round(3 * min(w, ih) / 1080)  # the line's own row
+        lit = p["light_top"][row, :, 3]
+        # The head is near the leading end, the tail fades behind it.
+        self.assertGreater(int(lit.argmax()), length - 2 * ahead)
+        self.assertLess(int(lit[0]), int(lit.max()) // 8)
+        # Along the right border it travels down: the head at the bottom of its sprite, at the outer edge.
+        col = p["light_right"][:, th - 1 - row, 3]
+        self.assertGreater(int(col.argmax()), length - 2 * ahead)
+        # Quiet: the line alone is faint, and it fades out before its strip ends.
+        self.assertLess(int(p["top"][row, th:w - th, 3].max()), 90)
+        self.assertLess(int(p["top"][th - 1, th:w - th, 3].max()), 8)
+
+    def test_the_light_goes_round_on_the_whole_videos_clock(self):
+        g = edge_glow_graph(2560, 1440, 0, "a", "b", [(0, 1e9, "1:v")])
+        speed = 2 * (2560 + 1440) / EDGE_LAP
+        self.assertIn(f"mod(t*{speed:.4f}+", g)
+        self.assertNotIn("enable", g)
+
+    def test_every_atlas_place_is_even_for_any_frame(self):
+        # A 4:2:0 crop snaps to even pixels: an odd place would shift a piece by one.
+        for w, h in ((2560, 1440), (1920, 1080), (1080, 1920), (1080, 1080), (720, 1280)):
+            places, size = edge_atlas_layout(w, h)
+            for name, box in places.items():
+                self.assertTrue(all(v % 2 == 0 for v in box), (w, h, name, box))
 
     def test_a_long_graph_goes_through_a_file(self):
         from python.video_generator import GRAPH_INLINE, graph_args

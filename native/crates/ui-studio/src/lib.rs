@@ -50,11 +50,26 @@ pub fn register_assistant_tools() {
     assist::register();
 }
 
+/// The one Studio page of the session: leaving Studio and coming back finds it as it was, its
+/// export (progress, Cancel, the exports queued after it) and Generate state included.
+struct Kept(Entity<page::StudioPage>);
+impl Global for Kept {}
+
 pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView> {
     // The assistant's video_* tools work from any page.
     vedit_tools::register();
     match route {
-        Route::Studio => Some(cx.new(|cx| page::StudioPage::new(window, cx)).into()),
+        Route::Studio => {
+            if let Some(Kept(page)) = cx.try_global::<Kept>() {
+                let page = page.clone();
+                // Chapters may have been downloaded or deleted elsewhere meanwhile.
+                page.update(cx, |p, cx| p.reload_library(cx));
+                return Some(page.into());
+            }
+            let page = cx.new(|cx| page::StudioPage::new(window, cx));
+            cx.set_global(Kept(page.clone()));
+            Some(page.into())
+        }
         Route::Thumbnails => Some(cx.new(ytpack::ThumbnailsPage::new).into()),
         Route::YouTubeVideos => Some(cx.new(ytpack::VideosPage::new).into()),
         _ => None,

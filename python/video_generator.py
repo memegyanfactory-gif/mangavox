@@ -17,6 +17,7 @@ import wave
 import math
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -577,89 +578,177 @@ def edge_thickness(w, h):
     return max(8, round(min(w, h) * 0.02) // 2 * 2)
 
 
-# The edge glow's layers at 1080 rows (scaled to the frame): distance in from the edge, thickness,
-# opacity and whether it is the near-white core (else the mood colour). Nested outlines of filled
-# boxes make a thin bright line a few pixels in with a soft halo either side, fading inward.
-EDGE_LAYERS = ((0, 3, 0.2, False), (4, 2, 0.6, True), (6, 2, 0.32, False), (8, 4, 0.16, False), (12, 8, 0.06, False))
-# Two lights chase each other clockwise round the frame once every EDGE_LAP seconds: a bright
-# head with a fading tail (length share of the perimeter, thickness, opacity, core or colour),
-# drawn over the core line.
+# The edge glow: a thin soft line of the mood's colour just inside the picture's border, and one
+# soft light gliding clockwise round it once every EDGE_LAP seconds, brightest at its head and
+# fading along its tail. Quiet by design (it must never pull the eye off the picture). Both are
+# stills, drawn once per size and colour (make_edge_glow) and laid over the borders only
+# (edge_glow_graph): the line as four strips, the light as one sprite per border that the overlay
+# moves along it every frame. (A moving picture as an overlay input costs far more: four renders
+# side by side spent more time passing its frames along than drawing.)
+EDGE_VERSION = 4
 EDGE_LAP = 12.0
-EDGE_COMET = ((0.035, 3, 0.75, True), (0.08, 2, 0.4, True), (0.16, 8, 0.12, False))
 EDGE_CORE = (255, 242, 222)
+# The light's tail: it fades over EDGE_TAIL of the way round (to 5% at three times that); ahead
+# of its head it rises over EDGE_RISE.
+EDGE_TAIL = 1 / 12
+EDGE_RISE = 1 / 160
 
 
 def _hex(rgb):
     return "0x%02x%02x%02x" % tuple(max(0, min(255, int(v))) for v in rgb)
 
 
-def edge_glow_filters(w, h, bar=0, segments=None):
-    """The edge glow as a chain of filled drawbox filters (each touches only its own pixels, so
-    the whole ring costs next to nothing per frame): EDGE_LAYERS as nested outlines along the
-    picture's four borders (inside letterbox bars `bar` high) and two EDGE_COMET lights running
-    round it. The near-white core is drawn once; the coloured halo and tails once per colour
-    segment (edge_segments: [(start, end, rgb)]), each switched on for its time only. Captions
-    are burnt in after, over it."""
-    segments = segments or [(0.0, float("inf"), EDGE_COLORS["neutral"])]
-    k = min(w, h) / 1080
-    top, ih = bar, h - 2 * bar
-    perim = 2 * w + 2 * ih
+def edge_geometry(w, ih):
+    """The edge glow's sizes in a picture w x ih (between any letterbox bars): strip thickness,
+    side strip length (the sides fit between the top and bottom strips), the light's sprite
+    length and where its head sits in it (px from its leading end)."""
+    th = edge_thickness(w, ih)
+    perim = 2 * (w + ih)
+    ahead = math.ceil(3 * EDGE_RISE * perim)
+    # Even, like every place in the atlas: a 4:2:0 crop snaps to even pixels.
+    length = (math.ceil(3 * EDGE_TAIL * perim) + ahead + 1) // 2 * 2
+    return th, ih - 2 * th, length, ahead
+
+
+def _edge_weights(d, k, th):
+    """The line's and the halo's weight at distance d (px) in from the border."""
+    import numpy as np
+    fade = np.clip((th - d) / (0.35 * th), 0, 1)
+    # A soft thread 3 px in (at 1080 rows), with a faint glow inward.
+    return np.exp(-0.5 * ((d - 3 * k) / (1.1 * k)) ** 2) * fade, np.exp(-d / (6 * k)) * fade
+
+
+def _edge_rgba(rgb, alpha, white):
+    import numpy as np
+    col, core = np.array(rgb, np.float32), np.array(EDGE_CORE, np.float32)
+    out = np.empty(alpha.shape + (4,), np.float32)
+    out[..., :3] = col + (core - col) * np.clip(white, 0, 1)[..., None]
+    out[..., 3] = np.clip(alpha, 0, 1) * 255
+    return (out + 0.5).clip(0, 255).astype(np.uint8)
+
+
+def edge_pieces(w, ih, rgb):
+    """The edge glow's stills (RGBA arrays): the line's strips "top", "bottom", "left", "right"
+    (each as laid: top and bottom w x th, the sides th x side, their outer edge at the border;
+    corners belong to the top and bottom strips, the line turning in them) and the light's sprite
+    per border, "light_top" etc., pointing the way it travels (clockwise)."""
+    import numpy as np
+    th, side, length, ahead = edge_geometry(w, ih)
+    k = min(w, ih) / 1080
+    perim = 2 * (w + ih)
+    pieces = {}
+    # The line: each strip pixel's distance in from its nearest border.
+    for name, (y0, x0, hh, ww) in (("top", (0, 0, th, w)), ("bottom", (ih - th, 0, th, w)),
+                                   ("left", (th, 0, side, th)), ("right", (th, w - th, side, th))):
+        y, x = np.mgrid[y0:y0 + hh, x0:x0 + ww].astype(np.float32)
+        d = np.minimum(np.minimum(y, ih - 1 - y), np.minimum(x, w - 1 - x))
+        line, halo = _edge_weights(d, k, th)
+        pieces[name] = _edge_rgba(rgb, line * 0.26 + halo * 0.05, line * 0.25)
+    # The light along the top border, head at `length - ahead` (travelling right): rows are the
+    # distance in, columns the way along.
+    d, c = np.mgrid[0:th, 0:length].astype(np.float32)
+    behind = (length - ahead) - c
+    light = np.where(behind >= 0, np.exp(-np.maximum(behind, 0) / (EDGE_TAIL * perim)), np.exp(-0.5 * (behind / (EDGE_RISE * perim)) ** 2))
+    line, halo = _edge_weights(d, k, th)
+    top = _edge_rgba(rgb, line * 0.5 * light + halo * 0.12 * light, line * (0.25 + 0.55 * light))
+    pieces["light_top"] = top
+    pieces["light_bottom"] = top[::-1, ::-1]
+    pieces["light_right"] = top.transpose(1, 0, 2)[:, ::-1]
+    pieces["light_left"] = top.transpose(1, 0, 2)[::-1, :]
+    return pieces
+
+
+def edge_atlas_layout(w, ih):
+    """Where each of edge_pieces' stills sits in their atlas: {name: (x, y, w, h)}, and its size.
+    The across-the-frame pieces stack at the left, the upright ones stand side by side right of them."""
+    th, side, length, _ = edge_geometry(w, ih)
+    across = max(w, length)
+    places = {"top": (0, 0, w, th), "bottom": (0, th, w, th), "light_top": (0, 2 * th, length, th), "light_bottom": (0, 3 * th, length, th),
+              "left": (across, 0, th, side), "right": (across + th, 0, th, side),
+              "light_left": (across + 2 * th, 0, th, length), "light_right": (across + 3 * th, 0, th, length)}
+    return places, (across + 4 * th, max(4 * th, side, length))
+
+
+def make_edge_glow(w, ih, rgb, work_dir):
+    """The edge glow's stills in colour `rgb` for a picture w x ih, packed in one PNG (see
+    edge_atlas_layout), made once per size and colour and kept in the fx cache. Returns its path."""
+    import numpy as np
+    from PIL import Image
+    root = fx_cache_dir() or work_dir
+    out = os.path.join(root, f"edge_{w}x{ih}_{_hex(rgb)[2:]}_v{EDGE_VERSION}.png")
+    if os.path.exists(out) and os.path.getsize(out) > 100:
+        return out
+    places, (aw, ah) = edge_atlas_layout(w, ih)
+    atlas = np.zeros((ah, aw, 4), np.uint8)
+    for name, img in edge_pieces(w, ih, rgb).items():
+        x, y, pw, ph = places[name]
+        atlas[y:y + ph, x:x + pw] = img
+    tmp = f"{out}.part{os.getpid()}_{threading.get_ident()}.png"
+    Image.fromarray(atlas, "RGBA").save(tmp, compress_level=1)
+    try:
+        os.replace(tmp, out)
+    except OSError:
+        if not os.path.exists(out):
+            return tmp
+        os.unlink(tmp)
+    return out
+
+
+def edge_glow_graph(w, h, bar, src, out, segments):
+    """The edge glow over [src] (a w x h picture, letterbox bars `bar` high) into [out].
+    `segments` is [(start, end, label)]: each label make_edge_glow's still in that stretch's
+    colour (see edge_segments), on for its time only. The line's strips are laid on their borders;
+    each light sprite moves along its border with the light's head, round the frame on the whole
+    video's clock (t), so the light runs on across the joins of the parts."""
+    ih = h - 2 * bar
+    th, side, length, ahead = edge_geometry(w, ih)
+    places, _ = edge_atlas_layout(w, ih)
+    perim = 2 * (w + ih)
     speed = perim / EDGE_LAP
 
-    def ring(on, col, core):
-        out = []
-        for d, th, alpha, is_core in EDGE_LAYERS:
-            if is_core != core:
-                continue
-            d, th = round(d * k), max(1, round(th * k))
-            c = f"{col}@{alpha}"
-            # Top and bottom span the width (less this layer's inset); the sides fit between them.
-            for x, y, bw, bh in ((d, top + d, w - 2 * d, th), (d, top + ih - d - th, w - 2 * d, th),
-                                 (d, top + d + th, th, ih - 2 * d - 2 * th), (w - d - th, top + d + th, th, ih - 2 * d - 2 * th)):
-                if bw > 0 and bh > 0:
-                    out.append(f"drawbox=x={x}:y={y}:w={bw}:h={bh}:color={c}:t=fill{on}")
-        for n in (0, 1):
-            head = f"mod(t*{speed:.3f}+{n * perim / 2:.1f},{perim})"
-            for share, th, alpha, is_core in EDGE_COMET:
-                if is_core != core:
-                    continue
-                ln = round(share * perim)
-                th = max(1, round(th * k))
-                d = max(0, round(5 * k) - th // 2)
-                c = f"{col}@{alpha}"
-                # The light's span [head - ln, head] on the way round, per edge (s0 = where the edge
-                # starts on the way round; along it or against it): off screen where it does not
-                # reach. The left edge comes twice, for a tail wrapping past the top left corner.
-                for s0, size_n, horiz, fwd, fixed in ((0, w, True, True, top + d), (w, ih, False, True, w - d - th),
-                                                      (w + ih, w, True, False, top + ih - d - th), (2 * w + ih, ih, False, False, d),
-                                                      (-ih, ih, False, False, d)):
-                    lo = f"max(0,{head}-{ln}-{s0})"
-                    hi = f"min({size_n},{head}-{s0})"
-                    pos = lo if fwd else f"{size_n}-{hi}"
-                    pos = f"if(gt({hi},{lo}),{pos}{'' if horiz else f'+{top}'},-99999)"
-                    size = f"max(1,{hi}-{lo})"
-                    if horiz:
-                        out.append(f"drawbox=x='{pos}':y={fixed}:w='{size}':h={th}:color={c}:t=fill{on}")
-                    else:
-                        out.append(f"drawbox=x={fixed}:y='{pos}':w={th}:h='{size}':color={c}:t=fill{on}")
-        return out
+    def along(s0):
+        # How far the head is along the border that starts s0 of the way round: from `ahead`
+        # before its start (so the light's rise reaches round a corner before its head does) to
+        # perim - ahead after it (the tail long gone by then).
+        return f"(mod(t*{speed:.4f}+{perim - s0 + ahead},{perim})-{ahead})"
 
-    boxes = []
-    for a, b, rgb in segments:
-        on = "" if len(segments) == 1 else f":enable='between(t,{a:.3f},{b - 0.0005:.3f})'"
-        boxes += ring(on, _hex(rgb), False)
-    boxes += ring("", _hex(EDGE_CORE), True)
-    return ",".join(boxes)
+    lead = length - ahead
+    at = {
+        "top": (0, bar), "bottom": (0, bar + ih - th), "left": (0, bar + th), "right": (w - th, bar + th),
+        "light_top": (f"{along(0)}-{lead}", bar),
+        "light_right": (w - th, f"{bar - lead}+{along(w)}"),
+        "light_bottom": (f"{w - ahead}-{along(w + ih)}", bar + ih - th),
+        "light_left": (0, f"{bar + ih - ahead}-{along(2 * w + ih)}"),
+    }
+    parts = []
+    cur = src
+    for n, (a, b, label) in enumerate(segments):
+        # Each colour from half a frame before its first frame to half a frame before the next
+        # colour's (the first open before, the last after), so every frame is in exactly one.
+        bounds = ([f"gte(t,{a - 0.5 / FPS:.6f})"] if n else []) + ([f"lt(t,{b - 0.5 / FPS:.6f})"] if n + 1 < len(segments) else [])
+        on = f":enable='{'*'.join(bounds)}'" if bounds else ""
+        e = f"{out}_e{n}"
+        names = list(at)
+        parts.append(f"[{label}]format=yuva420p,setparams=colorspace=bt470bg:range=tv,split={len(names)}" + "".join(f"[{e}{i}]" for i in range(len(names))))
+        for i, name in enumerate(names):
+            x, y, pw, ph = places[name]
+            parts.append(f"[{e}{i}]crop={pw}:{ph}:{x}:{y}[{e}{name}]")
+            nxt = f"{e}{name}o"
+            ox, oy = at[name]
+            parts.append(f"[{cur}][{e}{name}]overlay=x='{ox}':y='{oy}':format=yuv420{on}[{nxt}]")
+            cur = nxt
+    parts.append(f"[{cur}]null[{out}]")
+    return ";".join(parts)
 
 
 def look_filters(look, w, h, src, out, particles=None, vignette=None, edge=None):
     """Finishing filters for `look` on [src] (a w x h picture), labelled [out]: a gentle grade
     and colour preset (one lookup table), floating particles (the looped [particles] stream,
     when given), a vignette (the [vignette] mask of make_vignette_mask laid over, when given,
-    else the vignette filter), fine film grain, letterbox bars and the edge glow (in the colour
-    segments `edge`, edge_segments'; the neutral colour when not given), each only when the look
-    has it on. (The glow is baked into each still instead: it would cost more than the rest
-    together per frame.)"""
+    else the vignette filter), fine film grain, letterbox bars and the edge glow (`edge`:
+    edge_glow_graph's [(start, end, label)] streams; none drawn when not given), each only when
+    the look has it on. (The panel glow is baked into each still instead: it would cost more than
+    the rest together per frame.)"""
     parts = []
     cur = src
     lut = color_lut(look.get("grade"), look.get("color"))
@@ -680,12 +769,16 @@ def look_filters(look, w, h, src, out, particles=None, vignette=None, edge=None)
     if look.get("grain") and round(4 * gk) > 0:
         tail.append(f"noise=alls={round(4 * gk)}:allf=t")
     bar = letterbox_bar(w, h) if look.get("letterbox") else 0
-    if bar:
-        tail.append(f"drawbox=x=0:y=0:w={w}:h={bar}:color=black:t=fill")
-        tail.append(f"drawbox=x=0:y={h - bar}:w={w}:h={bar}:color=black:t=fill")
-    if look.get("edge_glow"):
-        tail.append(edge_glow_filters(w, h, bar, edge))
-    parts.append(f"[{cur}]{','.join(tail) if tail else 'null'}[{out}]")
+    bars = [f"drawbox=x=0:y=0:w={w}:h={bar}:color=black:t=fill", f"drawbox=x=0:y={h - bar}:w={w}:h={bar}:color=black:t=fill"] if bar else []
+    if look.get("edge_glow") and edge:
+        # The glow before the bars, so a light running on past a corner never shows on them.
+        parts.append(f"[{cur}]{','.join(tail) if tail else 'null'}[{out}_t]")
+        parts.append(edge_glow_graph(w, h, bar, f"{out}_t", f"{out}_e" if bars else out, edge))
+        if bars:
+            parts.append(f"[{out}_e]{','.join(bars)}[{out}]")
+    else:
+        tail += bars
+        parts.append(f"[{cur}]{','.join(tail) if tail else 'null'}[{out}]")
     return ";".join(parts)
 
 
@@ -1094,6 +1187,10 @@ def _warp(window, zoom, frames, interp, ease=None, held=True):
     (zoompan rounds its crop to whole, chroma-aligned pixels and visibly steps). With `held`
     False the input is already a moving picture of `frames` frames (a layered panel)."""
     e = ease or _ease("on", frames)
+    # A camera that does not move (no term of the eased progress): the corners are worked out
+    # once, not for every frame (perspective then also keeps its sampling table, the bulk of its
+    # cost per frame).
+    still = not any(re.search(r"\{e\}|\b(?:on|in|t)\b", v) for v in (zoom, *window))
     z = "(" + zoom.format(e=e) + ")"
     px, py = (v.format(e=e) for v in window)
     cw, ch = f"W/{z}", f"H/{z}"
@@ -1103,7 +1200,7 @@ def _warp(window, zoom, frames, interp, ease=None, held=True):
         f"{clock},"
         f"perspective=x0='{x}':y0='{y}':x1='{x}+{cw}':y1='{y}':"
         f"x2='{x}':y2='{y}+{ch}':x3='{x}+{cw}':y3='{y}+{ch}':"
-        f"interpolation={interp}:eval=frame"
+        f"interpolation={interp}:eval={'init' if still else 'frame'}"
     )
 
 
@@ -1516,22 +1613,29 @@ def _flash(impact):
 def _encode_clip(inputs, graph, frames, out_path):
     tmp = out_path + ".part.mp4"
     threads = ffmpeg_threads(render_jobs())
-    stderr = ""
-    for codec in clip_codecs(threads):
+    # Each input's decoder held to this run's share of the cores too (left alone, every one starts
+    # a thread per core, and buffers a frame for each: the atmosphere's 1440p frames add up).
+    capped = []
+    for arg in inputs:
+        if arg == "-i":
+            capped += ["-threads", str(threads)]
+        capped.append(arg)
+
+    def run(codec):
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-filter_complex_threads", str(threads),
-            *inputs,
+            *capped,
             "-filter_complex", ";".join(graph),
             "-map", "[v]", "-frames:v", str(frames), "-r", str(FPS),
             *codec, "-an", tmp,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0 and os.path.exists(tmp):
-            os.replace(tmp, out_path)
-            return
-        stderr = result.stderr
-        encoder_failed(codec)
-    raise RuntimeError(f"clip render failed: {stderr[:300]}")
+        return result.returncode == 0 and os.path.exists(tmp), result.stderr
+
+    ok, stderr = run_codecs(clip_codecs(threads), run)
+    if not ok:
+        raise RuntimeError(f"clip render failed: {stderr[:300]}")
+    os.replace(tmp, out_path)
 
 
 # Stills (full-range JPEG) are turned into video (limited) range once, before they are held,
@@ -2196,11 +2300,29 @@ def nvenc_available():
 
 
 def encoder_failed(codec):
-    """A run failed with `codec` (args from clip_codecs / final_codecs): stop using NVENC."""
+    """A run failed with `codec` (args from clip_codecs / final_codecs) and worked on the CPU:
+    stop using NVENC. (A run that fails on the CPU too is broken in itself, not the encoder.)"""
     global _NVENC
     if "h264_nvenc" in codec:
         with _NVENC_LOCK:
             _NVENC = False
+
+
+def run_codecs(codecs, run):
+    """Calls run(codec) -> (ok, stderr) with each of `codecs` (clip_codecs / final_codecs) until
+    one works; NVENC is turned off when it failed where the CPU then worked. Returns
+    (ok, stderr of the last try)."""
+    failed = None
+    stderr = ""
+    for codec in codecs:
+        ok, stderr = run(codec)
+        if ok:
+            if failed:
+                encoder_failed(failed)
+            return True, stderr
+        if "h264_nvenc" in codec:
+            failed = codec
+    return False, stderr
 
 
 def clip_codecs(threads):
@@ -2506,16 +2628,17 @@ def layered_job(c, frames, seg, panels, reads, look, output_dir, video_dir):
     }
 
 
-def run_layered(jobs, config, work_dir):
-    """Runs the pack (its own Python, below normal priority) on the jobs {clip: job}; returns
-    {job id: result}. Any failure leaves those clips to render as usual."""
+def run_layered(jobs, config, work_dir, threads=None):
+    """Runs the pack (its own Python, below normal priority) on the jobs {clip: job} with
+    `threads` CPU threads (default all of the share); returns {job id: result}. Any failure
+    leaves those clips to render as usual."""
     py, why = layered_plan.pack_python(config)
     if not py:
         _layered_note(f"skipped ({why})")
         return {}
     path = os.path.join(work_dir, "layered_jobs.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"threads": cpus(), "jobs": list(jobs.values())}, f)
+        json.dump({"threads": threads or cpus(), "jobs": list(jobs.values())}, f)
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layered_motion.py")
     env = os.environ.copy()
     env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"})
@@ -2971,22 +3094,6 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     except OSError as e:
         print(f"[video] Could not save the framing report: {e}", file=sys.stderr)
 
-    # The layered clips' panels, made in one run of the pack (models one after another on the
-    # GPU); a clip whose panel could not be made renders as usual, under its plain key.
-    if layer_jobs:
-        made = run_layered(layer_jobs, config, video_dir)
-        for n, (c, frames, path) in enumerate(todo):
-            k = clips.index(c)
-            job = layer_jobs.get(k)
-            if not job:
-                continue
-            if made.get(job["id"], {}).get("ok") and os.path.isfile(job["out"]):
-                c["images"] = dict(c["images"], fg_anim=job["out"])
-            else:
-                plain = clip_key(c["source"], c["focus"], c["spec"], frames, w, h, fill)
-                clip_paths[k] = os.path.join(video_dir, f"clip_{c['idx']:04d}_{plain}.mp4")
-                todo[n] = (c, frames, clip_paths[k])
-
     def render_one(c, frames, path):
         try:
             _render_clip(c, frames, w, h, path)
@@ -3004,17 +3111,90 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             _render_clip(c, frames, w, h, path)
         return frames
 
-    # Each clip is its own ffmpeg run whose filter graph mostly uses one core, so several run
-    # side by side; the clips are independent files, joined in order below.
-    with ThreadPoolExecutor(max_workers=render_jobs()) as pool:
-        for done in as_completed([pool.submit(render_one, *t) for t in todo]):
-            rendered += done.result()
-            report("clips", rendered / all_frames)
-
-    # Narration, sample-accurate against the same timeline (sped-up clips retimed first).
-    _retime_clips(clips, caption_segments, video_dir)
+    # Narration, sample-accurate against the same timeline (sped-up clips retimed first), and the
+    # captions timed to it: made beside the clips (they read only the timing, never a clip).
     narration = os.path.join(video_dir, "narration.wav")
-    _build_narration(clips, video_dir, narration)
+
+    def make_sound_and_captions():
+        _retime_clips(clips, caption_segments, video_dir)
+        _build_narration(clips, video_dir, narration)
+        try:
+            import captions
+            return captions.write_styled_captions(caption_segments, output_dir, w, h, config=config)
+        except Exception as e:
+            print(f"[video] Failed to generate styled captions: {e}", file=sys.stderr)
+            return None
+
+    def make_edge():
+        # The edge glow's loops for the finish (kept in the fx cache), drawn while clips render.
+        if look.get("edge_glow"):
+            try:
+                for rgb in dict.fromkeys(tuple(c["mood"]["edge"] if c["mood"] else EDGE_COLORS["neutral"]) for c in clips):
+                    make_edge_glow(w, h - 2 * inset, rgb, video_dir)
+            except Exception as e:
+                print(f"[video] {e}; the finish will try the edge glow again", file=sys.stderr)
+
+    # Each clip is its own ffmpeg run whose filter graph mostly uses one core, so several run
+    # side by side; the clips are independent files, joined in order below. The longest go first,
+    # so the last to finish is never a long clip started late, running on its own. While the
+    # layered pack runs, the plain clips render beside it in half the slots (the pack's encoder
+    # and its torch work need the rest; starved, it runs several times slower); its clips then go
+    # ahead of the plain ones still waiting.
+    t_clips = time.monotonic()
+    jobs = render_jobs()
+    lock = threading.Lock()
+    slots = threading.Semaphore(jobs)
+    queue = sorted((t for t in todo if clips.index(t[0]) not in layer_jobs), key=lambda t: -t[1])
+
+    def worker():
+        nonlocal rendered
+        while True:
+            with slots:
+                with lock:
+                    if not queue:
+                        return
+                    t = queue.pop(0)
+                frames = render_one(*t)
+            with lock:
+                rendered += frames
+                report("clips", rendered / all_frames)
+
+    layered_todo = [t for t in todo if clips.index(t[0]) in layer_jobs]
+    reserve = jobs // 2 if layer_jobs else 0
+    for _ in range(reserve):
+        slots.acquire()
+    with ThreadPoolExecutor(max_workers=2) as side, ThreadPoolExecutor(max_workers=2 * jobs) as pool:
+        sound = side.submit(make_sound_and_captions)
+        side.submit(make_edge)
+        futures = [pool.submit(worker) for _ in range(jobs)]
+        # The layered clips' panels, made in one run of the pack (models one after another on the
+        # GPU) while the plain clips render; a clip whose panel could not be made renders as
+        # usual, under its plain key.
+        if layer_jobs:
+            t_layered = time.monotonic()
+            try:
+                made = run_layered(layer_jobs, config, video_dir, threads=max(2, cpus() // 2))
+            finally:
+                for _ in range(reserve):
+                    slots.release()
+            print(f"[video] Timing: layered pack {time.monotonic() - t_layered:.1f} s", file=sys.stderr)
+            for n, (c, frames, path) in enumerate(layered_todo):
+                k = clips.index(c)
+                job = layer_jobs[k]
+                if made.get(job["id"], {}).get("ok") and os.path.isfile(job["out"]):
+                    c["images"] = dict(c["images"], fg_anim=job["out"])
+                else:
+                    plain = clip_key(c["source"], c["focus"], c["spec"], frames, w, h, fill)
+                    clip_paths[k] = os.path.join(video_dir, f"clip_{c['idx']:04d}_{plain}.mp4")
+                    layered_todo[n] = (c, frames, clip_paths[k])
+            with lock:
+                queue[:0] = sorted(layered_todo, key=lambda t: -t[1])
+            # Workers that found the queue empty while the pack ran have left: start them again.
+            futures += [pool.submit(worker) for _ in range(jobs)]
+        for f in futures:
+            f.result()
+        ass_path = sound.result()
+    print(f"[video] Timing: {len(todo)} clips {time.monotonic() - t_clips:.1f} s ({jobs} at once)", file=sys.stderr)
 
     # The clips go straight into the finish (made in parts side by side, see
     # _finalize_video_with_audio_mix_and_captions): no intermediate join, so no extra encode.
@@ -3036,15 +3216,6 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     # Sound effects on the story's big moments (sfx.py): a sparse stem under the narration.
     sfx_track = _build_sfx_stem(config, output_dir, render_items, clips, starts, trans, timeline, narration, narration_volume, video_dir)
 
-    ass_path = None
-    try:
-        import captions
-        ass_path = captions.write_styled_captions(
-            caption_segments, output_dir, w, h, config=config,
-        )
-    except Exception as e:
-        print(f"[video] Failed to generate styled captions: {e}", file=sys.stderr)
-
     video = {
         "inputs": video_inputs, "starts": video_starts, "trans": video_trans, "look": look,
         "overlays": edit.get("overlays") or [], "work_dir": video_dir,
@@ -3059,11 +3230,13 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         # The glow takes each clip's mood colour as it lands.
         video["edge_colors"] = [(c["start"], c["mood"]["edge"] if c["mood"] else EDGE_COLORS["neutral"]) for c in clips]
     on_final = lambda f: report("finalize", f)
+    t_final = time.monotonic()
     success = _finalize_video_with_audio_mix_and_captions(
         video, narration, final_video, ass_path, bg_music,
         narration_volume, bg_music_volume, bg_music_loop, w, h, timeline,
         score=score, music_volume=music_volume, on_fraction=on_final, sfx=sfx_track,
     )
+    print(f"[video] Timing: finish {time.monotonic() - t_final:.1f} s", file=sys.stderr)
     if not success:
         print("[video] Finalization failed, retrying without captions, music and finish", file=sys.stderr)
         success = _finalize_video_with_audio_mix_and_captions(
@@ -3330,6 +3503,16 @@ def _finalize_video_with_audio_mix_and_captions(
             vmask = make_vignette_mask(w, h, vignette_angle(video["look"]), work)
         except Exception as e:
             print(f"[video] {e}; using the vignette filter", file=sys.stderr)
+    # The edge glow's stills in each mood colour the video uses (none drawn if one cannot be made).
+    edge_stills = {}
+    if video.get("look") and video["look"].get("edge_glow"):
+        ih = h - 2 * (letterbox_bar(w, h) if video["look"].get("letterbox") else 0)
+        try:
+            for rgb in dict.fromkeys(tuple(c) for _, c in video.get("edge_colors") or [(0, EDGE_COLORS["neutral"])]):
+                edge_stills[rgb] = make_edge_glow(w, ih, rgb, work)
+        except Exception as e:
+            print(f"[video] {e}; no edge glow", file=sys.stderr)
+            edge_stills = {}
 
     def part_cmd(a, b, path, codec):
         ka = bisect.bisect_right(first, a) - 1
@@ -3343,7 +3526,10 @@ def _finalize_video_with_audio_mix_and_captions(
             inputs.extend(["-threads", str(threads), *seek, "-i", video["inputs"][k]])
             n = len(labels)
             labels.append(f"p{n}")
-            graph.append(f"[{n}:v]settb=AVTB,setpts=PTS-STARTPTS[p{n}]")
+            # Held in the clips' own 4:2:0: xfade works in 4:4:4 only, and left free the whole part
+            # (concat takes one format) was turned to 4:4:4 and back, two full-frame conversions on
+            # every frame. Now only a transition's few frames are.
+            graph.append(f"[{n}:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[p{n}]")
             return f"p{n}"
 
         # The part as a run of pieces: each clip alone between transitions, and each transition
@@ -3399,7 +3585,12 @@ def _finalize_video_with_audio_mix_and_captions(
                 # One still: overlay repeats it on every frame.
                 vlabel = f"{len(labels) + extra.count('-i')}:v"
                 extra += ["-i", vmask]
-            edge = edge_segments(video.get("edge_colors") or [], t0, b / FPS) if video["look"].get("edge_glow") else None
+            edge = []
+            if edge_stills:
+                colors = video.get("edge_colors") or [(0.0, EDGE_COLORS["neutral"])]
+                for s0, s1, rgb in edge_segments(colors, t0, b / FPS):
+                    edge.append((s0, s1, f"{len(labels) + extra.count('-i')}:v"))
+                    extra += ["-i", edge_stills[tuple(rgb)]]
             graph.append(look_filters(video["look"], w, h, "vraw", "vx", plabel, vlabel, edge))
         else:
             graph.append("[vraw]null[vx]")
@@ -3432,20 +3623,23 @@ def _finalize_video_with_audio_mix_and_captions(
     def make_part(i):
         a, b, path = parts[i]
         tmp = path + ".part.mp4"
-        stderr = ""
-        for codec in final_codecs(threads):
+
+        def run(codec):
             code, stderr = run_ffmpeg_progress(part_cmd(a, b, tmp, codec), (b - a) / FPS, lambda f: report_part(i, f), timeout=3600)
-            if code == 0 and os.path.exists(tmp):
-                os.replace(tmp, path)
-                return
-            print(f"[video] Part {i + 1} of the picture failed with {codec[1]}: {stderr[:300]}", file=sys.stderr)
-            encoder_failed(codec)
-        raise RuntimeError(f"part {i + 1} of the picture failed: {stderr[:300]}")
+            if code != 0 or not os.path.exists(tmp):
+                print(f"[video] Part {i + 1} of the picture failed with {codec[1]}: {stderr[:300]}", file=sys.stderr)
+                return False, stderr
+            return True, stderr
+
+        ok, stderr = run_codecs(final_codecs(threads), run)
+        if not ok:
+            raise RuntimeError(f"part {i + 1} of the picture failed: {stderr[:300]}")
+        os.replace(tmp, path)
 
     try:
-        # The audio takes a slot of its own for its second or two.
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = [pool.submit(make_audio)] + [pool.submit(make_part, i) for i in range(len(parts))]
+        # The audio is mixed beside the parts (it needs about one core), not in a part's slot.
+        with ThreadPoolExecutor(max_workers=1) as side, ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [side.submit(make_audio)] + [pool.submit(make_part, i) for i in range(len(parts))]
             for f in as_completed(futures):
                 f.result()
     except Exception as e:

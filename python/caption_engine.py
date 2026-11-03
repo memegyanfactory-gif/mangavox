@@ -1624,7 +1624,9 @@ def ffmpeg_filter_path(p: str) -> str:
 
 
 def subtitles_filter(ass_path: str) -> str:
-    f = f"subtitles={ffmpeg_filter_path(ass_path)}"
+    # `ass` hands the file to libass as it is; `subtitles` demuxes and decodes every event first
+    # (a few tenths of a second per run for a chapter's ~17k events), for the same picture.
+    f = f"ass={ffmpeg_filter_path(ass_path)}"
     if os.path.isdir(FONTS_DIR):
         f += f":fontsdir={ffmpeg_filter_path(FONTS_DIR)}"
     return f

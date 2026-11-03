@@ -1097,33 +1097,54 @@ pub fn ai_activity() -> Option<AiActivity> {
 /// and what it is doing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExportActivity {
+    /// Which export (for [`cancel_export`]).
+    pub id: u64,
     pub manga_id: String,
+    pub manga_title: String,
     pub progress: f32,
     pub label: String,
 }
 
-type ExportState = std::sync::Weak<Mutex<(f32, String)>>;
+/// One tracked export: its id, manga (id and title), progress and cancel flag. Weak, so an
+/// entry goes when its job and workers are gone.
+struct Tracked {
+    id: u64,
+    manga_id: String,
+    manga_title: String,
+    state: std::sync::Weak<Mutex<(f32, String)>>,
+    cancel: std::sync::Weak<AtomicBool>,
+}
 
-/// Exports in flight; an entry goes when its job and workers are gone.
-static EXPORTS: Mutex<Vec<(String, ExportState)>> = Mutex::new(Vec::new());
+/// Exports in flight.
+static EXPORTS: Mutex<Vec<Tracked>> = Mutex::new(Vec::new());
+static EXPORT_IDS: AtomicU64 = AtomicU64::new(1);
 
 /// Called by `export::Job::new`.
-pub(crate) fn track_export(manga_id: &str, state: &Arc<Mutex<(f32, String)>>) {
+pub(crate) fn track_export(manga_id: &str, manga_title: &str, state: &Arc<Mutex<(f32, String)>>, cancel: &Arc<AtomicBool>) {
     let mut g = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
-    g.retain(|(_, w)| w.strong_count() > 0);
-    g.push((manga_id.to_string(), Arc::downgrade(state)));
+    g.retain(|t| t.state.strong_count() > 0);
+    let id = EXPORT_IDS.fetch_add(1, Ordering::Relaxed);
+    g.push(Tracked { id, manga_id: manga_id.to_string(), manga_title: manga_title.to_string(), state: Arc::downgrade(state), cancel: Arc::downgrade(cancel) });
 }
 
 /// Exports and joins running now.
 pub fn exports() -> Vec<ExportActivity> {
     let mut g = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
-    g.retain(|(_, w)| w.strong_count() > 0);
+    g.retain(|t| t.state.strong_count() > 0);
     g.iter()
-        .filter_map(|(m, w)| {
-            let (progress, label) = w.upgrade()?.lock().ok()?.clone();
-            Some(ExportActivity { manga_id: m.clone(), progress: progress.clamp(0., 1.), label })
+        .filter_map(|t| {
+            let (progress, label) = t.state.upgrade()?.lock().ok()?.clone();
+            Some(ExportActivity { id: t.id, manga_id: t.manga_id.clone(), manga_title: t.manga_title.clone(), progress: progress.clamp(0., 1.), label })
         })
         .collect()
+}
+
+/// Cancels the export `id` (from [`exports`]); it stops at its next step and says so.
+pub fn cancel_export(id: u64) {
+    let g = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = g.iter().find(|t| t.id == id).and_then(|t| t.cancel.upgrade()) {
+        c.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
