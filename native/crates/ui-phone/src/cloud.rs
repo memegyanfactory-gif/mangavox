@@ -34,6 +34,7 @@ use tower::ServiceExt as _;
 
 use crate::auth::{self, CloudPeer, Device};
 use crate::cloud_crypto::{self as cc, Opener, Sealer, Transcript};
+use crate::server::{ApiError, ApiResult};
 use crate::state;
 
 /// The relay; `MANGAVOX_CLOUD_URL` points a dev build at a local one (`wrangler dev`).
@@ -197,6 +198,26 @@ fn uri_encode(s: &str) -> String {
 
 fn pc_name() -> String {
     std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "This PC".into())
+}
+
+// ---------------------------------------------------------------- home-screen invites
+
+/// `POST /api/cloud/invite` (behind the guard): a one-time link that lets this phone's
+/// home-screen icon pair itself (CLOUD.md, "Home-screen icon"). Only for a phone connected
+/// through the cloud; the link travels inside the encrypted session and never to the relay.
+pub(crate) fn routes() -> Router {
+    Router::new().route("/api/cloud/invite", axum::routing::post(invite))
+}
+
+async fn invite(peer: Option<axum::Extension<CloudPeer>>) -> ApiResult<axum::Json<Value>> {
+    let Some(axum::Extension(peer)) = peer else {
+        return Err(ApiError(axum::http::StatusCode::FORBIDDEN, "Only for a phone connected from anywhere.".into()));
+    };
+    let id = identity().ok_or_else(|| ApiError::unavailable("Cloud access is not ready on your PC."))?;
+    let code = auth::new_invite(&peer.device);
+    let fp = cc::fingerprint(&id.key.public_key());
+    let link = format!("{}/#p={}.{code}.{fp}&h={}", base_url(), id.room, peer.device);
+    Ok(axum::Json(json!({ "link": link, "expires_in": auth::INVITE_TTL.as_secs() })))
 }
 
 // ---------------------------------------------------------------- approvals
@@ -635,6 +656,9 @@ struct Hello {
     n: String,
     #[serde(default)]
     id: String,
+    /// PAIR with a home-screen invite: the cloud phone that asked for it (CLOUD.md, "Home-screen icon").
+    #[serde(default)]
+    h: String,
 }
 
 const UPDATE_PAGE: &str = "Reload this page: MangaVox on your PC speaks a different version.";
@@ -662,7 +686,8 @@ async fn session(mut inbox: mpsc::Receiver<Vec<u8>>, out: Out, router: Router) {
     };
     let (d, salt, code, known) = match kind {
         cc::KIND_PAIR => {
-            let Some(code) = auth::cloud_code_live(Instant::now()) else {
+            let live = if hello.h.is_empty() { auth::cloud_code_live(Instant::now()) } else { auth::invite_live(&hello.h, Instant::now()) };
+            let Some(code) = live else {
                 out.refuse("pair", PAIR_GONE);
                 return;
             };
@@ -716,39 +741,49 @@ async fn session(mut inbox: mpsc::Receiver<Vec<u8>>, out: Out, router: Router) {
     let dev = match (code, known) {
         (Some(code), _) => {
             // One question per code: it is used up before the PC asks.
-            if !auth::take_cloud_code(&code, Instant::now()) {
+            let invited = !hello.h.is_empty();
+            let taken = if invited { auth::take_invite(&hello.h, &code, Instant::now()) } else { auth::take_cloud_code(&code, Instant::now()) };
+            if !taken {
                 out.refuse("pair", PAIR_GONE);
                 return;
             }
             let ua: String = fin["ua"].as_str().unwrap_or("").chars().take(512).collect();
             let name = auth::device_name(&ua);
-            let (ask_id, mut answer) = ask(name.clone(), verify);
-            let _guard = AskGuard(ask_id);
-            tx.json(json!({ "t": "wait" }));
-            eprintln!("[cloud] {name} asks to connect; waiting for an answer on the Mobile page");
-            let deadline = tokio::time::sleep(APPROVAL_WAIT);
-            tokio::pin!(deadline);
-            let allowed = loop {
-                tokio::select! {
-                    a = &mut answer => break a.unwrap_or(false),
-                    _ = &mut deadline => break false,
-                    // Only the phone leaving, or its own sealed "cancel", ends the wait: a frame
-                    // the relay slips in does not open and is ignored.
-                    f = inbox.recv() => match f {
-                        None => break false,
-                        Some(f) => {
-                            if open_json(&mut opener, &f).is_some_and(|v| v["t"] == "cancel") {
-                                break false;
+            // A paired phone set up its own home-screen icon: it already holds that phone's
+            // access, so nothing is asked on the PC (the icon shows up as its own phone there).
+            if invited {
+                let name = format!("{name} (home screen)");
+                eprintln!("[cloud] {name} paired with an invite from {}", hello.h);
+                auth::add_cloud_device(name, hello.d.clone())
+            } else {
+                let (ask_id, mut answer) = ask(name.clone(), verify);
+                let _guard = AskGuard(ask_id);
+                tx.json(json!({ "t": "wait" }));
+                eprintln!("[cloud] {name} asks to connect; waiting for an answer on the Mobile page");
+                let deadline = tokio::time::sleep(APPROVAL_WAIT);
+                tokio::pin!(deadline);
+                let allowed = loop {
+                    tokio::select! {
+                        a = &mut answer => break a.unwrap_or(false),
+                        _ = &mut deadline => break false,
+                        // Only the phone leaving, or its own sealed "cancel", ends the wait: a frame
+                        // the relay slips in does not open and is ignored.
+                        f = inbox.recv() => match f {
+                            None => break false,
+                            Some(f) => {
+                                if open_json(&mut opener, &f).is_some_and(|v| v["t"] == "cancel") {
+                                    break false;
+                                }
                             }
-                        }
-                    },
+                        },
+                    }
+                };
+                if !allowed {
+                    out.refuse("denied", "Not allowed on your PC. Scan the code again to ask once more.");
+                    return;
                 }
-            };
-            if !allowed {
-                out.refuse("denied", "Not allowed on your PC. Scan the code again to ask once more.");
-                return;
+                auth::add_cloud_device(name, hello.d.clone())
             }
-            auth::add_cloud_device(name, hello.d.clone())
         }
         (None, Some(dev)) => dev,
         (None, None) => return,
@@ -968,7 +1003,7 @@ mod tests {
         let ep = EphemeralSecret::random(&mut OsRng);
         let mut np = [0u8; 16];
         OsRng.fill_bytes(&mut np);
-        let body = json!({ "v": 1, "e": cc::b64(&cc::point(&ep.public_key())), "d": cc::b64(&cc::point(&d.public_key())), "n": cc::b64(&np), "id": id });
+        let body = json!({ "v": 1, "e": cc::b64(&cc::point(&ep.public_key())), "d": cc::b64(&cc::point(&d.public_key())), "n": cc::b64(&np), "id": id, "h": if kind == KIND_PAIR { id } else { "" } });
         let mut f = vec![kind];
         f.extend_from_slice(body.to_string().as_bytes());
         (ep, np, f)
@@ -1188,6 +1223,68 @@ mod tests {
         assert!(auth::devices().is_empty());
         assert!(auth::cloud_code_live(Instant::now()).is_none());
         assert!(pending().is_empty());
+
+        r.task.abort();
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    fn salt_of(code: &str) -> [u8; 32] {
+        URL_SAFE_NO_PAD.decode(code).unwrap().try_into().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_paired_phone_sets_up_its_home_screen_icon() {
+        let _g = auth::tests::serial();
+        let (id, store) = setup("cloud-invite");
+        let mut r = relay();
+        // A phone paired the usual way (allowed on the Mobile page).
+        let code = auth::new_cloud_code();
+        r.open(1).await;
+        answer_soon(true);
+        let mut p = handshake(&mut r, 1, KIND_PAIR, SecretKey::random(&mut OsRng), "", salt_of(&code), &id.room_bytes).await.expect("paired");
+        assert_eq!(p.next(&mut r, 1).await.unwrap()["t"], "wait");
+        let by = p.next(&mut r, 1).await.unwrap()["id"].as_str().unwrap().to_string();
+
+        // It asks for a setup link through its session: room, invite, PC fingerprint and itself.
+        let link = |body: &str| -> (String, [u8; 32]) {
+            let v: Value = serde_json::from_str(body).unwrap();
+            let (p3, h) = v["link"].as_str().unwrap().split("#p=").nth(1).unwrap().split_once("&h=").unwrap();
+            let parts: Vec<&str> = p3.split('.').collect();
+            assert_eq!((parts[0], parts[2]), (id.room.as_str(), cc::fingerprint(&id.key.public_key()).as_str()));
+            (h.to_string(), salt_of(parts[1]))
+        };
+        let (st, body) = p.get(&mut r, 1, 1, "POST", "/api/cloud/invite").await;
+        assert_eq!(st, 200, "{body}");
+        let (h, salt) = link(&body);
+        assert_eq!(h, by);
+
+        // The icon pairs with it at once, without a question on the Mobile page.
+        r.open(2).await;
+        let mut icon = handshake(&mut r, 2, KIND_PAIR, SecretKey::random(&mut OsRng), &by, salt, &id.room_bytes).await.expect("icon paired");
+        let ok = icon.next(&mut r, 2).await.unwrap();
+        assert_eq!(ok["t"], "ok", "{ok}");
+        assert_eq!(ok["name"], "iPhone · Safari (home screen)");
+        assert!(pending().is_empty());
+        assert_eq!(auth::devices().iter().filter(|d| d.cloud).count(), 2);
+        // Single use.
+        r.open(3).await;
+        assert_eq!(handshake(&mut r, 3, KIND_PAIR, SecretKey::random(&mut OsRng), &by, salt, &id.room_bytes).await.err().expect("refused")["code"], "pair");
+        // A wrong invite fails like a wrong QR code (the fin does not open).
+        let (_, body) = p.get(&mut r, 1, 2, "POST", "/api/cloud/invite").await;
+        let (_, salt) = link(&body);
+        r.open(4).await;
+        let mut wrong = handshake(&mut r, 4, KIND_PAIR, SecretKey::random(&mut OsRng), &by, [7; 32], &id.room_bytes).await.expect("a reply");
+        assert_eq!(wrong.next(&mut r, 4).await.unwrap()["refused"]["code"], "pair");
+        // Expired.
+        auth::expire_invites_for_tests();
+        r.open(5).await;
+        assert_eq!(handshake(&mut r, 5, KIND_PAIR, SecretKey::random(&mut OsRng), &by, salt, &id.room_bytes).await.err().expect("refused")["code"], "pair");
+        // Gone with the phone that asked for it.
+        let (_, body) = p.get(&mut r, 1, 3, "POST", "/api/cloud/invite").await;
+        let (_, salt) = link(&body);
+        auth::revoke(&by);
+        r.open(6).await;
+        assert_eq!(handshake(&mut r, 6, KIND_PAIR, SecretKey::random(&mut OsRng), &by, salt, &id.room_bytes).await.err().expect("refused")["code"], "pair");
 
         r.task.abort();
         let _ = std::fs::remove_dir_all(store.parent().unwrap());

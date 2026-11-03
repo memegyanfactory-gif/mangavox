@@ -62,14 +62,15 @@ export async function fingerprint(raw) {
 
 /**
  * The first frame (PAIR or RESUME) and what is needed to finish.
- * pairing: { rid, code, fp } from the QR code; resuming: { rid, id, spub }.
+ * pairing: { rid, code, fp } from the QR code, plus `inv` (the phone that made the link) for a
+ * home-screen setup link; resuming: { rid, id, spub }.
  */
-export async function hello({ kind, rid, device, id }) {
+export async function hello({ kind, rid, device, id, inv }) {
   const eph = await subtle.generateKey(ECDH, false, ['deriveBits']);
   const ep = new Uint8Array(await subtle.exportKey('raw', eph.publicKey));
   const np = random(16);
   const body = kind === KIND.PAIR
-    ? { v: 1, e: b64(ep), d: b64(device.publicRaw), n: b64(np) }
+    ? { v: 1, e: b64(ep), d: b64(device.publicRaw), n: b64(np), ...(inv ? { h: inv } : {}) }
     : { v: 1, id, e: b64(ep), n: b64(np) };
   const frame = concat([Uint8Array.of(kind), te.encode(JSON.stringify(body))]);
   return { frame, state: { kind, rid: unb64(rid), eph, ep, np, device } };

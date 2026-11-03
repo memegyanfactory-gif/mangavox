@@ -3916,6 +3916,36 @@ function viewActivity(ctx) {
 /* ======================================================================
    More: Listen, Remote, PC shortcuts, this phone
    ====================================================================== */
+/** Opened as an installed home-screen app (asked of the top page: in the cloud it is the connector). */
+function standaloneApp() {
+  try { return window.top.matchMedia('(display-mode: standalone)').matches || window.top.navigator.standalone === true; } catch { return false; }
+}
+
+/**
+ * From anywhere, a home-screen icon on iPhone has its own storage, so the pairing here does not
+ * carry over. The PC makes a one-time setup link (30 minutes, through the encrypted session); it
+ * goes on the clipboard and, through the connector, into the address "Add to Home Screen" saves,
+ * so the new icon pairs itself (CLOUD.md, "Home-screen icon").
+ */
+function addToHome() {
+  const link = post('/api/cloud/invite').then(r => String((r && r.link) || ''));
+  // Written inside the tap (Safari allows the clipboard only then) and filled in when the PC answers.
+  try {
+    navigator.clipboard.write([new ClipboardItem({ 'text/plain': link.then(l => new Blob([l], { type: 'text/plain' })) })]).catch(() => {});
+  } catch { /* no clipboard: the address still carries the link */ }
+  link.then(l => {
+    if (!l) throw new ApiError('Couldn’t make a setup link. Try again.', 0);
+    window.parent.postMessage({ mv: 'homescreen', link: l }, location.origin);
+    const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    openSheet(p => p.append(h('div', { class: 'grip', 'aria-hidden': 'true' }),
+      h('h2', { class: 'sheet-h' }, 'Add to Home Screen'),
+      h('p', { class: 'muted small' }, ios
+        ? 'Tap the Share button, then Add to Home Screen. Open the new icon: it connects to your PC by itself.'
+        : 'Open the browser menu (⋮), then Add to Home screen or Install app. Open the new icon: it connects to your PC by itself.'),
+      h('p', { class: 'muted small' }, 'If the icon asks for it, tap Paste setup link there: the link is copied. It works once, for 30 minutes.')), { label: 'Add to Home Screen' });
+  }).catch(e => toast(e.message || 'Couldn’t make a setup link', 'err'));
+}
+
 function viewMore(ctx) {
   setTitle('More');
   const cell = (href, ic, t, s) => h('a', { class: 'cell', href },
@@ -3956,6 +3986,7 @@ function viewMore(ctx) {
     group('This phone',
       h('div', { class: 'cells' }, devRow, pcRow, appRow),
       h('p', { class: 'muted small', style: { margin: '10px 4px 0' } }, 'This phone stays paired until you forget it here or remove it in MangaVox → Mobile on your PC.'),
+      CLOUD && !standaloneApp() && h('button', { class: 'btn block', type: 'button', style: { marginBottom: '10px' }, onclick: () => addToHome() }, icon('phone'), 'Add to Home Screen'),
       forget)));
   getMe().then(m => {
     if (!ctx.alive) return;

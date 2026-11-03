@@ -47,14 +47,25 @@ fn pick_panel(ch: &ChapterRef, read: Option<&ChapterRead>, page: usize, wanted: 
         let ok = p.is_file() && !*blank.entry(p.clone()).or_insert_with(|| is_blank(&p));
         ok.then_some(p)
     };
+    let panels = read.and_then(|r| r.pages.iter().find(|p| p.index == page)).map(|p| p.panels.as_slice()).unwrap_or(&[]);
+    // A panel that is only balloons or captions shows the next panel with the action instead
+    // (the one before it when none follows).
+    let wanted = wanted.map(|w| match panels.get(w).filter(|p| text_only(p)) {
+        Some(_) => (w + 1..panels.len()).chain((0..w).rev()).find(|n| !text_only(&panels[*n])).unwrap_or(w),
+        None => w,
+    });
     if let Some(p) = wanted.and_then(&mut usable) {
         return Some((wanted.unwrap(), p));
     }
-    let panels = &read?.pages.iter().find(|p| p.index == page)?.panels;
     let mut order: Vec<usize> = (0..panels.len()).collect();
     let rank = |n: &usize| (!panels[*n].characters.is_empty(), panels[*n].bbox.map(|b| b.area()).unwrap_or(0.0));
     order.sort_by(|a, b| rank(b).partial_cmp(&rank(a)).unwrap_or(std::cmp::Ordering::Equal));
     order.into_iter().find_map(|n| usable(n).map(|p| (n, p)))
+}
+
+/// A panel with nothing but text: no one in it, and balloons or captions.
+fn text_only(p: &Panel) -> bool {
+    p.characters.is_empty() && !p.lines.is_empty()
 }
 
 /// The sentences of `text`, each with the space after it trimmed.
@@ -97,14 +108,14 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
     let mut script: Vec<Value> = vec![];
     let mut beats: Vec<Value> = vec![];
 
-    // The in-medias-res opening is voiced first, on the first narrated page, over its own panels.
-    let said = |s: &&StorySegment| !s.text.trim().is_empty();
-    let opening = story.segments.iter().filter(said).filter(|s| !s.hook).map(|s| s.page).min().or_else(|| story.segments.iter().filter(said).map(|s| s.page).min());
+    // A chapter never opens on a teaser: the hook lines older stories have are not spoken (the
+    // full recap export makes the one hook, before chapter 1).
+    let said = |s: &&StorySegment| !s.text.trim().is_empty() && !s.hook;
 
+    let mut last_shown: Option<(Value, Option<String>)> = None;
     for page in 0..page_count {
         let page_img = pages.get(page).map(|p| abs(p));
-        let hook = story.segments.iter().filter(said).filter(|s| s.hook && Some(page) == opening);
-        let segs: Vec<&StorySegment> = hook.chain(story.segments.iter().filter(said).filter(|s| !s.hook && s.page == page)).collect();
+        let segs: Vec<&StorySegment> = story.segments.iter().filter(said).filter(|s| s.page == page).collect();
         let text = segs.iter().map(|s| s.text.trim()).collect::<Vec<_>>().join(" ");
         script.push(json!({ "page": page, "text": text }));
 
@@ -117,11 +128,23 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
             // (sync_map times a page's beats by their text); the same picture twice in a row is one beat.
             let mut shown: Vec<(Value, Option<String>, String)> = vec![];
             for (wanted, text) in panel_parts(s) {
-                // A hook line shows its own page's panel while it is voiced on this page.
-                let (panel, image) = match pick_panel(ch, read.as_ref(), s.page, wanted, &mut blank) {
+                let picked = pick_panel(ch, read.as_ref(), s.page, wanted, &mut blank);
+                let caption = match &picked {
+                    Some((n, _)) => read.as_ref().and_then(|r| r.pages.iter().find(|p| p.index == s.page)).and_then(|p| p.panels.get(*n)).is_some_and(text_only),
+                    // A slice of a long strip is cut anywhere, often through a panel: never shown whole.
+                    None => read.as_ref().is_some_and(|r| !r.strip_done.is_empty()),
+                };
+                let (panel, image) = match picked {
                     Some((n, p)) => (json!(p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| n.to_string())), Some(abs(&p))),
                     None => (Value::Null, pages.get(s.page).map(|p| abs(p))),
                 };
+                // A page that is only a caption or a balloon (or a strip slice with no panel) keeps the
+                // last picture with the action on screen.
+                let (panel, image) = match last_shown.clone().filter(|_| caption) {
+                    Some(prev) => prev,
+                    None => (panel, image),
+                };
+                last_shown = Some((panel.clone(), image.clone()));
                 match shown.last_mut() {
                     Some(last) if last.1 == image => last.2 = format!("{} {text}", last.2),
                     _ => shown.push((panel, image, text)),
@@ -129,11 +152,17 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
             }
             for (i, (panel, image, text)) in shown.into_iter().enumerate() {
                 let mut beat = json!({ "page": page, "panel": panel, "panel_image": image, "text": text });
-                // The user's direction for this passage (narration_tts.build_plan: a beat's own
-                // kind / intensity win over the page's scene).
+                // The user's direction for this passage, else the writer's emotion for it
+                // (narration_tts.build_plan: a beat's own kind / mood / intensity win over the page's scene).
                 if let Some(d) = s.delivery.as_ref().filter(|d| !d.kind.is_empty()) {
                     beat["kind"] = json!(d.kind);
                     beat["intensity"] = json!(d.intensity.min(10));
+                } else if let Some(t) = s.tone.as_ref().filter(|t| !t.kind.is_empty()) {
+                    beat["kind"] = json!(t.kind);
+                    beat["intensity"] = json!(t.intensity.min(10));
+                    if !t.mood.is_empty() {
+                        beat["mood"] = json!(t.mood);
+                    }
                 }
                 // The writer's sound-effect cue (sync_map carries it; the renderer places it), on the passage's first picture.
                 if let Some(x) = s.sfx.as_ref().filter(|x| i == 0 && SFX_NAMES.contains(&x.name.as_str())) {

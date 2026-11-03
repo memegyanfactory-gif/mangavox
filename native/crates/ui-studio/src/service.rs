@@ -196,6 +196,8 @@ pub fn build_job(req: &NarrationRequest, env: &Env, ch: &ChapterItem) -> Pipelin
         "transition": "fade",
         "transition_duration": 0.5,
         "effect": "ken_burns",
+        // The chapter card at the top of the video as it starts ("CHAPTER 12" over its title).
+        "chapter": { "number": ch.number, "title": ch.title },
     });
     // The Studio-wide look (preset and effects; see `look`).
     job.video_config["look"] = crate::look::video_config();
@@ -558,6 +560,7 @@ mod tests {
         assert!(job.video_config["look"]["preset"].is_string(), "a render carries the Studio look");
         assert!(["off", "subtle", "punchy"].contains(&job.video_config["sfx"].as_str().unwrap()), "and the sound-effects switch");
         assert!(job.video_config["sfx_dir"].as_str().unwrap().ends_with("sfx"));
+        assert!(job.video_config["chapter"].is_object(), "and what the chapter card names");
         assert_eq!(job.output_dir, PathBuf::from("/lib/m/c1/pipeline"));
         assert!(!job.ollama_url.is_empty());
 

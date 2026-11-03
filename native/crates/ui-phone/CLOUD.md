@@ -49,7 +49,7 @@ Byte 0 is the kind; the rest is the body.
 
 | Kind | Dir | Body |
 |---|---|---|
-| 1 PAIR | phone→PC | JSON `{v:1, e, d, n}`: ephemeral key, device key (base64url, 65-byte uncompressed points), 16-byte nonce |
+| 1 PAIR | phone→PC | JSON `{v:1, e, d, n, h?}`: ephemeral key, device key (base64url, 65-byte uncompressed points), 16-byte nonce; `h`: the phone whose home-screen invite this uses (below) |
 | 2 RESUME | phone→PC | JSON `{v:1, id, e, n}`: device id |
 | 3 REPLY | PC→phone | JSON `{v:1, e, s, n}`: PC ephemeral key, PC static key, nonce |
 | 4 REFUSE | PC→phone | JSON `{code, error}`; the PC then closes the connection. `code`: `pair` (code wrong, used or expired), `unknown` (device removed), `denied`, `busy`, `bad` |
@@ -154,6 +154,27 @@ saved one (checked again after each write), so nothing stored in flight survives
 write drops the oldest entries beyond 400, and the first write after the worker starts also drops
 expired ones.
 
+## Home-screen icon
+
+On iPhone a home-screen web app has its own storage, separate from Safari's: the device key a
+phone paired with in Safari is not there when it is opened from its icon. So a paired cloud
+phone can set up its icon:
+
+1. More → Add to Home Screen asks `POST /api/cloud/invite` through the session (only a request
+   carrying `CloudPeer`; a phone on the Wi-Fi gets 403). The PC makes an invite: 32 random bytes,
+   in memory only, single use, 30 minutes, the newest only per phone, and dead once that phone is
+   removed. It answers `{link}`: `<relay>/#p=<rid>.<invite>.<fp>&h=<device id>`.
+2. The app writes the link to the clipboard (inside the tap) and hands it to the connector, which
+   puts it in its address bar (`history.replaceState`) and stores it for `sw.js`, which serves the
+   manifest with it as `start_url` while it works. Either way "Add to Home Screen" saves an icon
+   that opens with the link. It is only ever in a fragment, the clipboard or the phone's storage,
+   never sent to the relay.
+3. The icon opens with the link (or, when the browser saved another address, its "Set up this
+   icon" screen pastes it) and pairs: PAIR with `h`, the invite as `ps`. The handshake is the same;
+   the PC then adds it as "<name> (home screen)" without asking, since a paired phone vouched for
+   it. A failed fin counts towards the pairing rate limit like a wrong QR code. Opened again with
+   the same link while paired with that PC, the icon just resumes.
+
 ## Threat notes
 
 - Relay compromised: it sees room ids, timing and sizes, can drop or delay traffic, but cannot
@@ -172,5 +193,9 @@ expired ones.
 - Anyone who knows a room id (the relay, phones paired to it, someone who saw an old QR code) can
   hold up to 3 sockets from one address, or burn the cloud pairing rate limit (20 failures per 10
   minutes); paired phones' resume is not rate limited.
+- A home-screen setup link pairs without a question on the PC: whoever gets it within its 30
+  minutes, before the icon uses it, can add a phone (shown on the Mobile page, where it can be
+  removed). It is made only for a phone that is already paired through the cloud, and it never
+  passes the relay, which would still need the device key or the invite to pair.
 - A photographed or screen-shared QR code: the PC still asks before a cloud phone is added, and
   shows the verification code to compare.

@@ -37,6 +37,7 @@ const MOUSE: &str = r#"{"e":[{"t":"move","dx":40,"dy":-10},{"t":"click","b":"rig
 const API_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/me"),
     ("POST", "/api/logout"),
+    ("POST", "/api/cloud/invite"),
     ("GET", "/api/library"),
     ("GET", "/api/manga/m1"),
     ("GET", "/api/manga/m1/cover"),
@@ -429,7 +430,7 @@ async fn revoked_devices_are_locked_out_at_once() {
 async fn state_changes_need_the_csrf_header_and_same_origin() {
     let _g = setup();
     let cookie = pair().await;
-    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress", "/api/sources/mangadex/open", "/api/manga/m1/library", "/api/manga/m1/favorite", "/api/manga/m1/download", "/api/manga/m1/studio", "/api/privacy"];
+    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress", "/api/sources/mangadex/open", "/api/manga/m1/library", "/api/manga/m1/favorite", "/api/manga/m1/download", "/api/manga/m1/studio", "/api/privacy", "/api/cloud/invite"];
     for path in paths {
         let body = body_for(path);
         let base = || req("POST", path, PEER).header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json");
@@ -467,6 +468,17 @@ async fn state_changes_need_the_csrf_header_and_same_origin() {
     .await;
     assert!(!r.status().is_success(), "preflight is never granted: {}", r.status());
     assert_no_cors(&r, "preflight");
+}
+
+#[tokio::test]
+async fn home_screen_invites_are_for_cloud_phones_only() {
+    let _g = setup();
+    let cookie = pair().await;
+    // A phone on the Wi-Fi, with its CSRF header and origin: still no invite (only a phone that
+    // came through the encrypted cloud session can set up a home-screen icon that way).
+    let r = send(post("/api/cloud/invite", PEER).header(header::COOKIE, &cookie).body(Body::from("{}")).unwrap()).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert!(!text(r).await.contains("#p="));
 }
 
 #[tokio::test]

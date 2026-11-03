@@ -1520,10 +1520,6 @@ pub(crate) fn resolution_for(h: u32) -> &'static str {
     }
 }
 
-/// Panels a hook line may cut to after its own, and how far after it they may be.
-const HOOK_CUT_INS: usize = 2;
-const HOOK_CUT_REACH: usize = 4;
-
 /// What making a hook needs, gathered on the UI thread.
 pub(crate) struct HookJob {
     pub manga_id: String,
@@ -1562,33 +1558,15 @@ async fn wait_for<T: Send + 'static>(task: tokio::task::JoinHandle<T>, r: &Repor
     }
 }
 
-/// The `hook_maker.py` arguments for `script` over `chapters` (each with its beats). `None` when
-/// no line has a picture.
+/// The `hook_maker.py` arguments for `script` over `chapters` (each with its beats): each line on
+/// the panel of its beat (the one that proves it), the outro on the cover. `None` when no line has
+/// a picture.
 pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Vec<Beat>)], script: &mv_recap::hook::HookScript, resolution: &str, work: &Path) -> Option<Value> {
     let flat: Vec<(usize, &Beat)> = chapters.iter().enumerate().flat_map(|(c, (_, beats))| beats.iter().map(move |b| (c, b))).collect();
-    let lines: Vec<(usize, usize, &Beat, &String)> = script.lines.iter().filter_map(|(id, text)| flat.get(*id).filter(|(_, b)| b.image.is_some()).map(|(c, b)| (*id, *c, *b, text))).collect();
+    let lines: Vec<(usize, &Beat, &String)> = script.lines.iter().filter_map(|(id, text)| flat.get(*id).filter(|(_, b)| b.image.is_some()).map(|(c, b)| (*c, *b, text))).collect();
     lines.first()?;
-    // Fast cuts like a trailer: each line may cut to the next panels of the same moment.
-    let mut used: Vec<&str> = lines.iter().filter_map(|(_, _, b, _)| b.image.as_deref()).collect();
-    let cut_ins: Vec<Vec<Value>> = lines
-        .iter()
-        .map(|(id, c, _, _)| {
-            let mut more = vec![];
-            for (c2, b) in flat.iter().skip(id + 1).take(HOOK_CUT_REACH) {
-                let Some(img) = b.image.as_deref() else { continue };
-                if c2 != c || more.len() == HOOK_CUT_INS {
-                    break;
-                }
-                if !used.contains(&img) {
-                    used.push(img);
-                    more.push(json!({"image": img, "focus": b.focus}));
-                }
-            }
-            more
-        })
-        .collect();
     // The music of the most gripping line's moment.
-    let (_, loud_chapter, loud_beat, _) = lines.iter().max_by(|a, b| mv_recap::hook::beat_score(a.3).total_cmp(&mv_recap::hook::beat_score(b.3)))?;
+    let (loud_chapter, loud_beat, _) = lines.iter().max_by(|a, b| mv_recap::hook::beat_score(a.2).total_cmp(&mv_recap::hook::beat_score(b.2)))?;
     let (last, _) = chapters.last()?;
     // The manga's cover, else its first page or panel.
     let opening = job.cover.as_ref().map(|p| p.to_string_lossy().into_owned()).or_else(|| chapters.iter().find_map(|(_, beats)| beats.iter().find_map(|b| b.image.clone())).or_else(|| {
@@ -1602,7 +1580,8 @@ pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Ve
     let score = mv_score::score_wav(&crate::page::chref(&chapters[*loud_chapter].0));
     let score = score.is_file().then(|| json!({"wav": score.to_string_lossy(), "start": loud_beat.start, "seconds": job.seconds}));
     Some(json!({
-        "lines": lines.iter().zip(cut_ins).map(|((_, _, b, text), more)| json!({"text": text, "image": b.image, "focus": b.focus, "more": more})).collect::<Vec<_>>(),
+        "idea": script.idea,
+        "lines": lines.iter().map(|(_, b, text)| json!({"text": text, "image": b.image, "focus": b.focus})).collect::<Vec<_>>(),
         "outro": {"text": script.outro, "image": opening},
         "voice": voice,
         "engine": engine,

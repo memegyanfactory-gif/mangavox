@@ -117,6 +117,13 @@ pub struct ChapterRead {
     pub cast: Vec<(String, String)>,
     /// The panel boxes are snapped to the frames on the pages (see `panels.rs`).
     pub panels_snapped: bool,
+    /// Pages whose panels the user cropped by hand (see `manual.rs`): no frame snapping or
+    /// automatic crops touch them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub manual: Vec<usize>,
+    /// The reader's own panels of the hand-cropped pages, for "Reset to automatic": (page, panels).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub auto_panels: Vec<(usize, Vec<Panel>)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -152,14 +159,28 @@ pub struct StorySegment {
     /// deserve one). Exported on the beat as `sfx` / `sfx_strength`; the renderer places it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sfx: Option<SfxCue>,
-    /// Part of the in-medias-res opening of the recap's first chapter: spoken first (on the
-    /// chapter's first narrated page) while showing its own page and panel.
+    /// A teaser line from stories written before 9.0. Kept so they still load, never spoken: a
+    /// chapter has no hook (the full recap export makes the one hook, before chapter 1).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hook: bool,
     /// Further panels of the page the passage moves through after `panel`, in reading order: its
     /// sentences are shown over `panel` and these in turn.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub panels: Vec<usize>,
+    /// The emotion the writer gave the passage from its panel and moment. Exported on its beats
+    /// as `kind` / `mood` / `intensity` for the narration voice, unless the user picked a `delivery`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tone: Option<Tone>,
+}
+
+/// A passage's emotion: a scene kind (the narration's `KINDS`), a word or two of mood and an
+/// intensity 0-10. Plain narration is `other` at about 3.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tone {
+    pub kind: String,
+    pub mood: String,
+    pub intensity: u8,
 }
 
 /// Narrator direction for one passage: a scene kind the emotion mapping knows

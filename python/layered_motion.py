@@ -753,6 +753,8 @@ class Animator:
         self.text_a = matte(man["text"], max(1.0, up * 0.8), grow=max(1, round(up)), grow_src=max(2, round(min(sw, sh) / 300)) + 1, close=0.012)
         # Streaks keep clear of the lettering and the bubble around it.
         self.text_halo = halo(man["text"], 0.025)
+        # A pixel entrance of the characters (set by animate from the job), else None.
+        self.entrance = None
         self.layers = []
         for L in man["layers"]:
             a = matte(L["file"], max(0.9, up * 0.6))
@@ -784,6 +786,30 @@ class Animator:
             side = np.where(rng.random(n) < 0.5, 1.0, -1.0)
             self.puffs = dict(side=side, sp=rng.uniform(0.07, 0.2, n), sz=rng.uniform(0.025, 0.055, n), y0=rng.uniform(0.0, 0.06, n),
                               br=rng.uniform(0.25, 0.5, n), delay=rng.uniform(0, 0.25, n), lift=rng.uniform(-0.05, 0.02, n))
+
+    def _pixel_in(self, s, t):
+        """A character layer `s` (premultiplied RGB and alpha) on its entrance (self.entrance:
+        {"at", "dur" seconds, "block" px at 1080 rows}): not there before "at" (the clean plate shows
+        where it stands), then assembling from pixel blocks that light up one by one and shrink to
+        sharp, a little bright as they land. None while it is not there yet."""
+        en = self.entrance
+        p = (t - en["at"]) / max(1e-3, en["dur"])
+        if p >= 1:
+            return s
+        if p <= 0:
+            return None
+        torch, F = self.torch, self.F
+        b = max(1, round(en["block"] * self.H / 1080 * (1 - p) ** 2))
+        if b > 1:
+            small = F.avg_pool2d(s[None], b, stride=b, ceil_mode=True)
+            gh, gw = small.shape[2], small.shape[3]
+            gy, gx = torch.meshgrid(torch.arange(gh, device="cuda", dtype=torch.float32), torch.arange(gw, device="cuda", dtype=torch.float32), indexing="ij")
+            # Each block lights at its own moment (a fresh pattern at every block size).
+            rnd = torch.remainder(torch.sin(gx * 12.9898 + gy * 78.233 + b * 3.17) * 43758.5453, 1.0)
+            small = small * (rnd < p * 1.7).float()
+            s = F.interpolate(small, scale_factor=b, mode="nearest")[0, :, :self.H, :self.W]
+        glow = 0.35 * (1 - p) ** 2
+        return torch.cat([s[:3] + glow * s[3:4], s[3:4]], 0) * min(1.0, p / 0.12)
 
     def _orig(self, src, W, H, up):
         import numpy as np
@@ -844,6 +870,10 @@ class Animator:
                 ax, ay = cx, H
                 px1, py1 = ax + (px1 - ax) / sb, ay + (py1 - ay) / sb
             s = self._sample(torch.cat([L["rgb"], L["a"]], 0), px1, py1, pad="zeros")
+            if self.entrance:
+                s = self._pixel_in(s, t)
+                if s is None:
+                    continue
             out = out * (1 - s[3:4]) + s[:3]
             cover = cover + s[3:4] * (1 - cover)
         if plan.get("streaks"):
@@ -965,6 +995,8 @@ def animate(job, man, threads):
         subject = ((f[0] + f[2]) / 2 / sw, (f[1] + f[3]) / 2 / sh)
     # The panel as it is now (the cached manifest's path is stale after the data folder moved).
     anim = Animator(job["cache"], dict(man, src=job["src"]), (W, H), plan, faces, subject, job.get("drift"))
+    if isinstance(job.get("entrance"), dict) and man["layers"]:
+        anim.entrance = job["entrance"]
     grade = _grade_fn(job.get("grade"), job.get("glow"), W, H)
     tmp = job["out"] + ".part.mp4"
     enc = _encoder(tmp, W, H, threads)
@@ -990,6 +1022,7 @@ def run(jobs_path):
     """Prepares (cached) and animates a batch of clips. jobs.json:
     {"threads": n, "jobs": [{"id", "src", "panel" (read.json), "scene", "intensity", "cache",
     "size": [w, h], "frames", "ease": [per frame 0..1], "drift": [x, y], "grade", "glow",
+    "entrance"? ({"at", "dur", "block"}: the characters assemble from pixel blocks, Animator._pixel_in),
     "faces": [[x0, y0, x1, y1] crop fractions], "out"}]}.
     Emits progress / info lines and a final {"type": "done", "results": {id: {...}}}."""
     import torch

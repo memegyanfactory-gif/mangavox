@@ -165,6 +165,8 @@ pub(crate) struct Focus {
     pub video: VideoMeta,
     /// The take each page is narrated with (`audio/takes.json`; 0 = the original).
     pub takes: HashMap<usize, u32>,
+    /// The pages the user cropped into panels by hand (`studio/manual_panels.json`).
+    pub manual: mv_recap::ManualPanels,
 }
 
 /// What the files on disk say about a chapter's audio and video.
@@ -328,6 +330,8 @@ pub struct StudioPage {
     pub(crate) gen_answers: Option<crate::generate::Answers>,
     /// The open "Music & subtitles" sheet.
     pub(crate) restyle: Option<crate::restyle::Restyle>,
+    /// The Read step's panel cropper, while open.
+    pub(crate) crop: Option<crate::cropper::Crop>,
     /// The dashboard Video section's export choices, and its join / export in flight.
     pub(crate) export_prefs: crate::export::ExportPrefs,
     pub(crate) export_job: Option<crate::export::Job>,
@@ -471,6 +475,7 @@ impl StudioPage {
             sheet: None,
             gen_answers: None,
             restyle: None,
+            crop: None,
             export_prefs: style.prefs.export,
             export_job: None,
             export_queue: vec![],
@@ -605,6 +610,7 @@ impl StudioPage {
                 let status = mv_recap::chapter_status(&r);
                 let Media { clips, narrated, video, takes } = load_media(&r, &status);
                 Focus {
+                    manual: mv_recap::load_manual(&r),
                     read: mv_recap::load_read(&r),
                     transcript: mv_recap::load_transcript(&r),
                     story: mv_recap::load_story(&r),
@@ -1467,6 +1473,10 @@ impl StudioPage {
     /// driven (NN/g flexibility and efficiency: <https://www.nngroup.com/articles/flexibility-efficiency-heuristic/>).
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.view == View::Video && self.sheet.is_none() && self.restyle.is_none() && self.video_key(ev, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.view == View::Editor && self.crop_key(ev, cx) {
             cx.stop_propagation();
             return;
         }

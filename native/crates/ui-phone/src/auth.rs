@@ -137,6 +137,61 @@ pub(crate) fn record_cloud_fail(now: Instant) {
     CLOUD_FAILS.lock().unwrap_or_else(|e| e.into_inner()).push(now);
 }
 
+// ---------------------------------------------------------------- home-screen invites
+
+/// How long a home-screen setup link works (CLOUD.md, "Home-screen icon").
+pub(crate) const INVITE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// A setup link a paired cloud phone asked for, so its home-screen icon (which on iPhone has its
+/// own storage, without that phone's key) can pair itself. Memory only, single use, newest only
+/// per phone, and gone with the phone that asked for it.
+struct Invite {
+    by: String,
+    value: String,
+    issued: Instant,
+}
+
+static INVITES: Mutex<Vec<Invite>> = Mutex::new(Vec::new());
+
+/// A fresh invite for cloud phone `by`, replacing its older one.
+pub(crate) fn new_invite(by: &str) -> String {
+    let value = random_b64(32);
+    let mut g = INVITES.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|i| i.by != by && i.issued.elapsed() < INVITE_TTL);
+    g.push(Invite { by: by.to_string(), value: value.clone(), issued: Instant::now() });
+    value
+}
+
+/// The invite of cloud phone `by` while it works: unexpired, unused, its phone still paired, and
+/// cloud pairing not rate limited.
+pub(crate) fn invite_live(by: &str, now: Instant) -> Option<String> {
+    if cloud_too_many_fails(now) || cloud_device(by).is_none() {
+        return None;
+    }
+    let g = INVITES.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter().find(|i| i.by == by && now.saturating_duration_since(i.issued) < INVITE_TTL).map(|i| i.value.clone())
+}
+
+/// Uses up the invite of `by` when it still is `code`.
+pub(crate) fn take_invite(by: &str, code: &str, now: Instant) -> bool {
+    let mut g = INVITES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = g.iter().position(|i| i.by == by && now.saturating_duration_since(i.issued) < INVITE_TTL && bool::from(i.value.as_bytes().ct_eq(code.as_bytes()))) else {
+        return false;
+    };
+    g.remove(i);
+    true
+}
+
+/// Makes every invite look expired, for the tests.
+#[cfg(test)]
+pub(crate) fn expire_invites_for_tests() {
+    for i in INVITES.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+        if let Some(t) = i.issued.checked_sub(INVITE_TTL) {
+            i.issued = t;
+        }
+    }
+}
+
 /// Uses up the current code when `code` matches it and it has not expired.
 fn take_code(code: &str, now: Instant) -> bool {
     take_from(&CODE, code, now)

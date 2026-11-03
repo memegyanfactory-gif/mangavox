@@ -20,7 +20,7 @@ use crate::types::*;
 const MAX_FACES_PER_CHARACTER: usize = 4;
 const MAX_FACE_ATTACHMENTS: usize = 6;
 const FACE_PX: u32 = 192;
-const MIN_PANEL_AREA: f32 = 0.02;
+pub(crate) const MIN_PANEL_AREA: f32 = 0.02;
 const SCENE_KINDS: &[&str] = &["fight", "dialogue", "emotional", "comedy", "action", "reveal", "calm", "flashback", "romance", "horror", "other"];
 
 const READ_SYSTEM: &str = r##"You are an expert manga reader and script supervisor. You look at one manga page (plus reference face crops of known characters) and produce an exact, structured transcript. A narrator will later retell the story from your output as an anime-style recap video, so accuracy and consistent character names matter more than anything else. You never invent dialogue and never skip a speech balloon. Do not run commands, open other files or write files: use only the attached images and answer directly.
@@ -432,6 +432,8 @@ pub(crate) async fn read_chapter_with(
     read.panels_snapped |= read.pages.is_empty();
     read.chapter_id = ch.chapter_id.clone();
     read.model = model_label(model);
+    // Pages the user cropped by hand keep their panels; frames and crops are not looked for there.
+    let manual = crate::manual::load_manual(ch);
     // A chapter delivered as slices of one long strip is read in whole parts cut at panel gaps
     // (see `strip.rs`), so no panel or balloon is ever split between two reads; ordinary pages go one by one.
     let units = {
@@ -593,8 +595,9 @@ pub(crate) async fn read_chapter_with(
             // Sync the reading back onto the page files: a page the part starts at the top of is replaced,
             // a page it continues (the part above was read before) gets the rest of its panels appended.
             let mut read_part = parsed.page;
-            // The reader's panel boxes snap to the frames drawn on the page (a strip part's boxes stay as read).
-            if !unit.stitched && read_part.panels.iter().any(|p| p.bbox.is_some()) {
+            let hand: Vec<(usize, Vec<Bbox>)> = unit.spans.iter().filter_map(|s| manual.boxes(s.page, &file_of(s.page)).map(|b| (s.page, b.to_vec()))).collect();
+            // The reader's panel boxes snap to the frames drawn on the page (or strip part).
+            if read_part.panels.iter().any(|p| p.bbox.is_some()) && hand.len() < unit.spans.len() {
                 let img = image.clone();
                 let frames = tokio::task::spawn_blocking(move || image::open(&img).map(|i| crate::panels::detect(&i)).unwrap_or_default()).await.map_err(|e| anyhow!(e))?;
                 for p in &mut read_part.panels {
@@ -640,6 +643,7 @@ pub(crate) async fn read_chapter_with(
                 }
                 page.panels.push(panel);
             }
+            crops.retain(|c| !hand.iter().any(|(p, _)| *p == c.0));
 
             let assets = Assets { image, clear, panels: crops, faces: face_jobs, panels_dir: panels_dir(ch) };
             match tokio::task::spawn_blocking(move || write_assets(assets)).await.map_err(|e| anyhow!(e))? {
@@ -659,6 +663,13 @@ pub(crate) async fn read_chapter_with(
             }
             for p in out {
                 upsert(&mut read, p);
+            }
+            if !hand.is_empty() {
+                crate::manual::fold(&mut read, &hand, |p| unit.spans.iter().any(|s| s.page == p && s.y0 == 0));
+                let (c, all) = (ch.clone(), pages.clone());
+                if let Err(e) = tokio::task::spawn_blocking(move || crate::manual::write_all(&c, &all, &hand)).await.map_err(|e| anyhow!(e))? {
+                    progress(Progress::Log(format!("Page {}: hand-cropped panels failed: {e}", i + 1)));
+                }
             }
             if unit.stitched && !read.strip_done.contains(&unit.key()) {
                 read.strip_done.push(unit.key());
@@ -687,6 +698,9 @@ pub(crate) fn snap_read(ch: &ChapterRef, read: &mut ChapterRead) -> bool {
     }
     let pages = list_pages(&ch.pages_dir);
     for p in &mut read.pages {
+        if read.manual.contains(&p.index) {
+            continue;
+        }
         let Some(img) = pages.get(p.index).and_then(|f| image::open(f).ok()) else { continue };
         let frames = crate::panels::detect(&img);
         for (n, pn) in p.panels.iter_mut().enumerate() {

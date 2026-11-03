@@ -650,8 +650,7 @@ KNOWN CHARACTERS
 
 BATCH POSITION
 This is {position} batch of {chapter_label}. It covers pages {page_from}–{page_to} of {total_pages}.
-{'Open with a hook line that frames the chapter.' if batch_index == 0 else ''}
-{'Close with one cliffhanger / lead-out line that leaves the listener wanting the next chapter.' if batch_index == batch_count - 1 else ''}
+No hook, teaser, cliffhanger or lead-out lines: just tell these pages.
 
 Narrate this batch as one continuous prose passage, then emit the ---MEMORY--- delta."""
 
@@ -1565,8 +1564,7 @@ def run_ollama_two_phase(job: dict, pages: list[str], memory: dict,
             f"STORY SO FAR\n{story_so_far}\n\n"
             f"KNOWN CHARACTERS\n{known}\n\n"
             f"This is {position} {chap_lbl}, covering pages {page_from}-{page_to}.\n"
-            f"{'Open with a hook line that frames the chapter.' if ci == 0 else ''}\n"
-            f"{'End with a cliffhanger/lead-out line.' if ci == len(chunks)-1 else ''}\n\n"
+            "No hook, teaser, cliffhanger or lead-out lines: just tell these pages.\n\n"
             f"PAGE DESCRIPTIONS (narrate these into one flowing, in-depth passage):\n{desc_block}\n\n"
             f"Write the narration, then the ---MEMORY--- delta."
         )

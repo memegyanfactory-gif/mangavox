@@ -636,14 +636,51 @@ def _run_chatterbox(plan, audio_dir, voice, speed, strength, force_regen, progre
             w = cb.Worker()
             state["worker"] = w
             w.start()
-            log["worker"] = {k: w.ready_info.get(k) for k in ("device", "gpu", "sr", "load_s", "torch")}
+            log["worker"] = {k: w.ready_info.get(k) for k in ("device", "gpu", "sr", "load_s", "torch", "fast", "precision")}
         return w
 
     audio_files = []
     t_job = time.time()
     try:
+        # Every chunk the chapter still needs is voiced first, many sentences per GPU batch
+        # (op "voice"); the pages below are then put together from the cache. Progress counts
+        # pages whose chunks are all made, so it never goes back.
+        pending, seen, page_keys = [], set(), []
+        for p in plan:
+            out_path = os.path.join(audio_dir, f"page_{p['page']:04d}.wav")
+            if not p["text"] or (not force_regen and p["page"] not in regen and _wav_is_usable(out_path)):
+                page_keys.append([])
+                continue
+            keys = []
+            for c in _chatterbox_chunks(nt, cb, p["page"], p["units"], voice, strength, ref_sig, takes.get(p["page"], 0)):
+                keys.append(c["key"])
+                if c["key"] not in seen and not os.path.isfile(os.path.join(cache_dir, f"{c['key']}.wav")):
+                    seen.add(c["key"])
+                    pending.append({k: c[k] for k in ("text", "params", "seed", "key")})
+            page_keys.append(keys)
+        shown = 0
+
+        def pages_ready():
+            return sum(1 for keys in page_keys if all(os.path.isfile(os.path.join(cache_dir, f"{k}.wav")) for k in keys))
+
+        if pending:
+            t_pre, voiced, group, stats = time.time(), 0, 48, None
+            for k in range(0, len(pending), group):
+                try:
+                    res = worker().voice(voice, pending[k:k + group], cache_dir, reference=ref_path)
+                    voiced += int(res.get("voiced") or 0)
+                    stats = res.get("stats")
+                except RuntimeError as e:
+                    # The pages below voice whatever is still missing, one page at a time.
+                    print(f"[tts] Chatterbox batch voicing stopped ({e}); voicing page by page", file=sys.stderr)
+                    break
+                shown = max(shown, pages_ready())
+                if progress_cb:
+                    progress_cb("tts", shown, len(plan))
+            log["batchVoicing"] = {"chunks": len(pending), "voiced": voiced, "seconds": round(time.time() - t_pre, 1),
+                                   "stats": stats}
         for i, p in enumerate(plan):
-            if progress_cb:
+            if progress_cb and i + 1 > shown:
                 progress_cb("tts", i + 1, len(plan))
             text, page = p["text"], p["page"]
             output_path = os.path.join(audio_dir, f"page_{page:04d}.wav")

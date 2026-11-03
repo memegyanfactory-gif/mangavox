@@ -11,6 +11,7 @@ mod export;
 pub mod hook;
 mod json;
 mod llm;
+mod manual;
 pub mod media;
 mod panels;
 mod read;
@@ -26,6 +27,7 @@ pub use brain::{safe_id, Brain};
 pub use export::export_for_pipeline;
 pub use json::extract_json;
 pub use llm::retry_now;
+pub use manual::{load_manual, reset_manual_page, set_manual_page, ManualPage, ManualPanels};
 pub use read::read_chapter;
 pub use reset::{chapter_plan, reset_chapter, reset_phase, reset_plan, Footprint, ResetPlan, ResetReport, Step};
 pub use store::{

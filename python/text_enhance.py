@@ -100,10 +100,8 @@ TONE GUARDRAILS
 - Match the tone of the source. Action pages → tense, fast. Comedy pages → light, dry. Quiet pages → still, observational.
 - Never break the fourth wall. Never reference "the panel" or "the page."
 
-PACING — YOUTUBE-RECAP HOOKS (ONLY when asked in the user prompt's POSITION block)
-- FIRST page of the chapter: open with ONE punchy hook line that sets up the chapter — something a recap creator would say at the top of the video ("This is where it all started to fall apart.", "After everything we'd seen, no one expected what came next."). Then go into the page content normally.
-- LAST page of the chapter: close with ONE cliffhanger / lead-out line that leaves the listener wanting the next chapter ("…and that was just the beginning.", "By the time the dust settled, nothing would ever be the same."). Don't fabricate plot points — keep it grounded in what the page actually shows.
-- INTERSTITIAL pages (every 3rd middle page): you may open with ONE brief re-grounding line ("By now, …", "With everything that had happened, …") — but only if it adds momentum. Otherwise dive straight in.
+PACING
+- No hooks, teasers, cliffhangers or lead-out lines anywhere in a chapter: the first page just starts telling, the last page ends on its own last beat. (A full recap gets one hook before chapter 1, made separately.)
 
 OUTPUT FORMAT
 End your response with this exact block on a new line, nothing after it:
@@ -128,7 +126,7 @@ RULES
 - If two consecutive segments both open with "Meanwhile," or "Just then,", drop the second transition and rephrase to keep the rhythm varied.
 - Smooth scene-to-scene transitions between segments. Use connective tissue ("From there, …", "As that played out, …", "But the real shift came when …") rather than abrupt cuts.
 - Preserve EVERY line of original dialogue verbatim and in quotes. Speaker names stay.
-- Keep the hook line at the top and the cliffhanger line at the bottom intact — those are the chapter's bookends.
+- No hook line at the top and no cliffhanger line at the bottom: start on the story, end on its last beat.
 - Don't add facts that weren't in the source. Don't editorialize. Don't break the fourth wall.
 
 OUTPUT
@@ -153,33 +151,21 @@ def build_recap_user_prompt(story_so_far, recent_narration, raw_panel_text,
 
     sections = [f"== CHAPTER ==\n{header}"]
 
-    # Position-aware pacing — drives the YouTube-recap hook / cliffhanger /
-    # interstitial behaviour described in the system prompt's PACING section.
+    # The first and last page are told plainly: a chapter has no hook or cliffhanger.
     position = "first" if page_index == 0 else (
         "last" if page_index == total_pages - 1 else "middle"
     )
-    is_interstitial = position == "middle" and page_index > 0 and page_index % 3 == 0
-
     if position == "first":
         sections.append(
             "== POSITION ==\n"
-            "FIRST page of the chapter. Open with ONE punchy hook line "
-            "(YouTube recap-style) that sets up the chapter, then narrate "
-            "the page normally."
+            "FIRST page of the chapter. Narrate the page normally: no hook "
+            "or teaser line."
         )
     elif position == "last":
         sections.append(
             "== POSITION ==\n"
-            "LAST page of the chapter. After narrating the page, close with "
-            "ONE cliffhanger / lead-out line that makes the listener want the "
-            "next chapter. Stay grounded in what the page actually shows."
-        )
-    elif is_interstitial:
-        sections.append(
-            "== POSITION ==\n"
-            "Mid-chapter interstitial. You MAY open with one brief "
-            "re-grounding line (e.g. 'By now, …') if it adds momentum. "
-            "Otherwise dive straight in."
+            "LAST page of the chapter. Narrate the page and end on its last "
+            "beat: no cliffhanger or lead-out line."
         )
 
     # Cast block — known character names + descriptions. The model uses these
@@ -388,7 +374,7 @@ def run_combine_pass(job):
             "== TASK ==\n"
             "Merge these into ONE continuous voice-over script. "
             "De-duplicate repeated dialogue. Smooth transitions between pages. "
-            "Keep the hook at the start and the cliffhanger at the end. "
+            "No hook at the start and no cliffhanger at the end. "
             "Output prose only — no Page-N headers."
         )
         return call_ollama_chat(

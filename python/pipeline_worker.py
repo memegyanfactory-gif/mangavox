@@ -5,6 +5,7 @@ Reads a job JSON file, runs OCR → TTS → sync → video stages.
 Communicates via JSON lines on stdout.
 Usage: python pipeline_worker.py <job.json>
 """
+import contextlib
 import sys
 import json
 import os
@@ -31,6 +32,30 @@ def abort_pipeline(stage, message, recoverable=False):
 
 def emit_done(outputs):
     emit({"type": "done", "outputs": outputs})
+
+_GATE_NOUNS = {"voice": "voicing", "render": "video render", "ocr": "text reading"}
+
+
+def heavy_stage(kind, stage, label):
+    """resource_gate.heavy for one heavy stage: while another MangaVox job holds the PC's one
+    heavy slot, the job's status says what it waits for. Never fails the stage (no gate module,
+    or a broken gate, runs it ungated). The Studio logs every info line, so the notice goes out
+    once, and again only when what it waits for changes."""
+    last = [None]
+
+    def on_wait(holder):
+        what = _GATE_NOUNS.get((holder or {}).get("kind"), "heavy job")
+        message = f"Waiting for another chapter's {what} to finish (one heavy job at a time keeps the PC fast)"
+        if message != last[0]:
+            last[0] = message
+            emit({"type": "info", "stage": stage, "message": message})
+    try:
+        from resource_gate import heavy
+        return heavy(kind, label, on_wait=on_wait)
+    except Exception as e:
+        print(f"[gate] not used: {e}", file=sys.stderr)
+        return contextlib.nullcontext()
+
 
 def load_cached_stage(output_dir, filename):
     """Load a previously saved stage result from disk (for resume support)."""
@@ -124,6 +149,8 @@ def run_pipeline(job):
         }
 
     os.makedirs(output_dir, exist_ok=True)
+    # Names this job in another job's "waiting for" line (resource_gate's holder file).
+    gate_label = job.get("label") or os.path.basename(os.path.normpath(output_dir))
 
     # Collect page image paths
     page_files = sorted([
@@ -151,7 +178,11 @@ def run_pipeline(job):
         else:
             try:
                 from ocr_engine import run_ocr
-                ocr_results = run_ocr(page_files, output_dir, emit_progress, engine_pref=ocr_engine_pref, ollama_config=ollama_config, gemini_api_key=gemini_api_key)
+                # Local OCR (an Ollama vision model or Paddle) loads the GPU: one heavy job at a
+                # time. Gemini reads in the cloud and runs at once.
+                local_ocr = not gemini_api_key
+                with heavy_stage("ocr", "ocr", gate_label) if local_ocr else contextlib.nullcontext():
+                    ocr_results = run_ocr(page_files, output_dir, emit_progress, engine_pref=ocr_engine_pref, ollama_config=ollama_config, gemini_api_key=gemini_api_key)
                 outputs["ocr"] = ocr_results
                 # Count pages that actually have text
                 pages_with_text = sum(1 for r in ocr_results if r.get("texts"))
@@ -245,7 +276,11 @@ def run_pipeline(job):
                 abort_pipeline("tts", str(exc), recoverable=False)
 
             tts_config = {**tts_config, "force_regen": tts_config.get("force_regen", True)}
-            audio_files = run_tts(cleaned_text, output_dir, tts_config, emit_progress)
+            # Chatterbox fills the GPU: it waits for any other heavy job on the PC. Kokoro and
+            # Piper voicing is light and runs at once.
+            gpu_voice = engine_choice == "chatterbox"
+            with heavy_stage("voice", "tts", gate_label) if gpu_voice else contextlib.nullcontext():
+                audio_files = run_tts(cleaned_text, output_dir, tts_config, emit_progress)
             outputs["audio"] = audio_files
             successful = sum(1 for a in audio_files if a.get("path") and os.path.exists(a["path"]))
 
@@ -303,11 +338,14 @@ def run_pipeline(job):
 
         try:
             from video_generator import generate_video
-            video_path = generate_video(
-                page_files, sync_map, output_dir,
-                config=video_config,
-                progress_cb=emit_progress,
-            )
+            # One render (or Chatterbox voicing) at a time on the PC: two fight for the CPU and
+            # the GPU's encoder and each crawls.
+            with heavy_stage("render", "video", gate_label):
+                video_path = generate_video(
+                    page_files, sync_map, output_dir,
+                    config=video_config,
+                    progress_cb=emit_progress,
+                )
             outputs["video"] = {"path": video_path}
             emit_stage_complete("video", {"path": video_path})
         except Exception as e:

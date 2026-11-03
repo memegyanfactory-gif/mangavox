@@ -6,6 +6,7 @@ use gpui_kit::*;
 use mv_ui::Route;
 
 mod assist;
+mod cropper;
 pub mod audio;
 pub use export::join_full_recap;
 pub use generate::queue_saved;

@@ -39,6 +39,9 @@ impl StudioPage {
             }
             return self.welcome(cx);
         };
+        if self.crop_open() {
+            return self.crop_view(cx);
+        }
         let count = match self.phase {
             Phase::Read | Phase::Transcript => f.pages.len(),
             Phase::Story => f.story.as_ref().map(|s| s.segments.len()).unwrap_or(0),
@@ -350,6 +353,9 @@ impl StudioPage {
         let total = f.pages.len();
         let read = f.read.as_ref().and_then(|r| r.pages.iter().find(|p| p.index == ix)).cloned();
         let reading_now = self.run.as_ref().is_some_and(|r| r.running() && r.kind == RunKind::Read && r.chapter_id.as_deref() == Some(f.item.id.as_str()) && r.reading.contains(&ix));
+        let reading_chapter = self.run.as_ref().is_some_and(|r| r.running() && r.kind == RunKind::Read && r.chapter_id.as_deref() == Some(f.item.id.as_str())).then_some("Wait for the read of this chapter to finish");
+        let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let manual = f.manual.boxes(ix, &file).map(|b| b.len());
         let faces = run::brain_snapshot(&f.item.manga_id, &f.item.manga_title);
         let blocker = self.run_blocker();
         let stacked = self.center_w < STACK_BELOW;
@@ -385,7 +391,32 @@ impl StudioPage {
                         .when_some(blocker, |b, r| b.disabled(r))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.reread_page(ix, cx))),
                 )
-            });
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(space::SM))
+                    .when_some(manual, |d, n| d.child(tag(format!("{n} panel{} cropped by hand", plural(n)), Tone::Accent)))
+                    .child(
+                        btn(("crop", ix), if manual.is_some() { "Edit panels" } else { "Crop panels" }, ButtonKind::Ghost)
+                            .small()
+                            .icon(ph::CROP)
+                            .tooltip("Draw this page's panels yourself: reads then skip finding and cropping them")
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_crop(ix, cx))),
+                    )
+                    .when(manual.is_some(), |d| {
+                        d.child(
+                            btn(("crop-reset", ix), "Reset to automatic", ButtonKind::Ghost)
+                                .small()
+                                .icon(ph::ARROW_COUNTER_CLOCKWISE)
+                                .tooltip("Forget the hand-cropped panels: the AI's own panels and crops come back")
+                                .when_some(reading_chapter, |b, r| b.disabled(r))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.reset_crop(ix, cx))),
+                        )
+                    }),
+            );
         div().flex().when(stacked, |d| d.flex_col()).items_start().gap(px(space::LG)).child(page_image(ix, total, &path, ratio, PAGE_MAX_W, reading_now)).child(notes).into_any_element()
     }
 

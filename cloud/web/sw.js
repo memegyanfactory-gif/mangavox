@@ -115,10 +115,32 @@ async function store(path, res, age, who) {
   swept = true;
 }
 
+/**
+ * The manifest, with the home-screen setup link connect.js stored (CLOUD.md, "Home-screen icon")
+ * as start_url while it works, so an icon added now opens with it and pairs itself. The link is
+ * only ever in this phone's storage, never sent to the relay.
+ */
+async function manifest(req) {
+  const res = await fetch(req);
+  try {
+    const hit = await (await caches.open('mv-meta')).match(SCOPE + 'meta/start');
+    const m = hit && await hit.json();
+    if (!res.ok || !m || !(m.until > Date.now()) || !String(m.start).startsWith(SCOPE + '#')) return res;
+    const body = { ...(await res.clone().json()), start_url: m.start };
+    return new Response(JSON.stringify(body), { headers: { 'content-type': 'application/manifest+json', 'cache-control': 'no-store' } });
+  } catch {
+    return res;
+  }
+}
+
 self.addEventListener('fetch', e => {
   const req = e.request;
   const url = new URL(req.url);
   if (url.origin !== location.origin) return;
+  if (url.pathname === SCOPE + 'manifest.webmanifest' && req.method === 'GET') {
+    e.respondWith(manifest(req));
+    return;
+  }
   if (req.mode === 'navigate') {
     const app = appPath(url.pathname);
     // Only the connector's own frame: a top-level page load (a link or form from another site)

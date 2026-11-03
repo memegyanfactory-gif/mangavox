@@ -47,6 +47,12 @@ section { width: 100%; display: flex; flex-direction: column; gap: 10px; margin-
   font: inherit; font-weight: 600; cursor: pointer;
 }
 .btn.ghost { background: transparent; color: var(--text-2); border: 1px solid var(--border); }
+#paste { display: flex; flex-direction: column; gap: 10px; }
+#paste[hidden], #paste [hidden] { display: none; }
+.field {
+  width: 100%; min-height: 46px; padding: 0 14px; border-radius: 12px; border: 1px solid var(--border);
+  background: transparent; color: var(--text); font: inherit; font-size: 16px;
+}
 .spin {
   width: 32px; height: 32px; margin: 4px auto; border-radius: 50%;
   border: 3px solid var(--border); border-top-color: var(--accent); animation: spin .9s linear infinite;

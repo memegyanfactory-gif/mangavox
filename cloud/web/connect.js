@@ -39,13 +39,14 @@ const clearCache = () => caches.delete('mv-tunnel-1').catch(() => {});
 
 /* ---------------- screens */
 
-function show({ title = 'MangaVox', lead = '', busy = false, choose = false, retry = null, forget = false }) {
+function show({ title = 'MangaVox', lead = '', busy = false, choose = false, retry = null, forget = false, paste = false }) {
   document.body.classList.remove('in-app');
   $('app').hidden = true;
   $('title').textContent = title;
   $('lead').textContent = lead;
   $('busy').hidden = !busy;
   $('choose').hidden = !choose;
+  $('paste').hidden = !paste;
   $('retry').hidden = !retry;
   $('retry').onclick = retry;
   $('forget').hidden = !forget;
@@ -88,6 +89,14 @@ function readLink() {
   const raw = location.hash.slice(1);
   if (!raw) return null;
   history.replaceState(null, '', location.pathname);
+  return parseLink(raw);
+}
+
+/**
+ * A QR link's fragment, or a home-screen setup link's (CLOUD.md, "Home-screen icon"), which adds
+ * `h`: the paired phone that made it.
+ */
+function parseLink(raw) {
   const q = new URLSearchParams(raw);
   const p = (q.get('p') || '').split('.');
   if (p.length !== 3 || !/^[\w-]{22}$/.test(p[0]) || !/^[\w-]{43}$/.test(p[1]) || !/^[\w-]{22}$/.test(p[2])) return { bad: true };
@@ -96,8 +105,12 @@ function readLink() {
     const u = new URL(q.get('l') || '');
     if (u.protocol === 'http:' && privateIpv4(u.hostname) && u.pathname === '/pair' && !u.username && !u.password) lan = u.href;
   } catch { /* no Wi-Fi link */ }
-  return { rid: p[0], code: p[1], fp: p[2], lan };
+  const inv = /^[0-9a-f]{16}$/.test(q.get('h') || '') ? q.get('h') : '';
+  return { rid: p[0], code: p[1], fp: p[2], lan, inv };
 }
+
+/** Opened as an installed home-screen app (which on iPhone has its own storage). */
+const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 
 /* ---------------- the connection */
 
@@ -134,7 +147,7 @@ function connect(target) {
     c.chain = c.chain.then(async () => {
       if (target.mode === 'pair') {
         c.device = await newDeviceKey();
-        const h = await hello({ kind: KIND.PAIR, rid, device: c.device });
+        const h = await hello({ kind: KIND.PAIR, rid, device: c.device, inv: target.inv });
         c.state = h.state;
         ws.send(h.frame);
       } else {
@@ -215,6 +228,10 @@ function refused(c, code) {
   try { c.ws.close(); } catch { /* closed */ }
   const [title, lead] = REFUSED[code] || REFUSED.bad;
   closeApp();
+  if (code === 'pair' && c.target.inv) {
+    show({ title: 'This setup link no longer works', lead: SETUP_LEAD, paste: true });
+    return;
+  }
   // Never wipe the key on this: a REFUSE is not authenticated (the relay could forge it).
   show({ title, lead, forget: code === 'unknown' && !!saved, retry: code === 'busy' ? () => connect(c.target) : null });
 }
@@ -271,6 +288,7 @@ async function forget() {
   // The pairing first, then the cache (see sw.js, store).
   await wipePc();
   await clearCache();
+  await caches.delete(META).catch(() => {});
   show({ title: 'Connect your phone', lead: 'On your PC, open MangaVox → Mobile, turn on From anywhere, and scan the code with this phone.' });
 }
 
@@ -328,8 +346,47 @@ function onAppMessage(ev) {
     if (conn) { conn.retire(); conn = null; }
   } else if (m === 'forget') {
     forget();
+  } else if (m === 'homescreen') {
+    homeScreen(ev.data.link);
   }
 }
+
+/* ---------------- the home-screen icon (CLOUD.md, "Home-screen icon") */
+
+const META = 'mv-meta';
+const META_START = BASE + 'meta/start';
+
+/**
+ * The app made a setup link for this phone's home-screen icon (it is also on the clipboard). Put
+ * it where "Add to Home Screen" picks the icon's address: this page's address, and the manifest's
+ * start_url (sw.js serves it while the link works). The fragment never reaches the relay.
+ */
+async function homeScreen(link) {
+  const i = String(link || '').indexOf('#');
+  const v = i < 0 ? null : parseLink(link.slice(i + 1));
+  if (!v || v.bad || !v.inv || !saved || v.rid !== saved.rid) return;
+  const frag = '#' + link.slice(i + 1);
+  history.replaceState(null, '', BASE + frag);
+  try {
+    const until = Date.now() + 30 * 60 * 1000;
+    await (await caches.open(META)).put(META_START, new Response(JSON.stringify({ start: BASE + frag, until }), { headers: { 'content-type': 'application/json' } }));
+  } catch { /* the address bar still has it */ }
+}
+
+/** Pairs this icon from a setup link the user pastes (when its address did not carry one). */
+async function pasteLink(text) {
+  const s = String(text || '').trim();
+  const i = s.indexOf('#');
+  const v = i < 0 ? null : parseLink(s.slice(i + 1));
+  if (!v || v.bad) {
+    show({ title: 'That isn’t a setup link', lead: SETUP_LEAD, paste: true });
+    return;
+  }
+  if (saved && saved.rid === v.rid) { connect({ mode: 'resume', pc: saved }); return; }
+  connect({ mode: 'pair', rid: v.rid, code: v.code, fp: v.fp, inv: v.inv });
+}
+
+const SETUP_LEAD = 'On iPhone this icon keeps its own storage. In Safari, open MangaVox (app.bhippi.com/mangavox) and tap More → Add to Home Screen; it copies a setup link. Then come back here and tap Paste setup link.';
 
 /* ---------------- start */
 
@@ -356,6 +413,18 @@ async function main() {
     show({ title: 'This code is incomplete', lead: 'Scan the code in MangaVox → Mobile on your PC again.' });
     return;
   }
+  $('paste-btn').onclick = async () => {
+    try { await pasteLink(await navigator.clipboard.readText()); }
+    catch { $('paste-in').hidden = false; $('paste-go').hidden = false; $('paste-in').focus(); }
+  };
+  $('paste-go').onclick = () => pasteLink($('paste-in').value);
+  if (link && link.inv) {
+    // A home-screen setup link: already paired with this PC (the icon opened again) resumes;
+    // otherwise this icon pairs itself, without a question on the PC.
+    if (saved && saved.rid === link.rid) { connect({ mode: 'resume', pc: saved }); return; }
+    connect({ mode: 'pair', rid: link.rid, code: link.code, fp: link.fp, inv: link.inv });
+    return;
+  }
   if (link) {
     const lan = $('opt-lan');
     lan.hidden = !link.lan;
@@ -365,6 +434,7 @@ async function main() {
     return;
   }
   if (saved) { connect({ mode: 'resume', pc: saved }); return; }
+  if (standalone()) { show({ title: 'Set up this icon', lead: SETUP_LEAD, paste: true }); return; }
   show({ title: 'Connect your phone', lead: 'On your PC, open MangaVox → Mobile, turn on From anywhere, and scan the code with this phone.' });
 }
 

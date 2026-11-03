@@ -596,14 +596,27 @@ def _worker_env() -> dict:
     return env
 
 
-def _load_narration():
-    """narration_tts from this folder, without putting the folder (and its f5_tts.py etc.)
-    on sys.path while the engine's packages import."""
+def _load_sibling(name: str):
+    """A module from this folder, without putting the folder (and its f5_tts.py etc.) on
+    sys.path while the engine's packages import."""
     import importlib.util
-    spec = importlib.util.spec_from_file_location("narration_tts", os.path.join(HERE, "narration_tts.py"))
+    spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, f"{name}.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
+
+
+def _load_narration():
+    return _load_sibling("narration_tts")
+
+
+def _off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("0", "off", "false", "no")
+
+
+def runaway_limit(text: str) -> float:
+    """Seconds past which a chunk of `text` has run away (a hallucinated tail)."""
+    return 2.0 + len(text) / 8.0
 
 
 def serve() -> int:
@@ -629,13 +642,33 @@ def serve() -> int:
         nt = _load_narration()
         device = "cuda" if torch.cuda.is_available() else "cpu"
         t0 = time.time()
-        model = ChatterboxTTS.from_local(MODEL_DIR, device)
+        # The fast sampler (chatterbox_fast.py): many sentences per batch on the GPU, the same
+        # sampling maths. MANGAVOX_CB_FAST=0 turns it off; MANGAVOX_CB_PRECISION=fp32 keeps the
+        # voice model in fp32 (exact, slower) instead of bf16, the precision it ships in.
+        fast, cf, precision, model = None, None, None, None
+        if device == "cuda" and not _off("MANGAVOX_CB_FAST"):
+            try:
+                cf = _load_sibling("chatterbox_fast")
+                model = cf.load(MODEL_DIR, device)
+            except Exception as e:
+                print(f"[chatterbox] fast load failed ({type(e).__name__}: {e}); loading the usual way", file=sys.stderr, flush=True)
+                model = None
+        if model is None:
+            model = ChatterboxTTS.from_local(MODEL_DIR, device)
         sr = int(getattr(model, "sr", 24000))
         builtin = model.conds
         accepted = set(inspect.signature(model.generate).parameters)
         gpu = torch.cuda.get_device_name(0) if device == "cuda" else None
+        if cf is not None:
+            try:
+                precision = "fp32" if os.environ.get("MANGAVOX_CB_PRECISION", "").strip().lower() == "fp32" else "bf16"
+                fast = cf.FastT3(model, dtype=torch.float32 if precision == "fp32" else torch.bfloat16)
+            except Exception as e:
+                print(f"[chatterbox] fast sampler unavailable: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                fast, precision = None, None
+                model.t3.tfmr.float()
         send({"type": "ready", "device": device, "gpu": gpu, "sr": sr, "load_s": round(time.time() - t0, 2),
-              "torch": torch.__version__, "accepts": sorted(accepted)})
+              "torch": torch.__version__, "accepts": sorted(accepted), "fast": fast is not None, "precision": precision})
     except Exception as e:
         send({"type": "error", "message": f"Chatterbox could not start: {type(e).__name__}: {e}"})
         return 1
@@ -654,7 +687,19 @@ def serve() -> int:
                 conds[key] = builtin
         model.conds = conds[key]
 
-    def generate(text, params, seed):
+    def peak_safe(x):
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        # Loud takes can go past full scale; the 16-bit cache would clip them flat. The chapter
+        # gain comes later, so scaling just this chunk under 0 dBFS loses nothing.
+        peak = float(np.max(np.abs(x))) if x.size else 0.0
+        return x * (0.98 / peak) if peak > 0.98 else x
+
+    def slow_generate(text, params, seed):
+        nonlocal fast
+        if fast is not None and fast.dtype != torch.float32:
+            # model.generate needs the fp32 voice model: leave the fast sampler for this job.
+            model.t3.tfmr.float()
+            fast = None
         kwargs = {k: v for k, v in (params or {}).items() if k in accepted}
         torch.manual_seed(seed)
         random.seed(seed)
@@ -663,26 +708,68 @@ def serve() -> int:
             torch.cuda.manual_seed_all(seed)
         with torch.inference_mode():
             wav = model.generate(text, **kwargs)
-        x = wav.squeeze().detach().float().cpu().numpy().astype(np.float32)
-        # Loud takes can go past full scale; the 16-bit cache would clip them flat. The chapter
-        # gain comes later, so scaling just this chunk under 0 dBFS loses nothing.
-        peak = float(np.max(np.abs(x))) if x.size else 0.0
-        return x * (0.98 / peak) if peak > 0.98 else x
+        return peak_safe(wav.squeeze().detach().float().cpu().numpy())
+
+    def generate_many(reqs):
+        """[(text, params, seed)] -> arrays; through the fast sampler where it applies."""
+        out = [None] * len(reqs)
+        quick = [i for i, (_, p, _) in enumerate(reqs) if fast is not None and cf.supported(p)]
+        if quick:
+            wavs = cf.speak(model, fast, [{"text": reqs[i][0], "params": reqs[i][1], "seed": reqs[i][2],
+                                           "max_tokens": int(25 * runaway_limit(reqs[i][0]) * 1.1) + 8} for i in quick])
+            for i, w in zip(quick, wavs):
+                out[i] = peak_safe(w)
+        for i, (text, params, seed) in enumerate(reqs):
+            if out[i] is None:
+                out[i] = slow_generate(text, params, seed)
+        return out
+
+    def ran_away(text, x):
+        dur = len(x) / sr
+        return dur > runaway_limit(text) or (dur < 0.25 and len(text) > 8)
+
+    def synth_many(reqs):
+        """Chunks [(text, params, seed)], each retried once when it runs away (hallucinated
+        tail) or comes out empty. Returns [(array, retried)]."""
+        xs = generate_many(reqs)
+        redo = [i for i, (text, _, _) in enumerate(reqs) if ran_away(text, xs[i])]
+        if redo:
+            again = []
+            for i in redo:
+                text, params, seed = reqs[i]
+                p2 = dict(params or {})
+                p2["temperature"] = max(0.5, float(p2.get("temperature", 0.8)) - 0.1)
+                again.append((text, p2, seed + 7919))
+            for i, y in zip(redo, generate_many(again)):
+                text = reqs[i][0]
+                if abs(len(y) / sr - len(text) / 14.0) < abs(len(xs[i]) / sr - len(text) / 14.0):
+                    xs[i] = y
+        return [(x, i in redo) for i, x in enumerate(xs)]
 
     def synth_chunk(text, params, seed):
-        """One chunk, retried once when it runs away (hallucinated tail) or comes out empty."""
-        x = generate(text, params, seed)
-        dur = len(x) / sr
-        limit = 2.0 + len(text) / 8.0
-        retried = False
-        if dur > limit or (dur < 0.25 and len(text) > 8):
-            p2 = dict(params or {})
-            p2["temperature"] = max(0.5, float(p2.get("temperature", 0.8)) - 0.1)
-            y = generate(text, p2, seed + 7919)
-            if abs(len(y) / sr - len(text) / 14.0) < abs(dur - len(text) / 14.0):
-                x = y
-            retried = True
-        return x, retried
+        return synth_many([(text, params, seed)])[0]
+
+    def do_voice(req):
+        """Voices every chunk of `chunks` that is not in `cache_dir` yet, many at a time, so
+        the pages that follow are put together from the cache."""
+        t_all = time.time()
+        use_voice(req.get("voice"), req.get("reference"))
+        cache_dir = req["cache_dir"]
+        os.makedirs(cache_dir, exist_ok=True)
+        todo = []
+        for c in req.get("chunks") or []:
+            text, key = (c.get("text") or "").strip(), c.get("key")
+            if text and key and not os.path.isfile(os.path.join(cache_dir, f"{key}.wav")):
+                todo.append(c)
+        info = []
+        made = synth_many([((c.get("text") or "").strip(), c.get("params"), int(c.get("seed", 0))) for c in todo])
+        for c, (x, retried) in zip(todo, made):
+            nt.write_wav(os.path.join(cache_dir, f"{c['key']}.wav"), x, sr)
+            info.append({"key": c["key"], "retried": retried, "raw_seconds": round(len(x) / sr, 2)})
+        return {"voiced": len(info), "chunks": info, "elapsed": round(time.time() - t_all, 2),
+                "audio_seconds": round(sum(i["raw_seconds"] for i in info), 2), "fast": fast is not None,
+                "cooled_s": round(fast.guard.cooled_s, 1) if fast is not None else 0.0,
+                "stats": {k: round(v, 2) for k, v in fast.stats.items()} if fast is not None else None}
 
     def do_page(req):
         t_page = time.time()
@@ -732,6 +819,8 @@ def serve() -> int:
         try:
             if op == "page":
                 res = do_page(req)
+            elif op == "voice":
+                res = do_voice(req)
             elif op == "ping":
                 res = {"device": device}
             else:
@@ -856,6 +945,13 @@ class Worker:
         absolute = lambda p: os.path.abspath(p) if p else p  # noqa: E731
         return self.request({"op": "page", "out": absolute(out), "voice": voice, "reference": absolute(ref), "chunks": chunks,
                              "cache_dir": absolute(cache_dir), "lead_ms": lead_ms, "tail_ms": tail_ms, "tempo": tempo})
+
+    def voice(self, voice: str, chunks: list, cache_dir: str, reference: str | None = None) -> dict:
+        """Voices the chunks that are not in `cache_dir` yet, many at a time (see `do_voice`)."""
+        ref = reference if reference is not None else reference_path(voice)
+        absolute = lambda p: os.path.abspath(p) if p else p  # noqa: E731
+        return self.request({"op": "voice", "voice": voice, "reference": absolute(ref), "chunks": chunks,
+                             "cache_dir": absolute(cache_dir)})
 
     def close(self) -> None:
         if not self.proc:

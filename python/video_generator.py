@@ -109,11 +109,11 @@ COLOR_PRESETS = {
 # Transitions drawn by the clips themselves over a plain dissolve: a film burn (a hot flare
 # that swells over the cut) and a zoom blur (the old page rushes in and blurs, the new one
 # lands out of it).
-CLIP_TRANSITIONS = ("burn", "zoomblur")
+CLIP_TRANSITIONS = ("burn", "zoomblur", "particles")
 # Transitions the clips help draw, and the xfade under them: the two above, a glitch (pixelate
 # with an RGB tear and noise on both sides) and whips (a fast slide, both sides motion-blurred).
 CLIP_DRAWN = {
-    "burn": "fade", "zoomblur": "fade", "glitch": "pixelize",
+    "burn": "fade", "zoomblur": "fade", "glitch": "pixelize", "particles": "pixelize",
     "whipleft": "slideleft", "whipright": "slideright", "whipup": "slideup", "whipdown": "slidedown",
 }
 # The Video editor's per-clip transitions: name -> (transition as planned, default seconds).
@@ -136,6 +136,17 @@ LEAK_SEC = 1.1
 LEAK_GAP = 10.0
 BURN_SEC = 0.9
 BURN_PEAK = 0.32
+# A big scene change bursts into particles: sparks and pixel shards in the new scene's colour fly
+# out from the middle while the old page breaks into blocks that settle into the new one (xfade's
+# pixelize, under the burst; peaking BURST_PEAK in), at
+# most one every SCENE_GAP seconds; the join takes SCENE_TRANSITION of the base length.
+BURST_SEC = 1.0
+BURST_PEAK = 0.4
+SCENE_GAP = 30.0
+SCENE_TRANSITION = 1.6
+# Scenes that burst as they begin; an action scene keeps its whips, a horror or sad one its slow
+# fades (a burst would break them).
+BURST_MOODS = ("neutral", "calm", "mystery", "reveal", "romance", "comedy")
 ZOOM_BLUR = 0.14
 # Particle loop length (seconds): one seamless loop, made once per render.
 PARTICLE_SEC = 4.0
@@ -288,7 +299,8 @@ MOOD_TRANSITIONS = {
 }
 # Accents (a flash, a burn, a glitch, a circle) are rare: entering a reveal, a peak of action (a
 # page this intense) or a big comic beat, at most one every ACCENT_GAP seconds.
-ACCENTS = {"reveal": (("fadewhite", 0.6), ("burn", 1.0)), "action": (("glitch", 0.6),), "comedy": (("circleopen", 1.0),)}
+ACCENTS = {"reveal": (("fadewhite", 0.6), ("pixelize", 1.4), ("burn", 1.0)), "action": (("glitch", 0.6),), "comedy": (("circleopen", 1.0),),
+           "mystery": (("pixelize", 1.4),)}
 ACCENT_INTENSITY = 8
 ACCENT_GAP = 25.0
 # Grade per mood, baked into each clip's stills (free per frame): (saturation, contrast,
@@ -976,6 +988,7 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
     trans = [None]
     turn = 0
     last_accent = -ACCENT_GAP
+    last_scene = -SCENE_GAP
     for k in range(1, len(durations)):
         if forced[k]:
             name, dur = forced[k]
@@ -992,6 +1005,10 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
             name, dur = mood_transition(m["mood"], m.get("raw"), turn, base, entering and starts[k] - last_accent >= ACCENT_GAP)
             if any(name == a for v in ACCENTS.values() for a, _ in v):
                 last_accent = starts[k]
+            elif m["mood"] in BURST_MOODS and moods[k - 1] and (moods[k - 1]["mood"] != m["mood"] or moods[k - 1].get("kind") != m.get("kind")) and starts[k] - last_scene >= SCENE_GAP:
+                # A new scene bursts into particles (an accent keeps its own).
+                name, dur = "particles", round(base * SCENE_TRANSITION, 3)
+                last_scene = starts[k]
             turn += 1
         else:
             name, dur = names[turn % len(names)], base
@@ -999,6 +1016,61 @@ def plan_transitions(durations, pages, kind="crossfade", base=0.5, names=None, j
         dur = max(frame, min(dur, 0.45 * durations[k - 1], 0.45 * durations[k]))
         trans.append((name, round(dur, 3)))
     return starts, trans
+
+
+# Panels of one page come and go: the panel leaving slides PANEL_SLIDE of the frame width out
+# as the dissolve takes it, and the next slides in the same way and settles, a little after it
+# (PANEL_SETTLE seconds longer), so the swap moves instead of standing still.
+PANEL_SLIDE = 0.05
+PANEL_SETTLE = 0.3
+
+
+def plan_panel_moves(starts, trans, pages, joins=None, duo=None, forced=None, holds=None):
+    """Panel entrances and exits for clips on the same page as the one before: clip k-1 gets
+    "panel_out": (when the change starts, seconds, direction) and clip k "panel_in": (seconds,
+    direction), in their own seconds; the direction (+1: towards the left, -1: the right)
+    alternates. A cut, an impact, a duo clip (it slides in by itself) or a transition the editor
+    picked (`forced`) keeps its own entrance, and a hold (`holds`: the same panel again) stays put."""
+    joins = joins or [None] * len(starts)
+    holds = holds or [False] * len(starts)
+    duo = duo or [False] * len(starts)
+    forced = forced or [None] * len(starts)
+    out = [{} for _ in starts]
+    turn = 0
+    for k in range(1, len(starts)):
+        if pages[k] != pages[k - 1] or joins[k] or forced[k] or holds[k] or duo[k] or duo[k - 1] or not trans[k] or trans[k][1] < 1.5 / FPS:
+            continue
+        d = 1 if turn % 2 == 0 else -1
+        turn += 1
+        dur = trans[k][1]
+        out[k - 1]["panel_out"] = (round(starts[k] - starts[k - 1], 3), dur, d)
+        out[k]["panel_in"] = (round(dur + PANEL_SETTLE, 3), d)
+    return out
+
+
+def _panel_move(fx, w, axis):
+    """Overlay offset (pixels, of overlay time t) of a panel's entrance and exit (plan_panel_moves)."""
+    if axis != "x":
+        return "0"
+    terms = []
+    if "panel_in" in fx:
+        dur, d = fx["panel_in"]
+        terms.append(f"({round(d * PANEL_SLIDE * w)})*pow(max(0,1-t/{dur}),3)")
+    if "panel_out" in fx:
+        t0, dur, d = fx["panel_out"]
+        terms.append(f"({-round(d * PANEL_SLIDE * w)})*pow(min(1,max(0,(t-{t0})/{dur})),2)")
+    return "+".join(terms) if terms else "0"
+
+
+def scene_bursts(starts, trans, colors):
+    """The particle bursts the finish draws over the joins: [(first frame on the video's clock,
+    rgb)] for every "particles" join (plan_transitions), peaking halfway through it. `colors`:
+    each clip's rgb (the scene it bursts into gives the colour)."""
+    out = []
+    for k in range(1, len(starts)):
+        if trans[k] and trans[k][0] == "particles":
+            out.append((round((starts[k] - starts[0] + trans[k][1] / 2 - BURST_PEAK) * FPS), tuple(colors[k])))
+    return out
 
 
 def plan_clip_fx(starts, trans, pages, joins=None, leaks=False, impacts=None, gap=None, forced=None, quiet=None):
@@ -1036,6 +1108,10 @@ def plan_clip_fx(starts, trans, pages, joins=None, leaks=False, impacts=None, ga
         if joins[k] == "impact" or impacts[k] or pages[k] == pages[k - 1]:
             continue
         name, dur = trans[k]
+        if name == "particles":
+            # Drawn over the join by the finish (scene_bursts); it counts as a page-turn effect.
+            last = starts[k]
+            continue
         if name in CLIP_DRAWN and dur > 1.5 / FPS:
             if name in CLIP_TRANSITIONS:
                 last = starts[k]
@@ -1271,21 +1347,25 @@ def _paint(canvas, sprite, cx, cy):
         canvas.alpha_composite(sprite.crop((left, top, right, bottom)), (x + left, y + top))
 
 
-def make_flare_frames(kind, w, h, work_dir):
+def make_flare_frames(kind, w, h, work_dir, color=None):
     """PNG frames (a quarter of the frame size, RGBA) of a light leak ("leak": a warm flare with
     a lens streak sweeping across as a page lands) or a film burn ("burn": a hot orange-to-white
-    bloom that swells over a cut and dies away). The clips scale them up: they are soft, so the
-    low resolution never shows, and they cost a few milliseconds on the frames they touch only.
-    Returns (ffmpeg input pattern, frame count)."""
-    from PIL import Image
+    bloom that swells over a cut and dies away), or (half the frame size, they are finer) a
+    particle burst ("burst": sparks and pixel shards in `color` flying out from the middle over
+    a soft bloom as one scene dissolves into the next). The clips scale them up: they are soft,
+    so the low resolution never shows, and they cost a few milliseconds on the frames they touch
+    only. Returns (ffmpeg input pattern, frame count)."""
+    from PIL import Image, ImageDraw
     import random
-    sw, sh = max(32, w // 4), max(32, h // 4)
-    seconds = LEAK_SEC if kind == "leak" else BURN_SEC
+    div = 2 if kind == "burst" else 4
+    sw, sh = max(32, w // div), max(32, h // div)
+    seconds = {"leak": LEAK_SEC, "burst": BURST_SEC}.get(kind, BURN_SEC)
     count = max(2, round(seconds * FPS))
     # The frames depend on the size only, so they are kept between renders (they take seconds
     # to draw): in a shared cache when there is one, else next to the clips.
     root = fx_cache_dir() or work_dir
-    folder = os.path.join(root, f"fx_{kind}_{sw}x{sh}_v{FX_VERSION}")
+    tint = f"_{_hex(color)[2:]}" if color else ""
+    folder = os.path.join(root, f"fx_{kind}{tint}_{sw}x{sh}_v{FX_VERSION}")
     pattern = os.path.join(folder, "f_%03d.png")
     if os.path.exists(os.path.join(folder, f"f_{count - 1:03d}.png")):
         return pattern, count
@@ -1296,11 +1376,15 @@ def make_flare_frames(kind, w, h, work_dir):
     rng = random.Random(7)
     # The burn's flicker, drawn in frame order so every frame gets the same value as before.
     flicker = [0.88 + 0.12 * rng.random() for _ in range(count)]
+    if kind == "burst":
+        shards = _burst_shards(random.Random(23), sw, sh)
 
     def draw(i):
         u = i / (count - 1)
         img = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
-        if kind == "leak":
+        if kind == "burst":
+            _draw_burst(img, ImageDraw.Draw(img, "RGBA"), shards, u, sw, sh, color or (255, 214, 160))
+        elif kind == "leak":
             # Quick bloom, slow fade; the flare drifts left to right and rises a little.
             env = math.sin(math.pi * min(1.0, u ** 0.7)) ** 1.6
             cx = (-0.15 + 1.25 * u) * sw
@@ -1334,6 +1418,56 @@ def make_flare_frames(kind, w, h, work_dir):
             return os.path.join(tmp, "f_%03d.png"), count
         shutil.rmtree(tmp, ignore_errors=True)
     return pattern, count
+
+
+def _burst_shards(rng, sw, sh):
+    """The particle burst's shards: where each starts (around the middle, wider than high), where
+    it flies, when it lights and how big it is; a few in three are square pixel shards, the rest
+    sparks with a streak."""
+    out = []
+    for _ in range(240):
+        a = rng.uniform(0, 2 * math.pi)
+        r0 = rng.uniform(0.0, 0.22) ** 0.8
+        x0, y0 = 0.5 + r0 * math.cos(a) * 0.62, 0.5 + r0 * math.sin(a) * 0.5
+        speed = rng.uniform(0.25, 0.9)
+        out.append({"x0": x0, "y0": y0, "dx": math.cos(a) * speed * 0.75, "dy": math.sin(a) * speed * 0.55 - rng.uniform(0, 0.05),
+                    "on": rng.uniform(0.0, 0.3), "life": rng.uniform(0.45, 0.8), "size": rng.uniform(0.8, 2.6),
+                    "square": rng.random() < 0.5, "white": rng.random() < 0.4})
+    return out
+
+
+def _draw_burst(img, draw, shards, u, sw, sh, color):
+    """Frame u (0..1) of the particle burst on `img` (RGBA, sw x sh): a soft bloom swelling to
+    BURST_PEAK and dying, the shards flying out on an ease-out, each fading over its life."""
+    peak = BURST_PEAK / BURST_SEC
+    bloom = (u / peak) ** 1.3 if u < peak else (1 - (u - peak) / (1 - peak)) ** 1.6
+    unit = min(sw, sh)
+    _paint(img, _glow_sprite((unit * 1.6, unit * 1.1), color, 0.14 * bloom), sw / 2, sh / 2)
+    _paint(img, _glow_sprite((unit * 0.7, unit * 0.5), (255, 246, 232), 0.22 * bloom), sw / 2, sh / 2)
+    core = tuple(round(c + (255 - c) * 0.6) for c in color)
+    for p in shards:
+        v = (u - p["on"]) / p["life"]
+        if not 0 < v < 1:
+            continue
+        # Out fast, then slowing; bright as it lights, fading as it goes.
+        go = 1 - (1 - v) ** 2.2
+        x = (p["x0"] + p["dx"] * go) * sw
+        y = (p["y0"] + p["dy"] * go) * sh
+        a = (min(1.0, v / 0.12) * (1 - v) ** 1.4)
+        s = max(1.0, p["size"] * unit / 260)
+        col = core if p["white"] else color
+        if p["square"]:
+            # A pixel shard: solid enough to read on a white page as well as a dark one, with a
+            # darker rim.
+            q = s * 1.6
+            rim = tuple(round(c * 0.45) for c in col)
+            draw.rectangle([x - q - 1, y - q - 1, x + q + 1, y + q + 1], fill=rim + (round(150 * a),))
+            draw.rectangle([x - q, y - q, x + q, y + q], fill=col + (round(235 * a),))
+        else:
+            # A streak behind the spark, along its flight, shorter as it slows.
+            tail = (1 - v) ** 1.5 * 0.05
+            draw.line([(x - p["dx"] * tail * sw, y - p["dy"] * tail * sh), (x, y)], fill=col + (round(150 * a),), width=max(1, round(s)))
+            _paint(img, _glow_sprite((s * 7, s * 7), col, 0.65 * a), x, y)
 
 
 def make_particle_loop(w, h, work_dir):
@@ -2133,7 +2267,7 @@ def _render_clip(clip, frames, w, h, out_path):
     graph = [
         f"{bg}[bg]",
         f"[1:v]{TV}format=yuv420p,{_warp(window, fg_zoom, frames, 'cubic', ease, held=not anim)},setsar=1[fg]",
-        f"[bg][fg]overlay=x='{fx}+{_shake(jolt, 'x')}':y='{fy}+{_shake(jolt, 'y')}':eval=frame{_flash(impact)},format=yuv420p[base]",
+        f"[bg][fg]overlay=x='{fx}+{_shake(jolt, 'x')}+{_panel_move(clip.get('fx') or {}, w, 'x')}':y='{fy}+{_shake(jolt, 'y')}':eval=frame{_flash(impact)},format=yuv420p[base]",
     ]
     _finish_clip(clip, frames, w, h, inputs, graph, "base")
     _encode_clip(inputs, graph, frames, out_path)
@@ -2491,6 +2625,129 @@ def apply_edit_clips(items, clips):
     return out
 
 
+# The chapter card: a small dark card at the top of the frame naming the chapter ("CHAPTER 12"
+# over its title) as it starts. It slides down and fades in at CARD_IN, stays, and lifts away and
+# fades out by CARD_OUT (seconds on the chapter's clock). A full recap joins the chapters as they
+# are, so each chapter change carries its own.
+CARD_IN = 0.35
+CARD_OUT = 5.8
+CARD_EASE = 0.45
+CARD_FADE = 0.5
+CARD_ACCENT = (255, 188, 108)
+
+
+def _card_drawable(text):
+    """Whether the card's font (Inter: Latin, Greek, Cyrillic) has every letter of `text`."""
+    return all(c.isspace() or ord(c) <= 0x052F or 0x1E00 <= ord(c) <= 0x1FFF or 0x2010 <= ord(c) <= 0x206F for c in text)
+
+
+def chapter_card_text(chapter):
+    """(kicker, title) for the card from the job's `chapter` ({"number", "title"}): ("CHAPTER 12",
+    "The Duel"); ("CHAPTER", title) without a number (a title "Chapter 5" gives the number); None
+    with neither. A title that only repeats the number is left out, a "Ch. 7 - " prefix dropped,
+    and a title the card's font cannot draw (Japanese, say) left out rather than drawn as boxes."""
+    if not isinstance(chapter, dict):
+        return None
+    num = chapter.get("number")
+    title = " ".join(str(chapter.get("title") or "").split())
+    try:
+        kicker = f"CHAPTER {float(num):g}"
+    except (TypeError, ValueError):
+        kicker = None
+    only = re.fullmatch(r"(?i)(?:chapter|ch\.?)\s*([\d.]+)\s*[:.\-]?", title)
+    if only:
+        try:
+            kicker = kicker or f"CHAPTER {float(only.group(1)):g}"
+        except ValueError:
+            pass
+        title = ""
+    if title:
+        title = re.sub(r"(?i)^(chapter|ch\.?)\s*[\d.]+\s*[:.\-–—]*\s*", "", title) or title
+    if title and not _card_drawable(title):
+        title = ""
+    if not kicker:
+        return ("CHAPTER", title) if title else None
+    return kicker, title
+
+
+def make_chapter_card(w, h, chapter, work_dir, accent=CARD_ACCENT):
+    """The chapter card (chapter_card_text) as an RGBA PNG sized for a w x h frame, or None when
+    there is nothing to name. Returns (path, card width, card height)."""
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    text = chapter_card_text(chapter)
+    if not text:
+        return None
+    kicker, title = text
+    k = min(w, h) / 1080
+    fonts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+    f_kick = ImageFont.truetype(os.path.join(fonts, "Inter-ExtraBold.ttf"), max(10, round(22 * k)))
+    f_title = ImageFont.truetype(os.path.join(fonts, "Inter-Bold.ttf"), max(12, round(38 * k)))
+    spacing = 0.22 * f_kick.size
+    probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+
+    def width(s, f, track=0.0):
+        return sum(probe.textlength(ch, font=f) for ch in s) + track * max(0, len(s) - 1)
+
+    max_w = 0.62 * w
+    pad_x, pad_y, bar = round(30 * k), round(18 * k), max(2, round(4 * k))
+    gap = round(8 * k) if title else 0
+    # A long title is cut at a word with an ellipsis (a single long word, at a letter) rather
+    # than overflowing.
+    room = max_w - 2 * pad_x - bar
+    if title and width(title, f_title) > room:
+        words = title.split()
+        while len(words) > 1 and width(" ".join(words) + "…", f_title) > room:
+            words.pop()
+        title = " ".join(words)
+        while len(title) > 1 and width(title + "…", f_title) > room:
+            title = title[:-1]
+        title = title.rstrip() + "…"
+    kick_h = f_kick.getbbox("CHAPTER 0")[3]
+    title_h = f_title.getbbox("Ag")[3] if title else 0
+    inner_w = max(width(kicker, f_kick, spacing), width(title, f_title) if title else 0)
+    cw = round(inner_w + 2 * pad_x + bar + round(14 * k))
+    ch = round(kick_h + gap + title_h + 2 * pad_y)
+    shadow = round(18 * k)
+    img = Image.new("RGBA", (cw + 2 * shadow, ch + 2 * shadow), (0, 0, 0, 0))
+    # A soft shadow, the card, a hairline border and the accent bar on its left.
+    sh = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(sh).rounded_rectangle([shadow, shadow + round(4 * k), shadow + cw, shadow + ch + round(4 * k)], radius=round(14 * k), fill=(0, 0, 0, 150))
+    img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(10 * k)))
+    d = ImageDraw.Draw(img)
+    box = [shadow, shadow, shadow + cw, shadow + ch]
+    d.rounded_rectangle(box, radius=round(14 * k), fill=(12, 12, 16, 178), outline=(255, 255, 255, 34), width=max(1, round(1.5 * k)))
+    d.rounded_rectangle([shadow + pad_x - round(6 * k), shadow + pad_y, shadow + pad_x - round(6 * k) + bar, shadow + ch - pad_y], radius=bar // 2, fill=accent + (235,))
+    x = shadow + pad_x + bar + round(8 * k)
+    y = shadow + pad_y
+    for c in kicker:
+        d.text((x, y), c, font=f_kick, fill=accent + (240,))
+        x += probe.textlength(c, font=f_kick) + spacing
+    if title:
+        d.text((shadow + pad_x + bar + round(8 * k), y + kick_h + gap), title, font=f_title, fill=(250, 246, 240, 250))
+    out = os.path.join(work_dir, "chapter_card.png")
+    img.save(out)
+    return out, img.width, img.height
+
+
+def chapter_card_graph(card, w, h, bar, src, out, label, a):
+    """The chapter card (make_chapter_card's (path, width, height)) from stream `label` over
+    [src] into [out], for a part starting at frame `a` of the chapter: the card's frames run on
+    the chapter's clock from there, so it moves the same whichever part it falls in."""
+    _, cw, chh = card
+    n = round(CARD_OUT * FPS)
+    k = min(w, h) / 1080
+    y0 = bar + round(36 * k) - round(18 * k)
+    drop, lift = round(28 * k), round(14 * k)
+    ease_in = f"pow(max(0,1-(t-{CARD_IN})/{CARD_EASE}),3)"
+    ease_out = f"pow(max(0,(t-{CARD_OUT - CARD_FADE})/{CARD_FADE}),2)"
+    return (
+        f"[{label}]format=yuva420p,setparams=colorspace=bt470bg:range=tv,loop=loop={n - 1}:size=1,"
+        f"settb=AVTB,setpts=N/({FPS}*TB),trim=start_frame={a},setpts=(N+{a})/({FPS}*TB),"
+        f"fade=in:st={CARD_IN}:d={CARD_EASE * 0.8:.3f}:alpha=1,fade=out:st={CARD_OUT - CARD_FADE}:d={CARD_FADE}:alpha=1[{out}_c];"
+        f"[{src}][{out}_c]overlay=x='{(w - cw) // 2}':y='{y0}-{drop}*{ease_in}-{lift}*{ease_out}':format=yuv420:eof_action=pass[{out}]"
+    )
+
+
 def overlay_graph(overlays, w, h, total, src, out, first_input, work_dir, t0=0.0):
     """Image and text layers from the Video editor drawn over [src] (a w x h picture) into
     [out]. Each overlay: kind "image" (path, scale = width share of the frame) or "text" (text,
@@ -2600,8 +2857,15 @@ def clip_ease(clip, frames):
     return out
 
 
-def layered_job(c, frames, seg, panels, reads, look, output_dir, video_dir):
-    """The pack's job for one clip (see layered_motion.run), or None when it has no panel."""
+# A key clip's characters can assemble from pixel blocks as it opens a new page (the layered pack
+# draws it: they stand on the clean plate). Rare: at most one every PIXEL_GAP seconds.
+PIXEL_GAP = 40.0
+PIXEL_ENTRANCE = {"at": 0.1, "dur": 1.0, "block": 72}
+
+
+def layered_job(c, frames, seg, panels, reads, look, output_dir, video_dir, entrance=None):
+    """The pack's job for one clip (see layered_motion.run), or None when it has no panel.
+    `entrance` (PIXEL_ENTRANCE) has its characters assemble from pixel blocks."""
     panel = beat_panel(seg, panels)
     imgs = c.get("images") or {}
     if panel is None or not imgs.get("fg_size"):
@@ -2618,6 +2882,8 @@ def layered_job(c, frames, seg, panels, reads, look, output_dir, video_dir):
     drift = move_dirs(move) if move else PARALLAX_DIRS.get(c["motion"], (0.6, 0))
     ease = clip_ease(c, frames)
     plan_in = [list(imgs["fg_size"]), frames, ease, list(drift), c.get("grade"), look.get("glow"), scene, intensity]
+    if entrance:
+        plan_in.append(entrance)
     akey = layered_plan.anim_key(prep, plan_in)
     return {
         "id": f"clip_{c['idx']:04d}", "src": src, "panel": panel, "scene": scene, "intensity": intensity,
@@ -2625,6 +2891,7 @@ def layered_job(c, frames, seg, panels, reads, look, output_dir, video_dir):
         "ease": ease, "drift": list(drift), "grade": list(c["grade"]) if c.get("grade") else None, "glow": bool(look.get("glow")),
         "faces": [list(f) for _, f in layered_plan.panel_faces(panel)],
         "out": os.path.join(video_dir, f"fga_{c['idx']:04d}_{akey}.mp4"), "anim_key": akey,
+        **({"entrance": dict(entrance)} if entrance else {}),
     }
 
 
@@ -2995,6 +3262,13 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
 
     # ── Step 2: Render each clip's video (with a tail that the next crossfade eats) ──
     durations = [c["duration"] for c in clips]
+    # A beat showing the same panel as the one before (a caption-only page holds the last panel)
+    # is a hold: planned as the same page (a quick dissolve, no page-turn effect), its panel
+    # staying put.
+    holds, pages = [], []
+    for k, c in enumerate(clips):
+        holds.append(k > 0 and c["source"] == clips[k - 1]["source"])
+        pages.append(pages[-1] if holds[-1] else c["page"])
     # A duo clip that follows another slides in by itself (a cut), and a punch flashes in.
     joins = [None]
     for k in range(1, len(clips)):
@@ -3007,15 +3281,18 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     # The editor's own transition into a clip (a hard cut wins: it is a join above).
     forced = [None] + [tuple(c["trans"]) if c.get("trans") and not c["cut"] else None for c in clips[1:]]
     starts, trans = plan_transitions(
-        durations, [c["page"] for c in clips], trans_kind, trans_dur, look["transitions"], joins, forced,
+        durations, pages, trans_kind, trans_dur, look["transitions"], joins, forced,
         [c["mood"] for c in clips] if mood_on else None,
     )
     frame_counts = [clip_frames(starts, trans, k, durations[-1]) for k in range(len(clips))]
     # Page-turn effects the clips draw themselves, and the light frames they share (made once).
     clip_fx = plan_clip_fx(
-        starts, trans, [c["page"] for c in clips], joins, look.get("leaks", False), [c["impact"] for c in clips],
+        starts, trans, pages, joins, look.get("leaks", False), [c["impact"] for c in clips],
         forced=forced, quiet=[bool(c["mood"]) and c["mood"]["mood"] in ("horror", "sad") for c in clips],
     )
+    if effect != "none":
+        for f, moves in zip(clip_fx, plan_panel_moves(starts, trans, pages, joins, [bool(c["duo"]) for c in clips], forced, holds)):
+            f.update(moves)
     assets = {}
     for kind, key in (("leak", "leak"), ("burn", "burn_in")):
         if any(key in f for f in clip_fx):
@@ -3048,13 +3325,14 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     layered = select_layered_clips(look, config, clips, render_items, panels)
     reads = layered_plan.load_read(output_dir) if layered else {}
     layer_jobs = {}
+    last_pixel = -PIXEL_GAP
     for k, c in enumerate(clips):
         frames = frame_counts[k]
         c["fx"], c["assets"] = clip_fx[k], assets
         # Framing QA: the clip's must-see region on screen the whole time, else re-planned.
         rec = frame_clip(c, frames)
         framing.append({"clip": k, "idx": c["idx"], "page": c["page"], **rec})
-        drawn = lambda n: n.split("_")[0] in assets or "zoom" in n or n.split("_")[0] in CLIP_DRAWN and not n.startswith("burn")
+        drawn = lambda n: n.split("_")[0] in assets or "zoom" in n or n.startswith("panel_") or n.split("_")[0] in CLIP_DRAWN and not n.startswith("burn")
         spec = [c["motion"], c["impact"], c["push"], look["glow"], c["ramp"], c["chroma"] and c["impact"],
                 inset, drift, sorted((n, v) for n, v in clip_fx[k].items() if drawn(n)),
                 c["move"], c["punch"], c["chroma_k"], c["motion_k"], c["grade"],
@@ -3071,7 +3349,19 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             spec = spec + [("margin", margin)]
         c["spec"] = spec
         if k in layered:
-            job = layered_job(c, frames, render_items[c["idx"]], panels, reads, look, output_dir, video_dir)
+            # A key clip opening a new page may have its characters assemble from pixels. Its
+            # layers, when already prepared, say whether it has characters to cut out: without,
+            # the whole panel comes in from pixels instead (xfade's pixelize, same length).
+            pixel = (k == 0 or pages[k] != pages[k - 1]) and starts[k] - last_pixel >= PIXEL_GAP and not c["duo"]
+            job = layered_job(c, frames, render_items[c["idx"]], panels, reads, look, output_dir, video_dir, PIXEL_ENTRANCE if pixel else None)
+            if job and pixel:
+                last_pixel = starts[k]
+                # The entrance stays in the job whatever the prep finds (the pack skips it with no
+                # character), so the clip's key is the same on every run; prepared layers with no
+                # character have the whole panel come in from pixels instead.
+                man = layered_plan.read_manifest(job["cache"])
+                if man is not None and not man.get("layers") and k and trans[k] and not forced[k] and trans[k][0] not in CLIP_DRAWN and trans[k][1] >= 0.2:
+                    trans[k] = ("pixelize", trans[k][1])
             if job:
                 layer_jobs[k] = job
                 spec = spec + [("layered", job["anim_key"])]
@@ -3085,6 +3375,11 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         else:
             todo.append((c, frames, path))
     report("clips", rendered / all_frames)
+    at = lambda ks: ", ".join(f"{starts[k]:.1f}s" for k in ks) or "none"
+    print(f"[video] Edit: particle bursts at {at([k for k, t in enumerate(trans) if t and t[0] == 'particles'])}; "
+          f"pixel entrances at {at([k for k, j in layer_jobs.items() if j.get('entrance')])}; "
+          f"pixel reveals at {at([k for k, t in enumerate(trans) if t and t[0] == 'pixelize'])}; "
+          f"{sum('panel_in' in f for f in clip_fx)} panel slide(s)", file=sys.stderr)
     fixed = [f for f in framing if f["fix"]]
     print(f"[video] Framing: {len(framing)} clips, worst {min(f.get('worst_after', f['worst']) for f in framing):.3f} of the "
           f"must-see region on screen, {len(fixed)} re-planned", file=sys.stderr)
@@ -3220,6 +3515,19 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         "inputs": video_inputs, "starts": video_starts, "trans": video_trans, "look": look,
         "overlays": edit.get("overlays") or [], "work_dir": video_dir,
     }
+    # The scene bursts, drawn once over their joins by the finish (above the pixel break-up).
+    bursts = []
+    for f0, rgb in scene_bursts(starts, trans, [c["mood"]["edge"] if c["mood"] else EDGE_COLORS["neutral"] for c in clips]):
+        try:
+            bursts.append((f0,) + make_flare_frames("burst", w, h, video_dir, rgb))
+        except Exception as e:
+            print(f"[video] Could not make the particle burst: {e}", file=sys.stderr)
+    video["bursts"] = bursts
+    if config.get("chapter_card", True):
+        try:
+            video["chapter_card"] = make_chapter_card(w, h, config.get("chapter"), video_dir)
+        except Exception as e:
+            print(f"[video] Could not make the chapter card: {e}", file=sys.stderr)
     if look.get("particles") and not mood_on:
         # (With the mood on, each clip carries its own atmosphere instead.)
         try:
@@ -3240,7 +3548,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     if not success:
         print("[video] Finalization failed, retrying without captions, music and finish", file=sys.stderr)
         success = _finalize_video_with_audio_mix_and_captions(
-            dict(video, look=None, overlays=[]), narration, final_video, None, None,
+            dict(video, look=None, overlays=[], chapter_card=None, bursts=[]), narration, final_video, None, None,
             narration_volume, 0.0, False, w, h, timeline,
             score=None, music_volume=0.0, on_fraction=on_final,
         )
@@ -3572,8 +3880,20 @@ def _finalize_video_with_audio_mix_and_captions(
         graph.append(f"[vcat]settb=AVTB,setpts=N/({FPS}*TB)[vrel]")
         # On the whole video's clock from here, so the captions, layers and particles line up.
         t0 = a / FPS
-        graph.append(f"[vrel]setpts=PTS+{t0:.6f}/TB[vraw]")
+        graph.append(f"[vrel]setpts=PTS+{t0:.6f}/TB[vraw0]")
         extra = []
+        # The scene bursts over this part's joins (each from the frame it has reached here).
+        cur = "vraw0"
+        for i, (f0, pattern, count) in enumerate(video.get("bursts") or []):
+            if f0 + count <= a or f0 >= b:
+                continue
+            skip = max(0, a - f0)
+            graph.append(f"[{len(labels) + extra.count('-i')}:v]scale={w}:{h}:flags=bicubic,format=yuva420p,setparams=colorspace=bt470bg:range=tv,"
+                         f"settb=AVTB,setpts=(N+{f0 + skip})/({FPS}*TB)[bst{i}]")
+            graph.append(f"[{cur}][bst{i}]overlay=0:0:format=yuv420:eof_action=pass[bo{i}]")
+            extra += ["-framerate", str(FPS), "-start_number", str(skip), "-i", pattern]
+            cur = f"bo{i}"
+        graph.append(f"[{cur}]null[vraw]")
         if video.get("look"):
             plabel = vlabel = None
             if particles:
@@ -3594,10 +3914,17 @@ def _finalize_video_with_audio_mix_and_captions(
             graph.append(look_filters(video["look"], w, h, "vraw", "vx", plabel, vlabel, edge))
         else:
             graph.append("[vraw]null[vx]")
+        card = video.get("chapter_card")
         overlay_inputs, overlays = overlay_graph(
-            video.get("overlays"), w, h, total, "vx", "vo", len(labels) + extra.count("-i"), work, t0=t0,
+            video.get("overlays"), w, h, total, "vx", "vc" if card and a < round(CARD_OUT * FPS) else "vo",
+            len(labels) + extra.count("-i"), work, t0=t0,
         )
         graph.append(overlays)
+        if card and a < round(CARD_OUT * FPS):
+            # The chapter card over the opening seconds (under the captions).
+            bar = letterbox_bar(w, h) if (video.get("look") or {}).get("letterbox") else 0
+            graph.append(chapter_card_graph(card, w, h, bar, "vc", "vo", f"{len(labels) + extra.count('-i') + overlay_inputs.count('-i')}:v", a))
+            overlay_inputs = overlay_inputs + ["-i", card[0]]
         if has_subs:
             from caption_engine import subtitles_filter
             graph.append(f"[vo]{subtitles_filter(ass_path)},setpts=PTS-STARTPTS,format=yuv420p[v]")

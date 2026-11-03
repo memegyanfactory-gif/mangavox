@@ -268,6 +268,7 @@ pub(crate) fn router() -> Router {
         .route("/logo.png", get(|| async { asset(LOGO_PNG, "image/png", false) }))
         .route("/favicon.ico", get(|| async { asset(ICON_PNG, "image/png", false) }))
         .merge(auth::routes())
+        .merge(crate::cloud::routes())
         .merge(api_manga::routes())
         .merge(api_media::routes())
         .merge(api_anime::routes())

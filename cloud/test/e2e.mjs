@@ -31,18 +31,19 @@ function openSocket(headers = { Origin: origin }) {
 }
 
 /** Handshake; resolves { ws, session, ok } or rejects with the REFUSE body. */
-async function connect(mode, device, pc) {
+/** `inv`: { code, by } of a home-screen setup link instead of the QR code. */
+async function connect(mode, device, pc, inv) {
   const ws = await openSocket();
   const frames = [];
   let wake = null;
   ws.onmessage = ev => { if (typeof ev.data !== 'string') { frames.push(new Uint8Array(ev.data)); if (wake) wake(); } };
   const next = async () => { while (!frames.length) await new Promise(r => { wake = r; }); return frames.shift(); };
-  const h = await hello(mode === 'pair' ? { kind: KIND.PAIR, rid, device } : { kind: KIND.RESUME, rid, device, id: pc.id });
+  const h = await hello(mode === 'pair' ? { kind: KIND.PAIR, rid, device, inv: inv && inv.by } : { kind: KIND.RESUME, rid, device, id: pc.id });
   ws.send(h.frame);
   const reply = await next();
   if (reply[0] === KIND.REFUSE) throw JSON.parse(new TextDecoder().decode(reply.subarray(1)));
   const keys = await finish(h.state, reply, mode === 'pair'
-    ? { salt: unb64(code), trust: s => matchesFingerprint(fp, s) }
+    ? { salt: unb64(inv ? inv.code : code), trust: s => matchesFingerprint(fp, s) }
     : { salt: new Uint8Array(32), trust: async s => sameBytes(s, pc.spub) });
   const session = new Session(keys, f => ws.send(f));
   const control = [];
@@ -116,6 +117,23 @@ const pair = await request(a.session, 'GET', '/pair?code=x');
 check(pair.status === 404, `/pair is not reachable through the cloud: ${pair.status}`);
 const many = await Promise.all(Array.from({ length: 10 }, () => request(a.session, 'GET', '/api/me')));
 check(many.every(r => r.status === 200), 'ten requests in parallel');
+// A home-screen setup link (CLOUD.md, "Home-screen icon"): made through the session, it pairs a
+// new key once, as "(home screen)", and then no more.
+const inviteRes = await request(a.session, 'POST', '/api/cloud/invite', {});
+const setupLink = inviteRes.status === 200 ? JSON.parse(inviteRes.text).link : '';
+const lq = new URLSearchParams(setupLink.split('#')[1] || '');
+const [lrid, lcode, lfp] = (lq.get('p') || '').split('.');
+check(lrid === rid && lfp === fp && lq.get('h') === a.ok.id && /^[\w-]{43}$/.test(lcode || ''), `setup link for the home-screen icon: ${inviteRes.status}`);
+const inv = { code: lcode, by: a.ok.id };
+const icon = await connect('pair', await newDeviceKey(), null, inv);
+check(/\(home screen\)$/.test(icon.ok.name) && icon.ok.id !== a.ok.id, `the icon paired with it as ${icon.ok.name}`);
+icon.ws.close();
+try {
+  await connect('pair', await newDeviceKey(), null, inv);
+  check(false, 'a used setup link cannot pair again');
+} catch (e) {
+  check(e.code === 'pair', `a used setup link cannot pair again (${e.code})`);
+}
 a.ws.close();
 
 // The code is used up: pairing again with it fails.

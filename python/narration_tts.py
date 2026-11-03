@@ -5,9 +5,9 @@ voices it, text chunking, and the audio post-processing every engine shares.
 
   * Emotion plan: each page's scene {kind, mood, intensity} from `<output_dir>/studio/read.json`
     (per-beat kind/mood/intensity in `narration.studio.json` win when present), intensity
-    smoothed over neighbours (3-unit moving average, at most 3 points per step).
-  * Engine adapters: `chatterbox_params` (exaggeration / cfg_weight / temperature, per the
-    research mapping) and `kokoro_speed` (Kokoro and Piper only get a speed).
+    smoothed over neighbours (1/4-1/2-1/4 blend, at most 2 points per step).
+  * Engine adapters: `chatterbox_params` (exaggeration / cfg_weight / temperature: a calm
+    narrator, lifted only for real moments) and `kokoro_speed` (Kokoro and Piper only get a speed).
   * Text: 1-3 sentences or <= 250 characters per chunk (Chatterbox caps at ~40 s), shouts
     on their own, silence decided here and inserted in post instead of by the model.
   * Audio: WAV in/out at the engine's native rate, silence trimming, chapter loudness
@@ -53,11 +53,15 @@ _KIND_ALIASES = {
     "conversation": "dialogue", "talk": "dialogue",
 }
 
-# Research mapping (tts-research.json, emotion_mapping §1).
-KIND_BIAS = {
-    "calm": -0.10, "flashback": -0.05, "dialogue": 0.0, "romance": 0.0, "horror": 0.05,
-    "comedy": 0.10, "emotional": 0.10, "reveal": 0.15, "fight": 0.20, "action": 0.20, "other": 0.0,
+# How far each kind of scene may lift Chatterbox's exaggeration above the narrator's neutral
+# 0.5, at full emotion (see chatterbox_params). Calm and flashback never lift.
+EMOTION_LIFT = {
+    "calm": 0.0, "flashback": 0.0, "dialogue": 0.10, "romance": 0.10, "other": 0.10, "horror": 0.15,
+    "comedy": 0.15, "emotional": 0.20, "reveal": 0.18, "fight": 0.28, "action": 0.25,
 }
+# Intensity at or under which a line is read as plain narration, and where the lift is full.
+NEUTRAL_UP_TO = 4.0
+FULL_AT = 9.0
 FAST_KINDS = frozenset({"fight", "action", "comedy"})
 SLOW_KINDS = frozenset({"emotional", "horror", "reveal", "flashback", "romance", "calm"})
 
@@ -83,31 +87,31 @@ def _num(v, default=None):
 # ----------------------------------------------------------------------------- engine adapters
 
 def chatterbox_params(kind, intensity, line_kind: str = "narration", strength: float = 1.0) -> dict:
-    """Chatterbox generate() settings for a scene, per the research mapping:
+    """Chatterbox generate() settings for a line: a calm narrator first, emotion only for real
+    moments, never extreme.
 
-    exaggeration = clamp(0.35 + 0.075*i + kind_bias, 0.30, 1.20)
-    cfg_weight   = 0.5 for fight/action/comedy; 0.35..0.30 for emotional/horror/reveal/
-                   flashback/romance/calm; else max(0.3, 0.5 - 0.02*i)
-    temperature  = 0.90 at i >= 8, 0.70 for calm/flashback and quiet exposition, else 0.80
-    Thoughts get exaggeration -0.1. `strength` (the chapter's emotion strength, 0..2) scales
-    the intensity and the kind bias."""
+    exaggeration = 0.5 (Chatterbox's neutral read; 0.45 for calm/flashback) up to intensity 4,
+                   then lifts linearly by EMOTION_LIFT[kind] * strength until intensity 9;
+                   at most 0.8 (0.95 at strength 2). Thoughts are 0.05 softer.
+    cfg_weight   = 0.5 for plain narration, lowered as the exaggeration rises (more exaggeration
+                   speeds Chatterbox up; a lower cfg keeps the pace natural), 0.3 at least.
+    temperature  = 0.75 for calm/flashback, 0.85 at a peak, else 0.8 (Chatterbox's own).
+    `strength` is the chapter's emotion strength (0..2): 0 is plain narration throughout."""
     kind = normalize_kind(kind)
     s = clamp(_num(strength, 1.0), 0.0, 2.0)
-    i = clamp(_num(intensity, DEFAULT_INTENSITY) * s, 0.0, 10.0)
-    bias = KIND_BIAS.get(kind, 0.0) * min(s, 1.0)
-    exaggeration = clamp(0.35 + 0.075 * i + bias, 0.30, 1.20)
+    i = clamp(_num(intensity, DEFAULT_INTENSITY), 0.0, 10.0)
+    lift = clamp((i - NEUTRAL_UP_TO) / (FULL_AT - NEUTRAL_UP_TO), 0.0, 1.0)
+    calm = kind in ("calm", "flashback")
+    base = 0.45 if calm and s > 0 else 0.50
+    top = 0.80 + 0.15 * max(0.0, s - 1.0)
+    exaggeration = clamp(base + EMOTION_LIFT.get(kind, 0.10) * lift * s, 0.40, top)
     if line_kind == "thought":
-        exaggeration = clamp(exaggeration - 0.10, 0.30, 1.20)
-    if kind in FAST_KINDS:
-        cfg = 0.50
-    elif kind in SLOW_KINDS:
-        cfg = 0.35 - 0.005 * i
-    else:
-        cfg = max(0.30, 0.50 - 0.02 * i)
-    if i >= 8:
-        temperature = 0.90
-    elif kind in ("calm", "flashback") or (kind in ("other", "dialogue") and i <= 2):
-        temperature = 0.70
+        exaggeration = max(0.40, exaggeration - 0.05)
+    cfg = 0.50 - 0.6 * max(0.0, exaggeration - 0.50)
+    if calm and s > 0:
+        temperature = 0.75
+    elif lift * s >= 0.8:
+        temperature = 0.85
     else:
         temperature = 0.80
     return {
@@ -253,18 +257,19 @@ def _squash(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def smooth(values: list, window: int = 3, max_step: float = 3.0) -> list:
-    """Moving average over `window` neighbours, then at most `max_step` change per step."""
+def smooth(values: list, max_step: float = 2.0) -> list:
+    """Each value blended with its neighbours (1/4, 1/2, 1/4), then at most `max_step` change
+    from one line to the next, so the delivery never swings wildly. A lone spike is softened,
+    a run of strong lines keeps its strength."""
     if not values:
         return []
     known = [v for v in values if v is not None]
     fill = sum(known) / len(known) if known else DEFAULT_INTENSITY
     vals = [fill if v is None else float(v) for v in values]
-    half = window // 2
     avg = []
     for i in range(len(vals)):
-        part = vals[max(0, i - half): i + half + 1]
-        avg.append(sum(part) / len(part))
+        prev, nxt = vals[max(0, i - 1)], vals[min(len(vals) - 1, i + 1)]
+        avg.append(0.25 * prev + 0.5 * vals[i] + 0.25 * nxt)
     out = [avg[0]]
     for v in avg[1:]:
         prev = out[-1]
@@ -445,7 +450,7 @@ def plan_chunks(units: list, max_chars: int = 250) -> list:
                 pause += REVEAL_LEAD_MS
             intensity = u["intensity"]
             if c["shout"]:
-                intensity = min(10.0, intensity + 2.0)
+                intensity = min(10.0, intensity + 1.0)
             out.append({**c, "unit": ui, "kind": u["kind"], "mood": u.get("mood", ""), "intensity": intensity,
                         "line_kind": u.get("line_kind", "narration"), "pause_before_ms": int(pause)})
             prev = c

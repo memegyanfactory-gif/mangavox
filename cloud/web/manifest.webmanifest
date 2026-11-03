@@ -1,6 +1,7 @@
 {
   "name": "MangaVox",
   "short_name": "MangaVox",
+  "id": "/mangavox/",
   "start_url": "/mangavox/",
   "scope": "/mangavox/",
   "display": "standalone",
