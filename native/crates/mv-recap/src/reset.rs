@@ -657,7 +657,7 @@ mod tests {
         crate::save_read(&ch, &read).unwrap();
         let t = Transcript { pages: vec![TranscriptPage { index: 0, text: "Kai: Hello".into(), edited: true }, TranscriptPage { index: 1, text: "Kai: Hi".into(), edited: false }] };
         crate::save_transcript(&ch, &t).unwrap();
-        crate::save_story(&ch, &crate::Story { title: "T".into(), segments: vec![crate::StorySegment { page: 0, panel: None, text: "Once.".into(), delivery: None, sfx: None, hook: false }], ..Default::default() }).unwrap();
+        crate::save_story(&ch, &crate::Story { title: "T".into(), segments: vec![crate::StorySegment { page: 0, panel: None, text: "Once.".into(), delivery: None, sfx: None, hook: false, panels: vec![] }], ..Default::default() }).unwrap();
         use Owner::*;
         let files: Vec<(PathBuf, Owner)> = vec![
             (ch.pages_dir.join("001.jpg"), Outside),

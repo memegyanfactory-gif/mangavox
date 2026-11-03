@@ -9,7 +9,8 @@
 //!   carries it as the beat's `kind` / `intensity`, which the narration follows. A passage the writer
 //!   cued a sound effect on carries `sfx` / `sfx_strength` (1-3), which the renderer places.
 //!
-//! A passage is shown over its panel's crop. When it names no panel, or that crop is blank (an empty or
+//! A passage is shown over its panel's crop; one that moves through more panels of its page gets a
+//! beat per panel, its sentences spread over them in order. When it names no panel, or that crop is blank (an empty or
 //! nearly black / white panel), the page's most telling panel is used instead: one with characters in
 //! it, the largest first.
 
@@ -56,6 +57,38 @@ fn pick_panel(ch: &ChapterRef, read: Option<&ChapterRead>, page: usize, wanted: 
     order.into_iter().find_map(|n| usable(n).map(|p| (n, p)))
 }
 
+/// The sentences of `text`, each with the space after it trimmed.
+fn sentences(text: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut chars = text.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?' | '…') && chars.peek().is_some_and(|n| n.is_whitespace()) {
+            out.push(cur.trim().to_string());
+            cur.clear();
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// A passage as (panel, text) parts: its sentences spread in order over `panel` and `panels`
+/// (earlier panels take the extra sentence), or the whole text over `panel`.
+pub(crate) fn panel_parts(s: &StorySegment) -> Vec<(Option<usize>, String)> {
+    let wanted: Vec<Option<usize>> = std::iter::once(s.panel).chain(s.panels.iter().copied().map(Some)).collect();
+    let said = sentences(&s.text);
+    let k = wanted.len().min(said.len());
+    if k <= 1 {
+        return vec![(s.panel, s.text.trim().to_string())];
+    }
+    let (each, extra) = (said.len() / k, said.len() % k);
+    let mut rest = said.into_iter();
+    (0..k).map(|i| (wanted[i], rest.by_ref().take(each + usize::from(i < extra)).collect::<Vec<_>>().join(" "))).collect()
+}
+
 pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
     let pages = list_pages(&ch.pages_dir);
     let read = load_read(ch);
@@ -80,24 +113,35 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
             continue;
         }
         for s in segs {
-            // A hook line shows its own page's panel while it is voiced on this page.
-            let (panel, image) = match pick_panel(ch, read.as_ref(), s.page, s.panel, &mut blank) {
-                Some((n, p)) => (json!(p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| n.to_string())), Some(abs(&p))),
-                None => (Value::Null, pages.get(s.page).map(|p| abs(p))),
-            };
-            let mut beat = json!({ "page": page, "panel": panel, "panel_image": image, "text": s.text.trim() });
-            // The user's direction for this passage (narration_tts.build_plan: a beat's own
-            // kind / intensity win over the page's scene).
-            if let Some(d) = s.delivery.as_ref().filter(|d| !d.kind.is_empty()) {
-                beat["kind"] = json!(d.kind);
-                beat["intensity"] = json!(d.intensity.min(10));
+            // A passage that moves through several panels shows its sentences over them in turn
+            // (sync_map times a page's beats by their text); the same picture twice in a row is one beat.
+            let mut shown: Vec<(Value, Option<String>, String)> = vec![];
+            for (wanted, text) in panel_parts(s) {
+                // A hook line shows its own page's panel while it is voiced on this page.
+                let (panel, image) = match pick_panel(ch, read.as_ref(), s.page, wanted, &mut blank) {
+                    Some((n, p)) => (json!(p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| n.to_string())), Some(abs(&p))),
+                    None => (Value::Null, pages.get(s.page).map(|p| abs(p))),
+                };
+                match shown.last_mut() {
+                    Some(last) if last.1 == image => last.2 = format!("{} {text}", last.2),
+                    _ => shown.push((panel, image, text)),
+                }
             }
-            // The writer's sound-effect cue (sync_map carries it; the renderer places it).
-            if let Some(x) = s.sfx.as_ref().filter(|x| SFX_NAMES.contains(&x.name.as_str())) {
-                beat["sfx"] = json!(x.name);
-                beat["sfx_strength"] = json!(x.strength.clamp(1, 3));
+            for (i, (panel, image, text)) in shown.into_iter().enumerate() {
+                let mut beat = json!({ "page": page, "panel": panel, "panel_image": image, "text": text });
+                // The user's direction for this passage (narration_tts.build_plan: a beat's own
+                // kind / intensity win over the page's scene).
+                if let Some(d) = s.delivery.as_ref().filter(|d| !d.kind.is_empty()) {
+                    beat["kind"] = json!(d.kind);
+                    beat["intensity"] = json!(d.intensity.min(10));
+                }
+                // The writer's sound-effect cue (sync_map carries it; the renderer places it), on the passage's first picture.
+                if let Some(x) = s.sfx.as_ref().filter(|x| i == 0 && SFX_NAMES.contains(&x.name.as_str())) {
+                    beat["sfx"] = json!(x.name);
+                    beat["sfx_strength"] = json!(x.strength.clamp(1, 3));
+                }
+                beats.push(beat);
             }
-            beats.push(beat);
         }
     }
 

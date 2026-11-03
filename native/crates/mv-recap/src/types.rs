@@ -111,6 +111,12 @@ pub struct ChapterRead {
     pub model: String,
     /// Strip parts already read, as (first page, first row) - see `strip.rs`. Empty for ordinary pages.
     pub strip_done: Vec<(usize, u32)>,
+    /// The cast check ran on these pages (see `cast.rs`): their names are resolved. A new read clears it.
+    pub cast_checked: bool,
+    /// Who is who in the chapter, from the cast check: (name, one line on who they are).
+    pub cast: Vec<(String, String)>,
+    /// The panel boxes are snapped to the frames on the pages (see `panels.rs`).
+    pub panels_snapped: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -150,6 +156,10 @@ pub struct StorySegment {
     /// chapter's first narrated page) while showing its own page and panel.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hook: bool,
+    /// Further panels of the page the passage moves through after `panel`, in reading order: its
+    /// sentences are shown over `panel` and these in turn.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub panels: Vec<usize>,
 }
 
 /// Narrator direction for one passage: a scene kind the emotion mapping knows

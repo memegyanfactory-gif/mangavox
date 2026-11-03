@@ -70,6 +70,9 @@ const PAGE2: &str = r#"{"summary":"He is named.","scene":{"kind":"dialogue"},"pa
   "characters":[{"name":"Kaito","was":"Silver-haired swordsman","face":[0.6,0.1,0.8,0.25]}],
   "lines":[{"speaker":"Silver-haired swordsman","kind":"speech","text":"I am Kaito."}]}]}"#;
 
+/// The cast check's answer when every name was already right.
+const CAST_OK: &str = r#"{"fixes":[],"cast":[]}"#;
+
 #[test]
 fn json_extraction() {
     let v = extract_json("```json\n{\"a\": 1}\n```").unwrap();
@@ -211,8 +214,8 @@ fn export_formats() {
     std::fs::write(panel_path(&ch, 1, 0), b"x").unwrap();
     let story = Story {
         segments: vec![
-            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None, sfx: None, hook: false },
-            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }), sfx: SfxCue::parse("boom", Some(3.0)), hook: false },
+            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None, sfx: None, hook: false, panels: vec![] },
+            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }), sfx: SfxCue::parse("boom", Some(3.0)), hook: false, panels: vec![] },
         ],
         ..Default::default()
     };
@@ -290,9 +293,10 @@ async fn read_chapter_end_to_end_and_resume() {
     {
         let seen = llm.seen.lock().unwrap();
         assert_eq!(seen[0].images.len(), 1);
-        assert!(seen[1].images.len() >= 2);
+        assert!(seen[1].images.len() >= 3, "the page, the page before it and faces");
         let prompt = &seen[1].messages.last().unwrap().content;
-        assert!(prompt.contains("Image 2 = reference face of"));
+        assert!(prompt.contains("Image 2 = the page BEFORE it") && prompt.contains("Image 3 = reference face of"), "{prompt}");
+        assert!(!seen[0].messages.last().unwrap().content.contains("the page BEFORE"), "the first page has none");
         assert!(prompt.contains("Silver-haired swordsman"));
         assert_eq!(seen[1].workspace.as_ref().unwrap(), &chapter_dir(&ch).join("work").join("p0001"));
     }
@@ -348,19 +352,21 @@ async fn story_chunks_and_saves() {
     read_chapter_with(&llm, &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
     save_transcript(&ch, &Transcript { pages: vec![TranscriptPage { index: 0, text: "Ruko: EDITED LINE".into(), edited: true }] }).unwrap();
 
-    let story = Fake::new(&[r#"{"title":"Duel","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":2,"panel":null,"text":"Kaito speaks."},{"page":9,"text":"stray"}]}"#]);
+    let story = Fake::new(&[CAST_OK, r#"{"title":"Duel","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":2,"panel":null,"text":"Kaito speaks."},{"page":9,"text":"stray"}]}"#]);
     let out = write_story_with(&story, &model(), std::slice::from_ref(&ch), &[], &["Hard".to_string()], &brain, &silent(), &CancellationToken::new()).await.unwrap();
     assert_eq!(out.len(), 1);
     let s = &out[0].1;
     assert_eq!(s.title, "Duel");
     assert_eq!(s.segments, vec![
-        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None, sfx: None, hook: false },
-        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None, sfx: None, hook: false },
+        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None, sfx: None, hook: false, panels: vec![] },
+        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None, sfx: None, hook: false, panels: vec![] },
     ]);
     let req = story.seen.lock().unwrap();
-    let sys = &req[0].messages[0].content;
+    assert_eq!(req.len(), 2, "the cast check, then the story");
+    assert_eq!(req[1].effort, Some(mv_ai::AiEffort::Medium), "the story plans its scenes");
+    let sys = &req[1].messages[0].content;
     assert!(sys.contains("Hard: blunt"));
-    let user = &req[0].messages[1].content;
+    let user = &req[1].messages[1].content;
     assert!(user.contains("EDITED LINE") && !user.contains("Who {are} you?"));
     assert!(user.contains("Kaito"));
     assert_eq!(load_story(&ch).unwrap().title, "Duel");
@@ -390,7 +396,7 @@ fn saved_provider_messages_are_found() {
     use crate::store::provider_message_in;
     let note = "You've hit your session limit · resets 8am (Asia/Kolkata)";
     let read = |s: &str| ChapterRead { pages: vec![PageRead { index: 0, summary: s.into(), ..Default::default() }], ..Default::default() };
-    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None, sfx: None, hook: false }], ..Default::default() };
+    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None, sfx: None, hook: false, panels: vec![] }], ..Default::default() };
     assert_eq!(provider_message_in(Some(&read(note)), Some(&story(note))), Some(Step::Read));
     assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story(note))), Some(Step::Story));
     assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story("He has no limit to his rage."))), None);
@@ -431,7 +437,7 @@ fn export_skips_silent_pages_and_blank_panels() {
     let panel = |chars: bool| Panel { bbox: None, description: String::new(), characters: if chars { vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }] } else { vec![] }, lines: vec![] };
     let read = ChapterRead { pages: vec![PageRead { index: 1, panels: vec![panel(false), panel(true)], ..Default::default() }], ..Default::default() };
     save_read(&ch, &read).unwrap();
-    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None, sfx: None, hook: false }], ..Default::default() };
+    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None, sfx: None, hook: false, panels: vec![] }], ..Default::default() };
     export_for_pipeline(&ch, &story).unwrap();
     let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
     let b = beats["beats"].as_array().unwrap();
@@ -447,11 +453,11 @@ async fn story_sees_the_whole_chapter_and_remembers_it() {
     let ch = chapter(dir.path(), 2);
     let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
     read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
-    let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"Ruko meets Kaito.","segments":[{"page":2,"panel":1,"text":"Kaito speaks."}]}"#]);
+    let llm = Fake::new(&[CAST_OK, r#"{"title":"T","summary_so_far":"Ruko meets Kaito.","segments":[{"page":1,"panel":1,"text":"Ruko meets a stranger."},{"page":2,"panel":1,"text":"Kaito speaks."}]}"#]);
     write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
     let seen = llm.seen.lock().unwrap();
-    assert_eq!(seen.len(), 1, "one call for the whole chapter");
-    let (sys, user) = (&seen[0].messages[0].content, &seen[0].messages[1].content);
+    assert_eq!(seen.len(), 2, "the cast check, then one call for the whole chapter");
+    let (sys, user) = (&seen[1].messages[0].content, &seen[1].messages[1].content);
     assert!(user.contains("the whole chapter"));
     // The first chapter just begins the story: no in-medias-res hook, no rewind, no outro.
     assert!(user.contains("these pages begin the story"), "{user}");
@@ -475,6 +481,7 @@ async fn story_ignores_hooks_and_finishes_what_it_skipped() {
     // The first answer stops after page 1: the rest is asked for. A "hook" key is ignored, and a
     // segment outside the pages asked for is dropped.
     let llm = Fake::new(&[
+        CAST_OK,
         r#"{"title":"T","summary_so_far":"s","segments":[{"page":1,"panel":1,"hook":true,"text":"Ruko meets a stranger."}]}"#,
         r#"{"summary_so_far":"s2","segments":[{"page":1,"panel":1,"hook":true,"text":"Not on these pages."},{"page":2,"panel":1,"text":"The stranger is Kaito."}]}"#,
     ]);
@@ -483,9 +490,9 @@ async fn story_ignores_hooks_and_finishes_what_it_skipped() {
     assert_eq!(segs, vec![(0, false, "Ruko meets a stranger."), (1, false, "The stranger is Kaito.")]);
     {
         let seen = llm.seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        assert!(seen[0].messages[1].content.contains("LENGTH TARGET: about 200 words (2 lines"), "{}", seen[0].messages[1].content);
-        let again = &seen[1].messages[1].content;
+        assert_eq!(seen.len(), 3);
+        assert!(seen[1].messages[1].content.contains("LENGTH TARGET: about 250 words (2 lines"), "{}", seen[1].messages[1].content);
+        let again = &seen[2].messages[1].content;
         assert!(again.contains("pages 2-2") && again.contains("LAST LINES ALREADY SPOKEN") && again.contains("Ruko meets a stranger."), "{again}");
     }
 }
@@ -496,7 +503,7 @@ async fn old_stories_with_hook_segments_still_export() {
     let ch = chapter(dir.path(), 2);
     let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
     read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
-    let seg = |page: usize, hook: bool, text: &str| StorySegment { page, panel: Some(0), text: text.into(), delivery: None, sfx: None, hook };
+    let seg = |page: usize, hook: bool, text: &str| StorySegment { page, panel: Some(0), text: text.into(), delivery: None, sfx: None, hook, panels: vec![] };
     let saved = r#"{"title":"T","segments":[{"page":1,"panel":0,"text":"Kaito names himself.","hook":true},{"page":0,"panel":0,"text":"Ruko meets a stranger."},{"page":1,"panel":0,"text":"The stranger is Kaito."}]}"#;
     std::fs::write(chapter_dir(&ch).join("story.json"), saved).unwrap();
     let story = load_story(&ch).unwrap();
@@ -556,6 +563,9 @@ async fn later_chapters_continue_the_story_and_carry_planned_reminders() {
     let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
     read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
     brain.lock().unwrap().set_recap("Chapter 0", "Ruko trains alone.");
+    let mut read = load_read(&ch).unwrap();
+    read.cast_checked = true;
+    save_read(&ch, &read).unwrap();
     let words = |n: usize| Story { segments: vec![StorySegment { text: vec!["word"; n].join(" "), ..Default::default() }], ..Default::default() };
     let earlier = ChapterRef { chapter_id: "c0".into(), label: "Chapter 0".into(), pages_dir: dir.path().join("c0").join("pages"), output_dir: dir.path().join("c0"), ..ch.clone() };
     let answer = r#"{"title":"T","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko meets a stranger."},{"page":2,"panel":1,"text":"Kaito names himself."}]}"#;
@@ -594,7 +604,8 @@ async fn later_chapters_continue_the_story_and_carry_planned_reminders() {
 #[test]
 fn length_follows_what_the_chapter_says_and_the_cast_flags_looks() {
     use crate::story::{cast_text, length_target};
-    assert_eq!((length_target(10), length_target(208), length_target(2000)), (200, 600, 1400));
+    // Seven words a line, forty a story page: chapter 1 of a recap channel's video runs ~1100 words.
+    assert_eq!((length_target(10, 0), length_target(141, 27), length_target(208, 10), length_target(2000, 30)), (250, 1100, 1450, 2500));
     let dir = tempfile::tempdir().unwrap();
     let mut b = Brain::load_in(dir.path().to_path_buf(), "m1", "T");
     for (name, n, aliases) in [("Mujin", 50, vec!["Brown-haired young man", "Muj"]), ("Bald elder with glasses", 9, vec![]), ("Crying bald boy", 1, vec![])] {
@@ -604,4 +615,175 @@ fn length_follows_what_the_chapter_says_and_the_cast_flags_looks() {
     assert!(cast.starts_with("- Mujin (also called: Muj)"), "{cast}");
     assert!(cast.contains("Not named yet:\n- \"Bald elder with glasses\" (known only by looks)"), "{cast}");
     assert!(!cast.contains("Crying bald boy"), "one-off extras are left out");
+}
+
+#[test]
+fn cast_labels_are_replaced_as_whole_words() {
+    use crate::cast::replace_label;
+    assert_eq!(replace_label("The fur-collared man sighs; the Fur-collared man eats.", "Fur-collared man", "Hachiro"), "Hachiro sighs; Hachiro eats.");
+    assert_eq!(replace_label("A fur-collared man waves.", "Fur-collared man", "Hachiro"), "A Hachiro waves.");
+    assert_eq!(replace_label("Bigfur-collared mania", "Fur-collared man", "Hachiro"), "Bigfur-collared mania", "never inside a word");
+    assert_eq!(replace_label("The pink-haired girl cries.", "Pink-haired girl", "Hachiro's coworker"), "Hachiro's coworker cries.");
+    assert_eq!(replace_label("Then the pink-haired girl cries.", "Pink-haired girl", "his coworker"), "Then his coworker cries.");
+    assert_eq!(replace_label("A pink-haired girl cries.", "Pink-haired girl", "coworker"), "A coworker cries.");
+}
+
+#[tokio::test]
+async fn cast_check_names_one_person_told_by_several_looks() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 3);
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    {
+        let mut b = brain.lock().unwrap();
+        b.observe("Hachiro", None, "the hero", &[]);
+        b.observe("Fur-collared man", None, "", &[]);
+        b.add_note("[Chapter 1 p2] The fur-collared man buys ice cream.");
+        b.add_note("[Chapter 0 p2] The fur-collared man is someone else here.");
+    }
+    let person = |n: &str| CharacterSeen { name: n.into(), ..Default::default() };
+    let line = |s: &str, t: &str| Line { speaker: Some(s.into()), text: t.into(), kind: "speech".into() };
+    let page = |i: usize, summary: &str, who: Vec<&str>, lines: Vec<Line>| PageRead {
+        index: i,
+        summary: summary.into(),
+        scene: Scene { kind: "comedy".into(), ..Default::default() },
+        panels: vec![Panel { description: summary.into(), characters: who.into_iter().map(person).collect(), lines, bbox: None }],
+        ..Default::default()
+    };
+    let read = ChapterRead {
+        chapter_id: "c1".into(),
+        pages: vec![
+            page(0, "Hachiro walks with a girl.", vec!["Hachiro", "Pink-haired girl"], vec![line("Pink-haired girl", "Sooo, Hachiro...")]),
+            page(1, "The fur-collared man buys ice cream.", vec!["Fur-collared man", "Messy-haired man"], vec![line("Fur-collared man", "The cap's stuck...")]),
+            page(2, "A horned creature attacks the messy-haired man.", vec!["Horned creature", "Messy-haired man"], vec![line("Horned creature", "Crabstick is here. Die!")]),
+        ],
+        ..Default::default()
+    };
+    save_read(&ch, &read).unwrap();
+    let llm = Fake::new(&[
+        r#"{"fixes":[{"label":"Fur-collared man","name":"Hachiro","pages":[]},{"label":"Messy-haired man","name":"Hachiro","pages":[]},{"label":"Pink-haired girl","name":"Hachiro's coworker"},{"label":"Horned creature","name":"Crabstick","pages":[3]},{"label":"Hachiro","name":"Hachiro"}],
+            "cast":[{"name":"Hachiro","who":"the hero, a monster living as a human"},{"name":"Crabstick","who":"a fear who feeds on terror"}]}"#,
+        r#"{"title":"T","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Hachiro walks home."},{"page":2,"panel":1,"text":"He buys ice cream."},{"page":3,"panel":1,"text":"Crabstick attacks."}]}"#,
+    ]);
+    write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+
+    let r = load_read(&ch).unwrap();
+    assert!(r.cast_checked);
+    let names = |i: usize| r.pages[i].panels[0].characters.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(0), vec!["Hachiro", "Hachiro's coworker"]);
+    assert_eq!(names(1), vec!["Hachiro"], "two labels of one person in a panel are one person");
+    assert_eq!(names(2), vec!["Crabstick", "Hachiro"]);
+    assert_eq!(r.pages[1].summary, "Hachiro buys ice cream.");
+    assert_eq!(r.pages[1].panels[0].lines[0].speaker.as_deref(), Some("Hachiro"));
+    assert_eq!(r.pages[2].panels[0].lines[0].speaker.as_deref(), Some("Crabstick"));
+    assert!(load_transcript(&ch).unwrap().pages[1].text.starts_with("Hachiro: "), "the transcript follows");
+
+    let b = brain.lock().unwrap();
+    let hachiro = b.find("Hachiro").unwrap();
+    assert!(hachiro.aliases.iter().any(|a| a == "Fur-collared man"), "the placeholder folds into the named hero: {hachiro:?}");
+    assert!(b.find("Fur-collared man").is_some_and(|c| c.name == "Hachiro"));
+    assert!(b.find("Horned creature").is_none_or(|c| c.name != "Crabstick"), "a label split by page stays apart");
+    assert!(b.notes.contains("[Chapter 1 p2] Hachiro buys ice cream.") && b.notes.contains("[Chapter 0 p2] The fur-collared man"), "{}", b.notes);
+    drop(b);
+
+    let seen = llm.seen.lock().unwrap();
+    let check = &seen[0].messages[1].content;
+    assert!(check.contains("LABELS USED FOR PEOPLE") && check.contains("- Fur-collared man") && check.contains("Sooo, Hachiro"), "{check}");
+    let story = &seen[1].messages[1].content;
+    assert!(story.contains("WHO IS WHO IN THIS CHAPTER") && story.contains("- Crabstick: a fear who feeds on terror"), "{story}");
+    assert!(!story.contains("Fur-collared man buys"), "{story}");
+}
+
+#[tokio::test]
+async fn story_pages_left_out_are_written_before_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 3);
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let line = |t: &str| Line { speaker: Some("Ruko".into()), text: t.into(), kind: "speech".into() };
+    let panel = |lines: Vec<Line>| Panel { characters: vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }], lines, ..Default::default() };
+    let scene = Scene { kind: "fight".into(), ..Default::default() };
+    let read = ChapterRead {
+        pages: vec![
+            PageRead { index: 0, summary: "Ruko draws.".into(), scene: scene.clone(), panels: vec![panel(vec![line("Draw!")])], ..Default::default() },
+            PageRead { index: 1, summary: "Ruko strikes without a word.".into(), scene: scene.clone(), panels: vec![panel(vec![])], ..Default::default() },
+            PageRead { index: 2, summary: "Ruko wins.".into(), scene, panels: vec![panel(vec![line("Done.")])], ..Default::default() },
+        ],
+        cast_checked: true,
+        ..Default::default()
+    };
+    save_read(&ch, &read).unwrap();
+    let llm = Fake::new(&[
+        r#"{"title":"T","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"Ruko wins."}]}"#,
+        r#"{"segments":[{"page":2,"panel":1,"text":"One silent strike ends it."},{"page":3,"text":"not asked for"}]}"#,
+    ]);
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    let segs: Vec<(usize, &str)> = out[0].1.segments.iter().map(|s| (s.page, s.text.as_str())).collect();
+    assert_eq!(segs, vec![(0, "Ruko draws."), (1, "One silent strike ends it."), (2, "Ruko wins.")]);
+    let seen = llm.seen.lock().unwrap();
+    let fill = &seen[1].messages[1].content;
+    assert!(fill.contains("leaves out story pages 2.") && fill.contains("LINE BEFORE: Ruko draws.") && fill.contains("LINE AFTER: Ruko wins.") && fill.contains("Ruko strikes without a word."), "{fill}");
+}
+
+#[test]
+fn a_passage_moves_through_the_panels_it_lists() {
+    use crate::export::panel_parts;
+    let seg = |panel: Option<usize>, panels: Vec<usize>, text: &str| StorySegment { page: 0, panel, text: text.into(), panels, ..Default::default() };
+    assert_eq!(panel_parts(&seg(Some(0), vec![], "One. Two.")), vec![(Some(0), "One. Two.".to_string())]);
+    assert_eq!(panel_parts(&seg(Some(0), vec![2], "He runs. She waits! Done?")), vec![(Some(0), "He runs. She waits!".to_string()), (Some(2), "Done?".to_string())]);
+    assert_eq!(panel_parts(&seg(Some(0), vec![1, 2], "Only one sentence.")), vec![(Some(0), "Only one sentence.".to_string())]);
+    // The answer's "panels" (1-based) are parsed, the first standing in for a missing "panel".
+    let read = ChapterRead { pages: vec![PageRead { index: 0, panels: vec![Panel::default(); 3], ..Default::default() }], ..Default::default() };
+    let v = serde_json::json!({"segments":[{"page":1,"panel":1,"panels":[1,3,9],"text":"a"},{"page":1,"panels":[2,3],"text":"b"}]});
+    let segs = crate::story::parse_segments(&v, &[0], &read);
+    assert_eq!((segs[0].panel, segs[0].panels.clone()), (Some(0), vec![2]));
+    assert_eq!((segs[1].panel, segs[1].panels.clone()), (Some(1), vec![2]));
+
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 1);
+    std::fs::create_dir_all(panels_for(&ch)).unwrap();
+    png(&panels_for(&ch), "p0000_00.jpg", 128, 128);
+    png(&panels_for(&ch), "p0000_01.jpg", 130, 128);
+    let story = Story { segments: vec![StorySegment { page: 0, panel: Some(0), panels: vec![1], text: "He runs. She waits.".into(), sfx: SfxCue::parse("impact", Some(2.0)), ..Default::default() }], ..Default::default() };
+    export_for_pipeline(&ch, &story).unwrap();
+    let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
+    let b = beats["beats"].as_array().unwrap();
+    assert_eq!(b.len(), 2, "{b:?}");
+    assert!(b[0]["panel_image"].as_str().unwrap().ends_with("p0000_00.jpg") && b[1]["panel_image"].as_str().unwrap().ends_with("p0000_01.jpg"));
+    assert_eq!((b[0]["text"].as_str(), b[1]["text"].as_str()), (Some("He runs."), Some("She waits.")));
+    assert!(b[0].get("sfx").is_some() && b[1].get("sfx").is_none());
+    let script: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("script_edited.json")).unwrap()).unwrap();
+    assert_eq!(script[0]["text"], "He runs. She waits.", "the voice reads the passage whole");
+}
+
+#[test]
+fn rough_panel_boxes_snap_to_the_frames_on_the_page() {
+    use crate::panels::{detect, snap};
+    // A white page with two framed panels side by side (ink inside), split by a white gutter.
+    let mut img = image::RgbImage::from_pixel(1000, 1400, image::Rgb([255, 255, 255]));
+    for (x0, x1) in [(50u32, 480u32), (520, 950)] {
+        for y in 100..700u32 {
+            for x in x0..x1 {
+                let edge = x < x0 + 4 || x >= x1 - 4 || y < 104 || y >= 696;
+                let v = if edge { 0 } else { 120 + ((x + y) % 40) as u8 };
+                img.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+    }
+    let frames = detect(&image::DynamicImage::ImageRgb8(img));
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    // The reader's box spills over the gutter into the right panel: it snaps to the left frame.
+    let rough = Bbox([0.03, 0.06, 0.56, 0.52]);
+    let s = snap(&frames, rough);
+    assert!((s.0[0] - 0.05).abs() < 0.01 && (s.0[2] - 0.48).abs() < 0.01 && (s.0[1] - 0.071).abs() < 0.01, "{s:?}");
+    // A box matching no frame (two panels at once) stays as read.
+    let both = Bbox([0.04, 0.06, 0.96, 0.52]);
+    assert_eq!(snap(&frames, both), both);
+}
+
+#[test]
+fn cast_names_must_be_mentioned_in_the_chapter() {
+    use crate::cast::mentioned;
+    let said = "hachiro walks home. \"crabstik's the name!\" frankenstein laughs.";
+    assert!(mentioned(said, "Hachiro") && mentioned(said, "Crabstik") && mentioned(said, "Rodolphe Frankenstein"));
+    assert!(!mentioned(said, "Abyss★9000"), "a later chapter's monster that merely looks alike");
+    assert!(mentioned(said, "Hachiro's coworker"), "a role needs no mention");
 }

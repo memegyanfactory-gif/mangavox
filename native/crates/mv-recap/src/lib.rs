@@ -6,11 +6,13 @@
 //! moved to `spawn_blocking` internally. The LLM is reached through `mv_ai::Registry`.
 
 mod brain;
+mod cast;
 mod export;
 pub mod hook;
 mod json;
 mod llm;
 pub mod media;
+mod panels;
 mod read;
 mod reset;
 mod store;

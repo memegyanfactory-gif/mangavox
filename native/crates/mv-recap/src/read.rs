@@ -62,7 +62,7 @@ Rules
 3. LINES. Transcribe EVERY speech balloon, thought bubble, narration box and meaningful sound effect. kind is one of "speech", "thought", "narration", "sfx". Keep the original meaning; if the text is not English, translate it into natural English. Do not add stage directions. Merge a balloon that is split across several bubbles into one line. Narration boxes and sfx have speaker null. If you cannot tell who speaks, use null rather than guessing wildly; use the tail of the balloon, the facing direction and the roster to decide.
 4. CHARACTERS. A roster of known characters (the "character bank") is given with reference face crops attached after the page. Identify people by face, hair, eyes and outfit, matching them to the roster, and ALWAYS reuse the roster name exactly. Use a real name when it is written or spoken on the page. If someone is not in the roster and has no name yet, give a stable descriptive placeholder such as "Silver-haired swordsman" or "Girl with red ribbon" and reuse exactly the same placeholder next time you see them. If a character that is listed under a placeholder name is named on this page, return the real name in "name" and the old placeholder in "was" (otherwise "was" is null). Do not list background crowds. Only fill "description" and "traits" for a character who is new or whose details were missing; leave them empty for known characters.
 5. SCENE. Judge the depth of the page, not just the surface: fights, tension, grief, comedy beats, reveals, flashbacks. Pick the single best "kind", set intensity honestly (a quiet conversation is 1-3, a decisive blow or tearful goodbye is 8-10), and add 2-5 tags.
-6. SUMMARY continues the story: use the previous page's summary for continuity and write what is new here. If the page is only a title, credits or an ad, say so in the summary and return an empty "panels" list.
+6. SUMMARY continues the story: use the previous page (its summary, and its image when attached) for continuity and write what is new here. Say what HAPPENS, not only what is said: who arrives, attacks, transforms, flees, what object matters (look closely before naming anything gruesome: a flying object is a severed head only when it clearly is one). Keep a flashback a flashback until the page shows the return to the present. If the page is only a title, credits or an ad, say so in the summary and return an empty "panels" list.
 7. Never wrap the JSON in code fences. Never output anything but the JSON object."##;
 
 /// Pages read at the same time. Cloud models answer many requests at once; a CLI agent is a whole
@@ -239,6 +239,18 @@ pub(crate) fn prep_page(path: &Path, work: &Path, index: usize) -> Result<(PathB
     Ok((out, w, h))
 }
 
+/// Long side of the page-before image sent for context: enough to tell who is who, at a fraction of the cost.
+const CONTEXT_PX: u32 = 900;
+
+/// A small copy of the page before, in `work`, for the reader's context. `None` when it cannot be read.
+pub(crate) fn prep_context(path: &Path, work: &Path) -> Option<PathBuf> {
+    let img = image::open(path).ok()?;
+    let small = if img.width().max(img.height()) > CONTEXT_PX { img.resize(CONTEXT_PX, CONTEXT_PX, FilterType::Triangle) } else { img };
+    let out = work.join("page_before.jpg");
+    save_jpeg(&small, &out).ok()?;
+    Some(out)
+}
+
 pub(crate) fn is_webtoon(w: u32, h: u32) -> bool {
     h as f32 / w.max(1) as f32 >= 2.2
 }
@@ -328,6 +340,8 @@ pub(crate) struct PagePrompt<'a> {
     pub faces: &'a [(String, PathBuf)],
     /// Last page of a stitched strip part that starts at `index` (see `strip.rs`).
     pub strip_to: Option<usize>,
+    /// The page before is attached (Image 2) for context.
+    pub prev_image: bool,
 }
 
 pub(crate) fn page_prompt(p: &PagePrompt) -> String {
@@ -359,9 +373,13 @@ pub(crate) fn page_prompt(p: &PagePrompt) -> String {
     s += &format!("\nPREVIOUS {}: {}\n", if p.strip_to.is_some() { "PART" } else { "PAGE" }, if p.prev_summary.is_empty() { "(this is the first page read)" } else { p.prev_summary });
     s += &format!("\nCHARACTER BANK (reuse these exact names):\n{}\n", roster_text(p.brain, 40));
     s += if p.strip_to.is_some() { "\nATTACHED IMAGES:\nImage 1 = the strip part to read." } else { "\nATTACHED IMAGES:\nImage 1 = the page to read." };
+    if p.prev_image {
+        s += "\nImage 2 = the page BEFORE it, for context only: who is who, which scene and time this is (the present or a flashback), who is talking to whom. Never transcribe it; read only Image 1.";
+    }
+    let first_face = if p.prev_image { 3 } else { 2 };
     for (i, (name, path)) in p.faces.iter().enumerate() {
         let f = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-        s += &format!("\nImage {} = reference face of {} ({}).", i + 2, name, f);
+        s += &format!("\nImage {} = reference face of {} ({}).", i + first_face, name, f);
     }
     s += "\n\nRead Image 1 now and reply with the JSON object only.";
     s
@@ -410,6 +428,8 @@ pub(crate) async fn read_chapter_with(
         return Err(fail(format!("No page images found in {}", ch.pages_dir.display())));
     }
     let mut read = load_read(ch).unwrap_or_default();
+    // Pages read from now on are snapped as they are read.
+    read.panels_snapped |= read.pages.is_empty();
     read.chapter_id = ch.chapter_id.clone();
     read.model = model_label(model);
     // A chapter delivered as slices of one long strip is read in whole parts cut at panel gaps
@@ -441,6 +461,8 @@ pub(crate) async fn read_chapter_with(
         progress(Progress::Done);
         return Ok(read);
     }
+    // New names on the pages: the story's cast check runs again.
+    read.cast_checked = false;
     let total: usize = targets.iter().map(|u| u.spans.len()).sum();
     let mut finished = 0;
 
@@ -478,7 +500,7 @@ pub(crate) async fn read_chapter_with(
             let ws = if unit.stitched { work.join(format!("p{i:04}_{}", unit.spans[0].y0)) } else { work.join(format!("p{i:04}")) };
             std::fs::create_dir_all(&ws).context("create page workspace")?;
             let (all, wk, u) = (pages.clone(), ws.clone(), unit.clone());
-            let prepped = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, u32, u32)> {
+            let prepped = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, u32, u32, Option<PathBuf>)> {
                 let image = if u.stitched {
                     let out = wk.join("strip.jpg");
                     strip::compose(&u, &all, &out)?;
@@ -487,11 +509,12 @@ pub(crate) async fn read_chapter_with(
                     all[i].clone()
                 };
                 let (send, w, h) = prep_page(&image, &wk, i)?;
-                Ok((image, send, w, h))
+                let before = (!u.stitched && i > 0).then(|| prep_context(&all[i - 1], &wk)).flatten();
+                Ok((image, send, w, h, before))
             })
             .await
             .map_err(|e| anyhow!(e))?;
-            let (image, send_path, w, h) = match prepped {
+            let (image, send_path, w, h, before) = match prepped {
                 Ok(x) => x,
                 Err(e) => {
                     progress(Progress::Log(format!("Page {}: {e}", i + 1)));
@@ -511,10 +534,11 @@ pub(crate) async fn read_chapter_with(
                 let b = brain.lock().unwrap();
                 let faces = pick_faces(&b, &recent);
                 let strip_to = unit.stitched.then(|| unit.spans[unit.spans.len() - 1].page);
-                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces, strip_to });
+                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces, strip_to, prev_image: before.is_some() });
                 (prompt, faces)
             };
             let mut images = vec![send_path];
+            images.extend(before);
             images.extend(faces.iter().map(|(_, p)| p.clone()));
             let req = request(model, vec![AiMessage::system(READ_SYSTEM), AiMessage::user(prompt)], images, Some(ws));
             flight.push_back(ask(unit.clone(), image, Some(req)));
@@ -568,7 +592,15 @@ pub(crate) async fn read_chapter_with(
 
             // Sync the reading back onto the page files: a page the part starts at the top of is replaced,
             // a page it continues (the part above was read before) gets the rest of its panels appended.
-            let read_part = parsed.page;
+            let mut read_part = parsed.page;
+            // The reader's panel boxes snap to the frames drawn on the page (a strip part's boxes stay as read).
+            if !unit.stitched && read_part.panels.iter().any(|p| p.bbox.is_some()) {
+                let img = image.clone();
+                let frames = tokio::task::spawn_blocking(move || image::open(&img).map(|i| crate::panels::detect(&i)).unwrap_or_default()).await.map_err(|e| anyhow!(e))?;
+                for p in &mut read_part.panels {
+                    p.bbox = p.bbox.map(|b| crate::panels::snap(&frames, b));
+                }
+            }
             let mut clear = vec![];
             let mut out: Vec<PageRead> = unit
                 .spans
@@ -640,6 +672,35 @@ pub(crate) async fn read_chapter_with(
     }
     progress(Progress::Done);
     Ok(read)
+}
+
+/// Snap the panel boxes of a chapter read before snapping existed to the frames on its pages, and
+/// redo the crops of the panels that moved (blocking). A strip chapter keeps its boxes. Returns
+/// whether the reading changed.
+pub(crate) fn snap_read(ch: &ChapterRef, read: &mut ChapterRead) -> bool {
+    if read.panels_snapped {
+        return false;
+    }
+    read.panels_snapped = true;
+    if !read.strip_done.is_empty() {
+        return true;
+    }
+    let pages = list_pages(&ch.pages_dir);
+    for p in &mut read.pages {
+        let Some(img) = pages.get(p.index).and_then(|f| image::open(f).ok()) else { continue };
+        let frames = crate::panels::detect(&img);
+        for (n, pn) in p.panels.iter_mut().enumerate() {
+            let Some(b) = pn.bbox else { continue };
+            let s = crate::panels::snap(&frames, b);
+            if s != b {
+                pn.bbox = Some(s);
+                if s.area() >= MIN_PANEL_AREA {
+                    let _ = crop_panel(&img, s, &panel_path(ch, p.index, n));
+                }
+            }
+        }
+    }
+    true
 }
 
 fn upsert(read: &mut ChapterRead, page: PageRead) {
