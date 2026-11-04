@@ -6,6 +6,8 @@ use gpui_kit::*;
 use mv_ui::Route;
 
 mod assist;
+mod auto_export;
+pub use auto_export::folder_for as auto_export_folder;
 mod cropper;
 pub mod audio;
 pub use export::join_full_recap;

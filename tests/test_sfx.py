@@ -145,6 +145,35 @@ class LibraryTest(unittest.TestCase):
         # Other sounds stay built in.
         self.assertEqual(len(sfx.load_sound("whoosh", mine)), len(sfx.synthesize("whoosh")))
 
+    @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+    def test_library_only_cues_need_a_file_or_a_fallback(self):
+        lib = os.path.join(self.tmp, "lib")
+        os.makedirs(lib)
+        # No file: a punch falls back to the built-in impact, a gunshot has no sound at all.
+        self.assertTrue(sfx.playable("punch", lib))
+        self.assertEqual(len(sfx.load_sound("punch", lib)), len(sfx.synthesize("impact")))
+        self.assertFalse(sfx.playable("gunshot", lib))
+        self.assertIsNone(sfx.load_sound("gunshot", lib))
+        # A CC0 file in the library folder: played as it is.
+        shot = np.concatenate([np.zeros(SR // 20), np.exp(-np.arange(SR // 4) / 2000.0) * np.sin(np.arange(SR // 4))])
+        sfx.write_wav(os.path.join(lib, "gunshot_01.wav"), 0.8 * shot)
+        self.assertTrue(sfx.playable("gunshot", lib))
+        self.assertAlmostEqual(len(sfx.load_sound("gunshot", lib)) / SR, 0.25, delta=0.01)
+
+    def test_long_recordings_are_cut_and_faded(self):
+        rain = np.ones(int(30 * SR), dtype=np.float32) * 0.5
+        x = sfx.fit_length(rain, "rain")
+        self.assertEqual(len(x), int(sfx.AMBIENCE_SEC * SR))
+        self.assertLess(abs(float(x[0])), 1e-6, "ambience fades in")
+        self.assertLess(abs(float(x[-1])), 1e-3)
+        self.assertAlmostEqual(float(x[len(x) // 2]), 0.5, places=5)
+        thunder = sfx.fit_length(rain, "thunder")
+        self.assertEqual(len(thunder), int(sfx.MAX_SEC["hit"] * SR))
+        self.assertAlmostEqual(float(thunder[0]), 0.5, places=5, msg="a hit starts on its moment")
+        self.assertLess(abs(float(thunder[-1])), 1e-3)
+        short = np.ones(SR, dtype=np.float32)
+        self.assertIs(sfx.fit_length(short, "rain"), short)
+
     def test_user_dir_lookup(self):
         out = os.path.join(self.tmp, "data", "studio", "projects", "m", "c")
         self.assertEqual(sfx.user_dir_for({}, out), os.path.join(self.tmp, "data", "studio", "sfx"))
@@ -152,19 +181,34 @@ class LibraryTest(unittest.TestCase):
 
 
 class NamesTest(unittest.TestCase):
+    def test_story_vocabulary_matches(self):
+        # The story writer may cue exactly the sounds this module knows (mv-recap types.rs SFX_NAMES).
+        import re
+        path = os.path.join(os.path.dirname(__file__), "..", "native", "crates", "mv-recap", "src", "types.rs")
+        with open(path, encoding="utf-8") as f:
+            body = re.search(r"pub const SFX_NAMES: &\[&str\] = &\[(.*?)\];", f.read(), re.S).group(1)
+        self.assertEqual(set(re.findall(r'"([a-z_]+)"', body)), set(sfx.NAMES))
+
     def test_names_and_levels(self):
         self.assertEqual(sfx.normalize_name(" Sword clang"), "sword_clang")
         self.assertEqual(sfx.normalize_name("door-slam"), "door_slam")
         self.assertIsNone(sfx.normalize_name("laser"))
         self.assertIsNone(sfx.normalize_name(None))
+        self.assertEqual(sfx.normalize_name("Bullet"), "gunshot")
+        self.assertEqual(sfx.normalize_name("rain"), "rain")
+        self.assertEqual(sfx.normalize_name("glass break"), "glass")
+        self.assertEqual(set(sfx.CATEGORY), set(sfx.NAMES), "every cue has a level")
+        self.assertTrue(set(sfx.FALLBACK.values()) <= set(sfx.SOUNDS))
+        self.assertEqual(sfx.level_db("rain", 1), -28.0)
+        self.assertEqual(sfx.level_db("gunshot", 2), -12.0)
         self.assertEqual([sfx.normalize_strength(v) for v in (0, "3", 9, None, "x", 2.4)], [1, 3, 3, 2, 2, 2])
-        self.assertEqual(sfx.level_db("impact", 1), -18.0)
-        self.assertEqual(sfx.level_db("impact", 3), -12.0)
-        self.assertEqual(sfx.level_db("whoosh", 1), -25.0)
-        self.assertEqual(sfx.level_db("whoosh", 3), -18.0)
-        self.assertEqual(sfx.level_db("crowd_gasp", 1), -32.0)
-        self.assertEqual(sfx.level_db("heartbeat", 3), -24.0)
-        self.assertEqual(sfx.level_db("boom", 2, punchy=True), -15.0 + sfx.PUNCHY_DB)
+        self.assertEqual(sfx.level_db("impact", 1), -15.0)
+        self.assertEqual(sfx.level_db("impact", 3), -9.0)
+        self.assertEqual(sfx.level_db("whoosh", 1), -23.0)
+        self.assertEqual(sfx.level_db("whoosh", 3), -16.0)
+        self.assertEqual(sfx.level_db("crowd_gasp", 1), -28.0)
+        self.assertEqual(sfx.level_db("heartbeat", 3), -22.0)
+        self.assertEqual(sfx.level_db("boom", 2, punchy=True), -12.0 + sfx.PUNCHY_DB)
         self.assertEqual([sfx.mode_of(v) for v in (True, None, False, "off", "Punchy", "subtle", 0)],
                          ["subtle", "subtle", "off", "off", "punchy", "subtle", "off"])
 
@@ -239,10 +283,10 @@ class PlacementTest(unittest.TestCase):
         hit = lambda at, ai: {"name": "impact", "strength": 2, "at": at, "clip": 1, "ai": ai, "intensity": 0}
         ev = sfx.place([hit(10.0, True)], sounds, voice, level)
         self.assertAlmostEqual(ev[0]["start"], 9.82, delta=0.011, msg="moved into the pause")
-        self.assertEqual(ev[0]["rel_db"], -15.0)
+        self.assertEqual(ev[0]["rel_db"], -12.0)
         # No pause near 5 s: the writer's cue plays quieter, the renderer's own is dropped.
         ev = sfx.place([hit(5.0, True)], sounds, voice, level)
-        self.assertEqual((ev[0]["start"], ev[0]["rel_db"]), (5.0, -15.0 + sfx.MASKED_DB))
+        self.assertEqual((ev[0]["start"], ev[0]["rel_db"]), (5.0, -12.0 + sfx.MASKED_DB))
         self.assertEqual(sfx.place([hit(5.0, False)], sounds, voice, level), [])
 
 
@@ -282,7 +326,7 @@ class TrackTest(unittest.TestCase):
         # Loudness against loudness: each sound's loudest momentary LUFS against the narration's
         # integrated LUFS (ffmpeg's meter).
         level = sfx.narration_lufs(nar) if shutil.which("ffmpeg") else sfx.speech_db(voice)
-        for e, want in zip(events, (-12.0, -32.0, -21.5)):
+        for e, want in zip(events, (-9.0, -28.0, -19.5)):
             seg = stem[max(0, int(e["start"] * SR)):int((e["start"] + 3.0) * SR)]
             self.assertAlmostEqual(sfx.body_lufs(seg) - level, want, delta=0.6, msg=e["name"])
         self.assertLess(float(np.max(np.abs(stem))), 0.5, "well under full scale")

@@ -307,11 +307,15 @@ pub struct Cue {
     /// The music before this cue stops like a record (comedy beats).
     #[serde(default)]
     pub record_stop: bool,
+    /// The scene's music cue (one of [`crate::spot::MOODS`]): what the library bed is picked by.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mood: String,
 }
 
 impl Cue {
     pub fn label(&self) -> String {
-        format!("{} · {} BPM · {} {}", self.style.label(), self.bpm.round(), crate::theory::note_name(self.root), self.mode)
+        let mood = if self.mood.is_empty() { String::new() } else { format!("{} · ", self.mood) };
+        format!("{mood}{} · {} BPM · {} {}", self.style.label(), self.bpm.round(), crate::theory::note_name(self.root), self.mode)
     }
 }
 
@@ -339,7 +343,8 @@ pub struct Score {
 
 impl Score {
     /// 2: genre presets (phonk, epic, ...), SFX library, per-cue mix.
-    pub const VERSION: u32 = 2;
+    /// 3: cues carry the story's mood; beds picked by mood; slow shallow duck.
+    pub const VERSION: u32 = 3;
     pub const ENERGY_STEP: f64 = 0.5;
 
     pub fn track(&self, role: Role) -> Option<&Track> {
@@ -371,14 +376,14 @@ impl Level {
         }
     }
 
-    /// Music loudness relative to the narration's, in LU, before ducking. With the default 10 dB duck
-    /// "Normal" puts the bed about 24 LU under the voice while it speaks and 14 LU under in the gaps:
-    /// background music, inside the 12-25 dB range mixing guides give for music under narration.
+    /// Music loudness relative to the narration's, in LU, before ducking. With the default 6 dB duck
+    /// "Normal" puts the bed about 23 LU under the voice while it speaks and 17 LU under in the long
+    /// pauses: heard, never in the way (mixing guides give 12-25 dB for music under narration).
     pub fn offset_lu(self) -> f64 {
         match self {
-            Level::Quiet => -18.0,
-            Level::Normal => -14.0,
-            Level::Bold => -10.0,
+            Level::Quiet => -21.0,
+            Level::Normal => -17.0,
+            Level::Bold => -13.0,
         }
     }
 }
@@ -458,6 +463,10 @@ pub struct MusicSettings {
     pub use_ai: bool,
     /// The AI's last cue sheet, reused until the user asks again.
     pub directions: Vec<Direction>,
+    /// Version of the mix defaults the settings were saved with (see [`MusicSettings::MIX`]); 0 in
+    /// files saved before it existed.
+    #[serde(default)]
+    pub mix: u32,
 }
 
 impl Default for MusicSettings {
@@ -467,7 +476,7 @@ impl Default for MusicSettings {
             source: Source::Library,
             take: 0,
             level: Level::Normal,
-            duck_db: 10.0,
+            duck_db: 6.0,
             sfx: SfxAmount::Subtle,
             genre: None,
             energy: 0.5,
@@ -476,11 +485,25 @@ impl Default for MusicSettings {
             variations: BTreeMap::new(),
             use_ai: false,
             directions: vec![],
+            mix: Self::MIX,
         }
     }
 }
 
 impl MusicSettings {
+    /// 2: a slow, shallow duck (6 dB by default, held through sentence pauses) instead of a 10 dB
+    /// dip at every breath, which made the music pump.
+    pub const MIX: u32 = 2;
+
+    /// Settings saved before [`Self::MIX`] 2 move to the new duck depths (Light / Normal / Strong).
+    pub fn migrate(mut self) -> Self {
+        if self.mix < 2 && self.duck_db > 0.0 {
+            self.duck_db = if self.duck_db <= 6.0 { 4.0 } else if self.duck_db <= 10.0 { 6.0 } else { 9.0 };
+        }
+        self.mix = Self::MIX;
+        self
+    }
+
     pub fn strip(&self, role: Role) -> Strip {
         self.mixer.get(&role).copied().unwrap_or_default()
     }

@@ -249,7 +249,9 @@ fn story_sfx_cues_are_validated() {
     assert_eq!(SfxCue::parse(" Sword Clang ", Some(7.0)).map(|c| (c.name, c.strength)), Some(("sword_clang".into(), 3)));
     assert_eq!(SfxCue::parse("door-slam", None).map(|c| c.strength), Some(2), "missing strength: 2");
     assert_eq!(SfxCue::parse("whoosh", Some(0.0)).map(|c| c.strength), Some(1));
-    assert_eq!(SfxCue::parse("explosion", Some(2.0)), None);
+    assert_eq!(SfxCue::parse("explosion", Some(2.0)).map(|c| c.name), Some("explosion".into()));
+    assert_eq!(SfxCue::parse("Gunshot", None).map(|c| c.name), Some("gunshot".into()));
+    assert_eq!(SfxCue::parse("laser", Some(2.0)), None);
     assert_eq!(SfxCue::parse("", Some(2.0)), None);
 
     let read = ChapterRead { pages: (0..3).map(|i| PageRead { index: i, ..Default::default() }).collect(), ..Default::default() };
@@ -796,12 +798,16 @@ fn passages_carry_their_emotion_and_skip_text_only_panels() {
         ..Default::default()
     };
     let v = serde_json::json!({"segments":[
-        {"page":1,"panel":1,"text":"a","emotion":"Comedy","mood":"smug","intensity":12},
+        {"page":1,"panel":1,"text":"a","emotion":"Comedy","mood":"smug","intensity":12,"music":"Comedic"},
         {"page":1,"panel":2,"text":"b","emotion":"giddy"},
-        {"page":1,"panel":2,"text":"c"}]});
+        {"page":1,"panel":2,"text":"c"},
+        {"page":1,"panel":2,"text":"d","emotion":"giddy","music":"eerie"},
+        {"page":1,"panel":2,"text":"e","emotion":"calm","music":"disco"}]});
     let segs = crate::story::parse_segments(&v, &[0], &read);
-    assert_eq!(segs[0].tone, Some(Tone { kind: "comedy".into(), mood: "smug".into(), intensity: 10 }));
+    assert_eq!(segs[0].tone, Some(Tone { kind: "comedy".into(), mood: "smug".into(), intensity: 10, music: "comedic".into() }));
     assert_eq!((segs[1].tone.clone(), segs[2].tone.clone()), (None, None), "unknown or missing emotions follow the page's scene");
+    assert_eq!(segs[3].tone, Some(Tone { music: "eerie".into(), ..Default::default() }), "a music cue alone is kept");
+    assert_eq!(segs[4].tone.as_ref().map(|t| t.music.as_str()), Some(""), "an unknown music cue is dropped");
 
     let dir = tempfile::tempdir().unwrap();
     let ch = chapter(dir.path(), 1);
@@ -812,13 +818,14 @@ fn passages_carry_their_emotion_and_skip_text_only_panels() {
     let action = Panel { characters: vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }], ..Default::default() };
     let read = ChapterRead { pages: vec![PageRead { index: 0, panels: vec![Panel { lines: vec![line], ..Default::default() }, action], ..Default::default() }], ..Default::default() };
     save_read(&ch, &read).unwrap();
-    let tone = Some(Tone { kind: "comedy".into(), mood: "smug".into(), intensity: 6 });
+    let tone = Some(Tone { kind: "comedy".into(), mood: "smug".into(), intensity: 6, music: "comedic".into() });
     let story = Story { segments: vec![StorySegment { page: 0, panel: Some(0), text: "Ruko grins.".into(), tone, ..Default::default() }], ..Default::default() };
     export_for_pipeline(&ch, &story).unwrap();
     let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
     let b = &beats["beats"][0];
     assert!(b["panel_image"].as_str().unwrap().ends_with("p0000_01.jpg"), "the balloon-only panel is passed over: {b}");
     assert_eq!((b["kind"].as_str(), b["mood"].as_str(), b["intensity"].as_u64()), (Some("comedy"), Some("smug"), Some(6)));
+    assert_eq!(b["music"].as_str(), Some("comedic"));
 }
 
 #[test]

@@ -267,9 +267,9 @@ impl StudioRuns {
             }
         };
         let title = if e.manga_title.is_empty() { "Full video".to_string() } else { format!("{} · full video", e.manga_title) };
-        Card::new(format!("export-{id}"), order, Lead::Progress(e.progress), title, e.label.clone())
-            .progress(e.progress, true)
-            .count(format!("{}%", (e.progress * 100.).round() as u32))
+        let card = Card::new(format!("export-{id}"), order, Lead::Progress(e.progress), title, e.label.clone());
+        let card = if e.waiting { card.count("Queued") } else { card.progress(e.progress, true).count(format!("{}%", (e.progress * 100.).round() as u32)) };
+        card
             .action(btn("cancel", "Cancel", ButtonKind::Ghost).small().icon(ph::X).tooltip("Stop this export").on_click(move |_, _, _| pipeline::cancel_export(id)))
             .action(btn("open", "Open Studio", ButtonKind::Ghost).small().trailing_icon(ph::ARROW_RIGHT).on_click(|_, w, cx| mv_ui::navigate(Route::Studio, w, cx)))
             .on_close(close)
@@ -322,6 +322,11 @@ impl StudioRuns {
             Box::new(pipeline::resume_all)
         };
         let ids = t.active.clone();
+        // Auto export on: the run's card says the full recap follows, and where it goes.
+        let line = match ui_studio::auto_export_folder(manga_id) {
+            Some(dir) => format!("{line} · then auto export to {}", dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned())),
+            None => line,
+        };
         Card::new(key, r.order, Lead::Progress(t.progress), t.title, line)
             .progress(t.progress, t.running.is_some())
             .count(format!("{at} of {} chapters", t.total))

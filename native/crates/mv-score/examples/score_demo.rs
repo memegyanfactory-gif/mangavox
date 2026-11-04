@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         spans.push(Span { page: i, start: t, end: t + len });
         t += len;
         let sfx = if sfx.is_empty() { vec![] } else { vec![(0.3, sfx.to_string())] };
-        pages.push(PageInfo { page: i, kind: kind.to_string(), mood: mood.to_string(), intensity: *intensity, tags: vec![], sfx });
+        pages.push(PageInfo { page: i, kind: kind.to_string(), mood: mood.to_string(), intensity: *intensity, tags: vec![], sfx, music: String::new() });
     }
     let settings = MusicSettings::default();
     let (cues, energy) = plan(&pages, &spans, &[], &settings, 2);

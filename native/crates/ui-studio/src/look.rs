@@ -5,7 +5,7 @@
 //! File: `<data>/studio/video_look.json`. The export reads the same file on its own, so the keys
 //! are a fixed contract:
 //! `{"preset", "grade"?, "vignette"?, "grain"?, "glow"?, "impact"?, "leaks"?, "chroma"?,
-//! "parallax"?, "particles"?, "letterbox"?, "mood"?, "edge_glow"?, "color"?: "none|warm|cool|noir|vivid",
+//! "parallax"?, "particles"?, "letterbox"?, "mood"?, "edge_glow"?, "chapter_card"?, "color"?: "none|warm|cool|noir|vivid",
 //! "layered"?: "off|key|all", "framing"?: "fill", "duo"?: bool, "motion"?: 0..2,
 //! "logo": {on, path, pos, size, opacity}, "text": {on, text, pos, size, opacity}}`. A missing effect or colour
 //! key means "the preset's own default" (so files written before a switch existed keep working). A picked logo is copied into `<data>/studio/brand/logo.<ext>`: it is the user's
@@ -74,10 +74,10 @@ impl Preset {
     /// The effects this preset turns on by itself (mirrors the Python renderer's `LOOKS`).
     pub fn effects(self) -> Effects {
         match self {
-            Preset::Clean => Effects::default(),
-            Preset::Cinematic => Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, mood: true, ..Effects::default() },
-            Preset::Recap => Effects { grade: true, vignette: true, ..Effects::default() },
-            Preset::Dynamic => Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, ..Effects::default() },
+            Preset::Clean => Effects { chapter_card: true, ..Effects::default() },
+            Preset::Cinematic => Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, mood: true, chapter_card: true, ..Effects::default() },
+            Preset::Recap => Effects { grade: true, vignette: true, chapter_card: true, ..Effects::default() },
+            Preset::Dynamic => Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, chapter_card: true, ..Effects::default() },
         }
     }
 
@@ -213,10 +213,11 @@ pub enum Effect {
     Letterbox,
     Mood,
     EdgeGlow,
+    ChapterCard,
 }
 
 /// How many effect switches there are.
-pub const EFFECT_COUNT: usize = 12;
+pub const EFFECT_COUNT: usize = 13;
 
 impl Effect {
     pub const ALL: [Effect; EFFECT_COUNT] = [
@@ -232,6 +233,7 @@ impl Effect {
         Effect::Particles,
         Effect::Letterbox,
         Effect::EdgeGlow,
+        Effect::ChapterCard,
     ];
 
     /// The JSON key.
@@ -249,6 +251,7 @@ impl Effect {
             Effect::Letterbox => "letterbox",
             Effect::Mood => "mood",
             Effect::EdgeGlow => "edge_glow",
+            Effect::ChapterCard => "chapter_card",
         }
     }
 
@@ -266,6 +269,7 @@ impl Effect {
             Effect::Letterbox => "Cinematic bars (2.39:1)",
             Effect::Mood => "Follow the story's mood",
             Effect::EdgeGlow => "Edge glow",
+            Effect::ChapterCard => "Chapter card",
         }
     }
 
@@ -284,6 +288,7 @@ impl Effect {
             Effect::Letterbox => "Black bars top and bottom for a widescreen film look.",
             Effect::Mood => "Uses the chapter's AI reading: each scene gets its own colour grade, atmosphere (embers, rain, snow, dust) and transitions, and punches land only on the intense beats.",
             Effect::EdgeGlow => "A thin line of light along the frame's edges, with two lights circling it, in the scene's mood colour. Never covers the captions.",
+            Effect::ChapterCard => "The chapter's number and title glide in at the top right as each chapter starts, for about five seconds, in the captions' font and the scene's mood colour.",
         }
     }
 
@@ -301,6 +306,7 @@ impl Effect {
             Effect::Letterbox => ph::FILM_SLATE,
             Effect::Mood => ph::MASK_HAPPY,
             Effect::EdgeGlow => ph::FRAME_CORNERS,
+            Effect::ChapterCard => ph::TEXT_AA,
         }
     }
 
@@ -324,6 +330,7 @@ pub struct Effects {
     pub letterbox: bool,
     pub mood: bool,
     pub edge_glow: bool,
+    pub chapter_card: bool,
 }
 
 impl Effects {
@@ -341,6 +348,7 @@ impl Effects {
             Effect::Letterbox => self.letterbox,
             Effect::Mood => self.mood,
             Effect::EdgeGlow => self.edge_glow,
+            Effect::ChapterCard => self.chapter_card,
         }
     }
 
@@ -358,6 +366,7 @@ impl Effects {
             Effect::Letterbox => &mut self.letterbox,
             Effect::Mood => &mut self.mood,
             Effect::EdgeGlow => &mut self.edge_glow,
+            Effect::ChapterCard => &mut self.chapter_card,
         } = on;
     }
 }
@@ -597,6 +606,11 @@ impl Look {
         let mut m = Map::new();
         m.insert("preset".into(), json!(self.preset.key()));
         for e in Effect::ALL {
+            // The chapter card only when off (the renderer draws it unless told not to), so the
+            // render key of every existing video stays what it was.
+            if e == Effect::ChapterCard && fx.get(e) {
+                continue;
+            }
             m.insert(e.key().into(), json!(fx.get(e)));
         }
         m.insert("color".into(), json!(self.color().key()));
@@ -1326,7 +1340,7 @@ mod tests {
     fn defaults_match_the_contract() {
         let l = Look::default();
         assert_eq!(l.preset, Preset::Dynamic);
-        assert_eq!(l.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, ..Effects::default() });
+        assert_eq!(l.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, chapter_card: true, ..Effects::default() });
         assert_eq!(l.color(), ColorPreset::None);
         assert_eq!((l.logo.pos, l.logo.size, l.logo.opacity), (2, 0.12, 0.85));
         assert_eq!((l.text.pos, l.text.size, l.text.opacity), (0, 0.05, 0.6));
@@ -1343,10 +1357,10 @@ mod tests {
 
     #[test]
     fn preset_effects_mirror_the_renderer() {
-        assert_eq!(Preset::Clean.effects(), Effects::default());
-        assert_eq!(Preset::Cinematic.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, mood: true, ..Effects::default() });
-        assert_eq!(Preset::Recap.effects(), Effects { grade: true, vignette: true, ..Effects::default() });
-        assert_eq!(Preset::Dynamic.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, ..Effects::default() });
+        assert_eq!(Preset::Clean.effects(), Effects { chapter_card: true, ..Effects::default() });
+        assert_eq!(Preset::Cinematic.effects(), Effects { grade: true, vignette: true, grain: true, glow: true, leaks: true, letterbox: true, mood: true, chapter_card: true, ..Effects::default() });
+        assert_eq!(Preset::Recap.effects(), Effects { grade: true, vignette: true, chapter_card: true, ..Effects::default() });
+        assert_eq!(Preset::Dynamic.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, chapter_card: true, ..Effects::default() });
         // Every switch has a key, a label and a tooltip.
         for e in Effect::ALL {
             assert!(!e.key().is_empty() && !e.label().is_empty() && !e.tip().is_empty());
@@ -1361,7 +1375,8 @@ mod tests {
         let cfg = Look::default().render_config();
         let mut keys: Vec<String> = cfg.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        let mut want: Vec<String> = Effect::ALL.iter().map(|e| e.key().to_string()).chain(["preset".into(), "color".into()]).collect();
+        // (The chapter card is on: it is sent only when off.)
+        let mut want: Vec<String> = Effect::ALL.iter().filter(|e| **e != Effect::ChapterCard).map(|e| e.key().to_string()).chain(["preset".into(), "color".into()]).collect();
         want.sort();
         assert_eq!(keys, want);
         assert_eq!(Look::default().render_config_for(false), cfg);
@@ -1405,6 +1420,14 @@ mod tests {
         let cfg = l.render_config();
         assert_eq!((cfg["edge_glow"].as_bool(), cfg["mood"].as_bool()), (Some(false), Some(true)));
         assert_eq!(l.to_json()["edge_glow"], false);
+        // The chapter card: on by default and then not sent; switched off, it is sent off.
+        assert!(l.effects().chapter_card && cfg.get("chapter_card").is_none());
+        l.set_effect(Effect::ChapterCard, false);
+        assert_eq!(l.render_config()["chapter_card"], false);
+        assert_eq!(l.to_json()["chapter_card"], false);
+        assert!(!Look::from_json(&l.to_json()).effects().chapter_card, "saved off, loaded off");
+        l.set_effect(Effect::ChapterCard, true);
+        assert!(l.render_config().get("chapter_card").is_none() && l.to_json().get("chapter_card").is_none());
     }
 
     #[test]

@@ -92,8 +92,8 @@ LOOKS = {
     },
 }
 DEFAULT_LOOK = "dynamic"
-# Effects the user can switch on or off over a look.
-LOOK_EFFECTS = ("grade", "vignette", "grain", "glow", "impact", "leaks", "chroma", "parallax", "particles", "letterbox", "mood", "edge_glow")
+# Effects the user can switch on or off over a look ("chapter_card": on in every look unless switched off).
+LOOK_EFFECTS = ("grade", "vignette", "grain", "glow", "impact", "leaks", "chroma", "parallax", "particles", "letterbox", "mood", "edge_glow", "chapter_card")
 # Colour presets (one lookup table, merged with the grade): Y / U / V expressions of `val`.
 COLOR_PRESETS = {
     "none": None,
@@ -706,12 +706,10 @@ def make_edge_glow(w, ih, rgb, work_dir):
     return out
 
 
-def edge_glow_graph(w, h, bar, src, out, segments):
-    """The edge glow over [src] (a w x h picture, letterbox bars `bar` high) into [out].
-    `segments` is [(start, end, label)]: each label make_edge_glow's still in that stretch's
-    colour (see edge_segments), on for its time only. The line's strips are laid on their borders;
-    each light sprite moves along its border with the light's head, round the frame on the whole
-    video's clock (t), so the light runs on across the joins of the parts."""
+def edge_moves(w, h, bar):
+    """Where the edge glow's pieces go in a w x h picture with letterbox bars `bar` high: their
+    places in the atlas ({name: (x, y, w, h)}) and where each is laid ({name: (x, y)}, numbers or
+    overlay expressions of the video's time t: the lights move round the frame)."""
     ih = h - 2 * bar
     th, side, length, ahead = edge_geometry(w, ih)
     places, _ = edge_atlas_layout(w, ih)
@@ -732,6 +730,16 @@ def edge_glow_graph(w, h, bar, src, out, segments):
         "light_bottom": (f"{w - ahead}-{along(w + ih)}", bar + ih - th),
         "light_left": (0, f"{bar + ih - ahead}-{along(2 * w + ih)}"),
     }
+    return places, at
+
+
+def edge_glow_graph(w, h, bar, src, out, segments):
+    """The edge glow over [src] (a w x h picture, letterbox bars `bar` high) into [out].
+    `segments` is [(start, end, label)]: each label make_edge_glow's still in that stretch's
+    colour (see edge_segments), on for its time only. The line's strips are laid on their borders;
+    each light sprite moves along its border with the light's head, round the frame on the whole
+    video's clock (t), so the light runs on across the joins of the parts."""
+    places, at = edge_moves(w, h, bar)
     parts = []
     cur = src
     for n, (a, b, label) in enumerate(segments):
@@ -2625,15 +2633,28 @@ def apply_edit_clips(items, clips):
     return out
 
 
-# The chapter card: a small dark card at the top of the frame naming the chapter ("CHAPTER 12"
-# over its title) as it starts. It slides down and fades in at CARD_IN, stays, and lifts away and
-# fades out by CARD_OUT (seconds on the chapter's clock). A full recap joins the chapters as they
-# are, so each chapter change carries its own.
+# The chapter card: the chapter's number and title in the top right corner as it starts, in the
+# captions' font and the opening scene's mood colour. It glides in from the right edge at CARD_IN,
+# holds about five seconds, and slides back out by CARD_OUT (seconds on the chapter's clock). The
+# look's "chapter_card" switch (Studio's Look) turns it off. A full recap joins the chapters as
+# they are, so each chapter change carries its own.
 CARD_IN = 0.35
-CARD_OUT = 5.8
-CARD_EASE = 0.45
-CARD_FADE = 0.5
+CARD_OUT = 6.4
+CARD_EASE = 0.6
+CARD_FADE = 0.6
 CARD_ACCENT = (255, 188, 108)
+# The card's top right corner sits this far in from the frame's (at 1080 rows), clear of the
+# edge glow.
+CARD_MARGIN = 72
+# Words that mark a scanlation or upload tag rather than a chapter title.
+CARD_JUNK = re.compile(r"(?i)\b(scans?|scanlat\w*|translat(?:ion|ions|ed|or|ors)|fansubs?|raws?|tl|mtl)\b")
+_CARD_OPEN, _CARD_CLOSE = "([{【「『（", ")]}】」』）"
+_CARD_PREFIX = re.compile(
+    # "Vol. 2", then "Ch. 12" / "Chapter 12" (any separator after), or a bare "12 -" / "#12:" (only
+    # with a separator, so a title starting with a number, "100 Girlfriends", keeps it).
+    r"(?i)^(?:(?:vol(?:ume)?|v)\.?\s*\d+(?:\.\d+)?\s*[,:.\-–—|]*\s*)?"
+    r"(?:(?:chapter|chap|ch|episode|ep)\b\.?\s*#?\s*\d+(?:\.\d+)?\s*[:.\-–—|]*\s*|#?\d+(?:\.\d+)?\s*[:\-–—|]+\s*)"
+)
 
 
 def _card_drawable(text):
@@ -2641,59 +2662,115 @@ def _card_drawable(text):
     return all(c.isspace() or ord(c) <= 0x052F or 0x1E00 <= ord(c) <= 0x1FFF or 0x2010 <= ord(c) <= 0x206F for c in text)
 
 
+def clean_chapter_title(title):
+    """A chapter's title as the card shows it, or "" when it is not a real title: anything in
+    brackets or parentheses (a scanlation group's tag such as "(1r0n)") and "Vol. 2 Ch. 12 -"
+    style prefixes are dropped, and what is left must read as a title: letters, not one stray
+    tag of letters and digits ("1r0n", "v2"), no scanlation words, not just "Chapter"."""
+    t = " ".join(str(title or "").split())
+    out, depth = [], 0
+    for c in t:
+        if c in _CARD_OPEN:
+            depth += 1
+        elif c in _CARD_CLOSE:
+            depth = max(0, depth - 1)
+        elif not depth:
+            out.append(c)
+    t = " ".join("".join(out).split())
+    t = _CARD_PREFIX.sub("", t, count=1)
+    t = " ".join(t.strip(" -–—:|.,#").split())
+    if not t or not _card_drawable(t) or CARD_JUNK.search(t):
+        return ""
+    if sum(c.isalpha() for c in t) < 2:
+        return ""
+    if " " not in t and re.search(r"\d", t) and re.search(r"[^\W\d_]", t):
+        return ""
+    if re.fullmatch(r"(?i)(chapter|chap|ch|episode|ep|vol|volume|v)\.?\s*#?\s*[\d.]*", t):
+        return ""
+    return t
+
+
 def chapter_card_text(chapter):
     """(kicker, title) for the card from the job's `chapter` ({"number", "title"}): ("CHAPTER 12",
     "The Duel"); ("CHAPTER", title) without a number (a title "Chapter 5" gives the number); None
-    with neither. A title that only repeats the number is left out, a "Ch. 7 - " prefix dropped,
-    and a title the card's font cannot draw (Japanese, say) left out rather than drawn as boxes."""
+    with neither. The title is clean_chapter_title's: no group tags, no "Ch. 7 -" prefix, nothing
+    the card's font cannot draw (Japanese, say), rather than boxes or junk."""
     if not isinstance(chapter, dict):
         return None
     num = chapter.get("number")
-    title = " ".join(str(chapter.get("title") or "").split())
+    raw = " ".join(str(chapter.get("title") or "").split())
     try:
         kicker = f"CHAPTER {float(num):g}"
     except (TypeError, ValueError):
         kicker = None
-    only = re.fullmatch(r"(?i)(?:chapter|ch\.?)\s*([\d.]+)\s*[:.\-]?", title)
-    if only:
-        try:
-            kicker = kicker or f"CHAPTER {float(only.group(1)):g}"
-        except ValueError:
-            pass
-        title = ""
-    if title:
-        title = re.sub(r"(?i)^(chapter|ch\.?)\s*[\d.]+\s*[:.\-–—]*\s*", "", title) or title
-    if title and not _card_drawable(title):
-        title = ""
+    if not kicker:
+        m = re.search(r"(?i)\b(?:chapter|chap|ch)\b\.?\s*#?\s*(\d+(?:\.\d+)?)", raw)
+        if m:
+            kicker = f"CHAPTER {float(m.group(1)):g}"
+    title = clean_chapter_title(raw)
     if not kicker:
         return ("CHAPTER", title) if title else None
     return kicker, title
 
 
-def make_chapter_card(w, h, chapter, work_dir, accent=CARD_ACCENT):
+def chapter_card_on(config, look):
+    """Whether the video gets its chapter card: on unless the look's "chapter_card" switch (the
+    Studio's Look) or the job's own "chapter_card" says off."""
+    return config.get("chapter_card", True) is not False and (look or {}).get("chapter_card", True) is not False
+
+
+def card_font(config=None, output_dir=None):
+    """The card's display font: the captions' own (the caption style's), so the card belongs to
+    the video's look; Anton when it cannot be found."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        try:
+            import caption_engine as ce
+        except ImportError:
+            from . import caption_engine as ce
+        settings = ce.resolve_settings(config or {}, output_dir)
+        path = ce.font(ce.get_style(settings.get("style")).get("font")).path
+        if os.path.isfile(path):
+            return path
+    except Exception:
+        pass
+    return os.path.join(here, "fonts", "Anton-Regular.ttf")
+
+
+def make_chapter_card(w, h, chapter, work_dir, accent=CARD_ACCENT, font=None):
     """The chapter card (chapter_card_text) as an RGBA PNG sized for a w x h frame, or None when
-    there is nothing to name. Returns (path, card width, card height)."""
+    there is nothing to name. Returns (path, card width, card height).
+
+    A broadcast-style title for the top right corner: the chapter's number large in the display
+    `font` (the captions' own, card_font) over a slanted stroke of the scene's `accent` colour,
+    and beside it a tracked "CHAPTER" in the accent over a hairline rule and the title in a clean
+    weight. No box: the type carries it, with a soft shadow only so it reads over a bright page."""
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
     text = chapter_card_text(chapter)
     if not text:
         return None
     kicker, title = text
+    number = kicker[len("CHAPTER"):].strip()
+    accent = tuple(int(c) for c in accent)
     k = min(w, h) / 1080
-    fonts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-    f_kick = ImageFont.truetype(os.path.join(fonts, "Inter-ExtraBold.ttf"), max(10, round(22 * k)))
-    f_title = ImageFont.truetype(os.path.join(fonts, "Inter-Bold.ttf"), max(12, round(38 * k)))
-    spacing = 0.22 * f_kick.size
+    here = os.path.dirname(os.path.abspath(__file__))
+    display = font if font and os.path.isfile(font) else os.path.join(here, "fonts", "Anton-Regular.ttf")
+    f_num = ImageFont.truetype(display, max(24, round(124 * k)))
+    f_kick = ImageFont.truetype(display, max(10, round(30 * k)))
+    f_title = ImageFont.truetype(os.path.join(here, "fonts", "Inter-Bold.ttf"), max(12, round(33 * k)))
     probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    track = 0.2 * f_kick.size
 
-    def width(s, f, track=0.0):
-        return sum(probe.textlength(ch, font=f) for ch in s) + track * max(0, len(s) - 1)
+    def width(s, f, tr=0.0):
+        return sum(probe.textlength(c, font=f) for c in s) + tr * max(0, len(s) - 1)
 
-    max_w = 0.62 * w
-    pad_x, pad_y, bar = round(30 * k), round(18 * k), max(2, round(4 * k))
-    gap = round(8 * k) if title else 0
-    # A long title is cut at a word with an ellipsis (a single long word, at a letter) rather
-    # than overflowing.
-    room = max_w - 2 * pad_x - bar
+    label = "CHAPTER"
+    shown = number.zfill(2) if number.isdigit() else number
+    nl, nt, nr, nb = probe.textbbox((0, 0), shown, font=f_num) if shown else (0, 0, 0, 0)
+    num_w, num_h = nr - nl, nb - nt
+    gap = round(26 * k) if shown else 0
+    # A long title is cut at a word with an ellipsis (one long word, at a letter).
+    room = 0.46 * w - num_w - gap
     if title and width(title, f_title) > room:
         words = title.split()
         while len(words) > 1 and width(" ".join(words) + "…", f_title) > room:
@@ -2702,28 +2779,52 @@ def make_chapter_card(w, h, chapter, work_dir, accent=CARD_ACCENT):
         while len(title) > 1 and width(title + "…", f_title) > room:
             title = title[:-1]
         title = title.rstrip() + "…"
-    kick_h = f_kick.getbbox("CHAPTER 0")[3]
-    title_h = f_title.getbbox("Ag")[3] if title else 0
-    inner_w = max(width(kicker, f_kick, spacing), width(title, f_title) if title else 0)
-    cw = round(inner_w + 2 * pad_x + bar + round(14 * k))
-    ch = round(kick_h + gap + title_h + 2 * pad_y)
-    shadow = round(18 * k)
-    img = Image.new("RGBA", (cw + 2 * shadow, ch + 2 * shadow), (0, 0, 0, 0))
-    # A soft shadow, the card, a hairline border and the accent bar on its left.
-    sh = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ImageDraw.Draw(sh).rounded_rectangle([shadow, shadow + round(4 * k), shadow + cw, shadow + ch + round(4 * k)], radius=round(14 * k), fill=(0, 0, 0, 150))
-    img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(10 * k)))
-    d = ImageDraw.Draw(img)
-    box = [shadow, shadow, shadow + cw, shadow + ch]
-    d.rounded_rectangle(box, radius=round(14 * k), fill=(12, 12, 16, 178), outline=(255, 255, 255, 34), width=max(1, round(1.5 * k)))
-    d.rounded_rectangle([shadow + pad_x - round(6 * k), shadow + pad_y, shadow + pad_x - round(6 * k) + bar, shadow + ch - pad_y], radius=bar // 2, fill=accent + (235,))
-    x = shadow + pad_x + bar + round(8 * k)
-    y = shadow + pad_y
-    for c in kicker:
-        d.text((x, y), c, font=f_kick, fill=accent + (240,))
-        x += probe.textlength(c, font=f_kick) + spacing
+    kl, kt, kr, kb = probe.textbbox((0, 0), label, font=f_kick)
+    tl, tt, tr, tb = probe.textbbox((0, 0), title, font=f_title) if title else (0, 0, 0, 0)
+    kick_w = width(label, f_kick, track)
+    text_w = round(max(kick_w, tr - tl))
+    rule_gap, rule = round(10 * k), max(1, round(2 * k))
+    text_h = (kb - kt) + (2 * rule_gap + rule + (tb - tt) if title else 0)
+    body_h = max(num_h, text_h)
+    pad = round(24 * k)
+    slant = round(0.21 * num_h) if shown else 0
+    cw = pad * 2 + text_w + gap + num_w + slant + round(0.12 * num_w)
+    ch = pad * 2 + body_h + round(0.08 * num_h)
+    shapes = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    nx = pad + text_w + gap
+    ny = pad + (body_h - num_h) // 2
+    # A slanted plate of ink behind it all (cut at the stroke's angle), so the white type reads
+    # over a white page too.
+    lean = max(slant, round(0.16 * ch))
+    p0, p1 = round(pad * 0.35), ch - round(pad * 0.35)
+    ImageDraw.Draw(shapes).polygon([(round(pad * 0.35) + lean, p0), (cw - round(pad * 0.2), p0), (cw - round(pad * 0.2) - lean, p1),
+                                    (round(pad * 0.35), p1)], fill=(10, 10, 14, 200))
+    if shown:
+        # The number's stroke: a slanted band of the accent through its lower half, set a
+        # little right of the figure, like a marker swept under it.
+        y0, y1 = ny + round(0.46 * num_h), ny + num_h + round(0.08 * num_h)
+        x0, x1 = nx - round(0.08 * num_w), nx + num_w + round(0.12 * num_w)
+        ImageDraw.Draw(shapes).polygon([(x0 + slant, y0), (x1 + slant, y0), (x1, y1), (x0, y1)], fill=accent + (235,))
+    type_layer = Image.new("RGBA", shapes.size, (0, 0, 0, 0))
+    td = ImageDraw.Draw(type_layer)
+    # The text column, right-aligned against the number.
+    tx = nx - gap if shown else pad + text_w
+    ty = pad + (body_h - text_h) // 2
+    x = tx - kick_w
+    for c in label:
+        td.text((x - kl, ty - kt), c, font=f_kick, fill=accent + (255,))
+        x += probe.textlength(c, font=f_kick) + track
     if title:
-        d.text((shadow + pad_x + bar + round(8 * k), y + kick_h + gap), title, font=f_title, fill=(250, 246, 240, 250))
+        ry = ty + (kb - kt) + rule_gap
+        td.rectangle([tx - text_w, ry, tx, ry + rule - 1], fill=(255, 255, 255, 150))
+        td.text((tx - (tr - tl) - tl, ry + rule + rule_gap - tt), title, font=f_title, fill=(250, 248, 244, 255))
+    if shown:
+        td.text((nx - nl, ny - nt), shown, font=f_num, fill=(250, 248, 244, 255))
+    both = Image.alpha_composite(shapes, type_layer)
+    # A soft shadow under it all, only so it reads over a bright page.
+    shadow = Image.new("RGBA", both.size, (0, 0, 0, 0))
+    shadow.putalpha(both.getchannel("A").point(lambda v: int(v * 0.55)))
+    img = Image.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(max(1.5, 5 * k))), both)
     out = os.path.join(work_dir, "chapter_card.png")
     img.save(out)
     return out, img.width, img.height
@@ -2733,19 +2834,28 @@ def chapter_card_graph(card, w, h, bar, src, out, label, a):
     """The chapter card (make_chapter_card's (path, width, height)) from stream `label` over
     [src] into [out], for a part starting at frame `a` of the chapter: the card's frames run on
     the chapter's clock from there, so it moves the same whichever part it falls in."""
-    _, cw, chh = card
     n = round(CARD_OUT * FPS)
-    k = min(w, h) / 1080
-    y0 = bar + round(36 * k) - round(18 * k)
-    drop, lift = round(28 * k), round(14 * k)
-    ease_in = f"pow(max(0,1-(t-{CARD_IN})/{CARD_EASE}),3)"
-    ease_out = f"pow(max(0,(t-{CARD_OUT - CARD_FADE})/{CARD_FADE}),2)"
+    x, y = chapter_card_motion(card, w, h, bar)
     return (
         f"[{label}]format=yuva420p,setparams=colorspace=bt470bg:range=tv,loop=loop={n - 1}:size=1,"
         f"settb=AVTB,setpts=N/({FPS}*TB),trim=start_frame={a},setpts=(N+{a})/({FPS}*TB),"
-        f"fade=in:st={CARD_IN}:d={CARD_EASE * 0.8:.3f}:alpha=1,fade=out:st={CARD_OUT - CARD_FADE}:d={CARD_FADE}:alpha=1[{out}_c];"
-        f"[{src}][{out}_c]overlay=x='{(w - cw) // 2}':y='{y0}-{drop}*{ease_in}-{lift}*{ease_out}':format=yuv420:eof_action=pass[{out}]"
+        f"fade=in:st={CARD_IN}:d={CARD_EASE * 0.7:.3f}:alpha=1,fade=out:st={CARD_OUT - CARD_FADE}:d={CARD_FADE}:alpha=1[{out}_c];"
+        f"[{src}][{out}_c]overlay=x='{x}':y='{y}':format=yuv420:eof_action=pass[{out}]"
     )
+
+
+def chapter_card_motion(card, w, h, bar):
+    """Where the chapter card sits: its top right corner CARD_MARGIN in from the frame's (below
+    any letterbox bar). x is an expression of the chapter's time t: the card glides in from beyond
+    the right edge (easing out), holds, then slides back out (easing in) as it fades; y is fixed."""
+    _, cw, _ = card
+    k = min(w, h) / 1080
+    margin = round(CARD_MARGIN * k)
+    x0 = w - margin - cw
+    travel = cw + margin
+    ease_in = f"pow(max(0,1-(t-{CARD_IN})/{CARD_EASE}),3)"
+    ease_out = f"pow(max(0,(t-{CARD_OUT - CARD_FADE})/{CARD_FADE}),3)"
+    return f"{x0}+{travel}*min(1,{ease_in})+{travel}*{ease_out}", bar + round(44 * k)
 
 
 def overlay_graph(overlays, w, h, total, src, out, first_input, work_dir, t0=0.0):
@@ -2954,6 +3064,111 @@ def run_layered(jobs, config, work_dir, threads=None):
     except Exception as e:
         _layered_note(f"could not run the pack ({e}); rendering as usual")
     return result
+
+
+def render_engine(config=None):
+    """"gpu" when the GPU engine is asked for (MANGAVOX_RENDER_ENGINE=gpu, or the config's
+    "render_engine") and the layered pack's Python (PyTorch with CUDA) is installed to run it;
+    else "cpu", the clips-then-finish path (the default until the GPU engine is proven)."""
+    config = config if isinstance(config, dict) else {}
+    want = str(os.environ.get("MANGAVOX_RENDER_ENGINE") or config.get("render_engine") or "cpu").strip().lower()
+    if want != "gpu":
+        return "cpu"
+    py, why = layered_plan.pack_python(config)
+    if not py:
+        _layered_note(f"GPU engine off ({why})")
+        return "cpu"
+    return "gpu"
+
+
+def _gpu_picture(video, clips, frame_counts, made, w, h, total, ass_path, config, out, on_fraction=None):
+    """The finished picture (no audio) at `out`, drawn by the GPU engine: the plan
+    (gpu_timeline) written next to the clips, then gpu_render.py run in the pack's Python.
+    `made[k]` is clip k's file when an earlier run rendered it (read as it is). Raises on failure."""
+    try:
+        import gpu_timeline
+    except ImportError:
+        from . import gpu_timeline
+    work = video.get("work_dir") or os.path.dirname(os.path.abspath(out))
+    plans = [gpu_timeline.plan_clip(c, frame_counts[k], w, h, prerendered=made[k]) for k, c in enumerate(clips)]
+    vf = None
+    if ass_path and os.path.exists(ass_path):
+        try:
+            from caption_engine import subtitles_filter
+        except ImportError:
+            from .caption_engine import subtitles_filter
+        vf = subtitles_filter(ass_path)
+    py, why = layered_plan.pack_python(config)
+    if not py:
+        raise RuntimeError(why)
+    preset = os.environ.get("MANGAVOX_GPU_PRESET")
+    failed = None
+    last = None
+    # The encoders in order (NVENC, then x264): a run the encoder failed is tried on the next,
+    # and NVENC is turned off for the process when only x264 worked (as run_codecs does).
+    for codec in final_codecs(cpus()):
+        codec = list(codec)
+        if preset and "h264_nvenc" in codec and "-preset" in codec:
+            codec[codec.index("-preset") + 1] = preset
+        plan = gpu_timeline.plan_video(video, plans, w, h, total, ass_filter=vf, codec=codec, out=out)
+        try:
+            _gpu_render(plan, py, work, total, on_fraction)
+        except RuntimeError as e:
+            last = e
+            if "ENCODER:" in str(e) and "h264_nvenc" in codec:
+                failed = codec
+                continue
+            raise
+        if failed:
+            encoder_failed(failed)
+        return
+    raise last or RuntimeError("GPU engine: no encoder")
+
+
+def _gpu_render(plan, py, work, total, on_fraction=None):
+    """Runs gpu_render.py on `plan` in the pack's Python `py`; raises with its error."""
+    path = os.path.join(work, "gpu_plan.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpu_render.py")
+    env = os.environ.copy()
+    env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
+    env.pop("VIRTUAL_ENV", None)
+    # The fonts the captions need are found by caption_engine's filter (absolute paths).
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+    proc = subprocess.Popen([py, "-I", script, "run", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace", env=env, creationflags=flags)
+    cap = _num(os.environ.get("MANGAVOX_GPU_MAX_FPS"), 0.0, 0.0, 1000.0)
+    timer = threading.Timer(600 + 2 * total + (total * FPS / cap if cap > 0 else 0), proc.kill)
+    timer.start()
+    errs = []
+    pump = threading.Thread(target=lambda: errs.append(proc.stderr.read()), daemon=True)
+    pump.start()
+    done = error = None
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("type") == "progress" and on_fraction and msg.get("total"):
+                on_fraction(msg["done"] / msg["total"])
+            elif msg.get("type") == "done":
+                done = msg
+            elif msg.get("type") == "error":
+                error = msg.get("message")
+        proc.wait()
+        pump.join(timeout=5)
+    finally:
+        timer.cancel()
+    if not done or proc.returncode != 0 or not os.path.isfile(plan["out"]):
+        tail = error or "".join(errs).strip()[-300:] or f"exit {proc.returncode}"
+        raise RuntimeError(f"GPU engine: {tail}")
+    print(f"[video] GPU engine: {plan['frames']} frames in {done.get('seconds')} s ({done.get('fps')} fps, "
+          f"GPU memory peak {done.get('vram_peak_mb')} MB; drawing {done.get('draw_s')} s, waiting on the GPU {done.get('gpu_wait_s')} s, on the encoder {done.get('encoder_wait_s')} s)", file=sys.stderr)
 
 
 def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=None):
@@ -3439,7 +3654,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     jobs = render_jobs()
     lock = threading.Lock()
     slots = threading.Semaphore(jobs)
-    queue = sorted((t for t in todo if clips.index(t[0]) not in layer_jobs), key=lambda t: -t[1])
+    # The GPU engine draws every clip itself in the finish: only the layered panels are made here.
+    gpu = render_engine(config) == "gpu"
+    queue = [] if gpu else sorted((t for t in todo if clips.index(t[0]) not in layer_jobs), key=lambda t: -t[1])
 
     def worker():
         nonlocal rendered
@@ -3468,7 +3685,10 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         if layer_jobs:
             t_layered = time.monotonic()
             try:
-                made = run_layered(layer_jobs, config, video_dir, threads=max(2, cpus() // 2))
+                # The GPU engine animates the layered panels itself, straight into the video: the
+                # pack only cuts them into layers (cached).
+                pack_jobs = {k: dict(j, prep_only=True) for k, j in layer_jobs.items()} if gpu else layer_jobs
+                made = run_layered(pack_jobs, config, video_dir, threads=max(2, cpus() // 2))
             finally:
                 for _ in range(reserve):
                     slots.release()
@@ -3476,14 +3696,17 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             for n, (c, frames, path) in enumerate(layered_todo):
                 k = clips.index(c)
                 job = layer_jobs[k]
-                if made.get(job["id"], {}).get("ok") and os.path.isfile(job["out"]):
+                if gpu and made.get(job["id"], {}).get("ok"):
+                    c["images"] = dict(c["images"], fg_layered=job)
+                elif made.get(job["id"], {}).get("ok") and os.path.isfile(job["out"]):
                     c["images"] = dict(c["images"], fg_anim=job["out"])
                 else:
                     plain = clip_key(c["source"], c["focus"], c["spec"], frames, w, h, fill)
                     clip_paths[k] = os.path.join(video_dir, f"clip_{c['idx']:04d}_{plain}.mp4")
                     layered_todo[n] = (c, frames, clip_paths[k])
-            with lock:
-                queue[:0] = sorted(layered_todo, key=lambda t: -t[1])
+            if not gpu:
+                with lock:
+                    queue[:0] = sorted(layered_todo, key=lambda t: -t[1])
             # Workers that found the queue empty while the pack ran have left: start them again.
             futures += [pool.submit(worker) for _ in range(jobs)]
         for f in futures:
@@ -3523,9 +3746,12 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         except Exception as e:
             print(f"[video] Could not make the particle burst: {e}", file=sys.stderr)
     video["bursts"] = bursts
-    if config.get("chapter_card", True):
+    if chapter_card_on(config, look):
         try:
-            video["chapter_card"] = make_chapter_card(w, h, config.get("chapter"), video_dir)
+            # Themed to the video: the opening scene's mood colour, the captions' font.
+            accent = clips[0]["mood"]["edge"] if clips and clips[0]["mood"] else CARD_ACCENT
+            video["chapter_card"] = make_chapter_card(w, h, config.get("chapter"), video_dir, accent=accent,
+                                                      font=card_font(config, output_dir))
         except Exception as e:
             print(f"[video] Could not make the chapter card: {e}", file=sys.stderr)
     if look.get("particles") and not mood_on:
@@ -3539,12 +3765,64 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         video["edge_colors"] = [(c["start"], c["mood"]["edge"] if c["mood"] else EDGE_COLORS["neutral"]) for c in clips]
     on_final = lambda f: report("finalize", f)
     t_final = time.monotonic()
-    success = _finalize_video_with_audio_mix_and_captions(
-        video, narration, final_video, ass_path, bg_music,
-        narration_volume, bg_music_volume, bg_music_loop, w, h, timeline,
-        score=score, music_volume=music_volume, on_fraction=on_final, sfx=sfx_track,
-    )
-    print(f"[video] Timing: finish {time.monotonic() - t_final:.1f} s", file=sys.stderr)
+    success = False
+    if gpu:
+        # The whole picture in one pass on the graphics card (gpu_render.py); clips an earlier run
+        # already rendered are read as they are. Anything wrong: the CPU path below, as always.
+        waiting = {id(t[0]) for t in todo}
+        made = [None if id(c) in waiting else clip_paths[k] for k, c in enumerate(clips)]
+        # The picture fills the clips' share of the progress bar (the finish's is the join and mux).
+        picture = lambda path, on: _gpu_picture(video, clips, frame_counts, made, w, h, timeline, ass_path, config, path,
+                                                lambda f: report("clips", f))
+        drawn = os.path.join(video_dir, "final_gpu.mp4")
+        if os.path.exists(drawn):
+            os.remove(drawn)
+        success = _finalize_video_with_audio_mix_and_captions(
+            video, narration, final_video, ass_path, bg_music,
+            narration_volume, bg_music_volume, bg_music_loop, w, h, timeline,
+            score=score, music_volume=music_volume, on_fraction=on_final, sfx=sfx_track, picture=picture,
+        )
+        print(f"[video] Timing: GPU engine {'finished' if success else 'failed'} in {time.monotonic() - t_final:.1f} s", file=sys.stderr)
+        if not success and os.path.isfile(drawn):
+            # The picture was made (captions in it); only the sound or the join failed: try again
+            # without the music, reusing the picture, before drawing it all again on the CPU.
+            print("[video] Finalization failed, retrying without music (the GPU picture kept)", file=sys.stderr)
+            kept = drawn + ".keep.mp4"
+            os.replace(drawn, kept)
+            success = _finalize_video_with_audio_mix_and_captions(
+                video, narration, final_video, ass_path, None,
+                narration_volume, 0.0, False, w, h, timeline,
+                score=None, music_volume=0.0, on_fraction=on_final, picture=lambda path, on: shutil.copyfile(kept, path),
+            )
+        if not success:
+            print("[video] The GPU engine could not make the video; rendering it the usual way", file=sys.stderr)
+            # Its layered panels were only cut into layers: animate them now (the layers are cached).
+            waiting_anim = {k: layer_jobs[k] for k, c in enumerate(clips) if (c.get("images") or {}).get("fg_layered")}
+            if waiting_anim:
+                done_anim = run_layered(waiting_anim, config, video_dir, threads=max(2, cpus() // 2))
+                for n, (c, frames, path) in enumerate(layered_todo):
+                    k = clips.index(c)
+                    job = layer_jobs[k]
+                    c["images"] = {key: v for key, v in c["images"].items() if key != "fg_layered"}
+                    if k not in waiting_anim:
+                        continue
+                    if done_anim.get(job["id"], {}).get("ok") and os.path.isfile(job["out"]):
+                        c["images"]["fg_anim"] = job["out"]
+                    else:
+                        plain = clip_key(c["source"], c["focus"], c["spec"], frames, w, h, fill)
+                        clip_paths[k] = os.path.join(video_dir, f"clip_{c['idx']:04d}_{plain}.mp4")
+                        layered_todo[n] = (c, frames, clip_paths[k])
+            rest = [t for t in todo if clips.index(t[0]) not in layer_jobs] + layered_todo
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                list(pool.map(lambda t: render_one(*t), sorted(rest, key=lambda t: -t[1])))
+            t_final = time.monotonic()
+    if not success:
+        success = _finalize_video_with_audio_mix_and_captions(
+            video, narration, final_video, ass_path, bg_music,
+            narration_volume, bg_music_volume, bg_music_loop, w, h, timeline,
+            score=score, music_volume=music_volume, on_fraction=on_final, sfx=sfx_track,
+        )
+        print(f"[video] Timing: finish {time.monotonic() - t_final:.1f} s", file=sys.stderr)
     if not success:
         print("[video] Finalization failed, retrying without captions, music and finish", file=sys.stderr)
         success = _finalize_video_with_audio_mix_and_captions(
@@ -3713,7 +3991,7 @@ def _concat_list(paths, list_path):
 
 def _finalize_video_with_audio_mix_and_captions(
     video, narration, output_video, ass_path, bg_music,
-    narration_vol, bg_vol, bg_loop, w, h, total, score=None, music_volume=1.0, on_fraction=None, sfx=None,
+    narration_vol, bg_vol, bg_loop, w, h, total, score=None, music_volume=1.0, on_fraction=None, sfx=None, picture=None,
 ):
     """
     Joins the clip videos with their crossfades, gives them the look, burns subtitles, and
@@ -3962,6 +4240,18 @@ def _finalize_video_with_audio_mix_and_captions(
         if not ok:
             raise RuntimeError(f"part {i + 1} of the picture failed: {stderr[:300]}")
         os.replace(tmp, path)
+
+    if picture:
+        # The GPU engine: `picture(path, on_fraction)` draws the whole picture in one pass, in
+        # place of the parts (the audio, the join and the mux are the same).
+        parts = [(0, total_frames, os.path.join(work, "final_gpu.mp4"))]
+        jobs = 1
+
+        def make_part(i):
+            a, b, path = parts[i]
+            tmp = path + ".part.mp4"
+            picture(tmp, lambda f: report_part(i, f))
+            os.replace(tmp, path)
 
     try:
         # The audio is mixed beside the parts (it needs about one core), not in a part's slot.

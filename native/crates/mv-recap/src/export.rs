@@ -7,7 +7,8 @@
 //!   included) and numbering is 0-based like the audio files. A page the story leaves out gets one
 //!   `"skip": true` beat, which `sync_map` cuts from the video. A passage the user gave a delivery
 //!   carries it as the beat's `kind` / `intensity`, which the narration follows. A passage the writer
-//!   cued a sound effect on carries `sfx` / `sfx_strength` (1-3), which the renderer places.
+//!   cued a sound effect on carries `sfx` / `sfx_strength` (1-3), which the renderer places, and its
+//!   scene's `music` mood, which mv-score picks the music by.
 //!
 //! A passage is shown over its panel's crop; one that moves through more panels of its page gets a
 //! beat per panel, its sentences spread over them in order. When it names no panel, or that crop is blank (an empty or
@@ -163,6 +164,10 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
                     if !t.mood.is_empty() {
                         beat["mood"] = json!(t.mood);
                     }
+                }
+                // The scene's music mood (mv-score reads it from this file), whatever the delivery.
+                if let Some(t) = s.tone.as_ref().filter(|t| !t.music.is_empty()) {
+                    beat["music"] = json!(t.music);
                 }
                 // The writer's sound-effect cue (sync_map carries it; the renderer places it), on the passage's first picture.
                 if let Some(x) = s.sfx.as_ref().filter(|x| i == 0 && SFX_NAMES.contains(&x.name.as_str())) {

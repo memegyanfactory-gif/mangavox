@@ -181,6 +181,9 @@ pub struct Tone {
     pub kind: String,
     pub mood: String,
     pub intensity: u8,
+    /// The scene's music mood (one of [`MUSIC_CUES`]), exported on the beats as `music`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub music: String,
 }
 
 /// Narrator direction for one passage: a scene kind the emotion mapping knows
@@ -194,8 +197,15 @@ pub struct Delivery {
 }
 
 /// The sound effects the writer may cue (`python/sfx.py` makes each one).
-pub const SFX_NAMES: &[&str] =
-    &["impact", "whoosh", "riser", "boom", "sword_clang", "magic", "heartbeat", "glass", "crowd_gasp", "thunder", "footsteps_run", "door_slam"];
+pub const SFX_NAMES: &[&str] = &[
+    "impact", "whoosh", "riser", "boom", "sword_clang", "magic", "heartbeat", "glass", "crowd_gasp", "thunder", "footsteps_run", "door_slam",
+    // Recorded sounds (python/sfx.py LIBRARY_ONLY): what the panel shows or its lettering says.
+    "gunshot", "explosion", "punch", "slash", "footsteps", "door", "crowd", "rain", "wind", "fire", "scream", "car", "phone", "bell", "splash",
+];
+
+/// The background music's mood for a scene, the writer's `music` cue (mv-score `spot::MOODS`
+/// picks the bed by it).
+pub const MUSIC_CUES: &[&str] = &["calm", "tense", "action", "sad", "comedic", "mysterious", "triumphant", "romantic", "eerie"];
 
 /// A sound-effect cue: one of [`SFX_NAMES`] and how strong it lands, 1 (light) to 3 (big).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

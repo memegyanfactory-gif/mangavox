@@ -65,11 +65,13 @@ fn builds_a_mastered_score_that_follows_the_story() {
     let (m, n) = (report.music_lufs.unwrap(), report.narration_lufs.unwrap());
     assert!(m < n - 6.0, "music sits under the narration: {report:?}");
 
-    // Ducking: the music is quieter while the narrator speaks (0.2-1.2 s) than in the gap (1.5-1.9 s)
-    // of a calm passage.
+    // Even under the voice: the 0.6 s gaps between "sentences" keep the music down (no pumping)
+    // instead of letting it swell back up each time.
     let (music, sr) = read_wav_mono(&chapter::score_wav(&ch)).unwrap();
     let at = |a: f32, b: f32| &music[(a * sr as f32) as usize..(b * sr as f32) as usize];
-    assert!(rms(at(2.6, 3.2)) < rms(at(3.55, 3.95)) * 0.8, "ducked {} vs open {}", rms(at(2.6, 3.2)), rms(at(3.55, 3.95)));
+    let (speech, gap) = (rms(at(2.6, 3.2)), rms(at(3.55, 3.95)));
+    assert!(gap < speech * 1.5, "no swell in a sentence gap: speech {speech} vs gap {gap}");
+    assert!(m < n - 16.0, "the bed sits about 20 LU under the voice: {report:?}");
 
     assert!(chapter::is_fresh(&ch, &settings));
     assert!(chapter::preview_wav(&ch).is_file());
@@ -227,7 +229,45 @@ fn source_and_take_are_settings_and_old_files_still_load() {
 }
 
 #[test]
+fn old_settings_move_to_the_shallow_duck() {
+    let old: MusicSettings = serde_json::from_str(r#"{"enabled":true,"duck_db":10.0}"#).unwrap();
+    assert_eq!(old.mix, 0);
+    assert_eq!(old.clone().migrate().duck_db, 6.0);
+    let strong: MusicSettings = serde_json::from_str(r#"{"duck_db":12.0}"#).unwrap();
+    assert_eq!(strong.migrate().duck_db, 9.0);
+    let new: MusicSettings = serde_json::from_str(r#"{"duck_db":10.0,"mix":2}"#).unwrap();
+    assert_eq!(new.migrate().duck_db, 10.0, "a choice made since stays");
+    let off: MusicSettings = serde_json::from_str(r#"{"duck_db":0.0}"#).unwrap();
+    assert_eq!(off.migrate().duck_db, 0.0);
+    assert_eq!(MusicSettings::default().mix, MusicSettings::MIX);
+}
+
+#[test]
+fn the_story_music_cue_picks_the_mood() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = fake_chapter(dir.path());
+    // The writer's beats: pages 0-1 sad, the fight pages tense at a calm 5, the rest untagged.
+    let beat = |page: usize, music: &str, intensity: u8| serde_json::json!({ "page": page, "text": "He waits there, alone.", "music": music, "intensity": intensity });
+    let beats = vec![beat(0, "sad", 3), beat(1, "Sad", 3), beat(2, "tense", 5), beat(3, "tense", 5), beat(3, "tense", 5), beat(3, "action", 9), serde_json::json!({ "page": 4, "text": "", "skip": true })];
+    std::fs::write(ch.output_dir.join("narration.studio.json"), serde_json::json!({ "beats": beats }).to_string()).unwrap();
+    let cues = chapter::story_cues(&ch);
+    assert_eq!(cues[&0], ("sad".to_string(), Some(3)));
+    assert_eq!(cues[&3].0, "tense", "the music cue most of the page's words carry");
+    assert_eq!(cues[&3].1, Some(6));
+    assert!(!cues.contains_key(&4), "skipped beats carry nothing");
+
+    let infos = chapter::page_infos(&ch);
+    assert_eq!((infos[0].music.as_str(), infos[0].intensity), ("sad", 3));
+    assert_eq!(infos[4].music, "tense", "an untagged page keeps the scene's music");
+    assert_eq!(infos[5].music, "tense");
+    let score = chapter::compose_chapter(&ch, &MusicSettings::default(), false).unwrap();
+    assert_eq!(score.cues[0].mood, "sad");
+    assert_eq!(score.cues[0].style, Style::Sad);
+    assert!(score.cues.iter().all(|c| c.style != Style::Phonk), "no phonk unless the user picks it");
+}
+
+#[test]
 fn levels_sit_well_under_the_voice() {
-    assert_eq!(Level::ALL.map(|l| l.offset_lu()), [-18.0, -14.0, -10.0]);
-    assert_eq!(MusicSettings::default().duck_db, 10.0);
+    assert_eq!(Level::ALL.map(|l| l.offset_lu()), [-21.0, -17.0, -13.0]);
+    assert_eq!(MusicSettings::default().duck_db, 6.0);
 }

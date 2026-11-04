@@ -441,28 +441,53 @@ pub struct MixReport {
 }
 
 /// Side-chain gain (linear, per sample) that dips the music by `duck_db` while the narrator talks.
+/// Slow and held, the way an editor rides a bed under a voice: it starts down DUCK_AHEAD before the
+/// first word, stays down through the pauses between sentences (DUCK_HOLD), and only drifts back up
+/// over a few seconds in a real gap, so the music never pumps with the speech.
 /// Attack 60 ms, 250 ms hold, 450 ms release, and an 80 ms look-ahead so the dip starts before the word.
 fn duck_curve(env: &[f32], len: usize, duck_db: f32) -> Vec<f32> {
     let thresh = 0.012f32;
     let frames = env.len();
-    let speaking: Vec<bool> = (0..frames).map(|f| env[f..(f + 8).min(frames)].iter().any(|&e| e > thresh)).collect();
-    let target = db_to_gain(-duck_db.abs());
-    let (att, rel) = (1.0 - (-1.0f32 / 6.0).exp(), 1.0 - (-1.0f32 / 45.0).exp());
-    let mut g = 1.0f32;
+    let ahead = (DUCK_AHEAD * 100.0) as usize;
+    let speaking: Vec<bool> = (0..frames).map(|f| env[f..(f + ahead).min(frames)].iter().any(|&e| e > thresh)).collect();
+    let target = -duck_db.abs();
+    // Time constants in 10 ms frames; the gain moves in dB, so the fades sound even.
+    let (att, rel) = (1.0 - (-1.0f32 / (DUCK_ATTACK * 100.0)).exp(), 1.0 - (-1.0f32 / (DUCK_RELEASE * 100.0)).exp());
+    let mut g = 0.0f32;
     let mut hold = 0usize;
     let mut per_frame = vec![1f32; frames];
     for f in 0..frames {
         if speaking[f] {
-            hold = 25;
+            hold = (DUCK_HOLD * 100.0) as usize;
         } else {
             hold = hold.saturating_sub(1);
         }
-        let want = if hold > 0 { target } else { 1.0 };
+        let want = if hold > 0 { target } else { 0.0 };
         g += (want - g) * if want < g { att } else { rel };
-        per_frame[f] = g;
+        per_frame[f] = db_to_gain(g);
     }
-    (0..len).map(|i| per_frame.get(i * 100 / SR as usize).copied().unwrap_or(1.0)).collect()
+    // Linear between frames, so the gain glides instead of stepping every 10 ms.
+    let last = per_frame.last().copied().unwrap_or(1.0);
+    (0..len)
+        .map(|i| {
+            let x = i as f32 * 100.0 / SR as f32;
+            let f = x as usize;
+            match (per_frame.get(f), per_frame.get(f + 1)) {
+                (Some(a), Some(b)) => a + (b - a) * (x - f as f32),
+                (Some(a), None) => *a,
+                _ => last,
+            }
+        })
+        .collect()
 }
+
+/// The duck starts this long (s) before the first word, so it is down when the voice comes in.
+const DUCK_AHEAD: f32 = 0.3;
+/// Pauses shorter than this (s) keep the music down: the gaps between sentences never lift it.
+const DUCK_HOLD: f32 = 1.2;
+/// Time constants (s) of the dip and of the drift back up.
+const DUCK_ATTACK: f32 = 0.2;
+const DUCK_RELEASE: f32 = 1.2;
 
 /// Look-ahead peak limiter (5 ms) to `ceiling` (linear).
 fn limit(s: &mut Stereo, ceiling: f32) {
@@ -605,6 +630,56 @@ pub fn render(score: &Score, settings: &MusicSettings, narration: &Narration, or
     master(bus, sfx, settings, narration, preview)
 }
 
+/// Evens a track out for use as a bed: its level over ~3 s is drawn towards its average, quiet
+/// stretches lifted by up to `lift_db` and loud ones lowered by up to `cut_db`, gliding over about a
+/// second so it never pumps. Near-silence (40 dB under the average) is left alone.
+pub fn even(s: &mut Stereo, lift_db: f32, cut_db: f32) {
+    let hop = SR as usize / 10;
+    let frames = s.len() / hop + 1;
+    let p: Vec<f64> = (0..frames)
+        .map(|f| {
+            let (a, b) = (f * hop, ((f + 1) * hop).min(s.len()));
+            if b <= a {
+                return 0.0;
+            }
+            (a..b).map(|i| (s.l[i] * s.l[i] + s.r[i] * s.r[i]) as f64).sum::<f64>() / (2 * (b - a)) as f64
+        })
+        .collect();
+    let loud: Vec<f64> = p.iter().copied().filter(|&e| e > 1e-7).collect();
+    if loud.is_empty() {
+        return;
+    }
+    let avg = 10.0 * (loud.iter().sum::<f64>() / loud.len() as f64).log10();
+    let mut pre = vec![0f64; frames + 1];
+    for i in 0..frames {
+        pre[i + 1] = pre[i] + p[i];
+    }
+    let w = 15;
+    let k = 1.0 - (-1.0f64 / 10.0).exp();
+    let mut g = 0f64;
+    let gains: Vec<f32> = (0..frames)
+        .map(|f| {
+            let (a, b) = (f.saturating_sub(w), (f + w + 1).min(frames));
+            let l = 10.0 * ((pre[b] - pre[a]) / (b - a) as f64).max(1e-12).log10();
+            let want = if l < avg - 40.0 { 0.0 } else { (avg - l).clamp(-cut_db as f64, lift_db as f64) };
+            if f == 0 {
+                g = want;
+            }
+            g += (want - g) * k;
+            g as f32
+        })
+        .collect();
+    for i in 0..s.len() {
+        let x = i as f32 / hop as f32;
+        let f = x as usize;
+        let t = x - f as f32;
+        let gd = gains[f.min(frames - 1)] * (1.0 - t) + gains[(f + 1).min(frames - 1)] * t;
+        let v = db_to_gain(gd);
+        s.l[i] *= v;
+        s.r[i] *= v;
+    }
+}
+
 /// Rides the music's gain down wherever it swells more than `over_db` above its average level
 /// (3:1 above that, 400 ms windows, 200 ms look-ahead, 1.5 s release), so a crescendo or an impact
 /// never jumps out of the background.
@@ -652,7 +727,7 @@ pub fn master(mut bus: Stereo, mut sfx: Stereo, settings: &MusicSettings, narrat
     let len = bus.len();
     sfx.l.resize(len, 0.0);
     sfx.r.resize(len, 0.0);
-    level(&mut bus, 3.0);
+    level(&mut bus, 2.0);
 
     // Loudness relative to the narration (or a sensible absolute level without one).
     let narr_lufs = narration.loudness();
@@ -774,6 +849,49 @@ mod tests {
         }
         limit(&mut s, 0.5);
         assert!(s.l.iter().chain(s.r.iter()).all(|v| v.abs() <= 0.5 + 1e-6));
+    }
+
+    #[test]
+    fn even_pulls_quiet_and_loud_stretches_together() {
+        let sr = SR as usize;
+        let tone = |a: f32, i: usize| a * (i as f32 * 0.05).sin();
+        let mut s = Stereo::new(20 * sr);
+        for i in 0..20 * sr {
+            let v = tone(if i < 10 * sr { 0.03 } else { 0.3 }, i);
+            s.l[i] = v;
+            s.r[i] = v;
+        }
+        let db = |s: &Stereo, t: usize| {
+            let r = &s.l[t * sr..t * sr + sr / 2];
+            10.0 * (r.iter().map(|v| v * v).sum::<f32>() / r.len() as f32).log10()
+        };
+        let before = db(&s, 15) - db(&s, 5);
+        even(&mut s, 6.0, 10.0);
+        let after = db(&s, 15) - db(&s, 5);
+        assert!(before > 19.0 && after < before - 8.0, "before {before} after {after}");
+        // A steady track stays as it is.
+        let mut flat = Stereo { l: (0..10 * sr).map(|i| tone(0.2, i)).collect(), r: (0..10 * sr).map(|i| tone(0.2, i)).collect() };
+        let was = db(&flat, 5);
+        even(&mut flat, 6.0, 10.0);
+        assert!((db(&flat, 5) - was).abs() < 0.5);
+    }
+
+    #[test]
+    fn ducking_holds_through_sentence_gaps_and_drifts_up_in_long_pauses() {
+        // Speech 1-2 s, a 0.5 s gap, speech 2.5-3.5 s, then 4 s of silence (10 ms frames).
+        let mut env = vec![0f32; 750];
+        env[100..200].fill(0.2);
+        env[250..350].fill(0.2);
+        let sr = SR as usize;
+        let g = duck_curve(&env, sr * 15 / 2, 6.0);
+        let db = |t: f32| 20.0 * g[(t * sr as f32) as usize].log10();
+        assert!(db(1.5) < -5.5, "down while speaking: {}", db(1.5));
+        assert!(db(2.25) < -5.5, "held through the gap: {}", db(2.25));
+        assert!(db(0.75) < -1.0 && db(0.75) > -5.9, "already dipping before the first word: {}", db(0.75));
+        assert!(db(4.0) < -4.0, "no jump back right after the voice: {}", db(4.0));
+        assert!(db(7.4) > -1.0, "back up in a long pause: {}", db(7.4));
+        // Never steps: 10 ms apart it moves well under 1 dB.
+        assert!((1..g.len() / 480).all(|k| (20.0 * (g[k * 480] / g[(k - 1) * 480]).log10()).abs() < 0.5));
     }
 
     #[test]

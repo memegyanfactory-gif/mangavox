@@ -1,6 +1,12 @@
-//! The studio library: professionally produced, royalty-free tracks by Kevin MacLeod
-//! (incompetech.com, CC BY 4.0, credit required) picked for sitting under a narrator - no vocals,
-//! no busy leads. Tracks are downloaded on first use into `<data>/music/library/` and kept.
+//! The studio library: produced, royalty-free music that sits under a narrator - no vocals, no busy
+//! leads. Two sources:
+//!
+//! * The bed pack: ambient / underscore beds tagged by mood ([`crate::spot::MOODS`]), listed with
+//!   their source and licence in `<data>/music/library/manifest.json` (files beside it, never in
+//!   the repo). Only CC0 / public-domain / Pixabay-licence beds, or CC BY ones with their credit, are
+//!   used. A scene's bed is picked by the story's music cue.
+//! * Built in: tracks by Kevin MacLeod (incompetech.com, CC BY 4.0, credit required), downloaded on
+//!   first use into `<data>/music/library/` and kept; used for a mood the pack has nothing for.
 //!
 //! A chapter's cue sheet becomes a few long sections (one track each, never switching every page),
 //! each track looped with an equal-power crossfade when the section outlasts it, with crossfades
@@ -12,7 +18,7 @@ use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 
-use crate::mix::{loudness, Stereo};
+use crate::mix::{even, loudness, Stereo};
 use crate::model::*;
 use crate::synth::SR;
 use crate::theory::hash_str;
@@ -77,14 +83,17 @@ pub const TRACKS: &[Track] = &[
 ];
 
 /// A section never gets shorter than this; shorter cues join a neighbour.
-pub const MIN_SECTION: f64 = 40.0;
+pub const MIN_SECTION: f64 = 30.0;
 /// Crossfade between sections, and when a track loops.
-pub const SECTION_XFADE: f64 = 3.0;
+pub const SECTION_XFADE: f64 = 4.0;
 pub const LOOP_XFADE: f64 = 3.0;
 pub const FADE_IN: f64 = 1.5;
 pub const FADE_OUT: f64 = 3.0;
 /// Each track is set to this loudness before arranging, so sections match.
 const TRACK_LUFS: f64 = -20.0;
+/// How far [`even`] may lift a bed's quiet stretches and lower its loud ones (dB).
+const BED_LIFT_DB: f32 = 6.0;
+const BED_CUT_DB: f32 = 10.0;
 /// A quiet intro is skipped, but never more than this.
 const MAX_INTRO: f64 = 8.0;
 
@@ -100,9 +109,124 @@ pub fn url(title: &str) -> String {
     format!("https://incompetech.com/music/royalty-free/mp3-royaltyfree/{}.mp3", title.replace(' ', "%20"))
 }
 
-/// The attribution line CC BY asks for.
+/// The credit line for a track the score used: a pack bed's own (its attribution, or where it
+/// came from and its licence), else the attribution line CC BY asks for Kevin MacLeod's.
 pub fn credit(title: &str) -> String {
+    if let Some(b) = beds().into_iter().find(|b| b.title == title) {
+        return b.credit();
+    }
     format!("\"{title}\" Kevin MacLeod (incompetech.com) Licensed under Creative Commons: By Attribution 4.0 License http://creativecommons.org/licenses/by/4.0/")
+}
+
+// ---------------------------------------------------------------- the bed pack
+
+/// One bed of the pack (an entry of `manifest.json`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct Bed {
+    /// Path relative to the manifest.
+    pub file: String,
+    pub title: String,
+    pub artist: String,
+    /// Moods it suits, from [`crate::spot::MOODS`].
+    pub moods: Vec<String>,
+    /// How driving it is, 0 (still) .. 1 (full action).
+    pub energy: f32,
+    /// "CC0", "Public domain", "Pixabay Content License", "CC BY 4.0" ...
+    pub license: String,
+    /// The page it was downloaded from.
+    pub source: String,
+    /// The credit its licence asks for (CC BY); empty when none is needed.
+    pub attribution: String,
+}
+
+impl Bed {
+    /// Whether its licence allows monetised videos without asking: CC0, public domain, the Pixabay
+    /// licence, or CC BY with its credit line. Anything else (NC, ND, SA - which would bind the
+    /// video itself - or unknown) is never used.
+    pub fn usable(&self) -> bool {
+        let l = self.license.to_lowercase().replace(['-', '_'], " ");
+        let free = l.contains("cc0") || l.contains("public domain") || l.contains("pixabay");
+        let by = l.starts_with("cc by") && !["nc", "nd", "sa"].iter().any(|x| l.split_whitespace().any(|w| w == *x)) && !self.attribution.trim().is_empty();
+        free || by
+    }
+
+    pub fn path(&self) -> PathBuf {
+        mv_core::paths::music_library().join(&self.file)
+    }
+
+    pub fn credit(&self) -> String {
+        if !self.attribution.trim().is_empty() {
+            return self.attribution.trim().to_string();
+        }
+        let by = if self.artist.is_empty() { String::new() } else { format!(" by {}", self.artist) };
+        format!("\"{}\"{by} ({}, {})", self.title, self.license, self.source)
+    }
+}
+
+/// The pack's usable beds whose file is on disk.
+pub fn beds() -> Vec<Bed> {
+    let p = mv_core::paths::music_library().join("manifest.json");
+    let Ok(text) = std::fs::read_to_string(&p) else { return vec![] };
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        #[serde(default)]
+        music: Vec<Bed>,
+    }
+    match serde_json::from_str::<Manifest>(&text) {
+        Ok(m) => m.music.into_iter().filter(|b| b.usable() && !b.title.is_empty() && b.path().is_file()).collect(),
+        Err(e) => {
+            eprintln!("mv-score: {} unreadable: {e}", p.display());
+            vec![]
+        }
+    }
+}
+
+/// Moods that can stand in for one the pack has no bed for, closest first.
+fn related(mood: &str) -> &'static [&'static str] {
+    match mood {
+        "calm" => &["mysterious", "romantic", "sad"],
+        "tense" => &["eerie", "mysterious", "action"],
+        "action" => &["tense", "triumphant"],
+        "sad" => &["romantic", "calm"],
+        "comedic" => &["calm"],
+        "mysterious" => &["calm", "tense", "eerie"],
+        "triumphant" => &["action", "calm"],
+        "romantic" => &["sad", "calm"],
+        "eerie" => &["tense", "mysterious"],
+        _ => &["calm"],
+    }
+}
+
+/// What plays under one section: a pack bed or a built-in track.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pick {
+    Bed(Bed),
+    Track(&'static Track),
+}
+
+impl Pick {
+    pub fn title(&self) -> &str {
+        match self {
+            Pick::Bed(b) => &b.title,
+            Pick::Track(t) => t.title,
+        }
+    }
+}
+
+/// The bed for a section from the pack: its mood's beds (else a related mood's), the three closest
+/// to a calmed energy (beds sit under a voice), minus `avoid`, one chosen from (seed, section) and
+/// rotated by `take`. `None` when the pack has nothing near the mood.
+pub fn pick_bed(beds: &[Bed], mood: &str, energy: f32, seed: u64, take: u32, index: usize, avoid: Option<&str>) -> Option<Bed> {
+    let e = (energy / 10.0).clamp(0.0, 1.0) * 0.8;
+    let mut order: Vec<&str> = vec![mood];
+    order.extend_from_slice(related(mood));
+    let suits = |m: &str| beds.iter().filter(|b| b.moods.iter().any(|x| x == m) && Some(b.title.as_str()) != avoid).collect::<Vec<_>>();
+    let mut c = order.into_iter().map(suits).find(|c| !c.is_empty())?;
+    c.sort_by(|a, b| (a.energy - e).abs().total_cmp(&(b.energy - e).abs()).then(a.title.cmp(&b.title)));
+    c.truncate(3);
+    let h = hash_str(&format!("{seed}|{index}|{mood}"));
+    Some(c[((h % c.len() as u64) as usize + take as usize) % c.len()].clone())
 }
 
 /// Where a track is cached.
@@ -166,8 +290,10 @@ pub struct Prepared {
     pub to: usize,
 }
 
-/// Normalises a decoded track and finds its body: after a quiet intro, before the ring-out.
+/// Evens a decoded track out (a bed never swells), normalises it and finds its body: after a quiet
+/// intro, before the ring-out.
 pub fn prepare(mut audio: Stereo) -> Prepared {
+    even(&mut audio, BED_LIFT_DB, BED_CUT_DB);
     if let Some(l) = loudness(&audio.l, &audio.r, SR) {
         let g = db_to_gain((TRACK_LUFS - l).clamp(-30.0, 30.0) as f32);
         audio.l.iter_mut().chain(audio.r.iter_mut()).for_each(|v| *v *= g);
@@ -208,6 +334,8 @@ fn body(s: &Stereo) -> (usize, usize) {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Section {
     pub style: Style,
+    /// The scene's mood (see [`crate::spot::MOODS`]).
+    pub mood: &'static str,
     pub start: f64,
     pub end: f64,
     /// Average cue energy, 0..10.
@@ -220,10 +348,18 @@ impl Section {
     }
 }
 
-/// The cue sheet as library sections: same-genre neighbours merged, sections shorter than
-/// [`MIN_SECTION`] absorbed into the one before (or after, at the start), first from 0, last to `duration`.
+/// Moods that drive (a fight, dread, a climax) as against the soft ones: a short section joins a
+/// neighbour of its own kind, so a 15 s fight never ends up under a sad bed.
+fn intense(mood: &str) -> bool {
+    matches!(mood, "tense" | "action" | "eerie" | "triumphant")
+}
+
+/// The cue sheet as library sections: same-mood neighbours merged, sections shorter than
+/// [`MIN_SECTION`] absorbed into a neighbour of the same kind ([`intense`] or soft; else the one
+/// before, or after at the start), first from 0, last to `duration`.
 pub fn sections(cues: &[Cue], duration: f64) -> Vec<Section> {
-    let mut out: Vec<Section> = cues.iter().map(|c| Section { style: c.style, start: c.start, end: c.end, energy: c.energy }).collect();
+    let mood = |c: &Cue| crate::spot::parse_mood(&c.mood).unwrap_or_else(|| crate::spot::style_mood(c.style));
+    let mut out: Vec<Section> = cues.iter().map(|c| Section { style: c.style, mood: mood(c), start: c.start, end: c.end, energy: c.energy }).collect();
     if let Some(f) = out.first_mut() {
         f.start = 0.0;
     }
@@ -236,7 +372,8 @@ pub fn sections(cues: &[Cue], duration: f64) -> Vec<Section> {
         if out.len() < 2 {
             break;
         }
-        let into = if k > 0 { k - 1 } else { 1 };
+        let kin = [k.checked_sub(1), Some(k + 1)].into_iter().flatten().find(|&j| j < out.len() && intense(out[j].mood) == intense(out[k].mood));
+        let into = kin.unwrap_or(if k > 0 { k - 1 } else { 1 });
         let short = out.remove(k);
         let s = &mut out[if into > k { into - 1 } else { into }];
         s.energy = weighted(s, &short);
@@ -259,7 +396,10 @@ fn merge_same(v: Vec<Section>) -> Vec<Section> {
     let mut out: Vec<Section> = vec![];
     for s in v {
         match out.last_mut() {
-            Some(p) if p.style == s.style => {
+            Some(p) if p.mood == s.mood => {
+                if s.len() > p.len() {
+                    p.style = s.style;
+                }
                 p.energy = weighted(p, &s);
                 p.end = s.end;
             }
@@ -283,12 +423,17 @@ pub fn pick(style: Style, energy: f32, seed: u64, take: u32, index: usize, avoid
     c[((h % c.len() as u64) as usize + take as usize) % c.len()]
 }
 
-/// One track per section, never the same twice in a row.
-pub fn choose(sections: &[Section], seed: u64, take: u32) -> Vec<&'static Track> {
-    let mut out: Vec<&'static Track> = vec![];
+/// One track per section, never the same twice in a row: the pack's bed for its mood, else a
+/// built-in track of its genre.
+pub fn choose(sections: &[Section], beds: &[Bed], seed: u64, take: u32) -> Vec<Pick> {
+    let mut out: Vec<Pick> = vec![];
     for (k, s) in sections.iter().enumerate() {
-        let avoid = out.last().map(|t| t.title);
-        out.push(pick(s.style, s.energy, seed, take, k, avoid));
+        let avoid = out.last().map(|p| p.title().to_string());
+        let bed = pick_bed(beds, s.mood, s.energy, seed, take, k, avoid.as_deref());
+        out.push(match bed {
+            Some(b) => Pick::Bed(b),
+            None => Pick::Track(pick(s.style, s.energy, seed, take, k, avoid.as_deref())),
+        });
     }
     out
 }
@@ -374,25 +519,34 @@ pub fn place(out: &mut Stereo, sections: &[Section], k: usize, tr: &Prepared, du
 /// titles used, in order of first use. Fails when a track can't be downloaded or decoded.
 pub fn render(cues: &[Cue], duration: f64, seed: u64, take: u32) -> Result<(Stereo, Vec<String>)> {
     let secs = sections(cues, duration);
-    let picks = choose(&secs, seed, take);
-    let mut titles: Vec<&'static str> = vec![];
-    for t in &picks {
-        if !titles.contains(&t.title) {
-            titles.push(t.title);
+    let picks = choose(&secs, &beds(), seed, take);
+    let mut titles: Vec<&Pick> = vec![];
+    for p in &picks {
+        if !titles.iter().any(|t| t.title() == p.title()) {
+            titles.push(p);
         }
     }
     // The server is slow per file (~300 KB/s), so missing tracks download side by side.
     let files: Vec<PathBuf> = std::thread::scope(|s| {
-        let jobs: Vec<_> = titles.iter().map(|t| s.spawn(move || fetch(t))).collect();
+        let jobs: Vec<_> = titles
+            .iter()
+            .map(|p| match p {
+                Pick::Bed(b) => {
+                    let f = b.path();
+                    s.spawn(move || Ok(f))
+                }
+                Pick::Track(t) => s.spawn(move || fetch(t.title)),
+            })
+            .collect();
         jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Err(anyhow::anyhow!("download thread panicked")))).collect::<Result<_>>()
     })?;
     // One decoded track in memory at a time (a few minutes of float stereo is ~80 MB).
     let mut bus = Stereo::new(idx(duration + 3.0));
-    for (k, t) in picks.iter().enumerate() {
-        let f = &files[titles.iter().position(|x| *x == t.title).unwrap_or(0)];
+    for (k, p) in picks.iter().enumerate() {
+        let f = &files[titles.iter().position(|x| x.title() == p.title()).unwrap_or(0)];
         place(&mut bus, &secs, k, &prepare(decode(f)?), duration);
     }
-    Ok((bus, titles.into_iter().map(String::from).collect()))
+    Ok((bus, titles.into_iter().map(|p| p.title().to_string()).collect()))
 }
 
 #[cfg(test)]
@@ -400,7 +554,7 @@ mod tests {
     use super::*;
 
     fn cue(style: Style, start: f64, end: f64) -> Cue {
-        Cue { index: 0, start, end, style, pages: (0, 0), bpm: 90.0, root: 0, mode: "minor".into(), energy: 5.0, hit: false, drop_before: false, riser_out: false, record_stop: false }
+        Cue { index: 0, start, end, style, pages: (0, 0), bpm: 90.0, root: 0, mode: "minor".into(), energy: 5.0, hit: false, drop_before: false, riser_out: false, record_stop: false, mood: String::new() }
     }
 
     #[test]
@@ -432,12 +586,29 @@ mod tests {
     }
 
     #[test]
+    fn a_short_fight_joins_the_tension_not_the_sad_bed() {
+        let c = |style: Style, mood: &str, start: f64, end: f64| Cue { mood: mood.into(), ..cue(style, start, end) };
+        let cues = [
+            c(Style::Sad, "sad", 0.0, 61.0),
+            c(Style::Mystery, "calm", 61.0, 80.0),
+            c(Style::Tension, "tense", 80.0, 99.0),
+            c(Style::Tension, "action", 99.0, 114.0),
+            c(Style::Lofi, "comedic", 114.0, 124.0),
+            c(Style::Sad, "sad", 124.0, 134.0),
+            c(Style::Mystery, "calm", 134.0, 149.0),
+        ];
+        let got: Vec<(&str, f64, f64)> = sections(&cues, 149.0).iter().map(|s| (s.mood, s.start, s.end)).collect();
+        // The calm, comedic and sad scraps join the sad beds; the tension and the fight stay one tense bed.
+        assert_eq!(got, vec![("sad", 0.0, 80.0), ("tense", 80.0, 114.0), ("sad", 114.0, 149.0)]);
+    }
+
+    #[test]
     fn picks_are_deterministic_and_change_per_take() {
-        let secs: Vec<Section> = [Style::Mystery, Style::Epic, Style::Mystery, Style::Mystery].iter().enumerate().map(|(k, &style)| Section { style, start: k as f64 * 60.0, end: (k + 1) as f64 * 60.0, energy: 4.0 }).collect();
-        let a = choose(&secs, 42, 0);
-        assert_eq!(a, choose(&secs, 42, 0));
-        assert!(a.iter().zip(&secs).all(|(t, s)| t.style == s.style));
-        assert!(a.windows(2).all(|w| w[0].title != w[1].title), "no track twice in a row");
+        let secs: Vec<Section> = [Style::Mystery, Style::Epic, Style::Mystery, Style::Mystery].iter().enumerate().map(|(k, &style)| Section { style, mood: crate::spot::style_mood(style), start: k as f64 * 60.0, end: (k + 1) as f64 * 60.0, energy: 4.0 }).collect();
+        let a = choose(&secs, &[], 42, 0);
+        assert_eq!(a, choose(&secs, &[], 42, 0));
+        assert!(a.iter().zip(&secs).all(|(t, s)| matches!(t, Pick::Track(t) if t.style == s.style)));
+        assert!(a.windows(2).all(|w| w[0].title() != w[1].title()), "no track twice in a row");
         for take in 0..6 {
             let x = pick(Style::Sad, 3.0, 9, take, 0, None);
             let y = pick(Style::Sad, 3.0, 9, take + 1, 0, None);
@@ -446,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn loops_and_sections_crossfade_for_three_seconds() {
+    fn loops_and_sections_crossfade() {
         let sr = SR as usize;
         // A 10 s "track" of ones looped over 25 s keeps constant power through each 3 s loop seam.
         let ones = Stereo { l: vec![1.0; 10 * sr], r: vec![1.0; 10 * sr] };
@@ -459,19 +630,58 @@ mod tests {
         // Two sections, the second silent: the first fades over 3 s centred on the boundary.
         let a = Prepared { audio: Stereo { l: vec![1.0; 40 * sr], r: vec![1.0; 40 * sr] }, from: 0, to: 40 * sr };
         let b = Prepared { audio: Stereo::new(10 * sr), from: 0, to: 10 * sr };
-        let secs = [Section { style: Style::Sad, start: 0.0, end: 30.0, energy: 3.0 }, Section { style: Style::Epic, start: 30.0, end: 60.0, energy: 8.0 }];
+        let secs = [Section { style: Style::Sad, mood: "sad", start: 0.0, end: 30.0, energy: 3.0 }, Section { style: Style::Epic, mood: "triumphant", start: 30.0, end: 60.0, energy: 8.0 }];
         let mix = arrange(&secs, &[&a, &b], 60.0, 63 * sr);
         assert!((mix.l[28 * sr] - 1.0).abs() < 1e-3, "full before the crossfade");
         assert!((mix.l[30 * sr] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01, "half power at the boundary: {}", mix.l[30 * sr]);
-        assert!(mix.l[31 * sr + sr / 2 + 10].abs() < 1e-6, "gone after 3 s");
+        assert!(mix.l[32 * sr + 10].abs() < 1e-6, "gone after the 4 s crossfade");
         assert!(mix.l[sr / 2] > 0.3 && mix.l[sr / 2] < 0.8, "fading in");
+    }
+
+    fn bed(title: &str, moods: &[&str], energy: f32, license: &str) -> Bed {
+        Bed { file: format!("beds/{title}.mp3"), title: title.into(), artist: "A".into(), moods: moods.iter().map(|m| m.to_string()).collect(), energy, license: license.into(), source: "https://example.org".into(), attribution: String::new() }
+    }
+
+    #[test]
+    fn only_clearly_free_licences_are_used() {
+        assert!(bed("a", &[], 0.2, "CC0").usable());
+        assert!(bed("a", &[], 0.2, "Public Domain").usable());
+        assert!(bed("a", &[], 0.2, "Pixabay Content License").usable());
+        assert!(!bed("a", &[], 0.2, "CC BY 4.0").usable(), "CC BY needs its credit line");
+        assert!(Bed { attribution: "\"a\" by A (CC BY 4.0)".into(), ..bed("a", &[], 0.2, "CC-BY-4.0") }.usable());
+        assert!(!Bed { attribution: "x".into(), ..bed("a", &[], 0.2, "CC BY-NC 4.0") }.usable());
+        assert!(!Bed { attribution: "x".into(), ..bed("a", &[], 0.2, "CC BY-SA 4.0") }.usable());
+        assert!(!bed("a", &[], 0.2, "").usable());
+        assert!(!bed("a", &[], 0.2, "Free for personal use").usable());
+        assert_eq!(bed("Rain", &[], 0.2, "CC0").credit(), "\"Rain\" by A (CC0, https://example.org)");
+    }
+
+    #[test]
+    fn beds_follow_the_scene_mood() {
+        let beds = [bed("calm1", &["calm"], 0.1, "CC0"), bed("calm2", &["calm", "romantic"], 0.2, "CC0"), bed("dread", &["tense", "eerie"], 0.3, "CC0"), bed("sad", &["sad"], 0.2, "CC0")];
+        let secs: Vec<Section> = [("calm", Style::Mystery), ("tense", Style::Tension), ("sad", Style::Sad), ("action", Style::Tension), ("comedic", Style::Lofi)]
+            .iter()
+            .enumerate()
+            .map(|(k, &(mood, style))| Section { style, mood, start: k as f64 * 60.0, end: (k + 1) as f64 * 60.0, energy: 4.0 })
+            .collect();
+        let got: Vec<String> = choose(&secs, &beds, 7, 0).iter().map(|p| p.title().to_string()).collect();
+        assert!(got[0].starts_with("calm"), "{got:?}");
+        assert_eq!(got[1], "dread");
+        assert_eq!(got[2], "sad");
+        assert_eq!(got[3], "dread", "action falls back to a tense bed");
+        assert!(got[4].starts_with("calm"), "comedic falls back to calm");
+        // Nothing near the mood in the pack: a built-in track of the genre.
+        let only_sad = [bed("sad", &["sad"], 0.2, "CC0")];
+        assert!(matches!(&choose(&secs[1..2], &only_sad, 7, 0)[0], Pick::Track(t) if t.style == Style::Tension));
+        // Takes rotate among the beds that suit.
+        assert_ne!(pick_bed(&beds, "calm", 3.0, 1, 0, 0, None), pick_bed(&beds, "calm", 3.0, 1, 1, 0, None));
     }
 
     #[test]
     fn the_end_fades_out_after_the_narration() {
         let sr = SR as usize;
         let ones = Prepared { audio: Stereo { l: vec![1.0; 40 * sr], r: vec![1.0; 40 * sr] }, from: 0, to: 40 * sr };
-        let secs = [Section { style: Style::Lofi, start: 0.0, end: 30.0, energy: 3.0 }];
+        let secs = [Section { style: Style::Lofi, mood: "calm", start: 0.0, end: 30.0, energy: 3.0 }];
         let mix = arrange(&secs, &[&ones], 30.0, 33 * sr);
         assert!((mix.l[29 * sr] - 1.0).abs() < 1e-3);
         assert!(mix.l[31 * sr] < 0.9 && mix.l[31 * sr] > 0.1);

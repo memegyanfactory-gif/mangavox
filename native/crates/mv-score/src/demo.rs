@@ -73,6 +73,7 @@ pub fn demo_score(style: Style, secs: f64, energy: f32, sfx: SfxAmount) -> Score
             intensity: (*int as f32 + shift).clamp(0.0, 10.0) as u8,
             tags: vec![],
             sfx: if sfx.is_empty() { vec![] } else { vec![(0.4, sfx.to_string())] },
+            music: String::new(),
         })
         .collect();
     // Energy rises through the demo.
@@ -103,6 +104,7 @@ pub fn demo_score(style: Style, secs: f64, energy: f32, sfx: SfxAmount) -> Score
         drop_before: false,
         riser_out: false,
         record_stop: false,
+        mood: String::new(),
     };
     let mut a = cue(0, 0.0, split, (4.5 + shift).clamp(0.0, 10.0));
     let mut b = cue(1, split, secs, (7.5 + shift).clamp(0.0, 10.0));

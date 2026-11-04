@@ -337,6 +337,10 @@ pub struct StudioPage {
     pub(crate) export_job: Option<crate::export::Job>,
     /// Exports asked for while one runs, started in order as each ends.
     pub(crate) export_queue: Vec<crate::export::QueuedExport>,
+    /// Auto export: the mangas it is on for (and their folders), and the mangas that had
+    /// Generate work waiting or running at the last look (None before the first look).
+    pub(crate) auto_export: crate::auto_export::AutoExport,
+    pub(crate) auto_active: Option<HashSet<String>>,
     /// The Video section's "Video style" panel (and the export choices it keeps).
     pub(crate) style: crate::export::style_view::StyleUi,
     pub(crate) queue: crate::pipeline::Queue,
@@ -479,6 +483,8 @@ impl StudioPage {
             export_prefs: style.prefs.export,
             export_job: None,
             export_queue: vec![],
+            auto_export: crate::auto_export::AutoExport::load(),
+            auto_active: None,
             style,
             queue: crate::pipeline::snapshot(),
             seen_queue: crate::pipeline::version(),
@@ -490,7 +496,7 @@ impl StudioPage {
             _subs: subs,
         };
         page.reload_library(cx);
-        page.poll(cx);
+        page.poll(window, cx);
         page
     }
 
@@ -684,11 +690,11 @@ impl StudioPage {
     }
 
     /// Follows the AI run and the narration queue while the page is alive.
-    fn poll(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
+    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(POLL).await;
             let (rv, jv, qv) = (run::version(), service::version(), crate::pipeline::version());
-            let alive = this.update(cx, |this, cx| {
+            let alive = this.update_in(cx, |this, window, cx| {
                 let mut changed = false;
                 if qv != this.seen_queue {
                     this.seen_queue = qv;
@@ -698,6 +704,7 @@ impl StudioPage {
                         this.reload_library(cx);
                     }
                     this.queue = now;
+                    this.auto_export_check(window, cx);
                     changed = true;
                 }
                 this.video_poll(cx);

@@ -981,8 +981,9 @@ def _encoder(out, W, H, threads):
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_NO_WINDOW | _BELOW_NORMAL)
 
 
-def animate(job, man, threads):
-    import torch
+def animator(job, man):
+    """The clip's Animator, its per-frame grade and its motion plan: (anim, grade, plan). Also used
+    by the GPU engine (gpu_render.py), which draws the frames straight into the video."""
     W, H = job["size"]
     faces = [l["face"] for l in man["layers"]]
     sw, sh = man["size"]
@@ -997,15 +998,26 @@ def animate(job, man, threads):
     anim = Animator(job["cache"], dict(man, src=job["src"]), (W, H), plan, faces, subject, job.get("drift"))
     if isinstance(job.get("entrance"), dict) and man["layers"]:
         anim.entrance = job["entrance"]
-    grade = _grade_fn(job.get("grade"), job.get("glow"), W, H)
+    return anim, _grade_fn(job.get("grade"), job.get("glow"), W, H), plan
+
+
+def frame_ease(job, k):
+    """The camera's eased progress at frame k of the clip (the job's, else a cosine ease)."""
+    ease = job.get("ease") or []
+    n = int(job["frames"])
+    return float(ease[k]) if k < len(ease) else (0.5 - 0.5 * math.cos(math.pi * k / max(1, n - 1)))
+
+
+def animate(job, man, threads):
+    import torch
+    W, H = job["size"]
+    anim, grade, plan = animator(job, man)
     tmp = job["out"] + ".part.mp4"
     enc = _encoder(tmp, W, H, threads)
-    ease = job.get("ease") or []
     n = int(job["frames"])
     try:
         for k in range(n):
-            e = ease[k] if k < len(ease) else (0.5 - 0.5 * math.cos(math.pi * k / max(1, n - 1)))
-            img = grade(anim.frame(float(e), k / FPS))
+            img = grade(anim.frame(frame_ease(job, k), k / FPS))
             enc.stdin.write((img.permute(1, 2, 0) * 255 + 0.5).to(torch.uint8).cpu().numpy().tobytes())
         enc.stdin.close()
         err = enc.stderr.read().decode("utf-8", "replace")
@@ -1023,7 +1035,8 @@ def run(jobs_path):
     {"threads": n, "jobs": [{"id", "src", "panel" (read.json), "scene", "intensity", "cache",
     "size": [w, h], "frames", "ease": [per frame 0..1], "drift": [x, y], "grade", "glow",
     "entrance"? ({"at", "dur", "block"}: the characters assemble from pixel blocks, Animator._pixel_in),
-    "faces": [[x0, y0, x1, y1] crop fractions], "out"}]}.
+    "faces": [[x0, y0, x1, y1] crop fractions], "out", "prep_only"? (the layers only: the GPU engine
+    animates the clip itself, see animator)}]}.
     Emits progress / info lines and a final {"type": "done", "results": {id: {...}}}."""
     import torch
     with open(jobs_path, "r", encoding="utf-8") as f:
@@ -1055,6 +1068,9 @@ def run(jobs_path):
         man = lp.read_manifest(j["cache"])
         if not man:
             results[j["id"]] = {"ok": False, "error": "no layers"}
+            continue
+        if j.get("prep_only"):
+            results[j["id"]] = {"ok": True, "prep_only": True, "layers": len(man["layers"]), "prep": man.get("times")}
             continue
         t1 = time.time()
         try:

@@ -15,7 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{radius, space};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{btn, glyphs, icon_button, ph, size, ButtonKind, RampExt as _, Tokens};
+use mv_ui::{btn, glyphs, icon_button, ph, size, switch, tip, ButtonKind, RampExt as _, Tokens};
 use serde_json::{json, Value};
 
 use crate::data::{fresh, MangaGroup};
@@ -1898,7 +1898,15 @@ impl StudioPage {
     fn with_joined(&mut self, g: &MangaGroup, label: &str, then: impl FnOnce(&mut StudioPage, Joined, &Reporter, &mut Window, &mut Context<Self>) + 'static, window: &mut Window, cx: &mut Context<Self>) {
         if self.export_busy() {
             let (g, label) = (g.clone(), label.to_string());
-            self.export_queue.push(Box::new(move |this, window, cx| this.with_joined(&g, &label, then, window, cx)));
+            let waiting = crate::pipeline::wait_export(&g.id, &g.title);
+            self.export_queue.push(Box::new(move |this, window, cx| {
+                if crate::pipeline::start_waiting(waiting) {
+                    this.with_joined(&g, &label, then, window, cx);
+                } else {
+                    // Cancelled while it waited: the next one is up.
+                    this.export_ended(window, cx);
+                }
+            }));
             toast::show(cx, Toast::info("Export queued: it starts when the current one is done"));
             return;
         }
@@ -2021,26 +2029,13 @@ impl StudioPage {
         let name = export_name(&g.title, &videos);
         let prefs = self.export_prefs;
         let group = g.clone();
-        let env = self.setup.read(cx).env.clone();
-        let font = mark_font(env.as_ref());
-        let hook = if prefs.mode() == Mode::Whole && prefs.hook {
-            let Some((python, layout)) = env.and_then(|e| Some((e.python.ok()?, e.scripts.ok()?))) else {
-                toast::show(cx, Toast::error("The hook is voiced by Studio's Python, which is not set up yet. Finish Setup, or turn the hook off."));
+        let font = mark_font(self.setup.read(cx).env.as_ref());
+        let hook = match self.hook_job(g, &videos, prefs, cx) {
+            Ok(hook) => hook,
+            Err(e) => {
+                toast::show(cx, Toast::error(e));
                 return;
-            };
-            Some(HookJob {
-                manga_id: g.id.clone(),
-                manga_title: g.title.clone(),
-                cover: g.cover.clone().filter(|p| p.is_file()),
-                chapters: videos.clone(),
-                seconds: prefs.hook_secs,
-                model: self.model(cx).map(|m| m.0),
-                reg: ui_assistant::registry(cx),
-                python,
-                layout,
-            })
-        } else {
-            None
+            }
         };
         let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Export here".into()) });
         cx.spawn_in(window, async move |this, cx| {
@@ -2051,6 +2046,93 @@ impl StudioPage {
                 // asked about.
                 let g = group.clone();
                 this.style_gate(&g, style::Goal::Export, Box::new(move |this, window, cx| this.export_now(group, prefs, dir, name, font, hook, window, cx)), window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The hook an export of `videos` makes first, when the choices ask for one (one video with
+    /// the Hook on). Errs when the hook cannot be made: Studio's Python is not set up.
+    fn hook_job(&self, g: &MangaGroup, videos: &[crate::data::ChapterItem], prefs: ExportPrefs, cx: &mut Context<Self>) -> std::result::Result<Option<HookJob>, &'static str> {
+        if prefs.mode() != Mode::Whole || !prefs.hook {
+            return Ok(None);
+        }
+        let env = self.setup.read(cx).env.clone();
+        let Some((python, layout)) = env.and_then(|e| Some((e.python.ok()?, e.scripts.ok()?))) else {
+            return Err("The hook is voiced by Studio's Python, which is not set up yet. Finish Setup, or turn the hook off.");
+        };
+        Ok(Some(HookJob {
+            manga_id: g.id.clone(),
+            manga_title: g.title.clone(),
+            cover: g.cover.clone().filter(|p| p.is_file()),
+            chapters: videos.to_vec(),
+            seconds: prefs.hook_secs,
+            model: self.model(cx).map(|m| m.0),
+            reg: ui_assistant::registry(cx),
+            python,
+            layout,
+        }))
+    }
+
+    // ------------------------------------------------------------------ auto export
+
+    /// After the Generate queue moved: the mangas whose queued work has all gone through and
+    /// that have Auto export on are exported into their folder (see `auto_export`).
+    pub(crate) fn auto_export_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now: std::collections::HashSet<String> = self.queue.items.iter().filter(|i| i.state.active()).map(|i| i.chapter.manga_id.clone()).collect();
+        let done = crate::auto_export::finished(self.auto_active.as_ref(), &now);
+        self.auto_active = Some(now);
+        for id in done {
+            if self.auto_export.folder(&id).is_some() {
+                self.auto_export_now(&id, window, cx);
+            }
+        }
+    }
+
+    /// Exports `manga_id` into its Auto export folder with the section's choices, as Export
+    /// would, without asking anything: the chapter videos are taken as they were just made.
+    fn auto_export_now(&mut self, manga_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self.auto_export.folder(manga_id).map(Path::to_path_buf) else { return };
+        let crate::page::Load::Ready(groups) = &self.library else { return };
+        let Some(g) = groups.iter().find(|g| g.id == manga_id).cloned() else { return };
+        if !dir.is_dir() {
+            toast::show(cx, Toast::error(format!("Auto export of {}: the folder {} is not there any more. Pick a folder again under Full recap video.", g.title, dir.display())));
+            return;
+        }
+        let videos = self.timeline_chapters(&g);
+        if videos.is_empty() {
+            return;
+        }
+        let prefs = self.export_prefs;
+        let font = mark_font(self.setup.read(cx).env.as_ref());
+        let hook = match self.hook_job(&g, &videos, prefs, cx) {
+            Ok(hook) => hook,
+            Err(e) => {
+                toast::show(cx, Toast::info(format!("Auto export goes ahead without the hook: {e}")));
+                None
+            }
+        };
+        let failed = self.queue.items.iter().filter(|i| i.chapter.manga_id == g.id && i.state == crate::pipeline::ItemState::Failed).count();
+        let left_out = if failed > 0 { format!(" ({failed} chapter{} failed and {} left out)", plural(failed), if failed == 1 { "is" } else { "are" }) } else { String::new() };
+        toast::show(cx, Toast::info(format!("Auto export: saving {} to {}{left_out}", g.title, dir.display())).icon(glyphs::DOWNLOADS));
+        let name = export_name(&g.title, &videos);
+        self.export_now(g, prefs, dir, name, font, hook, window, cx);
+    }
+
+    /// Turns Auto export on for `g` once a folder is picked.
+    fn pick_auto_export_folder(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Auto export here".into()) });
+        let (id, title) = (g.id.clone(), g.title.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else { return };
+            let Some(dir) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.auto_export.turn_on(&id, dir.clone());
+                match this.auto_export.save() {
+                    Ok(()) => toast::show(cx, Toast::success(format!("Auto export on: once the chapters queued for {title} are made, the full recap is saved to {}", dir.display())).icon(ph::CHECK_CIRCLE)),
+                    Err(e) => toast::show(cx, Toast::error(format!("Could not save the Auto export setting: {e}"))),
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -2294,6 +2376,39 @@ impl StudioPage {
                             })),
                     ),
             );
+        let auto_dir = self.auto_export.folder(&g.id).map(Path::to_path_buf);
+        let auto = {
+            let (g_on, g_change) = (g.clone(), g.clone());
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(space::SM))
+                .child(switch("vid-auto", auto_dir.is_some()).on_click(cx.listener(move |this, on: &bool, window, cx| {
+                    if *on {
+                        this.pick_auto_export_folder(&g_on, window, cx);
+                    } else {
+                        this.auto_export.turn_off(&g_on.id);
+                        if let Err(e) = this.auto_export.save() {
+                            toast::show(cx, Toast::error(format!("Could not save the Auto export setting: {e}")));
+                        }
+                        cx.notify();
+                    }
+                })))
+                .child(
+                    div()
+                        .id("vid-auto-label")
+                        .tooltip(tip("When everything queued for this manga in Generate is made, the full recap is joined and exported into this folder by itself, with the choices above."))
+                        .child(div().text_size(px(size::SM)).child("Auto export")),
+                )
+                .child(div().flex_1().min_w(px(120.)).child(small(match &auto_dir {
+                    Some(d) => format!("after Generate, into {}", d.display()),
+                    None => "Off: export by hand with Export…".to_string(),
+                })))
+                .when(auto_dir.is_some(), |d| {
+                    d.child(btn("vid-auto-folder", "Change folder", ButtonKind::Ghost).small().icon(ph::FOLDER_OPEN).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.pick_auto_export_folder(&g_change, window, cx))))
+                })
+        };
         let style = self.style_panel(g, cx);
 
         let progress = job.map(|(here, (p, label))| {
@@ -2321,6 +2436,7 @@ impl StudioPage {
             .border_color(Tokens::border())
             .bg(Tokens::surface())
             .child(options)
+            .child(auto)
             .children(progress)
             .child(style)
             .into_any_element()

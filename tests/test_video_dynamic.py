@@ -25,6 +25,46 @@ class ChapterCardTests(unittest.TestCase):
         self.assertIsNone(vg.chapter_card_text({"number": None, "title": "第12話"}))
         self.assertIsNone(vg.chapter_card_text(None))
 
+    def test_tags_and_junk_never_reach_the_card(self):
+        clean = vg.clean_chapter_title
+        # A scanlation group's tag in brackets or parentheses, alone or around a real title.
+        self.assertEqual(vg.chapter_card_text({"number": 2, "title": "(1r0n)"}), ("CHAPTER 2", ""))
+        self.assertEqual(clean("Night Falls (1r0n)"), "Night Falls")
+        self.assertEqual(clean("[Asura Scans] Chapter 12 - The Duel"), "The Duel")
+        self.assertEqual(clean("【Team X】 Ch.3: Rain"), "Rain")
+        # Prefixes that only repeat the number go, however they are written.
+        self.assertEqual(clean("Vol.2 Ch.12: Rain"), "Rain")
+        self.assertEqual(clean("Episode 3 - A New Dawn"), "A New Dawn")
+        self.assertEqual(clean("#12: Home"), "Home")
+        for junk in ("1r0n", "Ch. 2", "Chapter 2", "Vol. 3", "v2", "x", "--", "Kaiju Scans", "MTL", "Raw"):
+            self.assertEqual(clean(junk), "", junk)
+        # Real titles stay as they are, numbers in them too.
+        for title in ("The Duel", "100 Girlfriends", "Oneshot", "Team Up!", "Level 99 Hero"):
+            self.assertEqual(clean(title), title)
+
+    def test_the_card_can_be_switched_off(self):
+        self.assertTrue(vg.chapter_card_on({}, vg.resolve_look("dynamic")))
+        self.assertFalse(vg.chapter_card_on({}, vg.resolve_look({"preset": "dynamic", "chapter_card": False})))
+        self.assertFalse(vg.chapter_card_on({"chapter_card": False}, vg.resolve_look("clean")))
+        self.assertTrue(vg.chapter_card_on({}, vg.resolve_look({"preset": "clean", "chapter_card": True})))
+
+    def test_the_card_sits_top_right_and_glides_in(self):
+        from python import ffexpr
+        card = ("card.png", 600, 200)
+        x, y = vg.chapter_card_motion(card, 2560, 1440, 0)
+        k = 1440 / 1080
+        at = lambda t: float(ffexpr.evaluate(x, t=t))
+        # Off the right edge before it comes in, in place for the hold, gone again at the end.
+        self.assertGreaterEqual(at(0.0), 2560)
+        rest = 2560 - round(vg.CARD_MARGIN * k) - 600
+        self.assertAlmostEqual(at(vg.CARD_IN + vg.CARD_EASE), rest)
+        self.assertAlmostEqual(at(3.0), rest)
+        self.assertGreaterEqual(round(at(vg.CARD_OUT)), 2560)
+        self.assertLess(at(vg.CARD_IN + vg.CARD_EASE / 2), 2560)
+        self.assertLess(y, 0.12 * 1440)
+        # It holds about five seconds.
+        self.assertGreater(vg.CARD_OUT - vg.CARD_FADE - (vg.CARD_IN + vg.CARD_EASE), 4.5)
+
     def test_the_card_is_drawn_and_fits_the_frame(self):
         with tempfile.TemporaryDirectory() as d:
             path, cw, ch = vg.make_chapter_card(1920, 1080, {"number": 1, "title": "A very long chapter title " * 6}, d)

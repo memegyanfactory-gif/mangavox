@@ -120,18 +120,20 @@ SEGMENTS
 The voice-over is a list of segments in story order. Each segment is 1-3 sentences (about 12-45 words) that carry a whole beat of the scene, never a single panel; a page usually gets one or two. A segment is about ONE page, shown over that page's panels: "panel" is the panel its first sentence is about, and when the next sentences move on to later panels of the same page, list those in reading order in "panels" (one panel per sentence after the first), so the picture follows the words. Pick panels that show what the sentence says, preferably with the characters or the action in them; never a text-only box, an empty or nearly black panel, or a sound effect. The picture must keep up with the story: the panels that carry the page's moments should all be shown, and a page is never told inside another page's segment. Plain text only: no markdown, emojis, brackets, stage directions or page numbers, because a text-to-speech voice reads it.
 EMOTION
 Every segment carries the feeling the narrator speaks it with, judged from its panel and its moment: "emotion" (one of: {kinds}) and "intensity" 0-10. Most of a recap is plain storytelling: "other" at 2-4. Give a real emotion only when the panel shows one (a joke landing: comedy; grief: emotional; a blow: fight; dread: horror; a twist: reveal), and keep intensity moderate (4-6); 7 and up only for the true peaks of the chapter, a handful at most. Calm scenes stay calm, and a scene keeps its feeling for its whole stretch instead of jumping segment to segment. "mood" is one or two words for that feeling ("smug", "heartbroken"), or leave it out.
-A segment that lands a truly big moment (a blow, a blast, a clash of blades, a shock, a reveal) may add "sfx" (one of: {sfx}) and "sfx_strength" 1-3. Leave it out everywhere else: a handful per chapter at most.
+"music" is the background music under the scene (one of: {music}): what a recap editor would lay under it, quiet and steady. Most of a recap is "calm"; a scene keeps its music for its whole stretch and changes only when its feeling truly turns.
+A segment may add "sfx" (one of: {sfx}) and "sfx_strength" 1-3 when its moment makes a sound the viewer should hear: what the panel shows or its sound-effect lettering says (a gunshot, an explosion, a punch, a door, rain, a crowd), or a truly big beat (a blow, a clash of blades, a shock). Never on quiet talk: a handful per chapter, about one a minute at most.
 
 OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
 {{"title": "short catchy title for this chapter's recap",
   "summary_so_far": "6-10 sentences with names: the whole story so far, this chapter included, used as memory for what comes next",
   "segments": [
-    {{"page": 3, "panel": 2, "text": "For one year, Arhan has hunted a single name: Karlos, the man who slaughtered his family.", "emotion": "other", "intensity": 3}},
-    {{"page": 4, "panel": 1, "panels": [3], "text": "He finally corners him in the rain. Karlos only laughs.", "emotion": "reveal", "mood": "chilling", "intensity": 5}},
-    {{"page": 7, "panel": 1, "text": "...", "emotion": "fight", "intensity": 8, "sfx": "impact", "sfx_strength": 2}}
+    {{"page": 3, "panel": 2, "text": "For one year, Arhan has hunted a single name: Karlos, the man who slaughtered his family.", "emotion": "other", "intensity": 3, "music": "sad"}},
+    {{"page": 4, "panel": 1, "panels": [3], "text": "He finally corners him in the rain. Karlos only laughs.", "emotion": "reveal", "mood": "chilling", "intensity": 5, "music": "tense", "sfx": "rain", "sfx_strength": 1}},
+    {{"page": 7, "panel": 1, "text": "...", "emotion": "fight", "intensity": 8, "music": "action", "sfx": "gunshot", "sfx_strength": 2}}
   ]}}
 "page", "panel" and "panels" use the numbers shown in the reading (all start at 1). Segments must be in story order."##,
         sfx = SFX_NAMES.join(", "),
+        music = MUSIC_CUES.join(", "),
         kinds = TONE_KINDS.join(", "),
     )
 }
@@ -270,7 +272,7 @@ fn untold_pages(read: &ChapterRead, transcript: Option<&Transcript>, content: &[
 /// the lines spoken around it, so the new segments slot in and the telling flows.
 fn fill_prompt(read: &ChapterRead, transcript: Option<&Transcript>, brain: &Brain, segs: &[StorySegment], missing: &[usize]) -> String {
     let mut s = format!(
-        "The voice-over of this chapter leaves out story pages {}. The video cuts a page without narration, so the picture jumps and the story has holes. Write the segments for THESE pages only (at least one each; a silent action page gets one short sentence on what happens), so each gap flows from the line before it to the line after it. Same voice, same rules, no repeats of the lines around the gap. Reply with JSON only: {{\"segments\": [{{\"page\": N, \"panel\": N, \"text\": \"...\", \"emotion\": \"other\", \"intensity\": 3}}]}}\n",
+        "The voice-over of this chapter leaves out story pages {}. The video cuts a page without narration, so the picture jumps and the story has holes. Write the segments for THESE pages only (at least one each; a silent action page gets one short sentence on what happens), so each gap flows from the line before it to the line after it. Same voice, same rules, no repeats of the lines around the gap. Reply with JSON only: {{\"segments\": [{{\"page\": N, \"panel\": N, \"text\": \"...\", \"emotion\": \"other\", \"intensity\": 3, \"music\": \"calm\"}}]}}\n",
         missing.iter().map(|p| (p + 1).to_string()).collect::<Vec<_>>().join(", ")
     );
     for &m in missing {
@@ -285,10 +287,17 @@ fn fill_prompt(read: &ChapterRead, transcript: Option<&Transcript>, brain: &Brai
 /// The emotions a segment may carry: the narration voice's scene kinds (`narration_tts.KINDS`).
 pub(crate) const TONE_KINDS: &[&str] = &["other", "dialogue", "calm", "comedy", "emotional", "romance", "action", "fight", "reveal", "horror", "flashback"];
 
-/// A segment's "emotion" / "mood" / "intensity", when the emotion is one the voice knows.
+/// A segment's "emotion" / "mood" / "intensity", when the emotion is one the voice knows, and its
+/// "music" cue when it is one of [`MUSIC_CUES`] (kept alone, with no emotion, when only it is valid).
 fn tone_of(sv: &Value) -> Option<Tone> {
     let kind = str_of(sv, "emotion").to_lowercase();
-    TONE_KINDS.contains(&kind.as_str()).then(|| Tone { kind, mood: str_of(sv, "mood"), intensity: num_of(sv, "intensity").map(|n| n.round().clamp(0.0, 10.0) as u8).unwrap_or(3) })
+    let music = str_of(sv, "music").to_lowercase();
+    let music = if MUSIC_CUES.contains(&music.as_str()) { music } else { String::new() };
+    if TONE_KINDS.contains(&kind.as_str()) {
+        Some(Tone { kind, mood: str_of(sv, "mood"), intensity: num_of(sv, "intensity").map(|n| n.round().clamp(0.0, 10.0) as u8).unwrap_or(3), music })
+    } else {
+        (!music.is_empty()).then(|| Tone { music, ..Default::default() })
+    }
 }
 
 /// Segments of an answer on `chunk_pages`, in page order. The writer no longer makes hook

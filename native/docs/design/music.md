@@ -76,8 +76,17 @@ as Subtle.
 - **Intros and builds:** after a soft change, the groove waits a bar or two. The last bar before an impact builds with a snare or tom roll, and the 808 drops out.
 
 ### Spotting (`spot.rs`)
-- **Scene to preset:**
-  - Fight pages are Phonk, or Epic for power-ups or intensity 9+.
+- **Story mood first (since 9.0.4):** the story writer tags every segment with a `music` mood
+  (`mv_recap::MUSIC_CUES`: calm, tense, action, sad, comedic, mysterious, triumphant, romantic,
+  eerie), exported on the beats of `narration.studio.json`. `chapter::story_cues` takes each page's
+  mood by word count, with the story's own intensity, and an untagged page keeps the page before's.
+  - Mood to preset: calm/mysterious Mystery, tense Tension, action Tension (Epic at intensity 8+),
+    triumphant Epic, sad/romantic Sad, comedic Lo-fi, eerie Horror. Phonk is never picked
+    automatically: its drums fight the voice. Only the user's genre pick brings it in.
+  - Each cue carries its `mood`; the library picks its bed by it.
+- **Scene to preset (no story mood):** the mood is read from the Read step's scene, as below, and
+  mapped as above.
+  - Fight pages read as Phonk, or Epic for power-ups or intensity 9+.
   - Reveals are Epic at 7+, Tension at 5+, Mystery below.
   - Horror words map to Horror; ominous words to Tension; sad, love and nostalgic words to Sad; comedy and daily-life words to Lo-fi.
   - Neutral narration gets Mystery, or Tension at intensity 7+.
@@ -102,8 +111,8 @@ No samples; everything is generated.
 - **Per-clip balance:** every musical clip is loudness-matched to its role's place in its genre's mix. Phonk puts drums and 808 at -19 LUFS and pads at -28; Sad puts the piano at -20; and so on. Energy moves a cue ±3 dB.
 - **Hits & risers** are balanced as a whole track.
 - **SFX** are on their own bus and duck half as far as the music, so a whoosh still reads under a sentence.
-- **Leveler:** before the loudness match, any swell more than 3 dB over the bus's average is ridden down 3:1 (400 ms windows, 200 ms look-ahead, 1.5 s release), so impacts and crescendos stay in the background.
-- **Ducking:** the bus is set under the narration by the Level (Quiet -18, Normal -14, Bold -10 LU) and ducks 10 dB while the voice speaks, which puts Normal about 24 LU under during speech and 14 LU under in the gaps. While ducked it also opens a 4 dB pocket at 2 kHz. (It was -7 LU / 8 dB, which users found too loud.)
+- **Leveler:** before the loudness match, any swell more than 2 dB over the bus's average is ridden down 3:1 (400 ms windows, 200 ms look-ahead, 1.5 s release), so impacts and crescendos stay in the background. Library beds are also evened first (`mix::even`: the 3 s level drawn to the track's average, quiet stretches up to +6 dB, loud ones down to -10 dB).
+- **Ducking (since 9.0.4):** the bus is set under the narration by the Level (Quiet -21, Normal -17, Bold -13 LU) and ducks 6 dB by default (Light 4 / Normal 6 / Strong 9) while the voice speaks: Normal sits about 23 LU under during speech and 17 LU under in long pauses. The duck starts 0.3 s before the first word, holds 1.2 s (the pauses between sentences never lift it), dips with a 0.2 s and rises with a 1.2 s time constant, in dB and interpolated, so it never pumps. While ducked it also opens a 4 dB pocket at 2 kHz. (Before: 10 dB dips with a 0.25 s hold and the bed 14 LU under in every breath, which pumped and users turned the music off. `music.json` files from then move to the new depths: `MusicSettings::migrate`.)
 - **Shared master:** `mix::master` does the leveler, loudness, ducking and limiter for both the synth score and the library.
 - **Limiter:** true-peak aware (4x interpolation), with a -6 dBFS stem ceiling.
 - **Final mix:** the video stage still applies `loudnorm=I=-14` to the full mix. No Python change was needed.
@@ -117,6 +126,25 @@ No samples; everything is generated.
   - Track gain is -4 dB.
 - **Punchy:** fight hits from intensity 6 (one per 4 s), whooshes on page turns in intense stretches (one per 8 s), full gain.
 - **Spacing:** never two effects within 1.2 s; the more important one wins.
+
+### Bed pack (since 9.0.4)
+Music beds tagged by mood, CC0 only (so the pack may be fetched for any user and used in monetised
+videos with no credit), listed in `python/audio_pack.json` with each file's source page and licence
+(checked on the page, 2026-11-04). `python/audio_pack.py` fetches them into `<data>/music/library/beds/`
+and writes `<data>/music/library/manifest.json`; the same script fetches the recorded sound effects
+into `<data>/studio/sfx/` (see `python/sfx.py`). No audio is in the repo.
+- 36 beds from OpenGameArt (cynicmusic, Juhani Junkala, Komiku, yd, Kistol, Emma_MA, isaiah658 ...),
+  2-5 per mood. Each has `moods` and an `energy` (0 still .. 1 driving).
+- `library::beds` uses only entries whose licence is CC0, public domain or Pixabay, or CC BY with its
+  credit line (never NC, ND or SA) and whose file exists.
+- A section's bed: its mood's beds (else a related mood's), the three closest to its energy × 0.8,
+  one picked from (chapter, section), rotated by `take`, never the same twice in a row. A mood the
+  pack has nothing near falls back to the built-in tracks below.
+- Credits: a bed's own attribution, else "Title" by Artist (licence, source page).
+- Excluded sources and why: Pixabay, Mixkit and Sonniss forbid redistributing the files (fine only
+  for hand-picked use in one's own videos); Scott Buckley's tracks are Content ID registered; BBC
+  Sound Effects is non-commercial; Uppbeat and the YouTube Audio Library need an account; Free Music
+  Archive's CC0 tracks download only behind its login.
 
 ### Studio library (`library.rs`, the default source)
 Users said the synth score sounded bad and sometimes too loud. The default source is now produced
@@ -141,7 +169,7 @@ chosen to sit under a voice: instrumental, no busy leads. `MusicSettings.source`
 - **Sections:** the spotting cue sheet with same-genre neighbours merged. Sections under 40 s join the one before, so the music does not change every page.
 - **Picks:** each section gets one of the four tracks of its genre closest to its energy, chosen from (chapter, section). `MusicSettings.take` ("regenerate music") rotates the pick, so every new take changes it. The same track never plays twice in a row.
 - **Playback:** each track is set to -20 LUFS. A quiet intro (up to 8 s) and the ring-out are skipped. When a section outlasts the track, it loops with a 3 s equal-power crossfade.
-- **Transitions:** sections crossfade over 3 s (equal power). The music fades in over 1.5 s and fades out over 3 s, ending 2 s after the narration.
+- **Transitions:** sections crossfade over 4 s (equal power). The music fades in over 1.5 s and fades out over 3 s, ending 2 s after the narration.
 - **Mastering:** the shared master. No sound effects are added.
 - **Credits:** the titles are stored in `score.json` (`library`). `music_credits.txt` beside `score.wav` holds the CC BY lines, and `mv_score::credits(ch)` returns them.
 - **Offline:** when a track can't be downloaded or decoded, the build logs to stderr and uses the synth score. Such a score is never "fresh", so the next build tries the library again.

@@ -16,6 +16,8 @@ pub struct PageInfo {
     pub tags: Vec<String>,
     /// Sound-effect lettering on the page, with where it sits in the page's narration (0..1).
     pub sfx: Vec<(f32, String)>,
+    /// The story writer's music cue for the page (beat `music`, one of [`MOODS`]), when it gave one.
+    pub music: String,
 }
 
 impl PageInfo {
@@ -71,6 +73,81 @@ pub fn family(s: Style) -> u8 {
 
 fn has(words: &str, any: &[&str]) -> bool {
     any.iter().any(|w| words.contains(w))
+}
+
+/// The music cues the story writer tags its beats with (beat `music`), one per scene: what the
+/// library bed is picked by.
+pub const MOODS: &[&str] = mv_recap::MUSIC_CUES;
+
+/// A mood from [`MOODS`] for a tag or a close word ("Funny", "horror", "epic" ...).
+pub fn parse_mood(s: &str) -> Option<&'static str> {
+    let t = s.trim().to_lowercase();
+    if let Some(m) = MOODS.iter().find(|m| **m == t) {
+        return Some(*m);
+    }
+    Some(match t.as_str() {
+        "peaceful" | "neutral" | "everyday" | "daily" | "quiet" | "gentle" | "warm" => "calm",
+        "suspense" | "suspenseful" | "danger" | "dread" | "ominous" | "tension" | "dark" => "tense",
+        "fight" | "battle" | "chase" | "intense" => "action",
+        "emotional" | "grief" | "melancholy" | "tragic" | "somber" => "sad",
+        "comedy" | "funny" | "playful" | "light" | "silly" | "happy" => "comedic",
+        "mystery" | "mysterious" | "curious" | "strange" => "mysterious",
+        "epic" | "heroic" | "victory" | "hopeful" | "power" => "triumphant",
+        "romance" | "love" | "tender" => "romantic",
+        "horror" | "scary" | "creepy" | "spooky" => "eerie",
+        _ => return None,
+    })
+}
+
+/// The genre a mood is scored in when the cue sheet needs one (the synth score, the cue lanes, and
+/// the built-in library). Never phonk: its drums fight the voice; only a user's pick brings it in.
+pub fn mood_style(mood: &str, intensity: u8) -> Style {
+    match mood {
+        "tense" => Style::Tension,
+        "action" if intensity >= 8 => Style::Epic,
+        "action" => Style::Tension,
+        "triumphant" => Style::Epic,
+        "sad" | "romantic" => Style::Sad,
+        "comedic" => Style::Lofi,
+        "eerie" => Style::Horror,
+        _ => Style::Mystery,
+    }
+}
+
+/// The mood a genre stands for (a cue forced into a genre by the user).
+pub fn style_mood(style: Style) -> &'static str {
+    match style {
+        Style::Tension => "tense",
+        Style::Epic => "triumphant",
+        Style::Phonk => "action",
+        Style::Sad => "sad",
+        Style::Lofi => "comedic",
+        Style::Horror => "eerie",
+        Style::Mystery => "mysterious",
+    }
+}
+
+/// The page's mood: the writer's music cue, else read from its scene.
+pub fn page_mood(p: &PageInfo) -> &'static str {
+    if let Some(m) = parse_mood(&p.music) {
+        return m;
+    }
+    let words = p.words();
+    let kind = p.kind.to_lowercase();
+    match classify(p) {
+        Style::Tension => "tense",
+        Style::Phonk => "action",
+        Style::Epic if p.is_fight() => "action",
+        Style::Epic if matches!(kind.as_str(), "reveal" | "twist" | "shock") => "tense",
+        Style::Epic => "triumphant",
+        Style::Sad if kind == "romance" || has(&words, &["love", "romantic", "tender"]) => "romantic",
+        Style::Sad => "sad",
+        Style::Lofi if kind == "comedy" || has(&words, &["funny", "silly", "comic", "goofy", "playful"]) => "comedic",
+        Style::Lofi => "calm",
+        Style::Horror => "eerie",
+        Style::Mystery if has(&words, &["mysteri", "strange", "curious", "secret", "eerie", "investig", "clue", "unknown", "puzzl"]) => "mysterious",
+        Style::Mystery => "calm",
+    }
 }
 
 /// The genre a page asks for.
@@ -185,6 +262,7 @@ pub fn plan(pages: &[PageInfo], spans: &[Span], directions: &[Direction], settin
     struct Pg {
         span: Span,
         style: Style,
+        mood: &'static str,
         energy: f32,
         hit: bool,
         reveal: bool,
@@ -195,10 +273,12 @@ pub fn plan(pages: &[PageInfo], spans: &[Span], directions: &[Direction], settin
         .map(|s| {
             let p = info(s.page).cloned().unwrap_or(PageInfo { page: s.page, kind: "dialogue".into(), intensity: 3, ..Default::default() });
             let d = direction(s.page);
-            let style = d.and_then(|d| d.style).unwrap_or_else(|| classify(&p));
+            let mood = page_mood(&p);
+            let style = d.and_then(|d| d.style).unwrap_or_else(|| mood_style(mood, p.intensity));
+            let mood = if mood_style(mood, p.intensity) == style { mood } else { style_mood(style) };
             let energy = (d.and_then(|d| d.energy).unwrap_or(p.intensity as f32) + shift).clamp(0.0, 10.0);
             let reveal = d.map(|d| d.drop).unwrap_or_else(|| p.is_reveal());
-            Pg { span: *s, style, energy, hit: d.is_some_and(|d| d.hit), reveal, bright: p.bright() }
+            Pg { span: *s, style, mood, energy, hit: d.is_some_and(|d| d.hit), reveal, bright: p.bright() }
         })
         .collect();
 
@@ -277,7 +357,17 @@ pub fn plan(pages: &[PageInfo], spans: &[Span], directions: &[Direction], settin
             let total: f64 = idx.iter().map(|&i| pg[i].span.end - pg[i].span.start).sum::<f64>().max(1e-3);
             let energy = idx.iter().map(|&i| pg[i].energy as f64 * (pg[i].span.end - pg[i].span.start)).sum::<f64>() / total;
             let bright_time: f64 = idx.iter().filter(|&&i| pg[i].bright).map(|&i| pg[i].span.end - pg[i].span.start).sum();
-            let style = settings.styles.get(&first.span.page).copied().or(settings.genre).unwrap_or(*style);
+            let forced = settings.styles.get(&first.span.page).copied().or(settings.genre);
+            let style = forced.unwrap_or(*style);
+            // The mood that fills most of the cue (pages in its genre), or the forced genre's own.
+            let mut time: Vec<(&'static str, f64)> = vec![];
+            for &i in idx.iter().filter(|&&i| pg[i].style == style) {
+                match time.iter_mut().find(|(m, _)| *m == pg[i].mood) {
+                    Some((_, t)) => *t += pg[i].span.end - pg[i].span.start,
+                    None => time.push((pg[i].mood, pg[i].span.end - pg[i].span.start)),
+                }
+            }
+            let mood = time.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(m, _)| m).filter(|_| forced.is_none()).unwrap_or(style_mood(style));
             let mode = mode(style, bright_time * 2.0 > total);
             Cue {
                 index,
@@ -293,6 +383,7 @@ pub fn plan(pages: &[PageInfo], spans: &[Span], directions: &[Direction], settin
                 drop_before: first.reveal,
                 riser_out: false,
                 record_stop: false,
+                mood: mood.to_string(),
             }
         })
         .collect();
@@ -420,7 +511,9 @@ mod tests {
         let sp = spans(&[8.0, 7.0, 6.0, 10.0, 9.0, 6.0]);
         let (cues, energy) = plan(&pages, &sp, &[], &MusicSettings::default(), 9);
         let styles: Vec<Style> = cues.iter().map(|c| c.style).collect();
-        assert_eq!(styles, vec![Style::Mystery, Style::Phonk, Style::Epic]);
+        assert_eq!(styles, vec![Style::Mystery, Style::Tension, Style::Tension]);
+        let moods: Vec<&str> = cues.iter().map(|c| c.mood.as_str()).collect();
+        assert_eq!(moods, vec!["calm", "action", "tense"]);
         assert!(cues[0].riser_out && cues[1].hit, "a riser builds into the fight");
         assert!(cues[2].drop_before && cues[2].hit, "the reveal drops then hits");
         assert_eq!(cues[0].start, 0.0);
@@ -463,6 +556,32 @@ mod tests {
         let (cues, _) = plan(&pages, &spans(&[12.0, 12.0, 12.0, 12.0]), &[], &MusicSettings::default(), 0);
         assert_eq!(cues.last().unwrap().style, Style::Lofi);
         assert!(cues.last().unwrap().record_stop);
+    }
+
+    #[test]
+    fn story_music_cues_win_and_map_to_calm_genres() {
+        let tagged = |kind: &str, intensity: u8, music: &str| PageInfo { kind: kind.into(), intensity, music: music.into(), ..Default::default() };
+        assert_eq!(page_mood(&tagged("fight", 8, "sad")), "sad", "the writer's cue wins");
+        assert_eq!(page_mood(&tagged("fight", 6, "")), "action");
+        assert_eq!(page_mood(&tagged("comedy", 3, "")), "comedic");
+        assert_eq!(page_mood(&tagged("dialogue", 2, "")), "calm");
+        assert_eq!(page_mood(&tagged("horror", 5, "")), "eerie");
+        assert_eq!(page_mood(&tagged("other", 3, "nonsense")), "calm");
+        assert_eq!(mood_style("action", 6), Style::Tension, "fights get a tension bed, not phonk drums");
+        assert_eq!(mood_style("action", 9), Style::Epic);
+        assert_eq!(mood_style("calm", 2), Style::Mystery);
+        assert_eq!(parse_mood("Funny"), Some("comedic"));
+        assert_eq!(parse_mood("whatever"), None);
+        for m in MOODS {
+            assert_eq!(parse_mood(m), Some(*m));
+        }
+        let pages = vec![tagged("dialogue", 2, "romantic"), tagged("dialogue", 3, "romantic")];
+        let pages: Vec<PageInfo> = pages.into_iter().enumerate().map(|(i, p)| PageInfo { page: i, ..p }).collect();
+        let (cues, _) = plan(&pages, &spans(&[30.0, 30.0]), &[], &MusicSettings::default(), 0);
+        assert_eq!((cues[0].style, cues[0].mood.as_str()), (Style::Sad, "romantic"));
+        let forced = MusicSettings { genre: Some(Style::Lofi), ..Default::default() };
+        let (cues, _) = plan(&pages, &spans(&[30.0, 30.0]), &[], &forced, 0);
+        assert_eq!(cues[0].mood, "comedic", "a forced genre brings its own mood");
     }
 
     #[test]

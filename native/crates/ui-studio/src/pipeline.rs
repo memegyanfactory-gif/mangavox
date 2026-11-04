@@ -1103,6 +1103,8 @@ pub struct ExportActivity {
     pub manga_title: String,
     pub progress: f32,
     pub label: String,
+    /// Waiting for the export before it to finish (not started yet).
+    pub waiting: bool,
 }
 
 /// One tracked export: its id, manga (id and title), progress and cancel flag. Weak, so an
@@ -1118,6 +1120,23 @@ struct Tracked {
 /// Exports in flight.
 static EXPORTS: Mutex<Vec<Tracked>> = Mutex::new(Vec::new());
 static EXPORT_IDS: AtomicU64 = AtomicU64::new(1);
+/// Exports asked for while another runs, in the order they start: (id, manga id, manga title).
+static WAITING: Mutex<Vec<(u64, String, String)>> = Mutex::new(Vec::new());
+
+/// An export of `manga_id` waits its turn (shown as activity until it starts or is cancelled).
+pub(crate) fn wait_export(manga_id: &str, manga_title: &str) -> u64 {
+    let id = EXPORT_IDS.fetch_add(1, Ordering::Relaxed);
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).push((id, manga_id.to_string(), manga_title.to_string()));
+    id
+}
+
+/// The waiting export `id` is up: true to start it, false when it was cancelled meanwhile.
+pub(crate) fn start_waiting(id: u64) -> bool {
+    let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    let had = g.iter().any(|w| w.0 == id);
+    g.retain(|w| w.0 != id);
+    had
+}
 
 /// Called by `export::Job::new`.
 pub(crate) fn track_export(manga_id: &str, manga_title: &str, state: &Arc<Mutex<(f32, String)>>, cancel: &Arc<AtomicBool>) {
@@ -1127,23 +1146,53 @@ pub(crate) fn track_export(manga_id: &str, manga_title: &str, state: &Arc<Mutex<
     g.push(Tracked { id, manga_id: manga_id.to_string(), manga_title: manga_title.to_string(), state: Arc::downgrade(state), cancel: Arc::downgrade(cancel) });
 }
 
-/// Exports and joins running now.
+/// Exports and joins running now, then the ones waiting their turn.
 pub fn exports() -> Vec<ExportActivity> {
     let mut g = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
     g.retain(|t| t.state.strong_count() > 0);
-    g.iter()
+    let mut out: Vec<ExportActivity> = g
+        .iter()
         .filter_map(|t| {
             let (progress, label) = t.state.upgrade()?.lock().ok()?.clone();
-            Some(ExportActivity { id: t.id, manga_id: t.manga_id.clone(), manga_title: t.manga_title.clone(), progress: progress.clamp(0., 1.), label })
+            Some(ExportActivity { id: t.id, manga_id: t.manga_id.clone(), manga_title: t.manga_title.clone(), progress: progress.clamp(0., 1.), label, waiting: false })
         })
-        .collect()
+        .collect();
+    drop(g);
+    out.extend(WAITING.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(id, m, t)| ExportActivity {
+        id: *id,
+        manga_id: m.clone(),
+        manga_title: t.clone(),
+        progress: 0.,
+        label: "Queued: starts when the export before it is done".into(),
+        waiting: true,
+    }));
+    out
 }
 
 /// Cancels the export `id` (from [`exports`]); it stops at its next step and says so.
 pub fn cancel_export(id: u64) {
+    // A waiting one simply never starts.
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.0 != id);
     let g = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = g.iter().find(|t| t.id == id).and_then(|t| t.cancel.upgrade()) {
         c.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod waiting_tests {
+    use super::*;
+
+    #[test]
+    fn a_waiting_export_shows_until_it_starts_or_is_cancelled() {
+        let a = wait_export("wait-a", "A");
+        let b = wait_export("wait-b", "B");
+        let shown = |id: u64| exports().iter().any(|e| e.id == id && e.waiting);
+        assert!(shown(a) && shown(b));
+        cancel_export(b);
+        assert!(!shown(b) && !start_waiting(b), "a cancelled one never starts");
+        assert!(start_waiting(a) && !shown(a), "starting takes it off the waiting list");
+        assert!(!start_waiting(a));
     }
 }
 

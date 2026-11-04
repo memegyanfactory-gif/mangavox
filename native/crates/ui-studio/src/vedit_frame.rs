@@ -179,6 +179,7 @@ fn set(fx: &mut Effects, e: crate::look::Effect, on: bool) {
         Letterbox => &mut fx.letterbox,
         Mood => &mut fx.mood,
         EdgeGlow => &mut fx.edge_glow,
+        ChapterCard => &mut fx.chapter_card,
     } = on;
 }
 

@@ -26,8 +26,9 @@ fn main() -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let (score, report) = mv_score::build(&ch, &settings, true)?;
     println!("built in {:.1}s: {report:?}", started.elapsed().as_secs_f64());
-    for s in mv_score::library::sections(&score.cues, score.duration).iter().zip(mv_score::library::choose(&mv_score::library::sections(&score.cues, score.duration), mv_recap_seed(&ch), take)) {
-        println!("  {:7.1}-{:7.1}s  {:<16} energy {:.1}  {}", s.0.start, s.0.end, s.0.style.label(), s.0.energy, s.1.title);
+    let secs = mv_score::library::sections(&score.cues, score.duration);
+    for s in secs.iter().zip(mv_score::library::choose(&secs, &mv_score::library::beds(), mv_recap_seed(&ch), take)) {
+        println!("  {:7.1}-{:7.1}s  {:<10} {:<16} energy {:.1}  {}", s.0.start, s.0.end, s.0.mood, s.0.style.label(), s.0.energy, s.1.title());
     }
     for c in mv_score::credits(&ch) {
         println!("  credit: {c}");

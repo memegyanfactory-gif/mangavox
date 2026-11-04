@@ -5,10 +5,15 @@ The story writer may cue a sound effect on a narration beat (sync_map beat keys 
 SOUNDS, and `sfx_strength` 1-3). The renderer turns those cues, plus a few of its own picture
 moments (whip / zoom page turns, action punches), into one sparse SFX stem (`build_track`):
 
-* Every sound is synthesised here with numpy (48 kHz, cached as WAVs in the fx cache,
-  `%TEMP%/mangavox-fx/sfx/`), so nothing can be claimed or needs a licence. A user may drop their
-  own licensed sounds in `<data>/studio/sfx/<name>*.wav|mp3|ogg|flac`; those win over the
-  built-in one. No third-party sound is ever bundled.
+* The SOUNDS are synthesised here with numpy (48 kHz, cached as WAVs in the fx cache,
+  `%TEMP%/mangavox-fx/sfx/`), so nothing can be claimed or needs a licence. Recorded sounds in
+  `<data>/studio/sfx/<name>*.wav|mp3|ogg|flac` win over the built-in one: the user's own, or the
+  CC0 library pack (listed with source and licence in that folder's `manifest.json`). The
+  LIBRARY_ONLY cues (gunshot, rain ...) play only from such a file, else from a close built-in
+  sound (FALLBACK), else not at all. No third-party sound is ever bundled in the repo.
+* A recorded sound plays at most MAX_SEC of its category (ambience such as rain, wind, fire or a
+  crowd: AMBIENCE_SEC, faded in and out; a long thunder or explosion tail fades out). Which of a
+  cue's files plays varies from chapter to chapter.
 * Placement is sparse (PLACEMENT constants): about one cue per SECONDS_PER_CUE seconds, never
   two within HARD_GAP, SPACING apart (SPACING_EARLY in the first EARLY_SEC seconds); the
   writer's cues outrank the renderer's own; hits land in the pause at the beat boundary;
@@ -17,8 +22,10 @@ moments (whip / zoom page turns, action punches), into one sparse SFX stem (`bui
   sits that far under the narration's integrated LUFS.
 
 `make_duck_gain` writes a gain curve that keeps the music DUCK_UNDER_DB under the voice while it
-speaks (and never louder than GAP_UNDER_DB under it in the pauses), applied by ffmpeg amultiply.
-It only ever turns the music down, so a score that is already ducked is left as it is.
+speaks (and never louder than GAP_UNDER_DB under it in the long pauses), applied by ffmpeg
+amultiply. It is slow and held: pauses shorter than DUCK_HOLD (the gaps between sentences) keep it
+down, so the music never pumps with the speech. It only ever turns the music down, so a score that
+is already ducked is left as it is.
 """
 import glob
 import hashlib
@@ -42,6 +49,27 @@ SOUNDS = (
     "impact", "whoosh", "riser", "boom", "sword_clang", "magic", "heartbeat", "glass",
     "crowd_gasp", "thunder", "footsteps_run", "door_slam",
 )
+# Cues the story writer may give that have no built-in synthesis: played from a library / user
+# file, else from FALLBACK, else dropped (a wrong sound is worse than none).
+LIBRARY_ONLY = (
+    "gunshot", "explosion", "punch", "slash", "footsteps", "door", "crowd", "rain", "wind", "fire",
+    "scream", "car", "phone", "bell", "splash",
+)
+NAMES = SOUNDS + LIBRARY_ONLY
+FALLBACK = {
+    "explosion": "boom", "punch": "impact", "slash": "whoosh", "door": "door_slam",
+    "footsteps": "footsteps_run", "crowd": "crowd_gasp",
+}
+# Words a beat may use for a cue.
+ALIASES = {
+    "gun": "gunshot", "gunfire": "gunshot", "shot": "gunshot", "bullet": "gunshot", "pistol": "gunshot",
+    "blast": "explosion", "bang": "gunshot", "kick": "punch", "hit": "punch", "blow": "punch",
+    "sword": "sword_clang", "clang": "sword_clang", "slice": "slash", "cut": "slash", "steps": "footsteps",
+    "running": "footsteps_run", "door_open": "door", "door_close": "door", "knock": "door",
+    "rainfall": "rain", "storm": "thunder", "flames": "fire", "fire_crackle": "fire", "shout": "scream",
+    "engine": "car", "ringtone": "phone", "ring": "phone", "chime": "bell", "water": "splash",
+    "spell": "magic", "glass_break": "glass", "shatter": "glass", "gasp": "crowd_gasp", "applause": "crowd",
+}
 USER_EXTS = (".wav", ".mp3", ".ogg", ".flac")
 
 # ── Levels: dB relative to the narration (the sound's loudest 400 ms, K-weighted, against the
@@ -50,12 +78,21 @@ CATEGORY = {
     "impact": "hit", "boom": "hit", "sword_clang": "hit", "door_slam": "hit", "thunder": "hit",
     "glass": "hit", "whoosh": "sweep", "riser": "sweep", "magic": "sweep", "footsteps_run": "sweep",
     "heartbeat": "bed", "crowd_gasp": "bed",
+    "gunshot": "hit", "explosion": "hit", "punch": "hit", "door": "hit", "splash": "hit",
+    "slash": "sweep", "footsteps": "sweep", "scream": "sweep", "car": "sweep", "phone": "sweep",
+    "bell": "sweep", "crowd": "bed", "rain": "bed", "wind": "bed", "fire": "bed",
 }
-LEVELS = {"hit": (-18.0, -12.0), "sweep": (-25.0, -18.0), "bed": (-32.0, -24.0)}
+# (Measured on a real chapter: at -18 a gunshot peaked 23 dB under the voice and went unnoticed.)
+LEVELS = {"hit": (-15.0, -9.0), "sweep": (-23.0, -16.0), "bed": (-28.0, -22.0)}
 # "Punchy" (Music step) lifts every effect a little.
 PUNCHY_DB = 2.0
 # Where a sound sits against its moment: "onset" starts on it, "peak" peaks on it, "end" ends on it.
-ANCHOR = {"whoosh": "peak", "riser": "end"}
+ANCHOR = {"whoosh": "peak", "riser": "end", "slash": "peak"}
+# Longest a recorded sound plays, by category (s), and its fades (in, out). Ambience ("bed")
+# fades in; a hit or a sweep starts on its moment and only its cut tail fades.
+AMBIENCE_SEC = 8.0
+MAX_SEC = {"bed": AMBIENCE_SEC, "hit": 5.0, "sweep": 6.0}
+FADES = {"bed": (0.6, 2.0), "hit": (0.0, 1.5), "sweep": (0.0, 1.5)}
 
 # ── Placement.
 HARD_GAP = 1.2           # never two effects within this many seconds
@@ -70,13 +107,15 @@ MASKED_DB = -3.0         # a writer's cue that cannot find a pause plays this mu
 AUTO_MIN_INTENSITY = 6   # the renderer's own hits only on pages at least this intense
 WHIP_TRANSITIONS = ("whip", "zoomblur")
 
-# ── Music duck.
-DUCK_UNDER_DB = 18.0     # music under the voice while it speaks
-GAP_UNDER_DB = 6.0       # music in the pauses: never louder than this under the voice
-DUCK_ATTACK = 0.02       # time to get (95 %) down when the voice starts
-DUCK_RELEASE = 0.4       # ... and back up after the hold when it stops
-DUCK_HOLD = 0.25         # bridges the gaps between words, so the music does not pump
-DUCK_LOOKAHEAD = 0.03    # the dip lands just before the first syllable
+# ── Music duck: a bed about 20 dB under the voice that only drifts up in real pauses. mv-score's
+# own score already sits ~23 dB under (its master ducks it), so this leaves it alone and only
+# tames a user's own background track.
+DUCK_UNDER_DB = 20.0     # music under the voice while it speaks
+GAP_UNDER_DB = 16.0      # music in the long pauses: never louder than this under the voice
+DUCK_ATTACK = 0.25       # time to get (95 %) down when the voice starts
+DUCK_RELEASE = 1.5       # ... and back up after the hold when it stops
+DUCK_HOLD = 1.2          # bridges the pauses between sentences, so the music does not pump
+DUCK_LOOKAHEAD = 0.3     # the dip is down by the first syllable
 DUCK_MAX_DB = 40.0
 DUCK_RATE = 4800         # sample rate of the gain curve (ffmpeg resamples it)
 
@@ -84,11 +123,12 @@ DUCK_RATE = 4800         # sample rate of the gain curve (ffmpeg resamples it)
 # ─────────────────────────────────────────────────────────────────────────── helpers
 
 def normalize_name(name):
-    """A cue name from a beat (`"Sword clang"`, `"door-slam"`) as one of SOUNDS, or None."""
+    """A cue name from a beat (`"Sword clang"`, `"door-slam"`, `"bullet"`) as one of NAMES, or None."""
     if not isinstance(name, str):
         return None
     key = name.strip().lower().replace(" ", "_").replace("-", "_")
-    return key if key in SOUNDS else None
+    key = ALIASES.get(key, key)
+    return key if key in NAMES else None
 
 
 def normalize_strength(v):
@@ -471,9 +511,31 @@ def _user_sound(path, cache):
     return x
 
 
+def playable(name, user_dir=None):
+    """Whether `name` has a sound: a file for it, its synthesis, or its FALLBACK's."""
+    if name in SOUNDS or user_sounds(name, user_dir):
+        return True
+    return name in FALLBACK and playable(FALLBACK[name], user_dir)
+
+
+def fit_length(x, name):
+    """A long recording cut to its category's MAX_SEC with its FADES (short sounds stay as they
+    are): a minute of rain becomes 8 s faded in and out, a long thunder roll fades after 5 s."""
+    cat = CATEGORY[name]
+    n = int(MAX_SEC[cat] * SR)
+    if len(x) <= n:
+        return x
+    x = x[:n].astype(np.float32).copy()
+    fin, fout = (int(s * SR) for s in FADES[cat])
+    if fin:
+        x[:fin] *= np.linspace(0.0, 1.0, fin, endpoint=False, dtype=np.float32)
+    x[n - fout:] *= np.linspace(1.0, 0.0, fout, dtype=np.float32)
+    return x
+
+
 def load_sound(name, user_dir=None, variant=0):
-    """Samples of sound `name`: the user's own file when there is one (variant picks among
-    several), else the built-in synthesis (cached)."""
+    """Samples of sound `name`: a recorded file for it when there is one (variant picks among
+    several), else the built-in synthesis (cached), else its FALLBACK's; None when there is none."""
     cache = fx_cache_dir()
     cache = os.path.join(cache, "sfx") if cache else None
     if cache:
@@ -484,6 +546,8 @@ def load_sound(name, user_dir=None, variant=0):
             return _user_sound(mine[variant % len(mine)], cache)
         except Exception as e:
             print(f"[sfx] Could not use {mine[variant % len(mine)]}: {e}", file=sys.stderr)
+    if name not in SYNTHS:
+        return load_sound(FALLBACK[name], user_dir, variant) if name in FALLBACK else None
     path = os.path.join(cache, f"{name}_v{SYNTH_VERSION}.wav") if cache else None
     if path and os.path.exists(path):
         try:
@@ -761,7 +825,10 @@ def build_track(items, clips, starts, trans, total, narration_path, out_path, mo
     if np is None or mode_of(mode) == "off" or not clips:
         return []
     punchy = mode_of(mode) == "punchy"
-    chosen = select(candidates(items, clips, starts, trans, scenes), total, punchy)
+    # Only cues that have a sound compete for the places (a gunshot with no file and no fallback
+    # would otherwise take one and play nothing).
+    cands = [c for c in candidates(items, clips, starts, trans, scenes) if playable(c["name"], user_dir)]
+    chosen = select(cands, total, punchy)
     if not chosen:
         return []
     narration, level = None, None
@@ -771,12 +838,14 @@ def build_track(items, clips, starts, trans, total, narration_path, out_path, mo
             level = speech_db(narration)
         except Exception as e:
             print(f"[sfx] Could not read the narration: {e}", file=sys.stderr)
-    counts = {}
+    # Which of a cue's files plays: varies with the chapter (its length), steady within it.
+    first = int(total * 10)
     sounds = {}
     for c in chosen:
         if c["name"] not in sounds:
-            sounds[c["name"]] = load_sound(c["name"], user_dir, counts.get(c["name"], 0))
-        counts[c["name"]] = counts.get(c["name"], 0) + 1
+            x = load_sound(c["name"], user_dir, first)
+            sounds[c["name"]] = fit_length(x, c["name"]) if x is not None else None
+    chosen = [c for c in chosen if sounds.get(c["name"]) is not None]
     loud = narration_lufs(narration_path, narration_vol) if narration is not None else None
     events = place(chosen, sounds, narration, level, punchy, loud)
     if events:

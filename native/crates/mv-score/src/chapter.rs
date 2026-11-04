@@ -44,7 +44,7 @@ fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
 }
 
 pub fn load_settings(ch: &ChapterRef) -> MusicSettings {
-    read_json(&settings_path(ch)).unwrap_or_default()
+    read_json::<MusicSettings>(&settings_path(ch)).map(MusicSettings::migrate).unwrap_or_default()
 }
 
 pub fn save_settings(ch: &ChapterRef, s: &MusicSettings) -> Result<()> {
@@ -103,9 +103,48 @@ fn settings_sig(s: &MusicSettings, orchestra: bool) -> u64 {
     hash_str(&format!("{}|{orchestra}", serde_json::to_string(&s).unwrap_or_default()))
 }
 
-/// What the Read phase knows about each page (scene + sound-effect lettering).
+/// The story writer's cues per page from the exported beats (`narration.studio.json`): the music
+/// cue its words mostly carry and their average intensity (the story step's calm 2-4 scale).
+pub fn story_cues(ch: &ChapterRef) -> std::collections::HashMap<usize, (String, Option<u8>)> {
+    let mut out = std::collections::HashMap::new();
+    let Some(v) = read_json::<serde_json::Value>(&ch.output_dir.join("narration.studio.json")) else { return out };
+    let mut pages: std::collections::BTreeMap<usize, (Vec<(String, f64)>, f64, f64)> = Default::default();
+    for b in v.get("beats").and_then(|b| b.as_array()).into_iter().flatten() {
+        let Some(page) = b.get("page").and_then(|p| p.as_u64()) else { continue };
+        if b.get("skip").and_then(|s| s.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let w = b.get("text").and_then(|t| t.as_str()).map(|t| t.split_whitespace().count()).unwrap_or(0).max(1) as f64;
+        let e = pages.entry(page as usize).or_default();
+        if let Some(m) = b.get("music").and_then(|m| m.as_str()).and_then(crate::spot::parse_mood) {
+            match e.0.iter_mut().find(|(x, _)| x == m) {
+                Some((_, t)) => *t += w,
+                None => e.0.push((m.to_string(), w)),
+            }
+        }
+        if let Some(i) = b.get("intensity").and_then(|i| i.as_f64()) {
+            e.1 += i.clamp(0.0, 10.0) * w;
+            e.2 += w;
+        }
+    }
+    for (page, (moods, isum, iw)) in pages {
+        let music = moods.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(m, _)| m).unwrap_or_default();
+        let intensity = (iw > 0.0).then(|| (isum / iw).round() as u8);
+        if !music.is_empty() || intensity.is_some() {
+            out.insert(page, (music, intensity));
+        }
+    }
+    out
+}
+
+/// What the Read phase knows about each page (scene + sound-effect lettering), with the story
+/// writer's music cue and intensity where it gave them.
 pub fn page_infos(ch: &ChapterRef) -> Vec<PageInfo> {
     let Some(read) = load_read(ch) else { return vec![] };
+    let story = story_cues(ch);
+    // The writer holds a scene's music until its feeling turns: a page it left untagged keeps the
+    // music of the page before.
+    let mut held = String::new();
     read.pages
         .iter()
         .map(|p| {
@@ -116,7 +155,11 @@ pub fn page_infos(ch: &ChapterRef) -> Vec<PageInfo> {
                 .enumerate()
                 .flat_map(|(k, panel)| panel.lines.iter().filter(|l| l.kind.eq_ignore_ascii_case("sfx")).map(move |l| ((k as f32 + 0.3) / n as f32, l.text.clone())))
                 .collect();
-            PageInfo { page: p.index, kind: p.scene.kind.clone(), mood: p.scene.mood.clone(), intensity: p.scene.intensity, tags: p.scene.tags.clone(), sfx }
+            let (music, told) = story.get(&p.index).cloned().unwrap_or_default();
+            let music = if music.is_empty() { held.clone() } else { music };
+            held = music.clone();
+            let intensity = told.unwrap_or(p.scene.intensity);
+            PageInfo { page: p.index, kind: p.scene.kind.clone(), mood: p.scene.mood.clone(), intensity, tags: p.scene.tags.clone(), sfx, music }
         })
         .collect()
 }

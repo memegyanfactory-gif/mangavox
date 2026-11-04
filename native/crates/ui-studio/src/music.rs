@@ -40,7 +40,7 @@ pub(crate) struct MusicState {
     pub previewing: Option<Style>,
 }
 
-const DUCKS: [(&str, f32); 3] = [("Light", 5.0), ("Normal", 8.0), ("Strong", 12.0)];
+const DUCKS: [(&str, f32); 3] = [("Light", 4.0), ("Normal", 6.0), ("Strong", 9.0)];
 /// The energy setting's steps (0 chill .. 1 hyped; 0.5 follows the story as read).
 const ENERGY: [(&str, f32); 5] = [("Chill", 0.0), ("Calm", 0.25), ("As the story", 0.5), ("Intense", 0.75), ("Hyped", 1.0)];
 const LANE_LABEL_W: f32 = 236.;
