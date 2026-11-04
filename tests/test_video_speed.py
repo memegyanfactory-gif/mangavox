@@ -34,6 +34,22 @@ class EncoderFallbackTests(unittest.TestCase):
         self.assertTrue(ok and tried == ["h264_nvenc"] and vg._NVENC)
 
 
+class ClipReuseTests(unittest.TestCase):
+    def test_a_clip_left_broken_by_a_power_cut_is_not_reused(self):
+        import os, subprocess, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(vg.clip_usable(os.path.join(d, "missing.mp4"), 2))
+            broken = os.path.join(d, "broken.mp4")
+            with open(broken, "wb") as f:
+                f.write(b"\0" * 4096)  # the right size, nothing in it
+            self.assertFalse(vg.clip_usable(broken, 2))
+            good = os.path.join(d, "good.mp4")
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=black:s=64x64:r=30:d=0.1",
+                            "-frames:v", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", good], check=True)
+            self.assertTrue(vg.clip_usable(good, 3))
+            self.assertFalse(vg.clip_usable(good, 4), "cut short")
+
+
 class WarpTests(unittest.TestCase):
     def test_a_camera_that_does_not_move_is_worked_out_once(self):
         still = vg._warp(("0.5", "0.5"), "1.08", 90, "cubic")

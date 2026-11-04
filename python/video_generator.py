@@ -1777,7 +1777,32 @@ def _encode_clip(inputs, graph, frames, out_path):
     ok, stderr = run_codecs(clip_codecs(threads), run)
     if not ok:
         raise RuntimeError(f"clip render failed: {stderr[:300]}")
+    # On disk before it gets its name: a power cut right after the rename otherwise leaves a
+    # clip of the right size full of nothing, which the next run would reuse (clip_usable).
+    with open(tmp, "rb+") as f:
+        os.fsync(f.fileno())
     os.replace(tmp, out_path)
+
+
+def clip_usable(path, frames):
+    """Whether a clip an earlier run left can be reused: it opens and holds `frames` frames.
+    (A clip cut short by a crash or a power cut is rendered again instead of failing the
+    finish.) Without ffprobe, any non-empty file counts."""
+    if not os.path.exists(path) or os.path.getsize(path) <= 100:
+        return False
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if r.returncode != 0 or r.stderr.strip():
+        return False
+    try:
+        return int(r.stdout.strip().splitlines()[0]) >= frames
+    except (ValueError, IndexError):
+        return False
 
 
 # Stills (full-range JPEG) are turned into video (limited) range once, before they are held,
@@ -3583,11 +3608,17 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         key = clip_key(c["source"], c["focus"], spec, frames, w, h, fill)
         path = os.path.join(video_dir, f"clip_{c['idx']:04d}_{key}.mp4")
         clip_paths.append(path)
-        # Reuse a clip an interrupted run already rendered.
-        if os.path.exists(path) and os.path.getsize(path) > 100:
+        # Reuse a clip an interrupted run already rendered (when it is whole: see clip_usable).
+        if clip_usable(path, frames):
             rendered += frames
             layer_jobs.pop(k, None)
         else:
+            if os.path.exists(path):
+                print(f"[video] Clip {c['idx']} from an earlier run is damaged; rendering it again", file=sys.stderr)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
             todo.append((c, frames, path))
     report("clips", rendered / all_frames)
     at = lambda ks: ", ".join(f"{starts[k]:.1f}s" for k in ks) or "none"
