@@ -1,4 +1,5 @@
-"""The GPU engine (MANGAVOX_RENDER_ENGINE=gpu): draws a video planned by gpu_timeline on the
+"""The GPU engine (the default whenever the layered pack is installed, see
+video_generator.render_engine): draws a video planned by gpu_timeline on the
 graphics card (PyTorch CUDA, the layered pack's Python) in one pass, frame by frame, and streams
 the frames to one ffmpeg that burns the captions and encodes (NVENC). No clip files, no second
 encode, no frame through the CPU's filters.

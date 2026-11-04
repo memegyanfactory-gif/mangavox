@@ -1,4 +1,4 @@
-"""The GPU engine's plan of a video (MANGAVOX_RENDER_ENGINE=gpu): every picture the clips and the
+"""The GPU engine's plan of a video (video_generator.render_engine): every picture the clips and the
 finish would draw, worked out frame by frame ahead of time, for gpu_render.py to draw on the
 graphics card in one pass straight into the encoder (no clip files, no second encode).
 

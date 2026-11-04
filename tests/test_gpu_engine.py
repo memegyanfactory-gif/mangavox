@@ -1,6 +1,8 @@
 """The GPU engine's plan (gpu_timeline) and the ffmpeg expressions it is made from (ffexpr).
 Pure numpy: no GPU, no ffmpeg."""
 import math
+import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -145,6 +147,56 @@ class VideoPlanTests(unittest.TestCase):
         self.assertEqual(len(y), 256)
         self.assertEqual(y[100], 100)
         self.assertEqual(y[200], int(min(255, (200 - 100) * 1.08 + 100)))
+
+
+class EngineChoiceTests(unittest.TestCase):
+    """Which engine a render uses: the GPU engine whenever the pack's Python is there, the CPU
+    path when it is not or when asked for."""
+
+    def setUp(self):
+        self.env = os.environ.pop("MANGAVOX_RENDER_ENGINE", None)
+        self.real_pack = vg.layered_plan.pack_python
+
+    def tearDown(self):
+        vg.layered_plan.pack_python = self.real_pack
+        os.environ.pop("MANGAVOX_RENDER_ENGINE", None)
+        if self.env is not None:
+            os.environ["MANGAVOX_RENDER_ENGINE"] = self.env
+
+    def pack(self, there):
+        vg.layered_plan.pack_python = lambda config=None, root=None: ("py.exe", None) if there else (None, "not installed")
+
+    def test_the_gpu_engine_is_the_default_with_the_pack(self):
+        self.pack(True)
+        self.assertEqual(vg.render_engine({}), "gpu")
+        self.pack(False)
+        self.assertEqual(vg.render_engine({}), "cpu")
+
+    def test_cpu_forces_the_old_path(self):
+        self.pack(True)
+        os.environ["MANGAVOX_RENDER_ENGINE"] = "cpu"
+        self.assertEqual(vg.render_engine({}), "cpu")
+        os.environ.pop("MANGAVOX_RENDER_ENGINE")
+        self.assertEqual(vg.render_engine({"render_engine": "cpu"}), "cpu")
+        self.assertEqual(vg.render_engine({"render_engine": "CPU "}), "cpu")
+
+    def test_asking_for_the_gpu_without_the_pack_falls_back(self):
+        self.pack(False)
+        os.environ["MANGAVOX_RENDER_ENGINE"] = "gpu"
+        self.assertEqual(vg.render_engine({}), "cpu")
+
+    def test_one_render_at_a_time_on_the_engine(self):
+        with tempfile.TemporaryDirectory() as d:
+            lock = os.path.join(d, "gpu.lock")
+            with vg._GpuTurn(0, lock) as first:
+                self.assertTrue(first)
+                # A second render (its own handle, as another process would have) does not get in
+                # while the first holds it, and gives up when its wait runs out.
+                with vg._GpuTurn(0, lock) as second:
+                    self.assertFalse(second)
+            # Let go: the next one gets it.
+            with vg._GpuTurn(0, lock) as third:
+                self.assertTrue(third)
 
 
 if __name__ == "__main__":
