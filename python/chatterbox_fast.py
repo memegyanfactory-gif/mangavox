@@ -26,6 +26,11 @@ import subprocess
 import time
 
 import torch
+
+try:
+    import gpu_power
+except ImportError:
+    gpu_power = None
 import torch.nn.functional as F
 
 STEPS_PER_BLOCK = 32  # noise is drawn, and "all done?" checked, once per block of steps
@@ -44,12 +49,14 @@ def _env_float(name, default, lo, hi):
 
 class GpuGuard:
     """Keeps voicing from holding the GPU flat out: after each piece of GPU work it rests for
-    a share of that time (`MANGAVOX_GPU_DUTY`, default 0.8 = busy 80% of the time), and while
-    the GPU is at `MANGAVOX_GPU_MAX_TEMP` (default 80 C) or hotter it waits until the GPU has
-    cooled 8 degrees. The temperature comes from nvidia-smi every few seconds."""
+    a share of that time (`MANGAVOX_GPU_DUTY`, default 0.65 = busy at most 65% of the time, less
+    when the GPU power governor, gpu_power, needs it to hold the card under its watt target),
+    and while the GPU is at `MANGAVOX_GPU_MAX_TEMP` (default 80 C) or hotter it waits until the
+    GPU has cooled 8 degrees. The temperature comes from nvidia-smi every few seconds."""
 
     def __init__(self):
-        self.duty = _env_float("MANGAVOX_GPU_DUTY", 0.8, 0.2, 1.0)
+        self.duty = _env_float("MANGAVOX_GPU_DUTY", 0.65, 0.2, 1.0)
+        self.gov = gpu_power.governor("voice") if gpu_power else None
         self.max_temp = _env_float("MANGAVOX_GPU_MAX_TEMP", 80.0, 60.0, 90.0)
         self.temp = None
         self.cooled_s = 0.0
@@ -71,7 +78,9 @@ class GpuGuard:
         return self.temp
 
     def pace(self, busy_s: float) -> None:
-        if self.duty < 1.0 and busy_s > 0:
+        if self.gov is not None:
+            self.gov.pace(busy_s, max_duty=self.duty)
+        elif self.duty < 1.0 and busy_s > 0:
             time.sleep(min(5.0, busy_s * (1.0 - self.duty) / self.duty))
         now = time.time()
         if now - self._last < 3.0:

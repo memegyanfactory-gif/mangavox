@@ -37,6 +37,12 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 
+try:
+    import gpu_power
+except ImportError:
+    gpu_power = None
+
+
 def layered_motion_ease(job, k):
     import layered_motion
     return layered_motion.frame_ease(job, k)
@@ -680,7 +686,10 @@ def render(plan):
 
     writer = threading.Thread(target=write, daemon=True)
     writer.start()
-    cap = float(os.environ.get("MANGAVOX_GPU_MAX_FPS") or 0)
+    # Paced to the GPU power target (gpu_power: Settings -> System -> GPU power limit), under a
+    # frame-rate ceiling from it (MANGAVOX_GPU_MAX_FPS overrides).
+    gov = gpu_power.governor("engine") if gpu_power else None
+    cap = float(os.environ.get("MANGAVOX_GPU_MAX_FPS") or (gpu_power.fps_cap() if gpu_power else 45))
     t0 = time.monotonic()
     # Seconds spent queueing the drawing, waiting for it and the copy back (to_420), and waiting
     # for the encoder to take a frame: which of the three holds the engine back.
@@ -710,6 +719,8 @@ def render(plan):
                     e.clips.pop(n).close()
                 if g % 15 == 0:
                     emit({"type": "progress", "done": g, "total": total})
+                if gov is not None:
+                    gov.pace()
                 if cap > 0:
                     ahead = (g + 1) / cap - (time.monotonic() - t0)
                     if ahead > 0:
@@ -734,7 +745,8 @@ def render(plan):
         raise RuntimeError(f"ENCODER: the encoder stopped: {msg[-300:] or failed or code}")
     secs = time.monotonic() - t0
     return {"seconds": round(secs, 2), "fps": round(total / max(secs, 1e-6), 1), "vram_peak_mb": round(torch.cuda.max_memory_allocated() / 2 ** 20),
-            "draw_s": round(spent[0], 2), "gpu_wait_s": round(spent[1], 2), "encoder_wait_s": round(spent[2], 2)}
+            "draw_s": round(spent[0], 2), "gpu_wait_s": round(spent[1], 2), "encoder_wait_s": round(spent[2], 2),
+            "power": gov.summary() if gov is not None else "no GPU power governor", "fps_cap": cap}
 
 
 def main(argv):

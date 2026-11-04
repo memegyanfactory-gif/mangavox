@@ -8,10 +8,48 @@
 //! - in-process pools size themselves with [`threads`] and run below normal priority.
 //!
 //! Changing the percentage updates the job at once, so running work is throttled too.
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
 use anyhow::Result;
 use serde_json::json;
+
+/// The GPU power limit for MangaVox's own GPU work (watts, saved as `system.gpuWatts`): the
+/// workers' GPU power governor (python/gpu_power.py, `MANGAVOX_GPU_WATTS`) paces renders,
+/// voicing and layered panels to hold the card's draw under it. The PC's power supply has cut
+/// out under sustained full GPU load, so the default is Safe.
+pub const GPU_WATTS_KEY: &str = "system.gpuWatts";
+/// The choices: Safe (the default), Balanced, Performance, and Max (no pacing under the card's
+/// own limit).
+pub const GPU_WATTS_CHOICES: [(&str, u16); 4] = [("Safe · 200 W", 200), ("Balanced · 250 W", 250), ("Performance · 300 W", 300), ("Max", GPU_WATTS_MAX)];
+pub const GPU_WATTS_DEFAULT: u16 = 200;
+pub const GPU_WATTS_MIN: u16 = 100;
+/// Above any desktop card's limit: the governor never holds work back.
+pub const GPU_WATTS_MAX: u16 = 1000;
+static GPU_WATTS: AtomicU16 = AtomicU16::new(0);
+
+/// Clamps any number of watts to the allowed range.
+pub fn clamp_gpu_watts(w: i64) -> u16 {
+    w.clamp(GPU_WATTS_MIN as i64, GPU_WATTS_MAX as i64) as u16
+}
+
+/// The saved GPU power limit (read once, then kept in memory).
+pub fn gpu_watts() -> u16 {
+    match GPU_WATTS.load(Ordering::Relaxed) {
+        0 => {
+            let w = crate::config::Config::open_default().get(GPU_WATTS_KEY).and_then(|v| v.as_i64()).map(clamp_gpu_watts).unwrap_or(GPU_WATTS_DEFAULT);
+            GPU_WATTS.store(w, Ordering::Relaxed);
+            w
+        }
+        w => w,
+    }
+}
+
+/// Saves a new GPU power limit; work started from now on keeps under it.
+pub fn set_gpu_watts(w: u16) -> Result<()> {
+    let w = clamp_gpu_watts(w as i64);
+    GPU_WATTS.store(w, Ordering::Relaxed);
+    crate::config::Config::open_default().set(GPU_WATTS_KEY, json!(w))
+}
 
 pub const MIN_PERCENT: u8 = 25;
 pub const MAX_PERCENT: u8 = 100;
@@ -86,13 +124,17 @@ fn threads_for(cores: usize, percent: u8) -> usize {
 }
 
 /// Env vars that size the thread pools of child processes (OpenMP, BLAS, PyTorch, our
-/// own Python scripts read `MANGAVOX_THREADS` for ONNX Runtime).
+/// own Python scripts read `MANGAVOX_THREADS` for ONNX Runtime), and the GPU power limit their
+/// GPU power governor keeps to (`MANGAVOX_GPU_WATTS`).
 pub fn child_env() -> Vec<(&'static str, String)> {
     let n = threads().to_string();
-    ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_MAX_THREADS", "VECLIB_MAXIMUM_THREADS", "MANGAVOX_THREADS"]
-        .into_iter()
-        .map(|k| (k, n.clone()))
-        .collect()
+    let mut env: Vec<(&'static str, String)> =
+        ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_MAX_THREADS", "VECLIB_MAXIMUM_THREADS", "MANGAVOX_THREADS"]
+            .into_iter()
+            .map(|k| (k, n.clone()))
+            .collect();
+    env.push(("MANGAVOX_GPU_WATTS", gpu_watts().to_string()));
+    env
 }
 
 /// Puts a freshly spawned heavy child process under the cap. Returns false when it could
@@ -298,6 +340,19 @@ mod tests {
         assert_eq!(threads_for(16, 75), 12);
         assert_eq!(threads_for(2, 25), 1);
         assert_eq!(threads_for(8, 100), 8);
+    }
+
+    #[test]
+    fn gpu_watts_are_clamped_and_reach_the_workers() {
+        assert_eq!(clamp_gpu_watts(20), GPU_WATTS_MIN);
+        assert_eq!(clamp_gpu_watts(5000), GPU_WATTS_MAX);
+        assert_eq!(clamp_gpu_watts(220), 220);
+        assert_eq!(GPU_WATTS_CHOICES[0].1, GPU_WATTS_DEFAULT, "Safe comes first and is the default");
+        assert!(GPU_WATTS_CHOICES.iter().all(|(_, w)| clamp_gpu_watts(*w as i64) == *w));
+        GPU_WATTS.store(230, Ordering::Relaxed);
+        let env = child_env();
+        assert!(env.iter().any(|(k, v)| *k == "MANGAVOX_GPU_WATTS" && v == "230"));
+        assert!(env.iter().any(|(k, _)| *k == "MANGAVOX_THREADS"));
     }
 
     #[cfg(windows)]

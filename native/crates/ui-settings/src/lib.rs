@@ -293,6 +293,8 @@ pub struct SettingsView {
     lab_voice: Entity<SelectState<Vec<SharedString>>>,
     /// Resource limit percentage shown next to the slider.
     limit: u8,
+    /// The GPU power limit in watts (`mv_core::limits::gpu_watts`).
+    gpu_watts: u16,
     limit_slider: Entity<SliderState>,
     meter: Option<system::Meter>,
     sampling: bool,
@@ -431,6 +433,7 @@ impl SettingsView {
             audio: audio::AudioState::default(),
             lab_voice,
             limit: mv_core::limits::percent(),
+            gpu_watts: mv_core::limits::gpu_watts(),
             limit_slider,
             meter: None,
             sampling: false,

@@ -3265,6 +3265,8 @@ def _gpu_render(plan, py, work, total, on_fraction=None):
         raise RuntimeError(f"GPU engine: {tail}")
     print(f"[video] GPU engine: {plan['frames']} frames in {done.get('seconds')} s ({done.get('fps')} fps, "
           f"GPU memory peak {done.get('vram_peak_mb')} MB; drawing {done.get('draw_s')} s, waiting on the GPU {done.get('gpu_wait_s')} s, on the encoder {done.get('encoder_wait_s')} s)", file=sys.stderr)
+    if done.get("power"):
+        print(f"[video] {done['power']} (frame-rate ceiling {done.get('fps_cap')})", file=sys.stderr)
 
 
 def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=None):

@@ -20,8 +20,18 @@ const SUBTITLES_ENDPOINT: &str = "https://opensubtitles-v3.strem.io";
 
 static ENGINE: OnceCell<Arc<Engine>> = OnceCell::const_new();
 
-/// The shared torrent engine, started on first use (or by [`warm_up`] at app start).
+/// The shared torrent engine (one per app process), started on first use (or by [`warm_up`] at
+/// app start). The start runs as its own task on the app's background runtime, so a caller that
+/// gives up (player closed, phone request dropped) never abandons a half-started session, and
+/// the engine never lives on a short-lived runtime.
 pub async fn engine() -> Result<Arc<Engine>> {
+    if let Some(e) = ENGINE.get() {
+        return Ok(e.clone());
+    }
+    mv_ui::bg::runtime().spawn(start_engine()).await.map_err(|e| anyhow!("torrent engine start was interrupted: {e}"))?
+}
+
+async fn start_engine() -> Result<Arc<Engine>> {
     ENGINE
         .get_or_try_init(|| async {
             let t = std::time::Instant::now();

@@ -43,6 +43,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import layered_plan as lp  # noqa: E402
+try:
+    import gpu_power  # noqa: E402
+except ImportError:  # an older install without it
+    gpu_power = None
 
 BASE_DIR = lp.data_dir()
 PACK_DIR = lp.pack_dir(BASE_DIR)
@@ -87,6 +91,12 @@ FPS = 30
 
 def emit(obj):
     print(json.dumps(obj), flush=True)
+
+
+def _pace():
+    """Rests after a piece of GPU work so the card stays under its power target (gpu_power)."""
+    if gpu_power is not None:
+        gpu_power.governor("layers").pace()
 
 
 def weight_path(folder, name):
@@ -499,6 +509,7 @@ def _sam_masks(models, prepped):
         return masks[0], scores[0]
 
     for p in prepped:
+        _pace()
         t0 = time.time()
         img = p["img"]
         w, h = img.size
@@ -602,6 +613,7 @@ def _lama(models, prepped):
     import numpy as np
     lama = models.lama()
     for p in prepped:
+        _pace()
         t0 = time.time()
         arr = np.asarray(p["img"])
         w, h = p["img"].size
@@ -620,6 +632,7 @@ def _depth(models, prepped):
     from PIL import Image, ImageFilter
     proc, model = models.depth()
     for p in prepped:
+        _pace()
         t0 = time.time()
         im = Image.fromarray(p["clean"])
         with torch.no_grad():
@@ -1018,6 +1031,7 @@ def animate(job, man, threads):
     try:
         for k in range(n):
             img = grade(anim.frame(frame_ease(job, k), k / FPS))
+            _pace()
             enc.stdin.write((img.permute(1, 2, 0) * 255 + 0.5).to(torch.uint8).cpu().numpy().tobytes())
         enc.stdin.close()
         err = enc.stderr.read().decode("utf-8", "replace")
@@ -1081,6 +1095,8 @@ def run(jobs_path):
             results[j["id"]] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         emit({"type": "progress", "stage": "layers", "current": i + 1, "total": len(jobs), "message": f"Animated {i + 1} of {len(jobs)} layered clips"})
     peak = round(torch.cuda.max_memory_allocated() / 2 ** 20)
+    if gpu_power is not None:
+        emit({"type": "info", "kind": "power", "message": gpu_power.governor("layers").summary()})
     emit({"type": "done", "results": results, "prep_seconds": round(prep_s, 2), "seconds": round(time.time() - t0, 2), "vram_peak_mb": peak})
     return 0
 

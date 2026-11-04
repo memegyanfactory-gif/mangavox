@@ -759,8 +759,7 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
         ffmpeg(&args, total, r, None, &mut |f| r.set(0.15 + 0.85 * f, "Joining the chapters (re-encoding: they differ in size or sound)"))?;
     }
-    let _ = std::fs::remove_file(out);
-    std::fs::rename(&tmp, out).with_context(|| format!("save {}", out.display()))?;
+    finish(&tmp, out)?;
     Ok((solo, kept))
 }
 
@@ -1249,17 +1248,71 @@ pub(crate) fn loudness_filter(lufs: f64) -> String {
     format!("{},aresample=48000", crate::encode::loudnorm_filter(lufs))
 }
 
-/// Filter joining the hook (input 0, its audio track `hook_track`) and the joined video (input
-/// 1, track `track`) into a `w`x`h` `[video]` and `[a]`.
-pub(crate) fn hook_concat_graph(hook_track: usize, track: usize, w: u32, h: u32, video: &str) -> String {
-    let af = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+/// Filter joining the hook's picture (input 0) and the joined video's (input 1) into a `w`x`h`
+/// `[video]`. The sound is made beforehand on its own ([`hook_sound_graph`]): joined in the same
+/// pass, ffmpeg ended the sound of a long recap part-way (a 2.6 h export went silent after 27 min).
+pub(crate) fn hook_concat_graph(w: u32, h: u32, video: &str) -> String {
     format!(
         "[0:v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[hv];\
-         [0:a:{hook_track}]{af}[ha];\
          [1:v:0]scale={w}:{h},setsar=1,fps=30,format=yuv420p[jv];\
-         [1:a:{track}]{af}[ja];\
-         [hv][ha][jv][ja]concat=n=2:v=1:a=1[{video}][a]"
+         [hv][jv]concat=n=2:v=1:a=0[{video}]"
     )
+}
+
+/// Filter joining the hook's sound (input 0, track `hook_track`, padded or cut to its picture's
+/// `hook_secs` so the recap's sound starts with its picture) and the joined video's (input 1,
+/// track `track`) into `[a]`, run through `loudnorm` when given.
+pub(crate) fn hook_sound_graph(hook_track: usize, hook_secs: f64, track: usize, loudnorm: Option<&str>) -> String {
+    let af = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+    let mut g = format!("[0:a:{hook_track}]{af},apad,atrim=0:{hook_secs:.3}[ha];[1:a:{track}]{af}[ja];[ha][ja]concat=n=2:v=0:a=1");
+    match loudnorm {
+        Some(f) => g.push_str(&format!("[j];[j]{f}[a]")),
+        None => g.push_str("[a]"),
+    }
+    g
+}
+
+/// How much shorter than the picture an export's sound may be (encoder padding and rounding).
+const SOUND_SLACK: f64 = 1.0;
+
+/// The lengths of `p`'s picture and first sound track, in seconds (0 for a missing one).
+fn track_lengths(p: &Path) -> Result<(f64, f64)> {
+    let out = mv_studio::python::quiet_command("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "json"])
+        .arg(p)
+        .output()
+        .context("run ffprobe (is ffmpeg installed?)")?;
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let streams = v["streams"].as_array().cloned().unwrap_or_default();
+    let len = |kind: &str| {
+        streams.iter().find(|s| s["codec_type"] == kind).and_then(|s| s["duration"].as_str()).and_then(|d| d.parse::<f64>().ok()).unwrap_or(0.)
+    };
+    Ok((len("video"), len("audio")))
+}
+
+/// Every export must have sound for its whole length: one whose sound stops early (the narration
+/// going silent part-way through) is an error, never a finished video.
+fn check_sound(p: &Path) -> Result<()> {
+    let (picture, sound) = track_lengths(p)?;
+    if picture > 0. && sound + SOUND_SLACK < picture {
+        bail!(
+            "the narration stopped at {} of {} while saving {}; nothing was kept, please export again",
+            fmt_duration(sound),
+            fmt_duration(picture),
+            p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// Saves the finished `tmp` as `out` once its sound is checked (a broken one is removed).
+fn finish(tmp: &Path, out: &Path) -> Result<()> {
+    if let Err(e) = check_sound(tmp) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(out);
+    std::fs::rename(tmp, out).with_context(|| format!("save {}", out.display()))
 }
 
 /// Writes the export of `j` into `out_dir`: one file, or (for parts and reels) a folder of them,
@@ -1299,9 +1352,8 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
             args.extend(extras.audio_args(true));
             args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
             ffmpeg(&args, j.total, r, None, &mut |f| r.set(0.9 + 0.1 * f, "Saving the video"))?;
-            let _ = std::fs::remove_file(&out);
-            std::fs::rename(&tmp, &out)?;
             let _ = std::fs::remove_file(&list);
+            finish(&tmp, &out)?;
             prune_segments(&dir, &segs, &spec, since);
             LastExport::save(&spec, &dir);
             return Ok(vec![out]);
@@ -1309,27 +1361,41 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         let (w, h) = size;
         let mut total = j.total;
         let mut args: Vec<String>;
+        // The hook's whole sound track, made first on its own (removed when this returns).
+        let sound = tmp.with_extension("sound.m4a");
+        struct Remove<'a>(&'a Path);
+        impl Drop for Remove<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+        let _sound = Remove(&sound);
         if let Some(hook) = hook {
             let hp = probe(hook)?;
             let hook_track = if music { 0 } else { hp.solo().unwrap_or(0) };
             total += hp.duration;
-            args = vec!["-i".into(), hook.to_string_lossy().into(), "-i".into(), src.clone()];
-            let mut graph = hook_concat_graph(hook_track, track, w, h, if mark.is_some() { "cv" } else { "v" });
+            // The sound first, on its own: quick (no picture to wait on), and then checked.
+            let sargs: Vec<String> = vec![
+                "-i".into(), hook.to_string_lossy().into(), "-i".into(), src.clone(),
+                "-filter_complex".into(), hook_sound_graph(hook_track, hp.duration, track, extras.loudnorm.as_deref()),
+                "-map".into(), "[a]".into(), "-vn".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(),
+                "-f".into(), "mp4".into(), sound.to_string_lossy().into(),
+            ];
+            ffmpeg(&sargs, total, r, None, &mut |f| r.set(0.4 * f, "Preparing the sound with its hook"))?;
+            let made = track_lengths(&sound)?.1;
+            if made + SOUND_SLACK < total {
+                bail!("the narration stopped at {} of {} while joining the hook; please export again", fmt_duration(made), fmt_duration(total));
+            }
+            args = vec!["-i".into(), hook.to_string_lossy().into(), "-i".into(), src.clone(), "-i".into(), sound.to_string_lossy().into()];
+            let mut graph = hook_concat_graph(w, h, if mark.is_some() { "cv" } else { "v" });
             if let Some(m) = &mark {
                 args.extend(m.inputs());
                 graph.push(';');
-                graph.push_str(&watermark_graph(&m.wm, "cv", "v", w, h, 2));
+                graph.push_str(&watermark_graph(&m.wm, "cv", "v", w, h, 3));
             }
-            let a = match &extras.loudnorm {
-                Some(f) => {
-                    graph.push_str(&format!(";[a]{f}[an]"));
-                    "[an]"
-                }
-                None => "[a]",
-            };
-            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), a.into()]);
+            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), "2:a:0".into()]);
             args.extend(extras.video_args());
-            args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
+            args.extend(["-c:a".into(), "copy".into()]);
         } else if let Some(m) = &mark {
             args = vec!["-i".into(), src.clone()];
             args.extend(m.inputs());
@@ -1355,8 +1421,7 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
         let (from, label) = if hook.is_some() { (0.4, "Saving the video with its hook") } else { (0., "Saving the video") };
         ffmpeg(&args, total, r, cwd.as_deref(), &mut |f| r.set(from + (1. - from) * f, label))?;
-        let _ = std::fs::remove_file(&out);
-        std::fs::rename(&tmp, &out)?;
+        finish(&tmp, &out)?;
         return Ok(vec![out]);
     }
     let cuts = match mode {
@@ -1389,8 +1454,7 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         args.push(tmp.to_string_lossy().into());
         let label = format!("{} {} of {n}", if mode == Mode::Reels { "Reel" } else { "Part" }, k + 1);
         ffmpeg(&args, d, r, cwd.as_deref(), &mut |f| r.set(((done + f as f64 * d) / j.total) as f32, &label))?;
-        let _ = std::fs::remove_file(&file);
-        std::fs::rename(&tmp, &file)?;
+        finish(&tmp, &file)?;
         done += d;
         out.push(file);
     }
@@ -2842,12 +2906,68 @@ mod tests {
 
     #[test]
     fn hook_joins_before_the_video_on_its_frame_and_sound() {
-        let g = hook_concat_graph(1, 0, 1920, 1080, "v");
+        let g = hook_concat_graph(1920, 1080, "v");
         assert!(g.starts_with("[0:v:0]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:"));
-        assert!(g.contains("[0:a:1]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ha]"));
-        assert!(g.contains("[1:a:0]aresample=48000"));
-        assert!(g.ends_with("[hv][ha][jv][ja]concat=n=2:v=1:a=1[v][a]"));
+        assert!(g.ends_with("[hv][jv]concat=n=2:v=1:a=0[v]"), "the picture pass carries no sound: {g}");
+        let a = super::hook_sound_graph(1, 21.9, 0, None);
+        assert!(a.contains("[0:a:1]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=0:21.900[ha]"));
+        assert!(a.contains("[1:a:0]aresample=48000"));
+        assert!(a.ends_with("[ha][ja]concat=n=2:v=0:a=1[a]"));
+        assert!(super::hook_sound_graph(0, 5., 1, Some("loudnorm=I=-14")).ends_with("concat=n=2:v=0:a=1[j];[j]loudnorm=I=-14[a]"));
         assert_eq!((resolution_for(720), resolution_for(1080), resolution_for(1440), resolution_for(2160)), ("720p", "1080p", "1440p", "4k"));
+    }
+
+    /// A tiny test video (`secs` long, a tone on each of `tracks` sound tracks) made with ffmpeg.
+    fn tiny_video(out: &std::path::Path, secs: f64, tracks: usize, sound_secs: f64) {
+        let mut args: Vec<String> = ["-y", "-v", "error", "-f", "lavfi", "-i"].map(String::from).to_vec();
+        args.push(format!("testsrc=size=160x90:rate=30:duration={secs}"));
+        for k in 0..tracks {
+            args.extend(["-f".into(), "lavfi".into(), "-i".into(), format!("sine=frequency={}:duration={sound_secs}", 300 + 100 * k)]);
+        }
+        args.extend(["-map".into(), "0:v".into()]);
+        for k in 0..tracks {
+            args.extend(["-map".into(), format!("{}:a", k + 1)]);
+        }
+        args.extend(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-ac", "2"].map(String::from));
+        args.push(out.to_string_lossy().into());
+        let ok = mv_studio::python::quiet_command("ffmpeg").args(&args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(ok, "ffmpeg made the test video");
+    }
+
+    fn have_ffmpeg() -> bool {
+        mv_studio::python::quiet_command("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    /// The user's 2.6 h export with a hook went silent after 27 min: the sound of an export with a
+    /// hook must run to its last frame, and an export whose sound stops early must fail, not save.
+    #[test]
+    fn exports_with_a_hook_keep_the_narration_to_the_end() {
+        if !have_ffmpeg() {
+            eprintln!("ffmpeg missing: skipped");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let (hook, video) = (d.path().join("hook.mp4"), d.path().join("joined.mp4"));
+        tiny_video(&hook, 2., 1, 2.);
+        tiny_video(&video, 6., 2, 6.);
+        let j = super::Joined { path: video.clone(), total: 6., boundaries: vec![], solo: true, music_kept: 0, files: vec![video.clone()] };
+        let r = Job::new("test", "Test", "test").reporter();
+        for (music, loud) in [(true, None), (false, Some(super::loudness_filter(-14.)))] {
+            let extras = Extras { hook: Some(hook.clone()), loudnorm: loud, codec: Some(["-c:v", "libx264", "-preset", "ultrafast"].map(String::from).to_vec()), ..Extras::default() };
+            let files = export(&j, Mode::Whole, music, d.path(), "Out", &extras, &r).unwrap();
+            let (picture, sound) = super::track_lengths(&files[0]).unwrap();
+            assert!((picture - 8.).abs() < 0.2, "hook + video: {picture}");
+            assert!(sound + 0.2 >= picture, "sound {sound} runs to the end of the picture {picture}");
+            assert!(!d.path().join("Out.part.sound.m4a").exists(), "the sound file is cleaned up");
+        }
+        // A video whose sound stops half-way is refused, and nothing is left behind.
+        let short = d.path().join("short.mp4");
+        tiny_video(&short, 6., 1, 2.);
+        let part = d.path().join("short.part.mp4");
+        std::fs::copy(&short, &part).unwrap();
+        let err = super::finish(&part, &d.path().join("kept.mp4")).unwrap_err();
+        assert!(err.to_string().contains("narration stopped"), "{err}");
+        assert!(!part.exists() && !d.path().join("kept.mp4").exists());
     }
 
     #[test]

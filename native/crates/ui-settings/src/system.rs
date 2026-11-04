@@ -1,12 +1,13 @@
-//! Settings → System: the resource limit for heavy work (`mv_core::limits`) and a live
-//! meter of CPU and memory use, for the whole PC and for MangaVox (app + its workers).
+//! Settings → System: the resource limit for heavy work (`mv_core::limits`), the GPU power
+//! limit its GPU work keeps under, and a live meter of CPU and memory use, for the whole PC and
+//! for MangaVox (app + its workers).
 use std::collections::HashSet;
 use std::sync::Mutex;
 
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::*;
 use mv_core::limits;
-use mv_ui::{ph, settings_block, settings_group, size, skeleton, skeleton_line, usage_bar, SettingsRow, Tokens};
+use mv_ui::{ph, segmented, settings_block, settings_group, size, skeleton, skeleton_line, usage_bar, SettingsRow, Tokens};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::ui::{format_bytes, icon_row};
@@ -144,6 +145,8 @@ impl SettingsView {
                 .child(div().w(px(44.)).text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(format!("{p}%"))),
         ));
 
+        let gpu = self.render_gpu_limit(_cx);
+
         let now = settings_group("Right now", Some("Updated every second.".into()));
         let now = match &self.meter {
             // Shaped like the four meter rows that are coming.
@@ -166,7 +169,36 @@ impl SettingsView {
                     .child(meter_row(ph::MEMORY, "Memory, MangaVox", "", mem(m.app_mem), format_bytes(m.app_mem), cap))
             }
         };
-        div().flex().flex_col().gap(px(mv_ui::settings::SETTINGS_GROUP_GAP)).child(limit).child(now)
+        div().flex().flex_col().gap(px(mv_ui::settings::SETTINGS_GROUP_GAP)).child(limit).child(gpu).child(now)
+    }
+
+    /// The GPU power limit: the choices of `limits::GPU_WATTS_CHOICES` (Safe by default).
+    fn render_gpu_limit(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = self.gpu_watts;
+        let choices = limits::GPU_WATTS_CHOICES;
+        // The choice at or just above the saved watts (a value from an older version lands on the nearest).
+        let ix = choices.iter().position(|(_, c)| *c >= w).unwrap_or(choices.len() - 1);
+        let detail = if w >= limits::GPU_WATTS_MAX {
+            "No limit: renders and voicing may run the graphics card up to its own power limit. Only for a power supply with plenty of headroom.".to_string()
+        } else {
+            format!("Renders, voicing and layered panels pace themselves to keep the graphics card under about {w} W. Lower is gentler on the power supply; higher is faster. Applies to work started from now on.")
+        };
+        settings_group(
+            "GPU power limit",
+            Some("How hard MangaVox may drive the graphics card. If the PC switches itself off during renders or voicing, keep this on Safe and have the power supply checked.".into()),
+        )
+        .child(icon_row(
+            ph::LIGHTNING,
+            "Limit",
+            detail,
+            segmented("gpu-watts", choices.map(|(label, _)| label), ix).on_change(cx.listener(|this, ix: &usize, _, cx| {
+                let (label, w) = limits::GPU_WATTS_CHOICES[*ix];
+                this.gpu_watts = w;
+                cx.notify();
+                let text = format!("GPU power limit: {label}");
+                this.background(cx, move || limits::set_gpu_watts(w), move |v, r, cx| v.report(&text, r, cx));
+            })),
+        ))
     }
 
     /// Takes a meter reading off the UI thread (one at a time).

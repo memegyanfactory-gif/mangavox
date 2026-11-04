@@ -32,6 +32,7 @@ use librqbit::{
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncSeekExt, ReadBuf};
+use tokio_util::sync::CancellationToken;
 
 use crate::http::{mime_from_name, BoxReader, ByteSource, SourceResolver, StreamServer};
 
@@ -352,6 +353,37 @@ fn listen_port_file(dir: &Path) -> PathBuf {
     dir.join("listen-port")
 }
 
+/// Which UDP port the DHT binds on one session start attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DhtPort {
+    /// The port saved in dht.json (random if none).
+    Saved,
+    /// A random free port; the saved routing table is still used.
+    Random,
+    /// No DHT (trackers only): the last resort.
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartAttempt {
+    /// 0 = random.
+    listen_port: u16,
+    dht: DhtPort,
+}
+
+/// Session start attempts, best first: the saved ports, then random ports,
+/// then (with DHT on) no DHT at all, so a busy port never stops playback.
+fn start_attempts(saved_listen_port: Option<u16>, dht: bool) -> Vec<StartAttempt> {
+    let mut v = vec![
+        StartAttempt { listen_port: saved_listen_port.unwrap_or(0), dht: DhtPort::Saved },
+        StartAttempt { listen_port: 0, dht: DhtPort::Random },
+    ];
+    if dht {
+        v.push(StartAttempt { listen_port: 0, dht: DhtPort::Off });
+    }
+    v
+}
+
 impl Engine {
     pub async fn new(cfg: EngineConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.download_dir)
@@ -363,19 +395,30 @@ impl Engine {
         }
 
         // Re-use the last listen port so UPnP mappings and peers' caches stay
-        // valid across restarts; fall back to a random one if it's taken.
+        // valid across restarts. If a port is busy (another MangaVox, another
+        // BitTorrent client, or a socket the OS has not released yet) fall back
+        // to random ports, then to no DHT: a busy port must never stop playback.
         let saved_port: Option<u16> = cfg
             .persist_session
             .then(|| std::fs::read_to_string(listen_port_file(&session_dir)).ok())
             .flatten()
             .and_then(|s| s.trim().parse().ok());
-        let session = match Self::start_session(&cfg, &session_dir, saved_port.unwrap_or(0)).await {
-            Ok(s) => s,
-            Err(e) if saved_port.is_some() => {
-                tracing::warn!("listen port {saved_port:?} unavailable ({e:#}); using a random one");
-                Self::start_session(&cfg, &session_dir, 0).await?
+        let mut session = None;
+        let mut last_err = None;
+        for attempt in start_attempts(saved_port, cfg.enable_dht) {
+            match Self::start_session(&cfg, &session_dir, attempt).await {
+                Ok(s) => {
+                    session = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("torrent session start {attempt:?} failed ({e:#}); trying the next fallback");
+                    last_err = Some(e);
+                }
             }
-            Err(e) => return Err(e),
+        }
+        let Some(session) = session else {
+            return Err(last_err.unwrap_or_else(|| anyhow!("torrent session did not start")));
         };
         if cfg.persist_session {
             if let Some(port) = session.listen_addr().map(|a| a.port()) {
@@ -407,14 +450,24 @@ impl Engine {
         Ok(Self { cfg, registry, server })
     }
 
-    async fn start_session(cfg: &EngineConfig, session_dir: &Path, port: u16) -> Result<Arc<Session>> {
+    async fn start_session(cfg: &EngineConfig, session_dir: &Path, attempt: StartAttempt) -> Result<Arc<Session>> {
         let trackers = cfg.trackers.iter().filter_map(|t| url::Url::parse(t).ok()).collect();
+        // librqbit only ties its listener / DHT tasks to the session once the
+        // session is fully built: if startup failed half-way (or this future
+        // was dropped) they kept running and held their UDP ports for the rest
+        // of the process, so every later start failed with "os error 10048".
+        // Cancel them unless the session comes up.
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
         let opts = SessionOptions {
-            dht: cfg.enable_dht.then(|| DhtSessionConfig {
+            cancellation_token: Some(token),
+            dht: (cfg.enable_dht && attempt.dht != DhtPort::Off).then(|| DhtSessionConfig {
                 persistence: cfg.persist_session.then(|| DhtPersistenceConfig {
                     dump_interval: Some(Duration::from_secs(60)),
                     config_filename: Some(session_dir.join("dht.json")),
                 }),
+                // `Some(0)` overrides the port saved in dht.json (the routing table is still loaded).
+                port: (attempt.dht == DhtPort::Random).then_some(0),
                 ..Default::default()
             }),
             persistence: cfg
@@ -423,7 +476,7 @@ impl Engine {
             fastresume: cfg.persist_session,
             listen: cfg.enable_listen.then(|| ListenerOptions {
                 mode: ListenerMode::TcpAndUtp,
-                listen_addr: SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+                listen_addr: SocketAddr::from((Ipv6Addr::UNSPECIFIED, attempt.listen_port)),
                 enable_upnp_port_forwarding: cfg.enable_upnp,
                 ..Default::default()
             }),
@@ -447,7 +500,9 @@ impl Engine {
             },
             ..Default::default()
         };
-        Session::new_with_opts(cfg.download_dir.clone(), opts).await
+        let session = Session::new_with_opts(cfg.download_dir.clone(), opts).await?;
+        guard.disarm();
+        Ok(session)
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -1231,6 +1286,102 @@ mod tests {
         cfg.enable_upnp = false;
         cfg.trackers.clear();
         cfg
+    }
+
+    #[test]
+    fn start_attempts_fall_back_to_random_ports_then_no_dht() {
+        let a = start_attempts(Some(6881), true);
+        assert_eq!(a[0], StartAttempt { listen_port: 6881, dht: DhtPort::Saved });
+        assert_eq!(a[1], StartAttempt { listen_port: 0, dht: DhtPort::Random });
+        assert_eq!(a[2], StartAttempt { listen_port: 0, dht: DhtPort::Off });
+        assert_eq!(start_attempts(None, false).len(), 2);
+        assert_eq!(start_attempts(None, true)[0].listen_port, 0);
+    }
+
+    /// A UDP port held so that nothing else can bind it. On Windows a plain bind is shared by a
+    /// later SO_REUSEADDR bind (which librqbit's sockets use), so it is held exclusively, the way
+    /// another program's socket held the user's port ("os error 10048").
+    fn hold_udp_port() -> (socket2::Socket, u16) {
+        use socket2::{Domain, Socket, Type};
+        let s = Socket::new(Domain::IPV6, Type::DGRAM, None).unwrap();
+        let _ = s.set_only_v6(false);
+        #[cfg(windows)]
+        // SAFETY: a valid socket handle and a 4-byte option value that outlives the call.
+        unsafe {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_EXCLUSIVEADDRUSE};
+            let on: i32 = 1;
+            setsockopt(s.as_raw_socket() as _, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &on as *const i32 as *const u8, 4);
+        }
+        s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into()).unwrap();
+        let port = s.local_addr().unwrap().as_socket().unwrap().port();
+        (s, port)
+    }
+
+    /// A valid dht.json (empty routing table) whose saved DHT address is `[::]:port`.
+    fn write_dht_json(session_dir: &Path, port: u16) {
+        let id = "2d7251393031302d000000000000000000000001";
+        let json = format!(
+            r#"{{"addr":"[::]:{port}","table":{{"id":"{id}","size":0,"buckets":{{"data":[{{"bits":160,"start":"{z}","end_inclusive":"{f}","data":{{"Leaf":{{"nodes":[]}}}}}}],"size":0,"max_size":512}}}}}}"#,
+            z = "0".repeat(40),
+            f = "f".repeat(40),
+        );
+        std::fs::write(session_dir.join("dht.json"), json).unwrap();
+    }
+
+    /// The UDP port saved in dht.json is taken (another MangaVox, another
+    /// client, a leaked socket): the engine must still start, on another port.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn busy_dht_port_falls_back_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = offline_cfg(dir.path());
+        cfg.enable_dht = true;
+        let session_dir = cfg.session_dir();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let (busy, port) = hold_udp_port();
+        write_dht_json(&session_dir, port);
+
+        // Precondition: the saved port really is busy (this is the user's "os error 10048").
+        let attempt = StartAttempt { listen_port: 0, dht: DhtPort::Saved };
+        let err = Engine::start_session(&cfg, &session_dir, attempt).await.err().expect("saved DHT port is busy");
+        assert!(format!("{err:#}").contains("DHT"), "{err:#}");
+
+        let engine = Engine::new(cfg).await.expect("engine starts despite the busy DHT port");
+        let dht = engine.registry.session.get_dht().expect("DHT still runs, on a random port");
+        assert_ne!(dht.listen_addr().port(), port);
+        drop(busy);
+    }
+
+    /// A start that fails half-way must not keep its listener / DHT sockets:
+    /// they held the ports for the rest of the process, so every retry failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_start_releases_its_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = offline_cfg(dir.path());
+        cfg.enable_dht = true;
+        cfg.enable_listen = true;
+        let session_dir = cfg.session_dir();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let (busy, port) = hold_udp_port();
+        write_dht_json(&session_dir, port);
+        let listen_port = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap().local_addr().unwrap().port();
+
+        // The listeners bind `listen_port` first, then the DHT fails on the busy port.
+        let attempt = StartAttempt { listen_port, dht: DhtPort::Saved };
+        assert!(Engine::start_session(&cfg, &session_dir, attempt).await.is_err());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let udp = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, listen_port));
+            let tcp = std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, listen_port));
+            if udp.is_ok() && tcp.is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "port {listen_port} still held after a failed start");
+            drop((udp, tcp));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(busy);
     }
 
     async fn local_torrent(dir: &Path, name: &str, len: usize) -> (PathBuf, Vec<u8>, Vec<u8>, String) {
