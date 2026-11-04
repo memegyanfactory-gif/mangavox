@@ -22,7 +22,7 @@ impl StudioPage {
             self.dock = ui_assistant::dock(window, cx);
         }
         // A live dot on Activity while something runs and another tab is open.
-        let live = self.run.as_ref().is_some_and(|r| r.running()) || self.jobs.iter().any(|j| !j.state.finished()) || self.queue.active() > 0;
+        let live = self.run.as_ref().is_some_and(|r| r.running()) || self.jobs.iter().any(|j| !j.state.finished()) || self.queue.active() > 0 || !crate::pipeline::exports().is_empty();
         let tabs = tab_bar(
             "studio-side-tabs",
             &[
@@ -81,6 +81,9 @@ impl StudioPage {
     fn activity(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let run = self.run.clone();
         let jobs = self.jobs.clone();
+        // Full-video exports and joins (this page's, an auto export's or the assistant's), the
+        // ones waiting their turn after them.
+        let exports = crate::pipeline::exports();
         let any_finished = jobs.iter().any(|j| j.state.finished());
         let can_read = self.view == crate::page::View::Editor && self.focus.is_some() && self.run_blocker().is_none();
         div()
@@ -94,7 +97,43 @@ impl StudioPage {
             .gap(px(space::MD))
             // What is happening now comes first; issues and the waiting queue follow.
             .when_some(run.clone(), |d, r| d.child(self.run_card(&r, cx)))
-            .when(run.is_none() && jobs.is_empty() && self.queue.items.is_empty(), |d| {
+            .when(!exports.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(space::SM))
+                        .pt(px(space::XS))
+                        .child(icon_ph(glyphs::DOWNLOADS, Tokens::text_3(), icon_px::SM))
+                        .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child("Exports")),
+                )
+                .children(exports.iter().map(|e| {
+                    let id = e.id;
+                    let title = if e.manga_title.is_empty() { "Full video".to_string() } else { format!("{} · full video", e.manga_title) };
+                    card()
+                        .gap(px(space::SM))
+                        .p(px(space::MD))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(space::SM))
+                                .child(icon_ph(glyphs::VIDEO, Tokens::text_2(), icon_px::MD))
+                                .child(div().flex_1().min_w_0().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(title))
+                                .child(status_tag(if e.waiting { StatusKind::Queued } else { StatusKind::Running }))
+                                .child(icon_button(SharedString::from(format!("export-x-{id}")), ph::X, "Cancel this export").small().on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                    crate::pipeline::cancel_export(id);
+                                    cx.notify();
+                                }))),
+                        )
+                        .child(if e.waiting {
+                            div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(e.label.clone())
+                        } else {
+                            div().child(progress_line(&format!("export-{id}"), e.progress, e.label.clone()))
+                        })
+                }))
+            })
+            .when(run.is_none() && jobs.is_empty() && self.queue.items.is_empty() && exports.is_empty(), |d| {
                 d.child(
                     div().pt(px(space::XL)).child(
                         empty_view(ph::PULSE, "Nothing running", "Pick chapters on the Dashboard and press Generate, or work on one step here. Progress, the characters the AI meets and every audio or video job show up here.")

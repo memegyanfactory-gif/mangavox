@@ -708,6 +708,10 @@ impl StudioPage {
                     changed = true;
                 }
                 this.video_poll(cx);
+                // Exports report through shared state: keep their Activity cards moving.
+                if !crate::pipeline::exports().is_empty() {
+                    changed = true;
+                }
                 // The runner reads the model and setup from here while it has work.
                 if this.queue.active() > 0 {
                     this.sync_pipeline(cx);

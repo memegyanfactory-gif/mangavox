@@ -2282,7 +2282,22 @@ impl StudioPage {
     }
 
     /// The manga's Video card: the made chapters as one video, to play or export.
+    /// `g` as the dashboard's Play, Preview export and Export use it: only the chapters ticked
+    /// on the dashboard when some of `g`'s are, else all of them. (Elsewhere, all of them.)
+    pub(crate) fn picked_group(&self, g: &MangaGroup) -> MangaGroup {
+        let ticked = picked_chapters(&g.chapters, &self.dash_pick);
+        if self.view != crate::page::View::Dashboard || ticked.is_empty() {
+            return g.clone();
+        }
+        MangaGroup { chapters: ticked, ..g.clone() }
+    }
+
     pub(crate) fn video_section(&mut self, g: &MangaGroup, cx: &mut Context<Self>) -> AnyElement {
+        // Play, Preview export and Export take the ticked chapters when there are any.
+        let full = g;
+        let picked = self.picked_group(full);
+        let ticked = picked.chapters.len() < full.chapters.len();
+        let g = &picked;
         let videos = self.made_videos(g);
         // Chapters on the timeline count (Play and Export render the ones not rendered yet); the
         // length is the rendered ones'.
@@ -2299,7 +2314,7 @@ impl StudioPage {
             btn("vid-play", "Play", ButtonKind::Primary)
                 .small()
                 .icon(ph::PLAY)
-                .tooltip("Play every made chapter as one video")
+                .tooltip(if ticked { "Play the ticked chapters as one video" } else { "Play every made chapter as one video" })
                 .when(n == 0 || busy, |b| b.disabled(if n == 0 { "Make a chapter video first" } else { "Busy with the video" }))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     if !this.style_first_open(cx) {
@@ -2336,6 +2351,7 @@ impl StudioPage {
         });
 
         let note = match mode {
+            Mode::Whole if ticked => "Saves the ticked chapters as one video file.".to_string(),
             Mode::Whole => "Saves everything as one video file.".to_string(),
             Mode::Parts(p) => format!("{p} videos of about {} each, cut between sentences.", if total > 0. { fmt_duration(total / p as f64) } else { "equal length".into() }),
             Mode::Reels => format!(
@@ -2354,12 +2370,20 @@ impl StudioPage {
                     .flex_wrap()
                     .items_center()
                     .gap(px(space::SM))
-                    .child(div().flex_1().min_w(px(160.)).child(small(if n == 0 {
-                        "Every made chapter joins here, in order, as one video.".to_string()
-                    } else if prefs.quality == Quality::Source {
-                        note
-                    } else {
-                        format!("{note} Scaled to {} (re-encoded, so it takes longer{}).", prefs.quality.label(), if prefs.quality == Quality::K4 { "; 4K is the slowest" } else { "" })
+                    .child(div().flex_1().min_w(px(160.)).child(small({
+                        let text = if n == 0 {
+                            "Every made chapter joins here, in order, as one video.".to_string()
+                        } else if prefs.quality == Quality::Source {
+                            note
+                        } else {
+                            format!("{note} Scaled to {} (re-encoded, so it takes longer{}).", prefs.quality.label(), if prefs.quality == Quality::K4 { "; 4K is the slowest" } else { "" })
+                        };
+                        if ticked {
+                            let k = g.chapters.len();
+                            format!("Only the {k} ticked chapter{} (untick them all to use every chapter). {text}", plural(k))
+                        } else {
+                            text
+                        }
                     })))
                     .children(hook_chip)
                     .child(preview)
@@ -2376,6 +2400,7 @@ impl StudioPage {
                             })),
                     ),
             );
+        let g = full;
         let auto_dir = self.auto_export.folder(&g.id).map(Path::to_path_buf);
         let auto = {
             let (g_on, g_change) = (g.clone(), g.clone());
@@ -2440,6 +2465,43 @@ impl StudioPage {
             .children(progress)
             .child(style)
             .into_any_element()
+    }
+}
+
+/// The chapters of `chapters` that are ticked, in their own order.
+pub(crate) fn picked_chapters(chapters: &[crate::data::ChapterItem], ticked: &std::collections::BTreeSet<String>) -> Vec<crate::data::ChapterItem> {
+    chapters.iter().filter(|c| ticked.contains(&c.id)).cloned().collect()
+}
+
+#[cfg(test)]
+mod picked_tests {
+    use super::picked_chapters;
+    use crate::data::ChapterItem;
+    use std::collections::BTreeSet;
+
+    fn ch(id: &str) -> ChapterItem {
+        ChapterItem {
+            id: id.into(),
+            manga_id: "m".into(),
+            manga_title: "M".into(),
+            number: None,
+            title: None,
+            pages_dir: Default::default(),
+            output_dir: Default::default(),
+            page_count: 0,
+            has_text: false,
+            video: None,
+            audio_files: 0,
+        }
+    }
+
+    #[test]
+    fn only_the_ticked_chapters_are_used_in_their_own_order() {
+        let all = vec![ch("1"), ch("2"), ch("3"), ch("4")];
+        let ticked: BTreeSet<String> = ["4", "2", "other-manga"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = picked_chapters(&all, &ticked).into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, ["2", "4"]);
+        assert!(picked_chapters(&all, &BTreeSet::new()).is_empty(), "none ticked: the caller uses them all");
     }
 }
 
