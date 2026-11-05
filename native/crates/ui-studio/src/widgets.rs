@@ -10,7 +10,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::theme::{duration, easing, icon as icon_px, radius, ramp, space};
-use mv_ui::{btn, glyphs, icon_ph, inline_alert, ph, ph_icon, pulse_dot, size, tip, AlertKind, ButtonKind, Hue, Interactive as _, Ph, RampExt as _, Tokens, Weight};
+use mv_ui::{btn, glyphs, icon_ph, inline_alert, ph, ph_icon, size, tip, AlertKind, ButtonKind, Hue, Interactive as _, Ph, RampExt as _, Tokens, Weight};
 
 use crate::page::Phase;
 
@@ -202,39 +202,14 @@ pub(crate) fn fold_head(id: &'static str, icon: Ph, title: &'static str, summary
 
 /// Segmented tab bar with icons (fill weight on the current tab) and an optional live dot, for
 /// panels whose tabs can be busy in the background (Fluent 2 TabList, filled icon = selected).
+/// The same strip as the app-wide panel's, so both look alike.
 pub(crate) fn tab_bar<T: Copy + PartialEq + 'static>(
     id: &'static str,
     tabs: &[(T, &'static str, Ph, bool)],
     current: T,
     on_pick: impl Fn(&T, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let on_pick = Rc::new(on_pick);
-    div().flex().items_center().gap(px(2.)).p(px(3.)).rounded(px(radius::MD)).bg(Tokens::well()).border_1().border_color(Tokens::border()).children(tabs.iter().enumerate().map(
-        |(i, &(t, label, icon, live))| {
-            let on = t == current;
-            let f = on_pick.clone();
-            let fg = if on { Tokens::text_1() } else { Tokens::text_2() };
-            div()
-                .id((id, i))
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap(px(6.))
-                .h(px(28.))
-                .rounded(px(radius::SM))
-                .text_size(px(size::SM))
-                .text_color(fg)
-                .role(Role::Tab)
-                .aria_selected(on)
-                .map(|d| if on { d.bg(Tokens::surface_3()).border_1().border_color(Tokens::border_strong()).font_weight(FontWeight::MEDIUM) } else { d.hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1())) })
-                .pressable()
-                .on_click(move |_, w, cx| f(&t, w, cx))
-                .child(ph_icon(icon, if on { Weight::Fill } else { Weight::Bold }, if on { Tokens::accent() } else { Tokens::text_3() }, icon_px::SM))
-                .child(label)
-                .when(live && !on, |d| d.child(pulse_dot((id, 100 + i), Tokens::accent(), 6.)))
-        },
-    ))
+    mv_ui::panel::tab_bar(id, tabs, current, on_pick)
 }
 
 // ---------------------------------------------------------------- reset confirmation

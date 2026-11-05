@@ -140,7 +140,7 @@ pub fn corner(cards: Vec<Card>, toast: Option<AnyView>, cx: &mut App) -> AnyElem
         // Opened past the window's height, the stack scrolls instead of running off the top.
         .when(expanded, |d| d.overflow_y_scroll())
         .when(many, |d| d.child(more_row(hidden, expanded)))
-        .children(shown.into_iter().filter_map(|i| slots[i].take()).map(card));
+        .children(shown.into_iter().filter_map(|i| slots[i].take()).map(|c| card(c, true)));
     div()
         .absolute()
         .top(px(MARGIN))
@@ -153,6 +153,17 @@ pub fn corner(cards: Vec<Card>, toast: Option<AnyView>, cx: &mut App) -> AnyElem
         .child(list)
         .children(toast)
         .into_any_element()
+}
+
+/// The same cards as a plain list for the side panel (`mv_ui::panel`): oldest first, full
+/// width, flat (no float, no fold: the panel scrolls). `None` when there are no cards.
+pub fn inline(cards: Vec<Card>) -> Option<AnyElement> {
+    if cards.is_empty() {
+        return None;
+    }
+    let mut cards = cards;
+    cards.sort_by_key(Card::order);
+    Some(div().flex().flex_col().gap(px(GAP)).children(cards.into_iter().map(|c| card(c, false))).into_any_element())
 }
 
 /// The opaque floating surface every card (and the "+N more" row) sits on.
@@ -186,14 +197,20 @@ fn more_row(hidden: usize, expanded: bool) -> AnyElement {
         .into_any_element()
 }
 
-fn card(c: Card) -> AnyElement {
+/// One card: `floating` in the corner stack (shadow, slides in from the edge), or flat in a list.
+fn card(c: Card, floating: bool) -> AnyElement {
     let lead = match c.lead {
         Lead::Progress(p) => progress_ring_sized(p, icon_px::LG),
         Lead::Done => ph_icon(ph::CHECK_CIRCLE, Weight::Fill, Tokens::success(), icon_px::LG).into_any_element(),
         Lead::Failed => ph_icon(ph::WARNING, Weight::Fill, Tokens::warning(), icon_px::LG).into_any_element(),
     };
     let footer = c.count.is_some() || !c.actions.is_empty();
-    let el = surface(c.key.clone())
+    let base = if floating {
+        surface(c.key.clone())
+    } else {
+        div().id(c.key.clone()).flex_none().rounded(px(radius::LG)).bg(Tokens::surface()).border_1().border_color(Tokens::border())
+    };
+    let el = base
         .flex()
         .flex_col()
         .gap(px(10.))
@@ -232,6 +249,10 @@ fn card(c: Card) -> AnyElement {
         });
     if reduced() {
         return el.into_any_element();
+    }
+    if !floating {
+        // In a list a card fades in where it lands; sliding would push its neighbours around.
+        return el.with_animation(SharedString::from(format!("{}-fade", c.key)), Animation::new(duration::BASE).with_easing(easing::enter), |el, t| el.opacity(t)).into_any_element();
     }
     el.with_animation(SharedString::from(format!("{}-in", c.key)), Animation::new(duration::SLOW).with_easing(easing::enter), |el, t| el.opacity(t).mr(px((1. - t) * -(WIDTH + MARGIN))))
         .into_any_element()

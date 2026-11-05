@@ -25,7 +25,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 RIBBON_SEC = 1.2
-REVEAL_SEC = 0.5
+REVEAL_SEC = 1.4  # long enough for the music to fade out under the recap settling in
 PASS_SEC = 0.768  # seconds into the transition when the camera passes through the ribbons
 SR = 48000
 

@@ -821,7 +821,7 @@ pub(crate) fn load_watermark(file: &Path) -> Option<Watermark> {
         .then(|| l["path"].as_str().map(PathBuf::from))
         .flatten()
         .filter(|p| p.is_file())
-        .map(|p| (p, pos(l), num(l, "size", 0.04, 0.4, 0.12), num(l, "opacity", 0., 1., 1.)));
+        .map(|p| (p, pos(l), num(l, "size", 0.04, 0.4, 0.06), num(l, "opacity", 0., 1., 1.)));
     let t = &v["text"];
     let text = (t["on"].as_bool() == Some(true))
         .then(|| t["text"].as_str().map(|s| s.trim().to_string()))

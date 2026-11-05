@@ -21,6 +21,7 @@ mod generate;
 mod issues;
 pub mod look;
 mod music;
+pub mod panel;
 pub mod pipeline;
 mod queue_view;
 mod restyle;
@@ -65,8 +66,12 @@ pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView>
         Route::Studio => {
             if let Some(Kept(page)) = cx.try_global::<Kept>() {
                 let page = page.clone();
-                // Chapters may have been downloaded or deleted elsewhere meanwhile.
-                page.update(cx, |p, cx| p.reload_library(cx));
+                // Chapters may have been downloaded or deleted elsewhere meanwhile. The page takes
+                // the keyboard here: the app-wide side panel may have made it without focus.
+                page.update(cx, |p, cx| {
+                    p.reload_library(cx);
+                    window.focus(&p.focus_handle, cx);
+                });
                 return Some(page.into());
             }
             let page = cx.new(|cx| page::StudioPage::new(window, cx));

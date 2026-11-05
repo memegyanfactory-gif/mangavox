@@ -402,7 +402,7 @@ pub struct Logo {
 
 impl Default for Logo {
     fn default() -> Self {
-        Self { on: false, path: None, pos: 2, size: 0.12, opacity: 0.85 }
+        Self { on: false, path: None, pos: 2, size: 0.06, opacity: 0.85 }
     }
 }
 
@@ -724,7 +724,9 @@ pub fn import_logo(src: &Path) -> std::io::Result<PathBuf> {
 
 // ------------------------------------------------------------------------------------ the panel
 
-const LOGO_SIZES: [f32; 4] = [0.08, 0.12, 0.16, 0.22];
+/// The logo's width as a share of the frame's: S, M (the default), L, XL. A channel mark stays
+/// small in a corner; 12% read as too big over the pictures.
+const LOGO_SIZES: [f32; 4] = [0.04, 0.06, 0.08, 0.11];
 const LOGO_OPACITY: [f32; 3] = [0.5, 0.75, 1.0];
 const TEXT_SIZES: [f32; 3] = [0.035, 0.05, 0.07];
 const TEXT_OPACITY: [f32; 3] = [0.4, 0.6, 0.8];
@@ -1342,7 +1344,7 @@ mod tests {
         assert_eq!(l.preset, Preset::Dynamic);
         assert_eq!(l.effects(), Effects { grade: true, vignette: true, glow: true, impact: true, leaks: true, chroma: true, parallax: true, mood: true, edge_glow: true, chapter_card: true, ..Effects::default() });
         assert_eq!(l.color(), ColorPreset::None);
-        assert_eq!((l.logo.pos, l.logo.size, l.logo.opacity), (2, 0.12, 0.85));
+        assert_eq!((l.logo.pos, l.logo.size, l.logo.opacity), (2, 0.06, 0.85));
         assert_eq!((l.text.pos, l.text.size, l.text.opacity), (0, 0.05, 0.6));
         let v = l.to_json();
         assert_eq!(v["preset"], "dynamic");
@@ -1522,7 +1524,9 @@ mod tests {
 
     #[test]
     fn size_options_pick_the_nearest() {
-        assert_eq!(nearest(&LOGO_SIZES, 0.12), 1);
+        assert_eq!(nearest(&LOGO_SIZES, 0.06), 1);
         assert_eq!(nearest(&LOGO_SIZES, 0.3), 3);
+        // A size saved before the scale was halved shows as the biggest option.
+        assert_eq!(nearest(&LOGO_SIZES, 0.12), 3);
     }
 }

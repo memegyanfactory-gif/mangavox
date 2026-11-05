@@ -1498,6 +1498,8 @@ impl ReaderPage {
             "space" if self.aloud.is_some() => self.aloud_play_pause(cx),
             "k" => self.aloud_play_pause(cx),
             "r" => self.toggle_aloud(cx),
+            // The side panel floating over the page goes first (the shell never sees this key).
+            "escape" if mv_ui::panel::floats_over_page(cx) => mv_ui::panel::set_open(false, cx),
             "escape" if self.show_keys => {
                 self.show_keys = false;
                 cx.notify();

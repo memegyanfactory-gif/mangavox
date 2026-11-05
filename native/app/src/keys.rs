@@ -10,7 +10,7 @@ use gpui_kit::*;
 
 actions!(
     mangavox,
-    [CommandPalette, ToggleSidebar, ToggleAssistant, OpenSettings, ShowManga, ShowAnime, ShowMovies, GoBack, GoForward, ToggleFullscreen, TogglePrivate]
+    [CommandPalette, ToggleSidebar, TogglePanel, OpenSettings, ShowManga, ShowAnime, ShowMovies, GoBack, GoForward, ToggleFullscreen, TogglePrivate]
 );
 
 /// What a shortcut does.
@@ -18,7 +18,8 @@ actions!(
 pub enum Shortcut {
     Palette,
     Sidebar,
-    Assistant,
+    /// The side panel (Activity, issues and chat): every page, the reader and the player.
+    Panel,
     Settings,
     Manga,
     Anime,
@@ -34,7 +35,7 @@ pub enum Shortcut {
 pub const SHORTCUTS: &[(&str, Shortcut)] = &[
     ("ctrl-k", Shortcut::Palette),
     ("ctrl-b", Shortcut::Sidebar),
-    ("ctrl-j", Shortcut::Assistant),
+    ("ctrl-j", Shortcut::Panel),
     ("ctrl-,", Shortcut::Settings),
     ("ctrl-1", Shortcut::Manga),
     ("ctrl-2", Shortcut::Anime),
@@ -50,7 +51,7 @@ impl Shortcut {
         match self {
             Shortcut::Palette => Box::new(CommandPalette),
             Shortcut::Sidebar => Box::new(ToggleSidebar),
-            Shortcut::Assistant => Box::new(ToggleAssistant),
+            Shortcut::Panel => Box::new(TogglePanel),
             Shortcut::Settings => Box::new(OpenSettings),
             Shortcut::Manga => Box::new(ShowManga),
             Shortcut::Anime => Box::new(ShowAnime),
@@ -77,7 +78,7 @@ fn binding(keys: &str, s: Shortcut) -> KeyBinding {
     match s {
         Shortcut::Palette => KeyBinding::new(keys, CommandPalette, None),
         Shortcut::Sidebar => KeyBinding::new(keys, ToggleSidebar, None),
-        Shortcut::Assistant => KeyBinding::new(keys, ToggleAssistant, None),
+        Shortcut::Panel => KeyBinding::new(keys, TogglePanel, None),
         Shortcut::Settings => KeyBinding::new(keys, OpenSettings, None),
         Shortcut::Manga => KeyBinding::new(keys, ShowManga, None),
         Shortcut::Anime => KeyBinding::new(keys, ShowAnime, None),
@@ -105,7 +106,7 @@ pub fn is_escape(k: &Keystroke) -> bool {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that would bring in gpui's `test` macro, which shadows the built-in one.
-    use super::{shortcut_for, SHORTCUTS};
+    use super::{shortcut_for, Shortcut, SHORTCUTS};
     use gpui_kit::Keystroke;
 
     #[test]
@@ -115,6 +116,11 @@ mod tests {
             assert_eq!(shortcut_for(&k), Some(*s), "{keys}");
             assert_eq!(s.keys(), *keys);
         }
+    }
+
+    #[test]
+    fn the_panel_shortcut_is_the_one_pages_name_in_tooltips() {
+        assert_eq!(Shortcut::Panel.keys(), mv_ui::panel::SHORTCUT);
     }
 
     #[test]

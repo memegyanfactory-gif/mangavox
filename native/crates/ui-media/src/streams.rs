@@ -613,7 +613,10 @@ pub fn sources_panel<V: 'static>(
     close: Option<fn(&mut V)>,
     retry: fn(&mut V, &mut Window, &mut Context<V>),
 ) -> Option<Stateful<Div>> {
-    let shell = div().id("sources-panel").flex().flex_col().size_full().overflow_y_scroll().p(px(16.)).rounded(px(radius::LG)).bg(Tokens::glass_strong()).border_1().border_color(Tokens::glass_border()).shadow_lg();
+    // `occlude`: GPUI hands a wheel turn to every scroll area under the pointer, so without it the
+    // page scrolled along with the list. The list now scrolls on its own; the page scrolls when
+    // the pointer is off it.
+    let shell = div().id("sources-panel").flex().flex_col().size_full().overflow_y_scroll().occlude().p(px(16.)).rounded(px(radius::LG)).bg(Tokens::glass_strong()).border_1().border_color(Tokens::glass_border()).shadow_lg();
     let head = |note: AnyElement, cx: &mut Context<V>| {
         div()
             .flex()

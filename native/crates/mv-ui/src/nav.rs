@@ -157,10 +157,16 @@ pub fn toggle_private(window: &mut Window, cx: &mut App) {
 
 static KEEP_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The player is being replaced by the next episode: the shell leaves full screen as it closes
-/// the player, so this keeps it on for that one change.
+/// The player is being replaced by the next episode: the shell takes the window out of full
+/// screen on every page but the reader and the player, so this keeps it on for that one change.
 pub fn keep_fullscreen_once() {
     KEEP_FULLSCREEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the closing player asked to stay in full screen, without clearing the request (the
+/// player clears it once the next episode is open).
+pub fn keeps_fullscreen() -> bool {
+    KEEP_FULLSCREEN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Whether the closing player asked to stay in full screen (clears the request).

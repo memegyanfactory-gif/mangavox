@@ -79,13 +79,6 @@ impl StudioPage {
     // ------------------------------------------------------------ Activity
 
     fn activity(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let run = self.run.clone();
-        let jobs = self.jobs.clone();
-        // Full-video exports and joins (this page's, an auto export's or the assistant's), the
-        // ones waiting their turn after them.
-        let exports = crate::pipeline::exports();
-        let any_finished = jobs.iter().any(|j| j.state.finished());
-        let can_read = self.view == crate::page::View::Editor && self.focus.is_some() && self.run_blocker().is_none();
         div()
             .id("studio-activity")
             .flex()
@@ -95,21 +88,41 @@ impl StudioPage {
             .overflow_y_scroll()
             .p(px(space::MD))
             .gap(px(space::MD))
-            // What is happening now comes first; issues and the waiting queue follow.
-            .when_some(run.clone(), |d, r| d.child(self.run_card(&r, cx)))
-            .when(!exports.is_empty(), |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(space::SM))
-                        .pt(px(space::XS))
-                        .child(icon_ph(glyphs::DOWNLOADS, Tokens::text_3(), icon_px::SM))
-                        .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child("Exports")),
-                )
-                .children(exports.iter().map(|e| {
-                    let id = e.id;
-                    let title = if e.manga_title.is_empty() { "Full video".to_string() } else { format!("{} · full video", e.manga_title) };
+            .children(self.activity_items(false, cx))
+    }
+
+    /// What Activity lists, top to bottom, for Studio's own panel and for the app-wide one
+    /// (`app_wide`). The app-wide panel scrolls and pads for itself and draws one shared empty
+    /// state, so there this returns nothing at all when nothing is happening, and "See all
+    /// issues" opens that panel's Issues tab instead of Studio's.
+    pub(crate) fn activity_items(&self, app_wide: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = vec![];
+        let run = self.run.clone();
+        let jobs = self.jobs.clone();
+        // Full-video exports and joins (this page's, an auto export's or the assistant's), the
+        // ones waiting their turn after them.
+        let exports = crate::pipeline::exports();
+        let any_finished = jobs.iter().any(|j| j.state.finished());
+        let can_read = self.view == crate::page::View::Editor && self.focus.is_some() && self.run_blocker().is_none();
+        // What is happening now comes first; issues and the waiting queue follow.
+        if let Some(r) = run.clone() {
+            out.push(self.run_card(&r, cx).into_any_element());
+        }
+        if !exports.is_empty() {
+            out.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(space::SM))
+                    .pt(px(space::XS))
+                    .child(icon_ph(glyphs::DOWNLOADS, Tokens::text_3(), icon_px::SM))
+                    .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child("Exports"))
+                    .into_any_element(),
+            );
+            for e in exports.iter() {
+                let id = e.id;
+                let title = if e.manga_title.is_empty() { "Full video".to_string() } else { format!("{} · full video", e.manga_title) };
+                out.push(
                     card()
                         .gap(px(space::SM))
                         .p(px(space::MD))
@@ -131,53 +144,62 @@ impl StudioPage {
                         } else {
                             div().child(progress_line(&format!("export-{id}"), e.progress, e.label.clone()))
                         })
-                }))
-            })
-            .when(run.is_none() && jobs.is_empty() && self.queue.items.is_empty() && exports.is_empty(), |d| {
-                d.child(
-                    div().pt(px(space::XL)).child(
+                        .into_any_element(),
+                );
+            }
+        }
+        // Studio's own panel explains the empty state and offers to read; the app-wide panel
+        // draws a single empty state for all of its tabs.
+        if !app_wide && run.is_none() && jobs.is_empty() && self.queue.items.is_empty() && exports.is_empty() {
+            out.push(
+                div()
+                    .pt(px(space::XL))
+                    .child(
                         empty_view(ph::PULSE, "Nothing running", "Pick chapters on the Dashboard and press Generate, or work on one step here. Progress, the characters the AI meets and every audio or video job show up here.")
                             .compact()
                             .when(can_read, |e| {
                                 e.action(btn("act-empty-read", "Read this chapter", ButtonKind::Secondary).icon(glyphs::READ).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_read(false, cx))))
                             }),
-                    ),
-                )
-            })
-            .when(!jobs.is_empty(), |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(space::SM))
-                        .pt(px(space::XS))
-                        .child(icon_ph(ph::QUEUE, Tokens::text_3(), icon_px::SM))
-                        .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child("Audio and video"))
-                        .when(any_finished, |d| {
-                            d.child(btn("jobs-clear", "Clear finished", ButtonKind::Ghost).small().icon(ph::BROOM).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                service::clear_finished();
-                                this.jobs = service::snapshot();
-                                cx.notify();
-                            })))
-                        }),
-                )
-                .children(jobs.into_iter().map(|j| {
-                    let kind = match &j.state {
-                        JobView::Queued => StatusKind::Queued,
-                        JobView::Running => StatusKind::Running,
-                        JobView::Done => StatusKind::Done,
-                        JobView::Failed(_) => StatusKind::Failed,
-                        JobView::Cancelled => StatusKind::Cancelled,
-                    };
-                    let video = j.stages.iter().any(|s| s == "video");
-                    let what = match (video, j.regen_pages.as_slice()) {
-                        (true, _) => "Video".to_string(),
-                        (false, [p]) => format!("Page {}", p + 1),
-                        (false, []) => "Audio".to_string(),
-                        (false, ps) => format!("{} pages", ps.len()),
-                    };
-                    let id = j.id;
-                    let narrator = j.narrator.clone();
+                    )
+                    .into_any_element(),
+            );
+        }
+        if !jobs.is_empty() {
+            out.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(space::SM))
+                    .pt(px(space::XS))
+                    .child(icon_ph(ph::QUEUE, Tokens::text_3(), icon_px::SM))
+                    .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child("Audio and video"))
+                    .when(any_finished, |d| {
+                        d.child(btn("jobs-clear", "Clear finished", ButtonKind::Ghost).small().icon(ph::BROOM).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            service::clear_finished();
+                            this.jobs = service::snapshot();
+                            cx.notify();
+                        })))
+                    })
+                    .into_any_element(),
+            );
+            for j in jobs.into_iter() {
+                let kind = match &j.state {
+                    JobView::Queued => StatusKind::Queued,
+                    JobView::Running => StatusKind::Running,
+                    JobView::Done => StatusKind::Done,
+                    JobView::Failed(_) => StatusKind::Failed,
+                    JobView::Cancelled => StatusKind::Cancelled,
+                };
+                let video = j.stages.iter().any(|s| s == "video");
+                let what = match (video, j.regen_pages.as_slice()) {
+                    (true, _) => "Video".to_string(),
+                    (false, [p]) => format!("Page {}", p + 1),
+                    (false, []) => "Audio".to_string(),
+                    (false, ps) => format!("{} pages", ps.len()),
+                };
+                let id = j.id;
+                let narrator = j.narrator.clone();
+                out.push(
                     card()
                         .gap(px(space::SM))
                         .p(px(space::MD))
@@ -206,10 +228,13 @@ impl StudioPage {
                             let step = if video { mv_recap::Step::Video } else { mv_recap::Step::Audio };
                             d.child(self.failure_block(&format!("job-{id}"), step, &e, Some(&j.chapter_id), cx))
                         })
-                }))
-            })
-            .children(self.issues_inline(cx))
-            .children(self.queue_card(cx))
+                        .into_any_element(),
+                );
+            }
+        }
+        out.extend(self.issues_inline(app_wide, cx));
+        out.extend(self.queue_card(cx));
+        out
     }
 
     fn run_card(&self, r: &run::RunInfo, cx: &mut Context<Self>) -> Div {

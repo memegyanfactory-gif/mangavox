@@ -304,7 +304,7 @@ pub struct StudioPage {
     pub(crate) center_w: f32,
     /// Studio's own focus, so its shortcuts work after a click anywhere on the page (kit
     /// controls do not take focus on click).
-    focus_handle: FocusHandle,
+    pub(crate) focus_handle: FocusHandle,
     // ---- Dashboard and Generate
     pub(crate) view: View,
     /// The manga whose chapters the dashboard shows (None: every manga).
@@ -359,6 +359,17 @@ pub struct StudioPage {
 
 impl StudioPage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(true, window, cx)
+    }
+
+    /// The page without taking keyboard focus: the app-wide side panel creates it while a video
+    /// plays or a chapter is read, whose shortcuts must keep working. Studio takes the focus
+    /// when its route opens (see `open` in lib.rs).
+    pub(crate) fn new_unfocused(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(false, window, cx)
+    }
+
+    fn build(focus: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let setup = cx.new(SetupView::new);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Filter manga"));
         let dash_search = cx.new(|cx| InputState::new(window, cx).placeholder("Find a manga"));
@@ -405,7 +416,9 @@ impl StudioPage {
         // Studio's shortcuts (Alt+1 to Alt+6, Esc) work from the first frame: kit controls never
         // take focus on a click, so nothing else would hand it to the page.
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        if focus {
+            window.focus(&focus_handle, cx);
+        }
         let style = crate::export::style_view::StyleUi::load();
         let (library, statuses) = match LAST_LIBRARY.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             Some((groups, statuses)) => {
@@ -580,6 +593,8 @@ impl StudioPage {
                     Err(e) if matches!(this.library, Load::Ready(_)) => eprintln!("[studio] could not refresh the library: {e:#}"),
                     Err(e) => this.library = Load::Failed(format!("{e:#}")),
                 }
+                // The chapters' names are part of every issue sentence.
+                this.refresh_issues_off_page(cx);
                 cx.notify();
             });
         })
@@ -757,6 +772,14 @@ impl StudioPage {
                     changed = true;
                 }
                 // Keep the "0:42" timer of a running read and a playing clip's line moving.
+                // Studio's render keeps the issues fresh while its page is on screen; elsewhere
+                // nothing renders it, yet the app-wide panel and its toggles read them. Here,
+                // when the queue, run or jobs moved (not every tick: the name map of the whole
+                // library is rebuilt each time), and in the panel's own render for what a click
+                // changes (Dismiss).
+                if changed {
+                    this.refresh_issues_off_page(cx);
+                }
                 let ticking = this.run.as_ref().is_some_and(|r| r.running() && !r.reading.is_empty()) || crate::audio::now_playing().is_some();
                 if changed || ticking {
                     cx.notify();
@@ -767,6 +790,21 @@ impl StudioPage {
             }
         })
         .detach();
+    }
+
+    /// Forgets fixes that are no longer queued and recomputes `issues`. Studio's render does it
+    /// every frame; off the Studio page `poll` and the app-wide panel's render do it.
+    pub(crate) fn refresh_issues(&mut self, cx: &mut Context<Self>) {
+        let queue = &self.queue;
+        self.fixing.retain(|c| queue.items.iter().any(|it| it.chapter.id == *c && it.state.active()));
+        self.issues = self.collect_issues(cx);
+    }
+
+    /// [`Self::refresh_issues`] unless the Studio page is on screen (its render does that).
+    fn refresh_issues_off_page(&mut self, cx: &mut Context<Self>) {
+        if mv_ui::current_route(cx) != Some(mv_ui::Route::Studio) {
+            self.refresh_issues(cx);
+        }
     }
 
     // ------------------------------------------------------------ model + targets
@@ -1672,18 +1710,25 @@ impl StudioPage {
             .child(setup_pill)
             .child(icon_button("studio-side-toggle", ph::SIDEBAR_SIMPLE, if self.side_shown() { "Hide the side panel" } else { "Show the side panel (Activity, Issues, Cast, Chat)" }).selected(self.side_shown()).on_click(cx.listener(
                 move |this, _: &ClickEvent, _, cx| {
-                    let open = !this.side_shown();
-                    if this.view == View::Video {
-                        this.video_side_open = open;
-                    } else {
-                        this.side_open = open;
-                    }
-                    if open && narrow {
-                        this.lib_open = false;
-                    }
+                    this.toggle_side();
                     cx.notify();
                 },
             )))
+    }
+
+    /// Shows or hides the side panel (Video mode has its own switch; a narrow window fits one
+    /// side column, so opening the panel closes the chapter list).
+    pub(crate) fn toggle_side(&mut self) {
+        let narrow = self.vw < NARROW;
+        let open = !self.side_shown();
+        if self.view == View::Video {
+            self.video_side_open = open;
+        } else {
+            self.side_open = open;
+        }
+        if open && narrow {
+            self.lib_open = false;
+        }
     }
 
     /// Whether the side panel shows in the current view (Video mode has its own switch).
@@ -2074,9 +2119,7 @@ impl Render for StudioPage {
         let side_open = self.side_shown();
         let show_lib = editor && self.lib_open && !(self.vw < NARROW && side_open);
         self.center_w = self.vw - 12. - if show_lib { LIBRARY_W + 6. } else { 0. } - if side_open { SIDE_W + 6. } else { 0. };
-        let queue = &self.queue;
-        self.fixing.retain(|c| queue.items.iter().any(|it| it.chapter.id == *c && it.state.active()));
-        self.issues = self.collect_issues(cx);
+        self.refresh_issues(cx);
         let center = match self.view {
             View::Editor => self.center(window, cx),
             View::Dashboard => self.dashboard(cx),

@@ -1,6 +1,7 @@
 //! App shell: a 40px title bar (sidebar toggle, back and forward, breadcrumbs, search, the
-//! assistant toggle), the sidebar (a 60px rail when collapsed or when the window is narrow), the
-//! page, the assistant dock on the trailing edge and the command palette (Ctrl+K).
+//! side panel toggle), the sidebar (a 60px rail when collapsed or when the window is narrow), the
+//! page, the side panel (Activity, Issues, Chat) on the trailing edge and the command palette
+//! (Ctrl+K).
 //!
 //! Layout follows Fluent NavigationView (expanded pane at 1008px and wider, compact rail below,
 //! the pane opening as an overlay in compact mode) and HIG split views (supplementary panes on
@@ -13,6 +14,7 @@ use gpui_kit::component::{FocusTrapElement as _, TitleBar, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_ui::nav::{set_back_label, set_back_target, set_current_route, set_navigator};
+use mv_ui::panel::PanelTab;
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::update::{version, Status, Updater};
@@ -21,19 +23,20 @@ use mv_ui::{appear, btn, empty_view, glyphs, icon_button, icon_ph, kbd, nav_item
 use crate::activity::StudioRuns;
 use crate::keys::{self, Shortcut};
 use crate::palette::{self, Cmd, Palette, Title};
+use crate::panel::Views;
 use crate::prefs::{self, ShellPrefs, DOCK_MAX, DOCK_MIN};
 use crate::routes::{is_detail, is_focus, is_workspace, keep_alive, nav_for, nav_label, Section, SECTIONS};
 use crate::updates;
 
 /// Fluent NavigationView: the expanded pane needs 1008px; below it the sidebar is a rail.
 const RAIL_BELOW: f32 = 1008.;
-/// Below this the assistant floats over the page instead of squeezing it.
+/// Below this the side panel floats over the page instead of squeezing it.
 const DOCK_OVERLAY_BELOW: f32 = 900.;
 /// The search field turns into an icon button below this width.
 const SEARCH_PILL_FROM: f32 = 840.;
 const SIDEBAR_W: f32 = 256.;
 const RAIL_W: f32 = 60.;
-/// The page never gets narrower than this next to the docked assistant.
+/// The page never gets narrower than this next to the docked side panel.
 const PAGE_MIN: f32 = 480.;
 /// Windows title bars grow from 32px when they hold controls; 40px fits a 32px button with air
 /// (the gpui-component caption buttons are a fixed 34px wide, so 48px would make them look thin).
@@ -88,9 +91,22 @@ impl Crumb {
     }
 }
 
-/// Drag payload for the assistant's resize edge.
+/// Drag payload for the side panel's resize edge.
 #[derive(Clone)]
 struct DockResize;
+
+/// Where the side panel is this frame (see `Shell::panel_layout`).
+struct PanelLayout {
+    /// Open, and this page draws it (not Studio, which has its own, nor the welcome setup).
+    shown: bool,
+    /// Over the page with a scrim (a narrow window), instead of beside it.
+    floating: bool,
+    /// The player: always docked, and its edge handle sits fully inside the panel.
+    player: bool,
+    w: f32,
+    /// The width it takes beside the page (0 while closed, hidden or floating).
+    docked: f32,
+}
 
 struct DragGhost;
 impl Render for DragGhost {
@@ -111,10 +127,24 @@ pub struct Shell {
     page: AnyView,
     kept: HashMap<String, AnyView>,
     parked: HashMap<Section, Parked>,
+    /// The side panel's views, created once and kept: Studio's Activity and Issues sections (Studio
+    /// mode only) and the assistant. Whether the panel is open and on which tab lives in
+    /// `mv_ui::panel::SidePanel`, so the title bar, the player's top bar and Ctrl+J share it.
+    studio_activity: Option<AnyView>,
+    studio_issues: Option<AnyView>,
     dock: Option<AnyView>,
-    dock_open: bool,
+    /// The Studio sections / the assistant were already asked for (a `None` answer is not retried
+    /// on every frame).
+    studio_tried: bool,
+    chat_tried: bool,
+    /// A couple of seconds after the first frame: create Studio's sections so the badges count its
+    /// issues before the panel is ever opened.
+    warm_studio: bool,
+    activity_scroll: ScrollHandle,
+    issues_scroll: ScrollHandle,
+    /// The panel's width.
     dock_w: f32,
-    /// The assistant edge is being dragged.
+    /// The panel's edge is being dragged.
     resizing: bool,
     /// The layout last written to config.json.
     saved: ShellPrefs,
@@ -177,6 +207,46 @@ impl Shell {
         // Title bar dims while the window is inactive.
         subs.push(cx.observe_window_activation(window, |_, _, cx| cx.notify()));
         let saved = prefs::load();
+        // The side panel opens the way it was left; Chat only exists in Studio mode.
+        let tab = PanelTab::from_id(&saved.panel_tab).unwrap_or_default();
+        let tab = if tab == PanelTab::Chat && !mv_ui::mode::studio_enabled(cx) { PanelTab::Activity } else { tab };
+        mv_ui::panel::set_open(saved.panel_open, cx);
+        mv_ui::panel::set_tab(tab, cx);
+        subs.push(cx.observe_global::<mv_ui::panel::SidePanel>(|this, cx| this.panel_changed(cx)));
+        // A couple of seconds after the first frame (not during startup): Studio's sections are
+        // created, so the toggles count its issues before the panel is first opened.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
+            if this
+                .update(cx, |s, cx| {
+                    s.warm_studio = true;
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+            // Studio's page does not tell the shell when its issues or runs change (and does not
+            // render while another page is up), so the toggles' marks look again every couple of
+            // seconds and redraw only when its summary changed.
+            let mut last = (ui_studio::panel::Summary::default(), false);
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                let alive = this.update(cx, |_, cx| {
+                    if mv_ui::mode::studio_enabled(cx) {
+                        let now = (ui_studio::panel::summary(cx), ui_studio::panel::side_panel_open(cx));
+                        if now != last {
+                            last = now;
+                            cx.notify();
+                        }
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
         // A fresh install (or a setup left part-way) opens on the welcome setup.
         let route = if ui_welcome::shows_at_start() { Route::Welcome } else { Route::Library };
         let page = Self::resolve(&route, window, cx);
@@ -190,8 +260,14 @@ impl Shell {
             page,
             kept: Default::default(),
             parked: Default::default(),
+            studio_activity: None,
+            studio_issues: None,
             dock: None,
-            dock_open: false,
+            studio_tried: false,
+            chat_tried: false,
+            warm_studio: false,
+            activity_scroll: ScrollHandle::new(),
+            issues_scroll: ScrollHandle::new(),
             dock_w: saved.dock_w,
             resizing: false,
             saved,
@@ -296,7 +372,6 @@ impl Shell {
                 }
             }
         }
-        self.leave_fullscreen(window);
         // Moving between Settings pages replaces the page instead of stacking Back steps.
         let between_settings = matches!(self.route, Route::Settings { .. }) && matches!(route, Route::Settings { .. });
         let page = self.open(&route, window, cx);
@@ -351,14 +426,25 @@ impl Shell {
         Entry::new(self.route.clone(), self.page.clone())
     }
 
-    fn leave_fullscreen(&self, window: &mut Window) {
-        // The next episode replaces the player: full screen stays on.
-        if mv_ui::nav::take_keep_fullscreen() {
+    /// Full screen belongs to the reader and the player. Off them (Back, a section, a breadcrumb,
+    /// the palette, the player's own Back) the window returns to how the user had it, normal or
+    /// maximized, with the taskbar in view. Checked a moment after the page changed: GPUI applies
+    /// a full screen switch later, and the player switches it off itself on its way out, so a
+    /// second switch at once undid the first and left the window covering the taskbar. The next
+    /// episode keeps full screen (the player asks for that with `keep_fullscreen_once`).
+    fn guard_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if is_focus(&self.route) {
             return;
         }
-        if matches!(self.route, Route::Player { .. }) && window.is_fullscreen() {
-            window.toggle_fullscreen();
-        }
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+            let _ = this.update_in(cx, |s, window, _| {
+                if !is_focus(&s.route) && window.is_fullscreen() && !mv_ui::nav::keeps_fullscreen() {
+                    window.toggle_fullscreen();
+                }
+            });
+        })
+        .detach();
     }
 
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -376,7 +462,6 @@ impl Shell {
                 None => return,
             },
         };
-        self.leave_fullscreen(window);
         let cur = self.current_entry();
         push_capped(&mut self.forward, cur);
         self.show(target, window, cx);
@@ -385,7 +470,6 @@ impl Shell {
     /// Alt+Right / the mouse forward button: the page Back left.
     fn forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(next) = self.forward.pop() else { return };
-        self.leave_fullscreen(window);
         let cur = self.current_entry();
         push_capped(&mut self.history, cur);
         self.show(next, window, cx);
@@ -396,7 +480,6 @@ impl Shell {
         if ix >= self.history.len() {
             return;
         }
-        self.leave_fullscreen(window);
         let mut later = self.history.split_off(ix + 1);
         let Some(target) = self.history.pop() else { return };
         let cur = self.current_entry();
@@ -451,6 +534,7 @@ impl Shell {
         self.watch_settings(window, cx);
         self.resolve_names(window, cx);
         self.sync_window_title(window);
+        self.guard_fullscreen(window, cx);
         cx.notify();
     }
 
@@ -495,7 +579,6 @@ impl Shell {
         if section == self.section {
             return;
         }
-        self.leave_fullscreen(window);
         let mut route = std::mem::replace(&mut self.route, section.home());
         let mut page = self.page.clone();
         let mut history = std::mem::take(&mut self.history);
@@ -710,7 +793,15 @@ impl Shell {
     /// (here and in parked sections) from leading to the Studio page that is now hidden.
     fn mode_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !mv_ui::mode::studio_enabled(cx) {
-            self.dock_open = false;
+            // Studio's sections and the assistant go with Studio mode; Chat has no tab then.
+            self.studio_activity = None;
+            self.studio_issues = None;
+            self.dock = None;
+            self.studio_tried = false;
+            self.chat_tried = false;
+            if mv_ui::panel::state(cx).tab == PanelTab::Chat {
+                mv_ui::panel::set_tab(PanelTab::Activity, cx);
+            }
             if is_workspace(&self.route) {
                 let home = self.section.home();
                 self.go(home, window, cx);
@@ -740,30 +831,116 @@ impl Shell {
             self.nav_overlay = !self.nav_overlay;
         } else {
             self.collapsed = !self.collapsed;
-            self.save_prefs();
+            self.save_prefs(cx);
         }
         cx.notify();
     }
 
-    fn dock_allowed(&self, cx: &App) -> bool {
-        mv_ui::mode::studio_enabled(cx) && !is_focus(&self.route) && !is_workspace(&self.route)
+    /// The app-wide panel is drawn on every page but the welcome setup and Studio (which has the
+    /// same panel built into its page).
+    fn panel_route(&self) -> bool {
+        !matches!(self.route, Route::Welcome | Route::Studio)
     }
 
-    fn toggle_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.dock_allowed(cx) {
+    /// Ctrl+J and the title-bar button. Studio's own panel is toggled there.
+    fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        match self.route {
+            Route::Welcome => {}
+            Route::Studio => ui_studio::panel::toggle_side_panel(cx),
+            _ => mv_ui::panel::toggle(cx),
+        }
+        // Studio's own panel is not the shell's global, so the title-bar button's state needs this.
+        cx.notify();
+    }
+
+    /// Where and how wide the panel is this frame. On the player it is always docked (the video
+    /// is a native window above this one and cannot be covered) and leaves the video at least
+    /// half the window; elsewhere a narrow window floats it over the page.
+    fn panel_layout(&self, window: &Window, cx: &App) -> PanelLayout {
+        let vw = viewport_w(window);
+        let player = matches!(self.route, Route::Player { .. });
+        let side_w = self.side_w(window);
+        let shown = self.panel_route() && mv_ui::panel::state(cx).open;
+        let floating = !player && dock_floats(vw, side_w);
+        let w = if player {
+            self.dock_w.min(vw * 0.5)
+        } else if floating {
+            self.dock_w.min(vw * 0.92)
+        } else {
+            self.dock_w.min(vw - side_w - PAGE_MIN).max(DOCK_MIN)
+        };
+        PanelLayout { shown, floating, player, w, docked: if shown && !floating { w } else { 0. } }
+    }
+
+    /// The panel changed (opened, closed, another tab): remember it, and redraw.
+    fn panel_changed(&mut self, cx: &mut Context<Self>) {
+        self.save_prefs(cx);
+        cx.notify();
+    }
+
+    /// Studio's Activity and Issues sections, created once.
+    fn ensure_studio_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.studio_tried {
             return;
         }
-        self.dock_open = !self.dock_open;
-        if self.dock_open && self.dock.is_none() {
-            self.dock = ui_assistant::dock(window, cx);
+        self.studio_tried = true;
+        self.studio_activity = ui_studio::panel::section(ui_studio::panel::Section::Activity, window, cx);
+        self.studio_issues = ui_studio::panel::section(ui_studio::panel::Section::Issues, window, cx);
+    }
+
+    fn ensure_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_tried {
+            return;
+        }
+        self.chat_tried = true;
+        self.dock = ui_assistant::dock(window, cx);
+    }
+
+    /// "Try again" on the Chat tab.
+    pub(crate) fn retry_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock = ui_assistant::dock(window, cx);
+        if self.dock.is_none() {
+            toast::show(cx, Toast::error("The assistant still could not start"));
         }
         cx.notify();
     }
 
-    fn save_prefs(&mut self) {
-        let p = ShellPrefs { collapsed: self.collapsed, dock_w: self.dock_w.clamp(DOCK_MIN, DOCK_MAX).round() };
+    /// What the toggles' marks show: something runs (a download, a Studio step or export), and
+    /// how many problems wait (Studio's issues and titles with failed downloads).
+    fn panel_status(&self, cx: &mut Context<Self>) -> (bool, usize) {
+        let studio = mv_ui::mode::studio_enabled(cx);
+        let downloading = {
+            let dl = ui_manga::downloads(cx);
+            let d = dl.read(cx);
+            d.is_busy() && !d.is_paused()
+        };
+        let sum = if studio { ui_studio::panel::summary(cx) } else { ui_studio::panel::Summary::default() };
+        let live = downloading || (studio && (sum.live || self.studio_runs.read(cx).live()));
+        (live, sum.issues + crate::panel::failed_downloads(cx).len())
+    }
+
+    /// The panel's header and open tab.
+    fn panel_content(&mut self, live: bool, issues: usize, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let studio = mv_ui::mode::studio_enabled(cx);
+        let tab = match mv_ui::panel::state(cx).tab {
+            PanelTab::Chat if !studio => PanelTab::Activity,
+            t => t,
+        };
+        if studio {
+            self.ensure_studio_views(window, cx);
+        }
+        if studio && tab == PanelTab::Chat {
+            self.ensure_chat(window, cx);
+        }
+        let views = Views { studio_activity: self.studio_activity.as_ref(), studio_issues: self.studio_issues.as_ref(), chat: self.dock.as_ref(), activity_scroll: &self.activity_scroll, issues_scroll: &self.issues_scroll };
+        crate::panel::content(tab, studio, live, issues, &views, cx)
+    }
+
+    fn save_prefs(&mut self, cx: &App) {
+        let panel = mv_ui::panel::state(cx);
+        let p = ShellPrefs { collapsed: self.collapsed, dock_w: self.dock_w.clamp(DOCK_MIN, DOCK_MAX).round(), panel_open: panel.open, panel_tab: panel.tab.id().to_string() };
         if p != self.saved {
-            self.saved = p;
+            self.saved = p.clone();
             prefs::save(p);
         }
     }
@@ -828,6 +1005,7 @@ impl Shell {
             }
             Cmd::Go(route) => self.go(route, window, cx),
             Cmd::Run(s) => self.run_shortcut(s, window, cx),
+            Cmd::Panel(tab) => mv_ui::panel::show(tab, cx),
             Cmd::SearchManga(q) => {
                 ui_manga::request_search(&q);
                 if self.section != Section::Manga {
@@ -855,7 +1033,7 @@ impl Shell {
         match s {
             Shortcut::Palette => self.toggle_palette(window, cx),
             Shortcut::Sidebar => self.toggle_sidebar(window, cx),
-            Shortcut::Assistant => self.toggle_dock(window, cx),
+            Shortcut::Panel => self.toggle_panel(cx),
             // Already in Settings, this keeps the page you are on (see `already_there`).
             Shortcut::Settings => self.go(Route::Settings { tab: None }, window, cx),
             Shortcut::Manga => self.show_section(Section::Manga, window, cx),
@@ -863,7 +1041,16 @@ impl Shell {
             Shortcut::Movies => self.show_section(Section::Movies, window, cx),
             Shortcut::Back => self.back(window, cx),
             Shortcut::Forward => self.forward(window, cx),
-            Shortcut::Fullscreen => window.toggle_fullscreen(),
+            // Full screen is for the reader and the player (they take F11 / F themselves). On any
+            // other page F11 maximizes the window or restores it, keeping the taskbar in view, and
+            // a window still in full screen comes out of it.
+            Shortcut::Fullscreen => {
+                if window.is_fullscreen() {
+                    window.toggle_fullscreen();
+                } else {
+                    ui_player::toggle_maximized(window);
+                }
+            }
             Shortcut::Private => crate::privacy::toggle_here(&self.route, window, cx),
         }
     }
@@ -906,8 +1093,10 @@ impl Shell {
         } else if self.nav_overlay {
             self.nav_overlay = false;
             cx.notify();
-        } else if self.dock_open && self.dock_allowed(cx) && dock_floats(viewport_w(window), self.side_w(window)) {
-            self.dock_open = false;
+        } else if self.panel_layout(window, cx).shown && self.panel_layout(window, cx).floating {
+            // Only while it floats over the page; docked it is part of the page, and the player
+            // uses Escape itself (its panel never floats).
+            mv_ui::panel::set_open(false, cx);
             cx.notify();
         } else if matches!(self.route, Route::Settings { .. }) {
             if typing {
@@ -1038,14 +1227,47 @@ impl Shell {
             icon_button("search", glyphs::SEARCH, "Search or jump to").kbd(Shortcut::Palette.keys()).occlude().on_click(cx.listener(|this, _, w, cx| this.toggle_palette(w, cx))).into_any_element()
         };
 
-        let assistant = (mv_ui::mode::studio_enabled(cx) && !is_focus(&self.route)).then(|| {
-            let allowed = self.dock_allowed(cx);
-            icon_button("assistant", glyphs::ASSISTANT, if self.dock_open { "Close assistant" } else { "Open assistant" })
-                .selected(self.dock_open && allowed)
-                .kbd(Shortcut::Assistant.keys())
-                .when(!allowed, |b| b.disabled("This page has its own assistant panel"))
+        // The side panel: a toggle on every page (Studio's own panel there), with the issue count
+        // or a breathing dot over its corner, and in Studio mode a chat button that opens it on Chat.
+        let on_studio = self.route == Route::Studio;
+        let studio = mv_ui::mode::studio_enabled(cx);
+        let panel = mv_ui::panel::state(cx);
+        let panel_toggle = (!welcome).then(|| {
+            let open = if on_studio { ui_studio::panel::side_panel_open(cx) } else { panel.open };
+            let label = match (on_studio, open) {
+                (true, true) => "Hide the side panel".to_string(),
+                (true, false) => "Show the side panel (Activity, Issues, Cast, Chat)".to_string(),
+                (false, _) => mv_ui::panel::toggle_label(&panel),
+            };
+            let button = icon_button("panel-toggle", ph::PULSE, label)
+                .selected(open)
+                .kbd(Shortcut::Panel.keys())
                 .occlude()
-                .on_click(cx.listener(|this, _, w, cx| this.toggle_dock(w, cx)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(cx)));
+            // The mark sits on the button's corner and passes the click on to it (the title bar
+            // is a window drag area, so it must take the pointer itself).
+            let mark = mv_ui::panel::status_mark("panel-mark", &panel).map(|m| {
+                div()
+                    .id("panel-mark-hit")
+                    .absolute()
+                    .top(px(1.))
+                    .right(px(1.))
+                    .occlude()
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(cx)))
+                    .child(m)
+            });
+            div().relative().flex_none().child(button).children(mark)
+        });
+        let chat_button = (studio && !on_studio && !welcome).then(|| {
+            let on_chat = panel.open && panel.tab == PanelTab::Chat;
+            icon_button("panel-chat", glyphs::ASSISTANT, if on_chat { "Close the assistant chat" } else { "Chat with the assistant" }).selected(on_chat).occlude().on_click(cx.listener(|_, _, _, cx| {
+                let now = mv_ui::panel::state(cx);
+                if now.open && now.tab == PanelTab::Chat {
+                    mv_ui::panel::set_open(false, cx);
+                } else {
+                    mv_ui::panel::show(PanelTab::Chat, cx);
+                }
+            }))
         });
 
         TitleBar::new().h(px(TITLE_BAR_H)).bg(Tokens::base()).border_b_1().border_color(Tokens::border()).child(
@@ -1062,7 +1284,7 @@ impl Shell {
                 .child(div().flex().flex_1().min_w_0().items_center().gap(px(2.)).children(toggle).when(!welcome, |d| d.child(back_el).children(forward_el)).child(self.crumbs_el(cx)))
                 .child(search)
                 // Private mode: only on Manga, Anime and Movies pages (see privacy.rs).
-                .child(div().flex().flex_1().min_w_0().justify_end().items_center().gap(px(4.)).children(crate::privacy::title_controls(&self.route)).children(assistant)),
+                .child(div().flex().flex_1().min_w_0().justify_end().items_center().gap(px(4.)).children(crate::privacy::title_controls(&self.route)).children(chat_button).children(panel_toggle)),
         )
     }
 
@@ -1280,13 +1502,14 @@ impl Shell {
             section: self.section,
             route: &self.route,
             studio: mv_ui::mode::studio_enabled(cx),
-            can_dock: self.dock_allowed(cx),
+            panel_here: self.panel_route(),
+            panel_open: if self.route == Route::Studio { ui_studio::panel::side_panel_open(cx) } else { mv_ui::panel::state(cx).open },
             settings_tab: self.settings_tab.filter(|_| matches!(self.route, Route::Settings { .. })).map(|t| t.id()),
             can_back: self.back_route().is_some(),
             can_forward: !self.forward.is_empty(),
             sidebar: self.sidebar_shown().then(|| self.sidebar_toggle_label(window)),
-            dock_open: self.dock_open,
             fullscreen: window.is_fullscreen(),
+            maximized: window.is_maximized(),
             recent: self.recent(),
         };
         let shell = cx.entity().downgrade();
@@ -1362,8 +1585,10 @@ impl Shell {
         )
     }
 
-    /// The docked assistant: trailing edge, drag its left edge to resize (320 to 560 px).
-    fn dock_column(&self, dock: AnyView, w: f32, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// The docked side panel: trailing edge, drag its left edge to resize (320 to 560 px). On the
+    /// player (`inside`) the handle lies fully inside the panel: the left half of one centred on
+    /// the edge would sit under the video window.
+    fn dock_column(&self, content: Div, w: f32, inside: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
             .id("dock")
             .relative()
@@ -1372,14 +1597,14 @@ impl Shell {
             .h_full()
             .border_l_1()
             .border_color(Tokens::border())
-            .child(dock)
+            .child(content)
             .child(
                 div()
                     .id("dock-resize")
                     .absolute()
                     .top_0()
                     .bottom_0()
-                    .left(px(-3.))
+                    .left(px(if inside { 0. } else { -3. }))
                     .w(px(6.))
                     .cursor_col_resize()
                     .group("dock-edge")
@@ -1390,7 +1615,7 @@ impl Shell {
                             .absolute()
                             .top_0()
                             .bottom_0()
-                            .left(px(2.))
+                            .left(px(if inside { 0. } else { 2. }))
                             .w(px(2.))
                             .when(self.resizing, |d| d.bg(Tokens::accent_a(0.6)))
                             .group_hover("dock-edge", |s| s.bg(Tokens::accent_a(0.6))),
@@ -1417,7 +1642,7 @@ fn viewport_w(window: &Window) -> f32 {
     f32::from(window.viewport_size().width)
 }
 
-/// The assistant floats over the page when docking it would squeeze the page below
+/// The side panel floats over the page when docking it would squeeze the page below
 /// [`PAGE_MIN`] or the window is narrow.
 fn dock_floats(vw: f32, side_w: f32) -> bool {
     vw < DOCK_OVERLAY_BELOW || vw - side_w - DOCK_MIN < PAGE_MIN
@@ -1491,25 +1716,32 @@ impl Render for Shell {
         let rail = self.rail(window);
         let focus = is_focus(&self.route);
         let show_sidebar = self.sidebar_shown();
-        let side_w = self.side_w(window);
-        let dock = self.dock.clone().filter(|_| self.dock_open && self.dock_allowed(cx));
-        let floating = dock_floats(vw, side_w);
-        let dock_w = if floating { self.dock_w.min(vw * 0.92) } else { self.dock_w.min(vw - side_w - PAGE_MIN).max(DOCK_MIN) };
+        let layout = self.panel_layout(window, cx);
         // A finished resize is saved once the drag ends.
         if !cx.has_active_drag() {
             self.resizing = false;
-            self.save_prefs();
+            self.save_prefs(cx);
+        }
+        // Every toggle's mark and the player's room for the panel follow what is drawn now. The
+        // setters only change the global when a value changed, so this cannot loop.
+        let (live, issues) = self.panel_status(cx);
+        mv_ui::panel::set_docked(layout.docked, cx);
+        mv_ui::panel::set_status(live, issues, cx);
+        // Studio's sections are made a few seconds after the first frame, so its issues are
+        // counted before the panel is ever opened.
+        if self.warm_studio && mv_ui::mode::studio_enabled(cx) {
+            self.ensure_studio_views(window, cx);
         }
 
         // Background work (one card per title downloading, per Generate run) and the app-wide
         // toast stack in the bottom-right corner of the page area. A card stays off the page that
-        // already lists its work. The reader and the player keep the screen: no cards, and the
-        // toast at the bottom centre.
+        // already lists its work, and off every page while the side panel lists it all. The reader
+        // and the player keep the screen: no cards, and the toast at the bottom centre.
         let corner = if focus {
             toast::host(cx)
         } else {
-            let mut cards = if self.route == Route::MangaDownloads { vec![] } else { ui_manga::download_cards(cx) };
-            if self.route != Route::Studio {
+            let mut cards = if self.route == Route::MangaDownloads || layout.shown { vec![] } else { ui_manga::download_cards(cx) };
+            if self.route != Route::Studio && !layout.shown {
                 cards.extend(self.studio_runs.read(cx).cards(&self.studio_runs));
             }
             mv_ui::activity::corner(cards, Some(toast::view(cx)), cx)
@@ -1517,28 +1749,18 @@ impl Render for Shell {
         let page = div().id("page").relative().flex_1().min_w_0().h_full().overflow_hidden().child(self.page.clone()).children(crate::privacy::page_tint(&self.route)).child(corner);
 
         let mut body = div().relative().flex().flex_1().min_h_0().when(show_sidebar, |d| d.child(self.sidebar(rail, false, cx))).child(page);
-        match dock {
-            Some(dock) if floating => {
-                body = body.child(self.scrim("dock-scrim", |this, _| this.dock_open = false, cx)).child(
+        if layout.shown {
+            let content = self.panel_content(live, issues, window, cx);
+            if layout.floating {
+                body = body.child(self.scrim("dock-scrim", |_, cx| mv_ui::panel::set_open(false, cx), cx)).child(
                     appear(
                         "dock-in",
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .h_full()
-                            .w(px(dock_w))
-                            .bg(Tokens::base())
-                            .border_l_1()
-                            .border_color(Tokens::border())
-                            .shadow_2xl()
-                            .occlude()
-                            .child(dock),
+                        div().absolute().top_0().right_0().h_full().w(px(layout.w)).bg(Tokens::base()).border_l_1().border_color(Tokens::border()).shadow_2xl().occlude().child(content),
                     ),
                 );
+            } else {
+                body = body.child(self.dock_column(content, layout.w, layout.player, cx));
             }
-            Some(dock) => body = body.child(self.dock_column(dock, dock_w, cx)),
-            None => {}
         }
         if self.nav_overlay && show_sidebar {
             body = body
@@ -1561,7 +1783,7 @@ impl Render for Shell {
             .child(self.title_bar(window, cx))
             .child(body)
             .children(palette)
-            // While the assistant edge is dragged the resize cursor stays on wherever the mouse goes.
+            // While the side panel's edge is dragged the resize cursor stays on wherever the mouse goes.
             .when(self.resizing, |d| d.child(div().id("resize-cursor").absolute().inset_0().cursor_col_resize().occlude()))
     }
 }

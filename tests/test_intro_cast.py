@@ -374,6 +374,56 @@ class DrawerTests(unittest.TestCase):
         self.assertEqual(len(d.credits), 2)
         self.assertEqual(load_json(os.path.join(tmp, "intro", "cast", "mu-gung-1.json"))["failed_exports"], 1)
 
+    def test_a_key_colour_that_showed_on_the_character_is_avoided_from_then_on(self):
+        class Recording(FakeDrawings):
+            def __init__(self, images):
+                super().__init__(images)
+                self.prompts = []
+
+            def call(self, method, url, body=None):
+                if method == "POST":
+                    self.prompts.append(body["prompt"])
+                return super().call(method, url, body)
+
+        # Cut off at the feet and a green sash on the green key: the checks stop at the first
+        # problem, yet the second drawing fixes both (the whole figure, on another key colour).
+        sash = [("rectangle", (151, 250, 233, 300), (60, 190, 70))]
+        both = figure(BG["green"], box=(130, 120, 254, 700), extra=sash)
+        tmp = tempfile.mkdtemp()
+        fake = Recording([both, figure(BG["blue"])])
+        card = a_card(tmp)
+        ic.Drawer(drawer_args(tmp), client=fake).draw([card])
+        self.assertTrue(card.get("drawn"), card.get("draw_fail"))
+        self.assertEqual(fake.posts, 2)
+        self.assertIn("(#00FF00)", fake.prompts[0])
+        self.assertIn("(#0000FF)", fake.prompts[1])
+        self.assertIn("at both sides", fake.prompts[1])
+        self.assertEqual(load_json(os.path.join(tmp, "intro", "cast", "mu-gung-1.json"))["key_colour"], "blue")
+
+        # Both drawings fail: the record keeps the colour that showed and the fix that was needed.
+        tmp = tempfile.mkdtemp()
+        cut_off_blue = figure(BG["blue"], box=(130, 120, 254, 700))
+        card = a_card(tmp)
+        ic.Drawer(drawer_args(tmp), client=Recording([both, cut_off_blue])).draw([card])
+        rec = load_json(os.path.join(tmp, "intro", "cast", "mu-gung-1.json"))
+        self.assertEqual((rec["failed_exports"], rec["leaked_colours"], rec["fixes"]), (1, ["green"], ["cut"]))
+
+        # The next export (here from a record written before colours were kept): green goes last
+        # and the fit is asked for in the first drawing, which then passes.
+        tmp = tempfile.mkdtemp()
+        cast = os.path.join(tmp, "intro", "cast")
+        os.makedirs(cast)
+        with open(os.path.join(cast, "mu-gung-1.json"), "w", encoding="utf-8") as f:
+            json.dump({"name": "Mu Gung", "id": "mu-gung-1", "failed_exports": 1,
+                       "last_failure": "the figure is cut off at the left and right; pure green shows on the character"}, f)
+        fake = Recording([figure(BG["blue"])])
+        card = a_card(tmp)
+        ic.Drawer(drawer_args(tmp), client=fake).draw([card])
+        self.assertTrue(card.get("drawn"), card.get("draw_fail"))
+        self.assertEqual(fake.posts, 1)
+        self.assertNotIn("(#00FF00)", fake.prompts[0])
+        self.assertIn("at both sides", fake.prompts[0])
+
     def test_no_credits_stops_drawing(self):
         tmp = tempfile.mkdtemp()
         fake = FakeDrawings([ic.MagnificError("credits", "no credits")] * 4)

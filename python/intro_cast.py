@@ -587,12 +587,17 @@ def key_out(img, colour):
 FIXES = {
     "background": "Important: the background must be one flat, solid {cname} ({hex}) from edge to edge: no gradient, floor, shadow or glow.",
     "figures": "Important: draw only {name}, alone: no other people, creatures, effects or objects around.",
-    "cut": "Important: the whole body must fit inside the picture with empty space all around: leave a gap above the head and below the feet; draw the character a little smaller.",
+    "cut": "Important: the whole body must fit inside the picture with empty space all around: leave a gap above the head, below the feet and at both sides; keep the arms, any weapon and any effect inside the picture (a compact pose); draw the character a little smaller.",
     "shape": "Important: {name} stands upright, full body from head to feet, taller than wide.",
     "small": "Important: {name} should fill about 80 percent of the picture's height.",
     "leak": "Important: no {cname} anywhere on the character (clothes, hair, eyes, effects) and no {cname} light or glow on them.",
     "safe": "Important: keep it calm and family-friendly: a relaxed, confident standing pose, no weapon drawn, no blood, no injuries, fully clothed.",
 }
+
+
+def leaks(info):
+    """The key colour shows on the character (or the key ate into it), whatever else is wrong."""
+    return info.get("leak", 0) > 0.006 or info.get("eaten", 0) > 0.015
 
 
 def check(info):
@@ -623,7 +628,7 @@ def check(info):
     fill = info.get("area", 0) / float(max(1, bw * bh))
     if not 0.15 <= fill <= 0.88:
         return "the figure has an odd shape", "shape"
-    if info.get("leak", 0) > 0.006 or info.get("eaten", 0) > 0.015:
+    if leaks(info):
         return f"{name} shows on the character", "leak"
     return None
 
@@ -1473,15 +1478,23 @@ class Drawer:
             c["draw_fail"] = "there was no picture of the character to draw from"
             return
         order, _ = choose_colours([r[0] for r in refs], c.get("description"))
+        # A key colour that showed on this character in an earlier export (a green shirt on a
+        # green key) is tried last, so the next drawing does not fail the same way.
+        avoid = self.leaked_colours(cid)
+        order = [o for o in order if o not in avoid] + [o for o in order if o in avoid]
         colour = order[0]
         mono = monochrome([r[0] for r in refs])
         facing = c.get("facing_want") or "left"
         kinds = [r[2] for r in refs]
         payload = [(jpeg_b64(im), cap) for im, cap, _ in refs]
-        fixes = []
+        # What earlier exports' drawings of this character got wrong is asked for from the start.
+        known = self.earlier_fixes(cid)
+        fixes = list(known)
+        seen_fixes = list(known)
         reasons = []
         spent = 0.0
         used = [colour]
+        leaked = []  # key colours that showed on the character in this run's drawings
         faults = 0  # drawings that failed because of the drawing itself (checks, content filter)
         for attempt in range(MAX_DRAWS):
             if self.stop.is_set():
@@ -1508,7 +1521,7 @@ class Drawer:
                 reasons.append(e.short())
                 if e.kind == "filter":
                     faults += 1
-                    fixes = ["safe"]
+                    fixes = list(dict.fromkeys(known + ["safe"]))
                     continue
                 break
             self._paid(True)
@@ -1538,8 +1551,16 @@ class Drawer:
             reason, fix = why
             reasons.append(reason)
             faults += 1
-            fixes = [fix]
-            if fix == "leak":
+            fixes = list(dict.fromkeys(known + [fix]))
+            # The checks stop at the first problem, and the key colour showing on the character is
+            # checked last: look for it on its own too, so the next drawing fixes both at once (a
+            # figure cut off at the sides and a green shirt on the green key, say).
+            if fix != "leak" and fix in ("cut", "figures", "shape", "small") and leaks(info):
+                reasons.append(f"{KEY_NAMES[colour][0]} shows on the character")
+                fixes.append("leak")
+            seen_fixes += [f for f in fixes if f not in seen_fixes]
+            if "leak" in fixes:
+                leaked.append(colour)
                 nxt = [o for o in order if o not in used]
                 if nxt:
                     colour = nxt[0]
@@ -1550,7 +1571,9 @@ class Drawer:
         c["draw_fail"] = ("the drawings did not pass the checks (" + fail + ")") if faults and all(
             not r.startswith("Magnific") for r in reasons) else fail
         if faults >= MAX_DRAWS:
-            self._remember_failure(cid, name, fail)
+            self._remember_failure(cid, name, fail, leaked, seen_fixes)
+        elif leaked or seen_fixes:
+            self._remember_failure(cid, name, fail, leaked, seen_fixes, count=False)
 
     stop_reason = "drawing stopped"
 
@@ -1566,12 +1589,41 @@ class Drawer:
         _write_atomic(os.path.join(self.folder, f"{cid}.json"), json.dumps(meta, indent=1).encode("utf-8"))
         c["cutout"], c["drawn"], c["facing"] = png, True, facing
 
-    def _remember_failure(self, cid, name, reason):
+    def leaked_colours(self, cid):
+        """Key colours that showed on this character in earlier drawings: kept in its failure
+        record, and named in the last failure of records written before that was kept."""
+        v = read_json(os.path.join(self.folder, f"{cid}.json")) if self.folder else {}
+        out = [k for k in v.get("leaked_colours") or [] if k in KEYS]
+        said = str(v.get("last_failure") or "")
+        out += [k for k, (cname, _) in KEY_NAMES.items() if f"{cname} shows on the character" in said and k not in out]
+        return out
+
+    def earlier_fixes(self, cid):
+        """The prompt fixes (FIXES keys but "leak", which a key colour change handles) that earlier
+        exports' drawings of this character needed: kept in its failure record, and read from the
+        last failure of records written before that was kept."""
+        v = read_json(os.path.join(self.folder, f"{cid}.json")) if self.folder else {}
+        out = [f for f in v.get("fixes") or [] if f in FIXES and f != "leak"]
+        if "cut off" in str(v.get("last_failure") or "") and "cut" not in out:
+            out.append("cut")
+        return out
+
+    def _remember_failure(self, cid, name, reason, leaked=(), fixes=(), count=True):
+        """Notes in the character's record that this export's drawings failed (`count`), which
+        key colours showed on the character (`leaked`) and which fixes they needed (`fixes`), so
+        later exports avoid the colours and ask for the fixes from the first drawing."""
         p = os.path.join(self.folder, f"{cid}.json")
         if os.path.isfile(kept_path(self.folder, cid) or ""):
             return
         v = read_json(p)
-        v.update({"name": name, "id": cid, "failed_exports": int(v.get("failed_exports") or 0) + 1, "last_failure": reason, "updated": int(time.time())})
+        v.update({"name": name, "id": cid, "updated": int(time.time())})
+        if count:
+            v.update({"failed_exports": int(v.get("failed_exports") or 0) + 1, "last_failure": reason})
+        if leaked:
+            v["leaked_colours"] = sorted(set(v.get("leaked_colours") or []) | set(leaked))
+        keep = [f for f in fixes if f in FIXES and f != "leak"]
+        if keep:
+            v["fixes"] = sorted(set(v.get("fixes") or []) | set(keep))
         try:
             _write_atomic(p, json.dumps(v, indent=1).encode("utf-8"))
         except OSError:

@@ -40,7 +40,7 @@ const CARD_SEC: f64 = 2.5;
 /// the ribbons, and the recap's first frame settling in. Must match intro_transition.py.
 const RIBBON_SEC: f64 = 1.2;
 const PASS_SEC: f64 = 0.768;
-const REVEAL_SEC: f64 = 0.5;
+const REVEAL_SEC: f64 = 1.4;
 /// The longest intro: every card, then the transition.
 const INTRO_SEC: f64 = MAX_CARDS as f64 * CARD_SEC + RIBBON_SEC + REVEAL_SEC;
 /// The music's big moment: the camera passing through the ribbons after the last card.
@@ -48,7 +48,7 @@ const MUSIC_HIT: f64 = MAX_CARDS as f64 * CARD_SEC + PASS_SEC;
 /// The music lasts the whole intro and rings on this much longer.
 const MUSIC_TAIL: f64 = 0.5;
 /// Bumped when the intro's makeup changes, so a kept one is made again.
-const INTRO_VERSION: u64 = 7;
+const INTRO_VERSION: u64 = 8;
 /// The renderer's share of the intro's bar (the steps before it are quick).
 const RENDER_FROM: f32 = 0.05;
 const RENDER_TO: f32 = 0.99;
@@ -997,14 +997,14 @@ mod tests {
     #[test]
     fn intro_length_matches_the_renderer() {
         // At most 4 cast cards of 2.5 s (time to read each profile), then the ribbon transition
-        // onto the recap's first frame: 11.7 s in all.
+        // onto the recap's first frame, which settles while the music fades out: 12.6 s in all.
         let (m, t) = ("intro_maker.py", "intro_transition.py");
         let (card, cards) = (python_number(m, "CARD_SEC"), python_number(m, "MAX_CARDS"));
         let (ribbon, pass, reveal) = (python_number(t, "RIBBON_SEC"), python_number(t, "PASS_SEC"), python_number(t, "REVEAL_SEC"));
         assert_eq!((card, cards, ribbon, pass, reveal), (CARD_SEC, MAX_CARDS as f64, RIBBON_SEC, PASS_SEC, REVEAL_SEC));
         assert_eq!(CARD_SEC, 2.5);
         let long = cards * card + ribbon + reveal;
-        assert!((long - INTRO_SEC).abs() < 1e-9 && (long - 11.7).abs() < 1e-9 && long <= 12.5, "{long}");
+        assert!((long - INTRO_SEC).abs() < 1e-9 && (long - 12.6).abs() < 1e-9 && long <= 13.5, "{long}");
         // The music's big moment is the pass through the ribbons, after the last card and before
         // the recap.
         let hit = cards * card + pass;

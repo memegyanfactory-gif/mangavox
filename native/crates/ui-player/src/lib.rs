@@ -21,6 +21,14 @@ pub(crate) fn bump_watch_epoch() {
     WATCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Maximizes the app window, or restores it when it is maximized. A maximized window keeps the
+/// taskbar in view; full screen (which covers it) belongs to the player and the reader.
+pub fn toggle_maximized(window: &Window) {
+    if let Some(h) = overlay::hwnd_of(window) {
+        overlay::toggle_maximized(h);
+    }
+}
+
 /// Warm the torrent behind `request` while the user is still choosing (detail pages).
 pub fn prefetch(request: &mv_ui::nav::PlayRequest) {
     backend::prefetch(request);

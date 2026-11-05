@@ -8,6 +8,7 @@ use std::rc::Rc;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::Icon;
 use gpui_kit::*;
+use mv_ui::panel::PanelTab;
 use mv_ui::{empty_view, glyphs, kbd, ph, size, Ph, Route, Tokens};
 
 use crate::keys::Shortcut;
@@ -31,6 +32,8 @@ pub enum Cmd {
     Go(Route),
     /// Same as pressing the shortcut.
     Run(Shortcut),
+    /// Opens the side panel on a tab.
+    Panel(PanelTab),
     CheckUpdates,
     /// Search every installed manga source (Browse).
     SearchManga(String),
@@ -54,8 +57,11 @@ pub struct Ctx<'a> {
     pub section: Section,
     pub route: &'a Route,
     pub studio: bool,
-    /// The assistant can open here (Studio mode on, not in Studio or a full-screen page).
-    pub can_dock: bool,
+    /// This page shows the app-wide side panel (every page but Studio, which has its own, and
+    /// the welcome setup).
+    pub panel_here: bool,
+    /// The side panel is open here (the app-wide one, or Studio's own on the Studio page).
+    pub panel_open: bool,
     /// The Settings page on screen (`Tab::id`), marked in the Settings group.
     pub settings_tab: Option<&'static str>,
     pub can_back: bool,
@@ -63,8 +69,9 @@ pub struct Ctx<'a> {
     /// What the sidebar toggle does right now ("Collapse sidebar", "Show navigation"...), or
     /// `None` where there is no sidebar (Settings, the reader, the player).
     pub sidebar: Option<&'static str>,
-    pub dock_open: bool,
     pub fullscreen: bool,
+    /// The window is maximized (F11 restores it off the reader and the player).
+    pub maximized: bool,
     pub recent: Vec<(SharedString, Ph, Route)>,
 }
 
@@ -164,9 +171,19 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
     if let Some(label) = c.sidebar {
         actions.push(row(label, ph::SIDEBAR_SIMPLE, Cmd::Run(Shortcut::Sidebar)).keys(["toggle sidebar", "navigation", "menu"]).shortcut(Shortcut::Sidebar));
     }
-    // Only where it can open: Studio has its own assistant panel, full-screen pages none.
-    if c.can_dock {
-        actions.push(row(if c.dock_open { "Close assistant" } else { "Open assistant" }, glyphs::ASSISTANT, Cmd::Run(Shortcut::Assistant)).keys(["toggle assistant", "chat", "ai"]).shortcut(Shortcut::Assistant));
+    // The side panel: a row per tab where the app-wide panel shows; Studio's own panel only
+    // gets the toggle.
+    if c.panel_here {
+        actions.push(row("Show activity", ph::PULSE, Cmd::Panel(PanelTab::Activity)).keys(["side panel", "downloads", "running", "progress", "queue"]));
+        actions.push(row("Show issues", ph::WARNING, Cmd::Panel(PanelTab::Issues)).keys(["side panel", "problems", "errors", "failed", "fix"]));
+        if c.studio {
+            actions.push(row("Chat with the assistant", glyphs::ASSISTANT, Cmd::Panel(PanelTab::Chat)).keys(["side panel", "assistant", "chat", "ai"]));
+        }
+    }
+    if c.panel_open {
+        actions.push(row("Hide the side panel", ph::SIDEBAR_SIMPLE, Cmd::Run(Shortcut::Panel)).keys(["activity", "issues", "chat", "toggle"]).shortcut(Shortcut::Panel));
+    } else if !c.panel_here && *c.route == Route::Studio {
+        actions.push(row("Show the side panel", ph::SIDEBAR_SIMPLE, Cmd::Run(Shortcut::Panel)).keys(["activity", "issues", "cast", "chat", "toggle"]).shortcut(Shortcut::Panel));
     }
     if c.can_back {
         actions.push(row("Go back", glyphs::BACK, Cmd::Run(Shortcut::Back)).keys(["previous"]).shortcut(Shortcut::Back));
@@ -177,7 +194,14 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
     for s in SECTIONS.into_iter().filter(|s| *s != c.section) {
         actions.push(row(format!("Switch to {}", s.label()), s.icon(), Cmd::Run(s.shortcut())).keys(["section"]).shortcut(s.shortcut()));
     }
-    actions.push(row(if c.fullscreen { "Exit full screen" } else { "Enter full screen" }, if c.fullscreen { ph::CORNERS_IN } else { ph::CORNERS_OUT }, Cmd::Run(Shortcut::Fullscreen)).keys(["fullscreen", "maximize"]).shortcut(Shortcut::Fullscreen));
+    // Off the reader and the player F11 maximizes or restores the window (full screen, which
+    // hides the taskbar, is for videos and reading).
+    let (label, glyph) = match (c.fullscreen, c.maximized) {
+        (true, _) => ("Exit full screen", ph::CORNERS_IN),
+        (false, true) => ("Restore window size", ph::CORNERS_IN),
+        (false, false) => ("Maximize window", ph::CORNERS_OUT),
+    };
+    actions.push(row(label, glyph, Cmd::Run(Shortcut::Fullscreen)).keys(["fullscreen", "maximize", "restore", "window"]).shortcut(Shortcut::Fullscreen));
     actions.push(row("Check for updates", glyphs::REFRESH, Cmd::CheckUpdates).keys(["update", "version", "upgrade"]));
     out.push(Group { heading: "Actions".into(), rows: actions });
 
@@ -265,10 +289,11 @@ mod tests {
     use crate::keys::Shortcut;
     use crate::routes::{nav_for, Section, SECTIONS};
     use gpui_kit::SharedString;
+    use mv_ui::panel::PanelTab;
     use mv_ui::{glyphs, Route};
 
     fn ctx(route: &Route) -> Ctx<'_> {
-        Ctx { section: Section::Manga, route, studio: false, can_dock: false, settings_tab: None, can_back: false, can_forward: false, sidebar: Some("Collapse sidebar"), dock_open: false, fullscreen: false, recent: vec![] }
+        Ctx { section: Section::Manga, route, studio: false, panel_here: true, panel_open: false, settings_tab: None, can_back: false, can_forward: false, sidebar: Some("Collapse sidebar"), fullscreen: false, maximized: false, recent: vec![] }
     }
 
     #[test]
@@ -308,15 +333,29 @@ mod tests {
         let off = cmds(&groups(&ctx(&route), "", &[]));
         assert!(!off.contains(&Cmd::Go(Route::Studio)));
         assert!(!off.contains(&Cmd::Go(Route::Settings { tab: Some("studio".into()) })));
-        assert!(!off.contains(&Cmd::Run(Shortcut::Assistant)));
-        let on = Ctx { studio: true, can_dock: true, ..ctx(&route) };
+        // The assistant is a Studio feature: no Chat row with Studio mode off.
+        assert!(!off.contains(&Cmd::Panel(PanelTab::Chat)));
+        let on = Ctx { studio: true, ..ctx(&route) };
         let on = cmds(&groups(&on, "", &[]));
         assert!(on.contains(&Cmd::Go(Route::Studio)));
-        assert!(on.contains(&Cmd::Run(Shortcut::Assistant)));
-        // In Studio (its own assistant panel) the assistant row would do nothing, so it is left out.
+        assert!(on.contains(&Cmd::Panel(PanelTab::Chat)));
+    }
+
+    #[test]
+    fn the_side_panel_rows_follow_where_it_shows() {
+        let route = Route::Library;
+        let closed = cmds(&groups(&ctx(&route), "", &[]));
+        assert!(closed.contains(&Cmd::Panel(PanelTab::Activity)) && closed.contains(&Cmd::Panel(PanelTab::Issues)));
+        assert!(!closed.contains(&Cmd::Run(Shortcut::Panel)));
+        let open = cmds(&groups(&Ctx { panel_open: true, ..ctx(&route) }, "", &[]));
+        assert!(open.contains(&Cmd::Run(Shortcut::Panel)));
+        // Studio has its own panel: only the toggle, whichever way it stands.
         let studio = Route::Studio;
-        let in_studio = cmds(&groups(&Ctx { studio: true, can_dock: false, ..ctx(&studio) }, "", &[]));
-        assert!(!in_studio.contains(&Cmd::Run(Shortcut::Assistant)));
+        let in_studio = cmds(&groups(&Ctx { studio: true, panel_here: false, ..ctx(&studio) }, "", &[]));
+        assert!(in_studio.contains(&Cmd::Run(Shortcut::Panel)));
+        assert!(!in_studio.contains(&Cmd::Panel(PanelTab::Activity)) && !in_studio.contains(&Cmd::Panel(PanelTab::Chat)));
+        let studio_open = cmds(&groups(&Ctx { studio: true, panel_here: false, panel_open: true, ..ctx(&studio) }, "", &[]));
+        assert!(studio_open.contains(&Cmd::Run(Shortcut::Panel)));
     }
 
     #[test]

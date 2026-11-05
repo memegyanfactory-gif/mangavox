@@ -52,11 +52,11 @@ class TimingTests(unittest.TestCase):
         with open(tr.__file__, encoding="utf-8") as f:
             src = f.read()
         vals = {k: float(re.search(rf"^{k} = ([0-9.]+)", src, re.M).group(1)) for k in ("RIBBON_SEC", "REVEAL_SEC", "PASS_SEC")}
-        self.assertEqual((vals["RIBBON_SEC"], vals["REVEAL_SEC"]), (1.2, 0.5))
+        self.assertEqual((vals["RIBBON_SEC"], vals["REVEAL_SEC"]), (1.2, 1.4))
         self.assertTrue(0.5 < vals["PASS_SEC"] < vals["RIBBON_SEC"], vals)
         self.assertAlmostEqual(vals["PASS_SEC"], tr.PASS_SEC)
         self.assertAlmostEqual(tr.PASS_U * tr.RIBBON_SEC, tr.PASS_SEC)
-        self.assertAlmostEqual(tr.total_seconds(), 1.7)
+        self.assertAlmostEqual(tr.total_seconds(), 2.6)
         # The pass comes after the lines part and before the centre clears onto the recap.
         self.assertTrue(tr.SPLIT_U[1] < tr.PASS_U < tr.OPEN_U)
 

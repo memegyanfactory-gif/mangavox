@@ -14,6 +14,7 @@ pub mod mode;
 pub mod perf;
 pub mod motion;
 pub mod nav;
+pub mod panel;
 pub mod settings;
 pub mod theme;
 pub mod thumbs;

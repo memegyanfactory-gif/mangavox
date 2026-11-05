@@ -7,6 +7,7 @@ use gpui_kit::*;
 use mv_recap::Step;
 use mv_ui::theme::{icon as icon_px, radius, space};
 use mv_ui::Interactive as _;
+use mv_ui::Route;
 use mv_ui::toast::{self, Toast};
 use mv_ui::{btn, confirm_dialog, disclosure, empty_view, icon_button, icon_ph, inline_alert, ph, ph_icon, size, status_tag, tip, AlertKind, ButtonKind, StatusKind, Tokens, Weight};
 
@@ -63,6 +64,15 @@ fn badge_tint(state: ItemState) -> (Rgba, Rgba) {
     }
 }
 
+/// Brings the user to Studio when a click in the app-wide panel opens a place in it. Deferred:
+/// opening the Studio route updates the kept page (it reloads its library), and this runs inside
+/// that page's own listener, where a second update of it would panic.
+fn bring_to_studio(window: &mut Window, cx: &mut App) {
+    if mv_ui::current_route(cx) != Some(Route::Studio) {
+        window.defer(cx, |window, cx| mv_ui::navigate(Route::Studio, window, cx));
+    }
+}
+
 impl StudioPage {
     /// The library's chapters with these ids.
     pub(crate) fn chapter_items(&self, ids: &[String]) -> Vec<ChapterItem> {
@@ -105,10 +115,14 @@ impl StudioPage {
                 self.side_open = true;
                 self.side = Side::Activity;
             }
-            Fix::Open { chapter, step } => self.go_to(&chapter, Some(step), cx),
+            Fix::Open { chapter, step } => {
+                self.go_to(&chapter, Some(step), cx);
+                bring_to_studio(window, cx);
+            }
             Fix::OpenSetup => {
                 self.show_setup = true;
                 self.sheet = None;
+                bring_to_studio(window, cx);
             }
             Fix::AudioSettings => StudioPage::open_audio_settings(window, cx),
             Fix::PickModel { chapter } => {
@@ -120,6 +134,7 @@ impl StudioPage {
                     }
                 }
                 toast::show(cx, Toast::info("Pick a model with the model button next to Read, then retry").icon(mv_ui::glyphs::MODEL));
+                bring_to_studio(window, cx);
             }
             Fix::ResumeQueue => {
                 self.sync_pipeline(cx);
@@ -214,8 +229,9 @@ impl StudioPage {
                     moved = true;
                     toast::show(
                         cx,
-                        Toast::success(format!("{}: recap ready", it.chapter.label())).icon(mv_ui::glyphs::VIDEO).action("Open", move |_, cx| {
+                        Toast::success(format!("{}: recap ready", it.chapter.label())).icon(mv_ui::glyphs::VIDEO).action("Open", move |window, cx| {
                             let _ = weak.update(cx, |this, cx| this.go_to(&chapter, Some(Step::Video), cx));
+                            bring_to_studio(window, cx);
                         }),
                     );
                 }
@@ -225,6 +241,12 @@ impl StudioPage {
                     toast::show(
                         cx,
                         Toast::error(format!("{}: {} failed", it.chapter.label(), step.label().to_lowercase())).action("See the fix", move |_, cx| {
+                            // Away from Studio the fix is in the app-wide panel; Studio's own
+                            // panel is not on screen.
+                            if mv_ui::current_route(cx) != Some(Route::Studio) {
+                                mv_ui::panel::show(mv_ui::panel::PanelTab::Issues, cx);
+                                return;
+                            }
                             let _ = weak.update(cx, |this, cx| {
                                 this.side_open = true;
                                 this.side = Side::Issues;
@@ -394,7 +416,10 @@ impl StudioPage {
             .tooltip(tip("Open this chapter at its current step"))
             .hover(|s| s.border_color(Tokens::border_strong()))
             .pressable()
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(&chapter, open_step, cx)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.go_to(&chapter, open_step, cx);
+                bring_to_studio(window, cx);
+            }))
             .child(
                 div()
                     .flex()
@@ -444,7 +469,12 @@ impl StudioPage {
             .border_1()
             .border_color(border)
             .when(nav.is_some(), |d| d.hover(|s| s.border_color(color)).pressable().tooltip(tip("Open this chapter at that step")))
-            .when_some(nav, |d, (c, s)| d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(&c, s, cx))))
+            .when_some(nav, |d, (c, s)| {
+                d.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.go_to(&c, s, cx);
+                    bring_to_studio(window, cx);
+                }))
+            })
             .child(div().pt(px(1.)).child(ph_icon(icon, Weight::Fill, color, icon_px::MD)))
             .child(
                 div()
@@ -515,7 +545,12 @@ impl StudioPage {
             .border_1()
             .border_color(Tokens::accent_border())
             .when(nav.is_some(), |d| d.hover(|s| s.border_color(Tokens::accent())).pressable().tooltip(tip("Open this chapter")))
-            .when_some(nav, |d, c| d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(&c, Some(step), cx))))
+            .when_some(nav, |d, c| {
+                d.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.go_to(&c, Some(step), cx);
+                    bring_to_studio(window, cx);
+                }))
+            })
             .child(div().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(issue.title.clone()))
             .child(crate::phases::progress_line(&format!("fixing-{ix}"), p, line))
             .into_any_element()
@@ -523,7 +558,6 @@ impl StudioPage {
 
     /// The Issues tab.
     pub(crate) fn issues_view(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let issues = self.issues.clone();
         div()
             .id("studio-issues")
             .flex()
@@ -533,37 +567,46 @@ impl StudioPage {
             .overflow_y_scroll()
             .p(px(space::MD))
             .gap(px(space::SM))
-            .map(|d| {
-                if issues.is_empty() {
-                    d.child(div().pt(px(space::XL)).child(empty_view(ph::CHECK_CIRCLE, "No issues", "When a step fails or a chapter is missing something, it shows up here with the fix.").compact()))
-                } else {
-                    let n = issues.iter().filter(|i| i.fixing.is_none()).count();
-                    let fixing = issues.len() - n;
-                    d.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(space::SM))
-                            .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(match (n, fixing) {
-                                (0, f) => format!("{f} being fixed"),
-                                (n, 0) => format!("{n} issue{}", plural(n)),
-                                (n, f) => format!("{n} issue{} · {f} being fixed", plural(n)),
-                            }))
-                            .when(!self.auto_fixes().is_empty(), |d| {
-                                d.child(btn("issues-fix-all", "Fix all", ButtonKind::Primary).small().icon(ph::WRENCH).tooltip("Make again or retry every chapter with an issue. Issues that need you (Setup, a voice, a model) keep their own button.").on_click(
-                                    cx.listener(|this, _: &ClickEvent, window, cx| this.fix_all(window, cx)),
-                                ))
-                            })
-                            .child(btn("issues-clear", "Dismiss all", ButtonKind::Ghost).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                for i in this.issues.clone() {
-                                    this.dismissed.insert(i.key);
-                                }
-                                cx.notify();
-                            }))),
-                    )
-                    .children(issues.iter().enumerate().map(|(i, is)| self.issue_card(i, is, cx)))
-                }
+            .children(self.issues_items(false, cx))
+    }
+
+    /// What the Issues tab lists: the count line with Fix all / Dismiss all, then one card per
+    /// issue. Studio's own tab (`app_wide` false) says "No issues" when there are none; the
+    /// app-wide panel scrolls and pads for itself and draws one shared empty state, so there
+    /// this returns nothing.
+    pub(crate) fn issues_items(&self, app_wide: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let issues = self.issues.clone();
+        if issues.is_empty() {
+            if app_wide {
+                return vec![];
+            }
+            return vec![div().pt(px(space::XL)).child(empty_view(ph::CHECK_CIRCLE, "No issues", "When a step fails or a chapter is missing something, it shows up here with the fix.").compact()).into_any_element()];
+        }
+        let n = issues.iter().filter(|i| i.fixing.is_none()).count();
+        let fixing = issues.len() - n;
+        let mut out: Vec<AnyElement> = vec![div()
+            .flex()
+            .items_center()
+            .gap(px(space::SM))
+            .child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(match (n, fixing) {
+                (0, f) => format!("{f} being fixed"),
+                (n, 0) => format!("{n} issue{}", plural(n)),
+                (n, f) => format!("{n} issue{} · {f} being fixed", plural(n)),
+            }))
+            .when(!self.auto_fixes().is_empty(), |d| {
+                d.child(btn("issues-fix-all", "Fix all", ButtonKind::Primary).small().icon(ph::WRENCH).tooltip("Make again or retry every chapter with an issue. Issues that need you (Setup, a voice, a model) keep their own button.").on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.fix_all(window, cx)),
+                ))
             })
+            .child(btn("issues-clear", "Dismiss all", ButtonKind::Ghost).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                for i in this.issues.clone() {
+                    this.dismissed.insert(i.key);
+                }
+                cx.notify();
+            })))
+            .into_any_element()];
+        out.extend(issues.iter().enumerate().map(|(i, is)| self.issue_card(i, is, cx)));
+        out
     }
 
     /// A failure as Activity shows it: the sentence, the fixes, and the raw error behind Details.
@@ -621,8 +664,9 @@ impl StudioPage {
         Some(div().flex().flex_col().gap(px(6.)).max_w(px(900.)).children(mine.iter().map(|(ix, i)| self.issue_card(200 + ix, i, cx))).into_any_element())
     }
 
-    /// The first issues, inline at the top of Activity, with a link to the rest.
-    pub(crate) fn issues_inline(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The first issues, inline at the top of Activity, with a link to the rest (Studio's Issues
+    /// tab, or the app-wide panel's when `app_wide`).
+    pub(crate) fn issues_inline(&self, app_wide: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.issues.is_empty() {
             return None;
         }
@@ -637,8 +681,12 @@ impl StudioPage {
                 })
                 .children(self.issues.iter().take(2).enumerate().map(|(i, is)| self.issue_card(100 + i, is, cx)))
                 .when(n > 2, |d| {
-                    d.child(btn("issues-more", format!("See all {n} issues"), ButtonKind::Ghost).small().trailing_icon(ph::ARROW_RIGHT).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.side = Side::Issues;
+                    d.child(btn("issues-more", format!("See all {n} issues"), ButtonKind::Ghost).small().trailing_icon(ph::ARROW_RIGHT).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if app_wide {
+                            mv_ui::panel::set_tab(mv_ui::panel::PanelTab::Issues, cx);
+                        } else {
+                            this.side = Side::Issues;
+                        }
                         cx.notify();
                     })))
                 })

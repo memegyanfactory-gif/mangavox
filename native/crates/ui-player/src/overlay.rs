@@ -30,6 +30,23 @@ struct Shared {
     placed_video: Cell<Option<[i32; 4]>>,
     /// A posted sync message is in flight.
     sync_pending: Cell<bool>,
+    /// Physical pixels both popups leave free at the right edge of the client area (the app-wide
+    /// side panel is drawn there, in the app window underneath).
+    right_inset: Cell<i32>,
+}
+
+/// The physical-pixel strip to leave free for a docked panel `docked` logical px wide.
+pub fn panel_inset(docked: f32, scale: f32) -> i32 {
+    if docked.is_finite() && scale.is_finite() {
+        (docked * scale).round().max(0.) as i32
+    } else {
+        0
+    }
+}
+
+/// The popups' width: the client width minus the free strip, never below 1 px.
+fn inset_width(client: i32, inset: i32) -> i32 {
+    (client - inset.max(0)).max(1)
 }
 
 pub struct Follower {
@@ -61,6 +78,17 @@ impl Follower {
 
     pub fn set_visible(&self, v: bool) {
         if self.shared.visible.replace(v) != v {
+            self.shared.placed.set(None);
+            self.shared.placed_video.set(None);
+            self.sync();
+        }
+    }
+
+    /// Leaves `px` physical pixels free at the right edge of the app window's client area (the
+    /// overlay and the video both stop there), so the side panel beside the video stays visible.
+    pub fn set_right_inset(&self, px: i32) {
+        let px = px.max(0);
+        if self.shared.right_inset.replace(px) != px {
             self.shared.placed.set(None);
             self.shared.placed_video.set(None);
             self.sync();
@@ -115,6 +143,11 @@ impl Drop for Follower {
         self.shared.alive.set(false);
         imp::uninstall(&self.shared);
     }
+}
+
+/// Maximizes the window `main`, or restores it when it is maximized.
+pub(crate) fn toggle_maximized(main: isize) {
+    imp::toggle_maximize(main);
 }
 
 /// Raw HWND of a GPUI window.
@@ -270,7 +303,8 @@ mod imp {
                 // Owned popups hide with a minimized owner on their own.
                 return;
             }
-            let Some(r) = client_rect(main) else { return };
+            let Some(mut r) = client_rect(main) else { return };
+            r[2] = super::inset_width(r[2], s.right_inset.get());
             let ov = h(s.overlay);
             if s.visible.get() {
                 // Compare with the real rect too: GPUI may move it itself (e.g. on DPI changes).
@@ -369,4 +403,25 @@ mod imp {
     pub fn close(_: isize) {}
     pub fn begin_move(_: isize) {}
     pub fn begin_resize_top(_: isize) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inset_width, panel_inset};
+
+    #[test]
+    fn the_panel_width_becomes_physical_pixels() {
+        assert_eq!(panel_inset(380., 1.5), 570);
+        assert_eq!(panel_inset(0., 2.), 0);
+        assert_eq!(panel_inset(f32::NAN, 2.), 0);
+        assert_eq!(panel_inset(-4., 1.), 0);
+    }
+
+    #[test]
+    fn the_inset_never_empties_or_grows_the_window() {
+        assert_eq!(inset_width(1280, 380), 900);
+        assert_eq!(inset_width(1280, 0), 1280);
+        assert_eq!(inset_width(1280, -5), 1280);
+        assert_eq!(inset_width(300, 380), 1);
+    }
 }

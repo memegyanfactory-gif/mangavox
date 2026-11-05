@@ -69,8 +69,8 @@ class LengthTests(unittest.TestCase):
         self.assertEqual(int(re.search(r"^MAX_CARDS = ([0-9]+)", src, re.M).group(1)), 4)
         for n in range(1, im.MAX_CARDS + 1):
             self.assertAlmostEqual(im.total_seconds(n), n * im.CARD_SEC + tr.RIBBON_SEC + tr.REVEAL_SEC)
-        # Four cards: 4 x 2.5 + 1.2 + 0.5.
-        self.assertAlmostEqual(im.total_seconds(4), 11.7)
+        # Four cards: 4 x 2.5 + 1.2 + 1.4.
+        self.assertAlmostEqual(im.total_seconds(4), 12.6)
 
     def test_frames_at_any_rate(self):
         for fps in (24.0, 25.0, 30000 / 1001, 30.0, 50.0, 60.0):
@@ -79,12 +79,12 @@ class LengthTests(unittest.TestCase):
                 self.assertEqual(total, int(round(im.total_seconds(n) * fps)), (fps, n))
                 self.assertEqual(cards, int(round(n * im.CARD_SEC * fps)), (fps, n))
                 self.assertGreater(total - cards, 0)
-        # Four cards, exactly: 351 frames at 30 fps (300 of cards), 702 at 60, 281 at 24, 293 at 25.
-        self.assertEqual(im.frame_counts(4, 30.0), (351, 300))
-        self.assertEqual(im.frame_counts(4, 60.0), (702, 600))
-        self.assertEqual(im.frame_counts(4, 24.0), (281, 240))
-        self.assertEqual(im.frame_counts(4, 25.0), (292, 250))
-        self.assertEqual(im.frame_counts(4, 30000 / 1001), (351, 300))
+        # Four cards, exactly: 378 frames at 30 fps (300 of cards), 756 at 60, 302 at 24, 315 at 25.
+        self.assertEqual(im.frame_counts(4, 30.0), (378, 300))
+        self.assertEqual(im.frame_counts(4, 60.0), (756, 600))
+        self.assertEqual(im.frame_counts(4, 24.0), (302, 240))
+        self.assertEqual(im.frame_counts(4, 25.0), (315, 250))
+        self.assertEqual(im.frame_counts(4, 30000 / 1001), (378, 300))
 
 
 class MusicTests(unittest.TestCase):
@@ -108,6 +108,47 @@ class MusicTests(unittest.TestCase):
             self.assertAlmostEqual(start + n * im.CARD_SEC + tr.PASS_SEC, im.MAX_CARDS * im.CARD_SEC + tr.PASS_SEC)
             self.assertEqual(len(x), int(round(im.total_seconds(n) * im.SR)))
             self.assertTrue(np.isfinite(x).all() and np.abs(x).max() <= 10 ** (-1 / 20) + 1e-9)
+
+    def test_the_music_fades_in_and_out_instead_of_stopping(self):
+        for n in range(1, im.MAX_CARDS + 1):
+            total = im.total_seconds(n)
+            hit = n * im.CARD_SEC + tr.PASS_SEC
+            g = lambda s: float(im.music_gain(np.array([s]), total, hit)[0])
+            # Silent at both ends, full in between, and it rings on just past the big moment.
+            self.assertAlmostEqual(g(0.0), 0.0)
+            self.assertLess(g(im.MUSIC_IN_SEC / 2), 0.75)
+            self.assertAlmostEqual(g(im.MUSIC_IN_SEC + 0.01), 1.0)
+            self.assertAlmostEqual(g(hit), 1.0)
+            self.assertAlmostEqual(g(total), 0.0, places=6)
+            # The fade-out is long and only ever goes down.
+            out = np.linspace(hit + im.MUSIC_HOLD_SEC, total, 200)
+            gains = im.music_gain(out, total, hit)
+            self.assertTrue(np.all(np.diff(gains) <= 1e-12))
+            self.assertGreaterEqual(total - (hit + im.MUSIC_HOLD_SEC), im.MUSIC_OUT_MIN_SEC)
+        # A steady tone through the whole intro comes in softly and ends in silence.
+        music = os.path.join(tempfile.mkdtemp(), "music.wav")
+        im.write_wav_stereo(music, np.zeros((im.SR, 2)))
+        tone = lambda path, seconds, start=0.0: np.tile(0.3 * np.sin(2 * np.pi * 220 * np.arange(int(seconds * im.SR)) / im.SR)[:, None], (1, 2))
+        with mock.patch.object(im, "decode_stereo", tone), mock.patch.object(tr, "sound", lambda **k: np.zeros((10, 2))), mock.patch.object(im, "card_swish", lambda *a, **k: np.zeros(10)):
+            x = im.soundtrack(4, music, "epic")
+        rms = lambda a, b: float(np.sqrt(np.mean(x[int(a * im.SR): int(b * im.SR)] ** 2)))
+        total = im.total_seconds(4)
+        self.assertLess(rms(0.0, 0.2), 0.3 * rms(4.0, 6.0))
+        self.assertLess(rms(total - 0.15, total), 0.05 * rms(4.0, 6.0))
+
+    def test_the_cards_slide_in_on_a_soft_unpitched_swish(self):
+        # The shared whoosh peaks near 2.3 kHz and rang like a "ting" on every card; the cards' own
+        # swish stays dark (most of its energy under 1.5 kHz), short, and well under the music.
+        x = im.card_swish()
+        self.assertAlmostEqual(len(x) / im.SR, im.CARD_SWISH_SEC, places=2)
+        self.assertAlmostEqual(float(np.abs(x).max()), 1.0, places=6)
+        spec = np.abs(np.fft.rfft(x)) ** 2
+        f = np.fft.rfftfreq(len(x), 1 / im.SR)
+        self.assertGreater(spec[f < 1500].sum() / spec.sum(), 0.9)
+        self.assertLess(float((f * spec).sum() / spec.sum()), 1000)
+        peak = int(np.argmax(np.abs(np.convolve(x, np.ones(480) / 480, mode="same"))))
+        self.assertLess(abs(peak / im.SR - im.CARD_SWISH_PEAK), 0.15)
+        self.assertLessEqual(im.CARD_SWISH_GAIN, 0.12)
 
     def test_the_transition_is_heard_where_the_camera_passes(self):
         x = im.soundtrack(2, None, "epic")

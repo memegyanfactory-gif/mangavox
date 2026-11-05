@@ -68,11 +68,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import intro_cast  # noqa: E402
 import intro_transition as tr  # noqa: E402
-import sfx  # noqa: E402
 
 CARD_SEC = 2.5
 SLIDE_SEC = 0.32
 MAX_CARDS = 4
+# The music fades in over MUSIC_IN_SEC, rings MUSIC_HOLD_SEC past its big moment, then fades out
+# to silence by the intro's end (over at least MUSIC_OUT_MIN_SEC); the whole mix's last
+# END_FADE_SEC fades too.
+MUSIC_IN_SEC = 1.2
+# Each card's slide-in sound: its length, where it peaks, and how loud under the music.
+CARD_SWISH_SEC = 0.7
+CARD_SWISH_PEAK = 0.3
+CARD_SWISH_GAIN = 0.1
+MUSIC_HOLD_SEC = 0.15
+MUSIC_OUT_MIN_SEC = 1.2
+END_FADE_SEC = 0.6
 SR = 48000
 LOUDNESS = -15.0  # LUFS, integrated (ITU-R BS.1770)
 NAME_FONT = os.path.join(HERE, "fonts", "Anton-Regular.ttf")
@@ -961,6 +971,35 @@ def loudness(x):
     return float(-0.691 + 10 * np.log10(np.mean(gated))) if len(gated) else None
 
 
+def ease(x):
+    """A 0..1 ramp that starts and ends gently (raised cosine): fades without a click or a step."""
+    x = np.clip(x, 0.0, 1.0)
+    return 0.5 - 0.5 * np.cos(np.pi * x)
+
+
+def card_swish(seed=5):
+    """The soft rush of air as a card slides in: band-limited noise (120 Hz to 1.1 kHz) swelling
+    to its peak at CARD_SWISH_PEAK and fading, mono, peaking at 1. The shared effects' whoosh is a
+    resonant sweep that peaks near 2.3 kHz; under the cards' music it rang like a "ting" on every
+    card, so the cards have their own, darker and unpitched."""
+    rng = np.random.default_rng(seed)
+    n = int(CARD_SWISH_SEC * SR)
+    t = np.arange(n) / SR
+    env = np.where(t < CARD_SWISH_PEAK, (t / CARD_SWISH_PEAK) ** 2, np.exp(-(t - CARD_SWISH_PEAK) / 0.11))
+    x = tr.fft_filter(rng.standard_normal(n), lo=120, hi=1100) * env
+    x[-int(0.02 * SR):] *= np.linspace(1.0, 0.0, int(0.02 * SR))
+    return x / (np.abs(x).max() + 1e-9)
+
+
+def music_gain(t, total, hit):
+    """The music's gain at times `t` (seconds) in an intro `total` seconds long whose big moment
+    is at `hit`: it fades in over MUSIC_IN_SEC, rings on MUSIC_HOLD_SEC after the big moment, then
+    fades out to silence by the end (never over less than MUSIC_OUT_MIN_SEC), so it never stops
+    on a held note when the recap starts."""
+    out_from = max(0.0, min(hit + MUSIC_HOLD_SEC, total - MUSIC_OUT_MIN_SEC))
+    return ease(t / MUSIC_IN_SEC) * (1.0 - ease((t - out_from) / max(total - out_from, 1e-6)))
+
+
 def soundtrack(n_cards, music, style=None):
     """The cards' music (read from where its big moment lands as the camera passes through the
     ribbons) and their whooshes, then the transition's own sound; about LOUDNESS LUFS."""
@@ -974,8 +1013,8 @@ def soundtrack(n_cards, music, style=None):
         except (OSError, subprocess.CalledProcessError, ValueError):
             m = np.zeros((0, 2))
         t = np.arange(len(m)) / SR
-        # In softly, carried through the dive, out with the recap's arrival.
-        env = np.minimum(1, t / 0.2) * np.clip((total - t) / 0.45, 0, 1)
+        # Faded in, carried through the dive, faded out under the recap settling in.
+        env = music_gain(t, total, trans_at + tr.PASS_SEC)
         mix[: len(m)] += m * env[:, None] * 0.75
 
     def place(x, at_sec, gain):
@@ -985,13 +1024,15 @@ def soundtrack(n_cards, music, style=None):
         x = x[: max(0, n - at)] * gain
         mix[at: at + len(x)] += x if x.ndim == 2 else x[:, None]
 
-    whoosh = sfx.synthesize("whoosh").astype(np.float64)
+    swish = card_swish()
     for i in range(n_cards):
-        place(whoosh, i * CARD_SEC + SLIDE_SEC * 0.5 - 0.36, 0.18)  # peaks as the card slides in
+        place(swish, i * CARD_SEC + SLIDE_SEC * 0.5 - CARD_SWISH_PEAK, CARD_SWISH_GAIN)  # peaks as the card slides in
     # The shimmer in the music's key: C major for lo-fi, A minor for the rest.
     major = style == "lofi"
     place(tr.sound(root=65.41 if major else 55.0, minor=not major), trans_at, 1.0)
-    fade = np.minimum(1, np.arange(n) / (0.01 * SR)) * np.clip((n - np.arange(n)) / (0.03 * SR), 0, 1)
+    # Everything (the transition's airy release too) ends in silence, not on a cut.
+    i = np.arange(n)
+    fade = np.minimum(1, i / (0.01 * SR)) * (1.0 - ease((i - (n - END_FADE_SEC * SR)) / (END_FADE_SEC * SR)))
     mix *= fade[:, None]
     # To LOUDNESS, a soft limit keeping the peaks under -1 dBFS (measured again after the limit,
     # which takes a little off the loudest moments).

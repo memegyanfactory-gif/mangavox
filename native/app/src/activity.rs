@@ -241,6 +241,19 @@ impl StudioRuns {
         cx.notify();
     }
 
+    /// Something is being made now: a Generate run with chapters still to make (and not on hold),
+    /// or an export running. The side panel's live dot reads this before the Studio page exists.
+    pub fn live(&self) -> bool {
+        if self.exports.iter().any(|e| !e.waiting) {
+            return true;
+        }
+        !self.held
+            && self.runs.iter().any(|(m, r)| {
+                let t = tally(&self.items, m, r.from);
+                r.ended.is_none() && t.active.len() > t.paused.len()
+            })
+    }
+
     /// One card per Generate run and per export to show.
     pub fn cards(&self, this: &Entity<Self>) -> Vec<Card> {
         let runs = self.runs.iter().filter_map(|(m, r)| {

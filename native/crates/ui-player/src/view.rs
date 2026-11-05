@@ -34,6 +34,8 @@ const TRACKS_EVERY: u32 = 8; // polls (~1 s)
 const SAVE_EVERY: Duration = Duration::from_secs(10);
 /// How long a full-screen switch may take before the window's own state counts again.
 const FS_SETTLE: Duration = Duration::from_secs(1);
+/// Longer than a closing dialog's animation (it hands the keyboard back to its page when done).
+const FOCUS_SETTLE: Duration = Duration::from_millis(450);
 /// Controls fade in / out (the kit's slow transition).
 const FADE: Duration = duration::SLOW;
 /// Scrubber grows on hover.
@@ -154,6 +156,10 @@ pub struct PlayerView {
     main_hwnd: Option<isize>,
     overlay: Option<AnyWindowHandle>,
     follower: Option<Follower>,
+    /// Physical pixels last handed to the follower for the app-wide side panel at the right edge.
+    right_inset: i32,
+    /// Redraws the player when the side panel opens, closes or its status changes.
+    _panel_obs: Subscription,
     fullscreen: bool,
     /// Full screen as last asked for, until the window has switched (it does so after this update).
     fs_wanted: Option<(bool, Instant)>,
@@ -300,6 +306,7 @@ impl PlayerView {
         let pending_hash = backend::source_hash(&req);
         let alternates = backend::take_alternates(&req);
         let now = Instant::now();
+        let panel_obs = cx.observe_global::<mv_ui::panel::SidePanel>(|_, cx| cx.notify());
         let mut this = Self {
             req,
             ident,
@@ -308,6 +315,8 @@ impl PlayerView {
             main_hwnd: overlay::hwnd_of(window),
             overlay: None,
             follower: None,
+            right_inset: 0,
+            _panel_obs: panel_obs,
             fullscreen: window.is_fullscreen(),
             fs_wanted: None,
             ov_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -391,6 +400,15 @@ impl PlayerView {
             }
         })
         .detach();
+        // A dialog that opened the player (Studio's "chapter changed since it was rendered") hands
+        // the keyboard back to the page it was opened on once its closing animation ends, after
+        // the player took it: take it back then, or no shortcut (Space, M, F...) worked until a
+        // click on the video.
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(FOCUS_SETTLE).await;
+            let _ = in_main(&this, main, cx, |this, window, cx| this.keep_focus(window, cx));
+        })
+        .detach();
         this
     }
 
@@ -401,6 +419,8 @@ impl PlayerView {
         let bounds = window.bounds();
         let display_id = window.display(cx).map(|d| d.id());
         let player = cx.entity().downgrade();
+        // Only the app window knows its scale; the panel's width is in logical pixels.
+        let scale = window.scale_factor();
         cx.defer(move |cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -433,6 +453,9 @@ impl PlayerView {
                     }
                     let Some(ov) = ov_hwnd else { return false };
                     let f = Follower::new(main_hwnd, ov);
+                    // The panel may already be open: keep the video out of its strip from the start.
+                    this.right_inset = overlay::panel_inset(mv_ui::panel::state(cx).docked, scale);
+                    f.set_right_inset(this.right_inset);
                     if let Some(m) = &this.mpv {
                         f.set_video(m.surface());
                     }
@@ -2045,6 +2068,10 @@ impl PlayerView {
         let episode = logic::episode_label(&self.req.title, self.req.season, self.req.episode);
         let windowed = !self.fullscreen;
         let maximized = self.follower.as_ref().is_some_and(|f| f.is_maximized());
+        let panel = mv_ui::panel::state(cx);
+        // With the panel docked, the shell's real caption buttons show above it at the window's
+        // top-right corner, so the overlay's own copies would be doubles.
+        let docked = panel.docked > 0.;
         let slide = if motion::reduced() { 0.0 } else { -(1.0 - o) * 14.0 };
         div()
             .id("top-bar")
@@ -2059,7 +2086,7 @@ impl PlayerView {
             .pl(px(18.))
             .pt(px(14.))
             // Full screen has no caption buttons at the right edge to keep the pill off it.
-            .when(!windowed, |d| d.pr(px(18.)))
+            .when(!windowed || docked, |d| d.pr(px(18.)))
             .gap(px(12.))
             .bg(linear_gradient(180., linear_color_stop(shade(0.7), 0.), linear_color_stop(shade(0.), 1.)))
             // Empty top-bar space moves the window (drag) / maximizes it (double-click).
@@ -2102,7 +2129,23 @@ impl PlayerView {
             // The title bar (and its private-mode button) is hidden behind the player, so catalog
             // titles get the toggle here too. Studio / local videos are never recorded anyway.
             .when(self.ident.tracked, |d| d.child(self.private_btn(cx)))
-            .when(windowed, |d| {
+            .child(
+                // The panel toggle (activity, issues, chat), with the live dot / issue count on its corner.
+                div()
+                    .relative()
+                    .flex_none()
+                    // The mark sits outside the button: a click on it must not start a window drag.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        ctl("panel-toggle", ph::PULSE.bold(), BAR_PX, mv_ui::panel::toggle_label(&panel), Some(mv_ui::panel::SHORTCUT))
+                            .bg(if panel.open { Tokens::accent_soft() } else { Tokens::glass() })
+                            .border_1()
+                            .border_color(if panel.open { Tokens::accent_border() } else { Tokens::glass_border() })
+                            .on_click(cx.listener(|_, _, _w, cx| mv_ui::panel::toggle(cx))),
+                    )
+                    .children(mv_ui::panel::status_mark("panel-mark", &panel).map(|m| div().absolute().top(px(-2.)).right(px(-2.)).child(m))),
+            )
+            .when(windowed && !docked, |d| {
                 d.child(
                     div()
                         .flex()
@@ -2633,6 +2676,7 @@ impl PlayerView {
                     ui::shortcut_row("Skip intro, recap or outro", &["s"]),
                     ui::shortcut_row("Next episode", &["n"]),
                     ui::shortcut_row("Close menu / back", &["escape"]),
+                    ui::shortcut_row("Activity, issues and chat", &["ctrl-j"]),
                     ui::shortcut_row("This list", &["?"]),
                 ],
             ));
@@ -2733,6 +2777,15 @@ impl Drop for PlayerView {
 /// (or if it cannot be created) the overlay content is drawn here instead.
 impl Render for PlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The side panel is drawn in this window at the right edge, under the popups: they leave
+        // that strip free, so the video is never drawn beneath it.
+        let inset = overlay::panel_inset(mv_ui::panel::state(cx).docked, window.scale_factor());
+        if inset != self.right_inset {
+            self.right_inset = inset;
+            if let Some(f) = &self.follower {
+                f.set_right_inset(inset);
+            }
+        }
         let fallback = self.overlay.is_none().then(|| self.render_overlay(window, cx, false));
         div()
             .id("player-root")

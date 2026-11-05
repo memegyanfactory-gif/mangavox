@@ -2,6 +2,7 @@
 mod activity;
 mod keys;
 mod palette;
+mod panel;
 mod perf;
 mod prefs;
 mod privacy;
