@@ -879,9 +879,23 @@ impl Session {
                         st = ps.next(), if !added_all => {
                             match st {
                                 Some(st) => {
-                                    let (id, st) = st?;
+                                    // MV-PATCH: one unreadable saved torrent is skipped
+                                    // instead of failing the whole session start.
+                                    let (id, st) = match st {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            error!("error restoring torrent from persistence: {e:#}");
+                                            continue;
+                                        }
+                                    };
                                     let span = add_torrent_span(st.info_hash());
-                                    let (add_torrent, mut opts) = st.into_add_torrent()?;
+                                    let (add_torrent, mut opts) = match st.into_add_torrent() {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            error!("error restoring torrent from persistence: {e:#}");
+                                            continue;
+                                        }
+                                    };
                                     opts.preferred_id = Some(id);
                                     let fut = session.add_torrent(add_torrent, Some(opts));
                                     let fut = fut.instrument(span);

@@ -7,6 +7,7 @@
 
 mod brain;
 mod cast;
+pub mod cast_profile;
 mod export;
 pub mod hook;
 mod json;
@@ -23,7 +24,7 @@ pub mod thumb;
 mod transcript;
 mod types;
 
-pub use brain::{safe_id, Brain};
+pub use brain::{safe_id, Brain, ChapterRecap};
 pub use export::export_for_pipeline;
 pub use json::extract_json;
 pub use llm::retry_now;

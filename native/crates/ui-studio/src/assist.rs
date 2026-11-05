@@ -664,26 +664,42 @@ async fn run_export(g: MangaGroup, made: Vec<ChapterItem>, prefs: ExportPrefs, d
     let out = export::joined_path(&g.id);
     let rr = r.clone();
     let joined = mv_ui::bg::blocking(move || export::join(&files, &out, &rr)).await.map_err(|e| e.to_string())?.map_err(|e| format!("Could not join the chapter videos: {e:#}"))?;
+    let env2 = env.clone();
+    // The hook and the intro's cast profiles are written with the assistant's own model.
+    let (reg, model, model_name) = ui_assistant::on_ui(|_, cx| {
+        let (provider, model) = ui_assistant::assistant_model(cx);
+        let model = serde_json::from_value::<mv_ai::AiProviderId>(Value::String(provider)).ok().map(|provider| ModelChoice { provider, model });
+        (ui_assistant::registry(cx), model, ui_assistant::model_label(cx))
+    })
+    .await?;
     let hook = if prefs.mode() == Mode::Whole && prefs.hook {
         let Some((python, layout)) = env.and_then(|e| Some((e.python.ok()?, e.scripts.ok()?))) else {
             return Err("The hook is voiced by Studio's Python, which is not set up yet. Finish Setup, or export without the hook.".into());
         };
-        let (reg, model) = ui_assistant::on_ui(|_, cx| {
-            let (provider, model) = ui_assistant::assistant_model(cx);
-            let model = serde_json::from_value::<mv_ai::AiProviderId>(Value::String(provider)).ok().map(|provider| ModelChoice { provider, model });
-            (ui_assistant::registry(cx), model)
-        })
-        .await?;
-        Some(export::HookJob { manga_id: g.id.clone(), manga_title: g.title.clone(), cover: g.cover.clone().filter(|p| p.is_file()), chapters: made.clone(), seconds: prefs.hook_secs, model, reg, python, layout })
+        Some(export::HookJob { manga_id: g.id.clone(), manga_title: g.title.clone(), cover: g.cover.clone().filter(|p| p.is_file()), chapters: made.clone(), seconds: prefs.hook_secs, model: model.clone(), reg: reg.clone(), python, layout })
     } else {
         None
     };
+    let profile_model = export::intro::profile_model(model.map(|m| (m, model_name)));
+    let intro = (prefs.mode() == Mode::Whole && prefs.intro).then_some(()).and(env2).and_then(|e| {
+        Some(export::intro::IntroJob {
+            manga_id: g.id.clone(),
+            manga_title: g.title.clone(),
+            chapters: made.clone(),
+            numbers: export::intro::chapter_numbers(&g.chapters),
+            model_name: profile_model.as_ref().map(|m| m.1.clone()).unwrap_or_default(),
+            model: profile_model.map(|m| m.0),
+            reg,
+            python: e.python.ok()?,
+            layout: e.scripts.ok()?,
+        })
+    });
     // The hook needs the GPUI background executor: the rest runs on the UI thread's executor.
     let (tx, rx) = futures::channel::oneshot::channel();
     ui_assistant::on_ui(move |_, cx| {
         let ex = cx.background_executor().clone();
         cx.spawn(async move |_| {
-            let out = export::export_joined(joined, hook, prefs, dir, name, font, r, ex).await;
+            let out = export::export_joined(joined, hook, intro, prefs, dir, name, font, r, ex).await;
             let _ = tx.send(out);
         })
         .detach();

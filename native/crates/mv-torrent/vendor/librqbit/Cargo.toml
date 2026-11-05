@@ -13,6 +13,11 @@
 #    peer's measured rate (upstream: 128 requests regardless), per-peer and
 #    swarm chunk-latency tracking (slow peers stay off the playhead), late /
 #    cancelled chunks are kept when still needed instead of discarded.
+#  * session_persistence/json.rs: session.json, <hash>.torrent and <hash>.bitv
+#    are written durably (temp file fsynced, then renamed over the old one), so
+#    a power cut never leaves them empty / zero-filled.
+#  * session.rs: one unreadable saved torrent is skipped at startup instead of
+#    failing the whole session.
 #  * lib.rs: export FileStream; tests module and optional features that pull
 #    extra crates (postgres, http-api, webui, ...) removed.
 # Of upstream's src/tests only test_util.rs is vendored (e2e suites dropped).

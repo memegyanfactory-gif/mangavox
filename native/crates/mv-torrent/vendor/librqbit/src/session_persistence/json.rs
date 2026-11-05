@@ -1,4 +1,8 @@
-use std::{any::TypeId, collections::HashMap, path::PathBuf};
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     api::TorrentIdOrHash,
@@ -16,10 +20,41 @@ use futures::{StreamExt, stream::BoxStream};
 use itertools::Itertools;
 use librqbit_core::Id20;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tracing::{debug, trace, warn};
 
 use super::{SerializedTorrent, SessionPersistenceStore};
+
+/// MV-PATCH: replaces `path` with `bytes` so that a crash or power cut at any
+/// point leaves either the old or the new content, never an empty or
+/// zero-filled file: write `<path>.tmp` in the same folder, fsync it, close it,
+/// then rename it over `path`.
+async fn write_atomic(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || write_atomic_sync(&path, &bytes))
+        .await
+        .context("atomic write task failed")?
+}
+
+fn write_atomic_sync(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp).with_context(|| format!("error opening {tmp:?}"))?;
+        f.write_all(bytes).with_context(|| format!("error writing {tmp:?}"))?;
+        f.sync_all().with_context(|| format!("error syncing {tmp:?}"))?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("error renaming {tmp:?} to {path:?}"))?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, Default)]
 struct SerializedSessionDatabase {
@@ -87,28 +122,16 @@ impl JsonSessionPersistenceStore {
     async fn flush(&self) -> anyhow::Result<()> {
         // we don't need the write lock technically, but we need to stop concurrent modifications
         let db_content = self.db_content.write().await;
-        let tmp_filename = format!("{}.tmp", self.db_filename.to_str().unwrap());
-        let mut tmp = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_filename)
-            .await
-            .with_context(|| format!("error opening {tmp_filename:?}"))?;
-        trace!(?tmp_filename, "opened temp file");
-
         let mut buf = Vec::new();
         serde_json::to_writer(&mut buf, &*db_content).context("error serializing")?;
+        trace!(filename=?self.db_filename, "serialized DB as JSON");
 
-        trace!(?tmp_filename, "serialized DB as JSON");
-        tmp.write_all(&buf)
+        // MV-PATCH: fsync the temp file before the rename (upstream did not, so a
+        // power cut on NTFS left session.json the right size but zero-filled, and
+        // every later session start failed to parse it).
+        write_atomic(&self.db_filename, buf)
             .await
-            .with_context(|| format!("error writing {tmp_filename:?}"))?;
-        trace!(?tmp_filename, "wrote to temp file");
-
-        tokio::fs::rename(&tmp_filename, &self.db_filename)
-            .await
-            .context("error renaming persistence file")?;
+            .context("error writing persistence file")?;
         trace!(filename=?self.db_filename, "wrote persistence");
         Ok(())
     }
@@ -158,22 +181,10 @@ impl JsonSessionPersistenceStore {
             .unwrap_or_default();
 
         if write_torrent_file && !torrent_bytes.is_empty() {
+            // MV-PATCH: atomic + durable (upstream truncated the file in place).
             let torrent_bytes_file = self.torrent_bytes_filename(&torrent.info_hash());
-            match tokio::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&torrent_bytes_file)
-                .await
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&torrent_bytes).await {
-                        warn!(error=?e, file=?torrent_bytes_file, "error writing torrent bytes")
-                    }
-                }
-                Err(e) => {
-                    warn!(error=?e, file=?torrent_bytes_file, "error opening torrent bytes file")
-                }
+            if let Err(e) = write_atomic(&torrent_bytes_file, torrent_bytes.to_vec()).await {
+                warn!(error=?e, file=?torrent_bytes_file, "error writing torrent bytes")
             }
         }
 
@@ -228,6 +239,11 @@ impl BitVFactory for JsonSessionPersistenceStore {
         tokio::io::copy(&mut b.as_raw_slice(), &mut dst)
             .await
             .context("error writing bitslice to {filename:?}")?;
+        // MV-PATCH: durable before it replaces the old bitfield.
+        dst.sync_all()
+            .await
+            .with_context(|| format!("error syncing {tmp_filename:?}"))?;
+        drop(dst);
         tokio::fs::rename(&tmp_filename, &filename)
             .await
             .with_context(|| format!("error renaming {tmp_filename:?} to {filename:?}"))?;

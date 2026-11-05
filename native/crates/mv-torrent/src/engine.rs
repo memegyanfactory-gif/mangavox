@@ -35,6 +35,7 @@ use tokio::io::{AsyncRead, AsyncSeekExt, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::http::{mime_from_name, BoxReader, ByteSource, SourceResolver, StreamServer};
+use crate::persist;
 
 /// Public trackers merged into every torrent, on top of the magnet's own
 /// `tr=` list (ngosang/trackerslist "best", 2026-10, plus a few HTTP(S)
@@ -350,7 +351,12 @@ fn tail_warm_bytes(file_len: u64) -> u64 {
 }
 
 fn listen_port_file(dir: &Path) -> PathBuf {
-    dir.join("listen-port")
+    dir.join(persist::LISTEN_PORT)
+}
+
+/// The session start failed on librqbit's session database (session.json).
+fn is_session_db_error(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("session persistence store")
 }
 
 /// Which UDP port the DHT binds on one session start attempt.
@@ -385,44 +391,89 @@ fn start_attempts(saved_listen_port: Option<u16>, dht: bool) -> Vec<StartAttempt
 }
 
 impl Engine {
-    pub async fn new(cfg: EngineConfig) -> Result<Self> {
+    pub async fn new(mut cfg: EngineConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.download_dir)
             .with_context(|| format!("creating {}", cfg.download_dir.display()))?;
         let session_dir = cfg.session_dir();
-        if cfg.persist_session {
-            std::fs::create_dir_all(&session_dir)
-                .with_context(|| format!("creating {}", session_dir.display()))?;
+        // Saved state (torrent list, piece bitfields, DHT table, listen port)
+        // only makes restarts faster: a state file a crash or power cut broke
+        // is quarantined and the session starts fresh, and if persistence
+        // still cannot start the engine runs without it. Never fail playback.
+        let mut persist = cfg.persist_session;
+        if persist {
+            match std::fs::create_dir_all(&session_dir) {
+                Ok(()) => {
+                    persist::heal_session_dir(&session_dir);
+                }
+                Err(e) => {
+                    log().warn(
+                        "torrent",
+                        &format!("cannot create {} ({e}); running without saved torrent state", session_dir.display()),
+                    );
+                    persist = false;
+                }
+            }
         }
 
         // Re-use the last listen port so UPnP mappings and peers' caches stay
         // valid across restarts. If a port is busy (another MangaVox, another
         // BitTorrent client, or a socket the OS has not released yet) fall back
         // to random ports, then to no DHT: a busy port must never stop playback.
-        let saved_port: Option<u16> = cfg
-            .persist_session
+        let saved_port: Option<u16> = persist
             .then(|| std::fs::read_to_string(listen_port_file(&session_dir)).ok())
             .flatten()
             .and_then(|s| s.trim().parse().ok());
         let mut session = None;
         let mut last_err = None;
-        for attempt in start_attempts(saved_port, cfg.enable_dht) {
-            match Self::start_session(&cfg, &session_dir, attempt).await {
+        let mut db_quarantined = false;
+        let attempts = start_attempts(saved_port, cfg.enable_dht);
+        let mut i = 0;
+        while let Some(&attempt) = attempts.get(i) {
+            match Self::start_session(&cfg, &session_dir, attempt, persist).await {
                 Ok(s) => {
                     session = Some(s);
                     break;
                 }
-                Err(e) => {
-                    tracing::warn!("torrent session start {attempt:?} failed ({e:#}); trying the next fallback");
+                // The session database is unreadable in a way the pre-check
+                // missed: move it aside and retry the same attempt; if that
+                // still fails, retry it without persistence.
+                Err(e) if persist && is_session_db_error(&e) => {
+                    if !db_quarantined {
+                        db_quarantined = true;
+                        persist::quarantine_with_reason(&session_dir.join(persist::SESSION_DB), &format!("unusable ({e:#})"));
+                    } else {
+                        log().warn("torrent", &format!("torrent session state still unusable ({e:#}); running without it"));
+                        persist = false;
+                    }
                     last_err = Some(e);
                 }
+                Err(e) => {
+                    tracing::warn!("torrent session start {attempt:?} failed ({e:#}); trying the next fallback");
+                    log().warn("torrent", &format!("torrent session start {attempt:?} failed ({e:#}); trying the next fallback"));
+                    last_err = Some(e);
+                    i += 1;
+                }
+            }
+        }
+        // Last resort: nothing persisted, trackers only.
+        if session.is_none() && persist {
+            persist = false;
+            let attempt = StartAttempt { listen_port: 0, dht: DhtPort::Off };
+            match Self::start_session(&cfg, &session_dir, attempt, false).await {
+                Ok(s) => {
+                    log().warn("torrent", "torrent session started without saved state or DHT (every other start failed)");
+                    session = Some(s);
+                }
+                Err(e) => last_err = Some(e),
             }
         }
         let Some(session) = session else {
             return Err(last_err.unwrap_or_else(|| anyhow!("torrent session did not start")));
         };
-        if cfg.persist_session {
+        cfg.persist_session = persist;
+        if persist {
             if let Some(port) = session.listen_addr().map(|a| a.port()) {
-                let _ = std::fs::write(listen_port_file(&session_dir), port.to_string());
+                let _ = persist::write_atomic(&listen_port_file(&session_dir), port.to_string().as_bytes());
             }
         }
 
@@ -450,7 +501,14 @@ impl Engine {
         Ok(Self { cfg, registry, server })
     }
 
-    async fn start_session(cfg: &EngineConfig, session_dir: &Path, attempt: StartAttempt) -> Result<Arc<Session>> {
+    /// `persist`: load and save session state in `session_dir` (overrides
+    /// `cfg.persist_session` once startup has given up on the saved state).
+    async fn start_session(
+        cfg: &EngineConfig,
+        session_dir: &Path,
+        attempt: StartAttempt,
+        persist: bool,
+    ) -> Result<Arc<Session>> {
         let trackers = cfg.trackers.iter().filter_map(|t| url::Url::parse(t).ok()).collect();
         // librqbit only ties its listener / DHT tasks to the session once the
         // session is fully built: if startup failed half-way (or this future
@@ -462,7 +520,7 @@ impl Engine {
         let opts = SessionOptions {
             cancellation_token: Some(token),
             dht: (cfg.enable_dht && attempt.dht != DhtPort::Off).then(|| DhtSessionConfig {
-                persistence: cfg.persist_session.then(|| DhtPersistenceConfig {
+                persistence: persist.then(|| DhtPersistenceConfig {
                     dump_interval: Some(Duration::from_secs(60)),
                     config_filename: Some(session_dir.join("dht.json")),
                 }),
@@ -470,10 +528,8 @@ impl Engine {
                 port: (attempt.dht == DhtPort::Random).then_some(0),
                 ..Default::default()
             }),
-            persistence: cfg
-                .persist_session
-                .then(|| SessionPersistenceConfig::Json { folder: Some(session_dir.to_path_buf()) }),
-            fastresume: cfg.persist_session,
+            persistence: persist.then(|| SessionPersistenceConfig::Json { folder: Some(session_dir.to_path_buf()) }),
+            fastresume: persist,
             listen: cfg.enable_listen.then(|| ListenerOptions {
                 mode: ListenerMode::TcpAndUtp,
                 listen_addr: SocketAddr::from((Ipv6Addr::UNSPECIFIED, attempt.listen_port)),
@@ -1343,7 +1399,7 @@ mod tests {
 
         // Precondition: the saved port really is busy (this is the user's "os error 10048").
         let attempt = StartAttempt { listen_port: 0, dht: DhtPort::Saved };
-        let err = Engine::start_session(&cfg, &session_dir, attempt).await.err().expect("saved DHT port is busy");
+        let err = Engine::start_session(&cfg, &session_dir, attempt, true).await.err().expect("saved DHT port is busy");
         assert!(format!("{err:#}").contains("DHT"), "{err:#}");
 
         let engine = Engine::new(cfg).await.expect("engine starts despite the busy DHT port");
@@ -1368,7 +1424,7 @@ mod tests {
 
         // The listeners bind `listen_port` first, then the DHT fails on the busy port.
         let attempt = StartAttempt { listen_port, dht: DhtPort::Saved };
-        assert!(Engine::start_session(&cfg, &session_dir, attempt).await.is_err());
+        assert!(Engine::start_session(&cfg, &session_dir, attempt, true).await.is_err());
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1454,6 +1510,97 @@ mod tests {
         assert!(engine.stats(&added.info_hash).is_err());
         let r = c.get(&added.stream_url).send().await.unwrap();
         assert_eq!(r.status(), 404);
+        engine.shutdown().await;
+    }
+
+    fn quarantined(session_dir: &Path, name: &str) -> usize {
+        let prefix = format!("{name}.corrupt-");
+        std::fs::read_dir(session_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)))
+            .count()
+    }
+
+    /// Adds `bytes` and reads the whole file back over the stream server.
+    async fn stream_whole(engine: &Engine, bytes: Vec<u8>, seed: PathBuf, data: &[u8]) -> String {
+        let added = engine
+            .add(Source::TorrentBytes(bytes), AddOptions { output_dir: Some(seed), ..Default::default() })
+            .await
+            .unwrap();
+        let body = reqwest::get(&added.stream_url).await.unwrap().bytes().await.unwrap();
+        assert_eq!(body.as_ref(), data);
+        added.info_hash
+    }
+
+    /// The user's v9.0.8 bug: a power cut left session.json as 15 zero bytes,
+    /// librqbit refused to start ("error deserializing session database:
+    /// expected value at line 1 column 1") and every stream failed. Broken
+    /// state (empty, zero-filled, garbage session.json; truncated dht.json;
+    /// junk listen-port) is quarantined and the engine still streams.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn corrupt_session_state_is_quarantined_and_playback_works() {
+        for bad in [&b""[..], &[0u8; 15][..], b"{\"torrents\":{\"0\":", b"\xff\xfegarbage"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (seed, data, bytes, hash) = local_torrent(dir.path(), "episode.mkv", 100_000).await;
+            let cfg = offline_cfg(dir.path());
+            let session_dir = cfg.session_dir();
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(session_dir.join("session.json"), bad).unwrap();
+            std::fs::write(session_dir.join("dht.json"), [0u8; 64]).unwrap();
+            std::fs::write(session_dir.join("listen-port"), b"\0\0\0").unwrap();
+
+            let engine = Engine::new(cfg).await.expect("engine starts despite corrupt session state");
+            assert!(engine.config().persist_session, "fresh state is persisted again");
+            assert_eq!(stream_whole(&engine, bytes, seed, &data).await, hash);
+            assert_eq!(quarantined(&session_dir, "session.json"), 1, "{bad:?}");
+            assert_eq!(quarantined(&session_dir, "dht.json"), 1);
+            assert_eq!(quarantined(&session_dir, "listen-port"), 1);
+
+            // The new database was written durably and is valid.
+            let db = std::fs::read(session_dir.join("session.json")).unwrap();
+            assert!(persist::valid_session_db(&db), "{}", String::from_utf8_lossy(&db));
+            assert!(String::from_utf8_lossy(&db).contains(&hash));
+            assert!(!session_dir.join("session.json.tmp").exists());
+            engine.shutdown().await;
+        }
+    }
+
+    /// session.json that is valid JSON of the right shape but that librqbit
+    /// still rejects (the pre-check cannot catch it): quarantined after the
+    /// failed start, and the retry starts with fresh state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_db_rejected_by_librqbit_is_quarantined_on_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seed, data, bytes, _) = local_torrent(dir.path(), "movie.mp4", 50_000).await;
+        let cfg = offline_cfg(dir.path());
+        let session_dir = cfg.session_dir();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let bad = br#"{"torrents":{"0":{"info_hash":42}}}"#;
+        assert!(persist::valid_session_db(bad), "passes the pre-check");
+        std::fs::write(session_dir.join("session.json"), bad).unwrap();
+
+        let engine = Engine::new(cfg).await.expect("engine starts");
+        assert!(engine.config().persist_session);
+        stream_whole(&engine, bytes, seed, &data).await;
+        assert_eq!(quarantined(&session_dir, "session.json"), 1);
+        engine.shutdown().await;
+    }
+
+    /// When persistence cannot start at all, the engine runs without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unusable_session_dir_falls_back_to_no_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seed, data, bytes, _) = local_torrent(dir.path(), "clip.mkv", 50_000).await;
+        let mut cfg = offline_cfg(dir.path());
+        // A file where the session folder should be: it can never be created.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        cfg.session_dir = Some(blocker.join("session"));
+
+        let engine = Engine::new(cfg).await.expect("engine starts without persistence");
+        assert!(!engine.config().persist_session);
+        stream_whole(&engine, bytes, seed, &data).await;
         engine.shutdown().await;
     }
 

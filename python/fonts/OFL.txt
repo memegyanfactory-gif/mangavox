@@ -2,13 +2,16 @@ Caption fonts bundled with MangaVox
 ===================================
 
 Every font in this folder is licensed under the SIL Open Font License, Version 1.1
-(full text below). They are used unmodified to burn styled subtitles into videos.
+(full text below). They are used unmodified to burn styled subtitles into videos and to letter
+the intro's cast cards.
 
 Anton-Regular.ttf             Copyright 2020 The Anton Project Authors (https://github.com/googlefonts/AntonFont.git)
 ArchivoBlack-Regular.ttf      Copyright 2017 The Archivo Black Project Authors (https://github.com/Omnibus-Type/ArchivoBlack)
 DMSerifDisplay-Regular.ttf    Copyright 2014 - 2017 Adobe Systems Incorporated (http://www.adobe.com/), with Reserved Font Name 'Source'.
 DMSerifDisplay-Italic.ttf     Copyright 2014 - 2017 Adobe Systems Incorporated (http://www.adobe.com/), with Reserved Font Name 'Source'.
                               DM Serif Display: https://github.com/googlefonts/dm-fonts
+Inter-Medium.ttf              Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
+Inter-SemiBold.ttf            Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
 Inter-Bold.ttf                Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
 Inter-ExtraBold.ttf           Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
 Inter-Black.ttf               Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)

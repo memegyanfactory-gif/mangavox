@@ -24,6 +24,7 @@ use crate::restyle::safe_file_name;
 
 pub(crate) mod style;
 pub(crate) mod style_view;
+pub(crate) mod intro;
 
 /// The name generated videos give their music-free audio track.
 pub(crate) const NARRATION_ONLY: &str = "Narration only";
@@ -157,11 +158,14 @@ pub(crate) struct ExportPrefs {
     pub hook: bool,
     pub hook_secs: u32,
     pub quality: Quality,
+    /// The character intro just before chapter 1 (one video only): the main characters on cast
+    /// cards, then the ribbon transition into the recap.
+    pub intro: bool,
 }
 
 impl Default for ExportPrefs {
     fn default() -> Self {
-        ExportPrefs { kind: 0, parts: 6, music: true, hook: false, hook_secs: 30, quality: Quality::Source }
+        ExportPrefs { kind: 0, parts: 6, music: true, hook: false, hook_secs: 30, quality: Quality::Source, intro: true }
     }
 }
 
@@ -1157,6 +1161,8 @@ fn prune_segments(dir: &Path, keep: &[PathBuf], spec: &SegmentSpec, since: std::
 pub(crate) struct Extras {
     /// A hook video played before chapter 1 (one video only).
     pub hook: Option<PathBuf>,
+    /// The character intro, played after the hook, just before chapter 1 (one video only).
+    pub intro: Option<PathBuf>,
     pub watermark: Option<Watermark>,
     /// The watermark text's font file.
     pub font: Option<PathBuf>,
@@ -1272,6 +1278,29 @@ pub(crate) fn hook_sound_graph(hook_track: usize, hook_secs: f64, track: usize, 
     g
 }
 
+/// Removes a work file when it goes out of scope.
+struct Remove<'a>(&'a Path);
+
+impl Drop for Remove<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+/// The hook (its sound track `hook_track`) and then the intro, as one short `w`x`h` video at `out`.
+fn join_opening(hook: &Path, hook_track: usize, intro: &Path, w: u32, h: u32, out: &Path, r: &Reporter) -> Result<()> {
+    let af = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+    let fit = |i: usize| format!("[{i}:v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{i}]");
+    let graph = format!("{};[0:a:{hook_track}]{af}[a0];{};[1:a:0]{af}[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]", fit(0), fit(1));
+    let mut args: Vec<String> = vec!["-i".into(), hook.to_string_lossy().into(), "-i".into(), intro.to_string_lossy().into()];
+    args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), "[a]".into()]);
+    args.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "16", "-c:a", "aac", "-b:a", "256k", "-f", "mp4"].map(String::from));
+    let tmp = out.with_extension("part.mp4");
+    args.push(tmp.to_string_lossy().into());
+    ffmpeg(&args, 0., r, None, &mut |_| {})?;
+    finish(&tmp, out)
+}
+
 /// How much shorter than the picture an export's sound may be (encoder padding and rounding).
 const SOUND_SLACK: f64 = 1.0;
 
@@ -1323,10 +1352,11 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
     let src = j.path.to_string_lossy().to_string();
     let mark = Mark::prepare(extras.watermark.clone(), extras.font.as_deref())?;
     let cwd = mark.as_ref().and_then(|m| m.dir.clone());
-    let hook = if mode == Mode::Whole { extras.hook.as_ref().filter(|h| h.is_file()) } else { None };
+    let hook = if mode == Mode::Whole { extras.hook.clone().filter(|h| h.is_file()) } else { None };
+    let intro = if mode == Mode::Whole { extras.intro.clone().filter(|h| h.is_file()) } else { None };
     let q = extras.quality;
     let scaling = q.short_side().is_some();
-    let size = if mark.is_some() || hook.is_some() || scaling { probe(&j.path)?.size } else { (0, 0) };
+    let size = if mark.is_some() || hook.is_some() || intro.is_some() || scaling { probe(&j.path)?.size } else { (0, 0) };
     // The output frame (what the watermark is placed on) and the filter that gets the picture there.
     let (size, scale) = match q.short_side() {
         Some(s) if size.0 > 0 => {
@@ -1341,10 +1371,13 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         // The watermark (and the size) baked into each chapter once, then the chapters joined
         // without re-encoding: seconds when the segments were made in the background after each
         // render (`prepare_segment`) or by an earlier export, instead of the whole recap again.
-        if let Some(spec) = SegmentSpec::of(extras).filter(|_| hook.is_none() && track == 0 && uniform(&j.files)) {
+        // The intro alone (no hook) joins as one more segment before chapter 1: it is rendered
+        // at the chapters' size and frame rate, so the export still re-encodes nothing else.
+        let files: Vec<PathBuf> = intro.iter().cloned().chain(j.files.iter().cloned()).collect();
+        if let Some(spec) = SegmentSpec::of(extras).filter(|_| hook.is_none() && track == 0 && uniform(&files)) {
             let since = std::time::SystemTime::now();
             let dir = segment_dir(&j.path);
-            let segs = segments(&dir, &j.files, &spec, r, 0.9)?;
+            let segs = segments(&dir, &files, &spec, r, 0.9)?;
             let list = dir.join("export_list.txt");
             std::fs::write(&list, concat_list(&segs))?;
             let mut args: Vec<String> = ["-f", "concat", "-safe", "0", "-i"].map(String::from).to_vec();
@@ -1361,14 +1394,20 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         let (w, h) = size;
         let mut total = j.total;
         let mut args: Vec<String>;
+        // The opening before chapter 1: the hook, then the intro, joined into one short video.
+        let opening = out.with_extension("opening.mp4");
+        let _opening = Remove(&opening);
+        let hook: Option<PathBuf> = match (hook, intro) {
+            (Some(hk), Some(it)) => {
+                let ht = if music { 0 } else { probe(&hk)?.solo().unwrap_or(0) };
+                join_opening(&hk, ht, &it, w, h, &opening, r)?;
+                Some(opening.clone())
+            }
+            (hk, it) => hk.or(it),
+        };
+        let hook = hook.as_ref();
         // The hook's whole sound track, made first on its own (removed when this returns).
         let sound = tmp.with_extension("sound.m4a");
-        struct Remove<'a>(&'a Path);
-        impl Drop for Remove<'_> {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(self.0);
-            }
-        }
         let _sound = Remove(&sound);
         if let Some(hook) = hook {
             let hp = probe(hook)?;
@@ -1518,10 +1557,15 @@ fn kept_hook_path(manga_id: &str) -> PathBuf {
     joined_path(manga_id).with_file_name("full_recap_hook.mp4")
 }
 
-/// What a kept hook was made for: the joined video's sources (its `.json` record) and its length.
+/// The chapter videos the joined video at `joined` was made from (its `.json` record's `sources`),
+/// `Null` without a record.
+fn joined_sources(joined: &Path) -> Value {
+    std::fs::read(joined.with_extension("json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|m| m["sources"].clone()).unwrap_or(Value::Null)
+}
+
+/// What a kept hook was made for: the joined video's sources and its length.
 fn hook_record(joined: &Path, secs: u32) -> Value {
-    let sources = std::fs::read(joined.with_extension("json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|m| m["sources"].clone()).unwrap_or(Value::Null);
-    json!({ "sources": sources, "secs": secs })
+    json!({ "sources": joined_sources(joined), "secs": secs })
 }
 
 /// Keeps a hook an export made at `to` (next to the joined video) for the export preview.
@@ -1742,16 +1786,15 @@ pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &Backg
 
 // ------------------------------------------------------------------ UI
 
-/// "1:02:05" / "12:05".
-/// After the join: the hook intro (when asked for), then the export with the watermark. Returns
-/// the files and a note about the hook (" · without the hook (…)") for the result message. Used
-/// by the Export button and the assistant's `studio_export`.
+/// After the join: the character intro and the hook (when asked for), then the export with the
+/// watermark. Returns the files and a note about the intro and the hook (" · without the hook
+/// (…)") for the result message. Used by the Export button and the assistant's `studio_export`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: ExportPrefs, dir: PathBuf, name: String, font: Option<PathBuf>, r: Reporter, ex: BackgroundExecutor) -> (Result<Vec<PathBuf>>, String) {
+pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, intro: Option<intro::IntroJob>, prefs: ExportPrefs, dir: PathBuf, name: String, font: Option<PathBuf>, r: Reporter, ex: BackgroundExecutor) -> (Result<Vec<PathBuf>>, String) {
     let hook_dir = hook.as_ref().map(HookJob::work_dir);
     // Where the hook is kept for the export preview, and its length.
     let keep_at = hook.as_ref().map(|h| (kept_hook_path(&h.manga_id), h.seconds));
-    if hook.is_some() {
+    if hook.is_some() || intro.is_some() {
         let rr = r.clone();
         if let Err(e) = mv_ui::bg::blocking(move || rr.take_turn()).await.and_then(|x| x) {
             return (Err(e), String::new());
@@ -1759,6 +1802,19 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
     }
     // A hook that could not be made leaves the video without it (said in the result).
     let mut hook_note = String::new();
+    // The character intro, a pipeline of its own with its steps on the activity line (made once
+    // and kept; an intro that cannot be made is left out, and the result says why).
+    let mut intro_path = None;
+    if let Some(job) = intro {
+        match intro::make_intro(job, &j, &r, &ex).await {
+            Ok(made) => {
+                hook_note.push_str(&made.note());
+                intro_path = Some(made.path);
+            }
+            Err(e) if e.to_string() == CANCELLED => return (Err(e), String::new()),
+            Err(e) => hook_note.push_str(&format!(" · without the character intro ({e:#})")),
+        }
+    }
     let mut hook_path = None;
     // Only the chapters in the video (unrendered ones may have been left out).
     let hook = hook.map(|mut h| {
@@ -1769,7 +1825,7 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
         Some(job) => match make_hook(job, &j, &r, &ex).await {
             Ok((path, why)) => {
                 if let Some(why) = why {
-                    hook_note = format!(" · the AI hook script failed ({why}), so the hook uses the narration's own lines");
+                    hook_note.push_str(&format!(" · the AI hook script failed ({why}), so the hook uses the narration's own lines"));
                 }
                 if let Some((to, secs)) = keep_at {
                     let (hook, joined) = (path.clone(), j.path.clone());
@@ -1780,7 +1836,7 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
             }
             Err(e) if e.to_string() == CANCELLED => Err(e),
             Err(e) => {
-                hook_note = format!(" · without the hook ({e:#})");
+                hook_note.push_str(&format!(" · without the hook ({e:#})"));
                 Ok(())
             }
         },
@@ -1788,7 +1844,7 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, prefs: Expor
     };
     let res = match res {
         Ok(()) => mv_ui::bg::blocking(move || {
-            let extras = Extras { hook: hook_path, watermark: load_watermark(&video_look_path()), font, quality: prefs.quality, ..Extras::default() };
+            let extras = Extras { hook: hook_path, intro: intro_path, watermark: load_watermark(&video_look_path()), font, quality: prefs.quality, ..Extras::default() };
             let out = export(&j, prefs.mode(), prefs.music, &dir, &name, &extras, &r);
             if let Some(d) = hook_dir {
                 let _ = std::fs::remove_dir_all(d);
@@ -1832,6 +1888,7 @@ pub(crate) fn mark_font(env: Option<&crate::setup::Env>) -> Option<PathBuf> {
     scripts.or_else(|| mv_studio::PythonLayout::resolve(None).ok().map(|l| l.dir)).map(|d| d.join("fonts").join(MARK_FONT))
 }
 
+/// "1:02:05" / "12:05".
 pub(crate) fn fmt_duration(secs: f64) -> String {
     let s = secs.max(0.).round() as u64;
     if s >= 3600 {
@@ -1851,13 +1908,29 @@ struct ExportPreview {
     /// `None`: no hook (it is off, or not one video); `Some(None)`: the export writes one (none
     /// was made for these videos yet); `Some(Some(file))`: the one the last export made for them.
     hook: Option<Option<PathBuf>>,
+    /// The character intro, the same way: off, made when exporting, or the one kept for them.
+    intro: Option<Option<PathBuf>>,
     prefs: ExportPrefs,
     /// The Look has a watermark.
     marked: bool,
 }
 
-/// The export preview's lines under the picture: what is made, the hook, the watermark.
-fn preview_lines(prefs: &ExportPrefs, hook: &Option<Option<PathBuf>>, marked: bool) -> Vec<String> {
+/// `list` (label, video) played in order: as a playlist written to `file` (in the manga's folder)
+/// when there is more than one video, else (or when it cannot be written) the last video alone.
+fn play_list(file: &Path, list: &[(String, PathBuf)]) -> PathBuf {
+    let last = list.last().map(|l| l.1.clone()).unwrap_or_default();
+    if list.len() < 2 {
+        return last;
+    }
+    let videos: Vec<mv_recap::media::ChapterVideo> = list.iter().map(|(label, video)| mv_recap::media::ChapterVideo { chapter_id: String::new(), number: None, label: label.clone(), video: video.clone(), thumbnail: None }).collect();
+    match std::fs::write(file, mv_recap::media::playlist_m3u(&videos)) {
+        Ok(()) => file.to_path_buf(),
+        Err(_) => last,
+    }
+}
+
+/// The export preview's lines under the picture: what is made, the hook, the intro, the watermark.
+fn preview_lines(prefs: &ExportPrefs, hook: &Option<Option<PathBuf>>, intro: &Option<Option<PathBuf>>, marked: bool) -> Vec<String> {
     let what = match prefs.mode() {
         Mode::Whole => "One video".to_string(),
         Mode::Parts(n) => format!("{n} parts"),
@@ -1873,6 +1946,11 @@ fn preview_lines(prefs: &ExportPrefs, hook: &Option<Option<PathBuf>>, marked: bo
         Some(Some(_)) => "The hook plays first (the one the last export made for these chapters).".to_string(),
         Some(None) => "A hook is written and voiced when you export, then plays first (none was made for these chapters yet).".to_string(),
     });
+    out.push(match intro {
+        None => "No intro.".to_string(),
+        Some(Some(_)) => "The intro plays just before chapter 1 (the one made last for these chapters).".to_string(),
+        Some(None) => "The intro (the cast cards, then the transition into the recap) is made when you export, then plays just before chapter 1.".to_string(),
+    });
     out.push(if marked { "The watermark is drawn as in the picture.".to_string() } else { "No watermark (add one in Look & branding).".to_string() });
     out
 }
@@ -1881,15 +1959,27 @@ fn preview_lines(prefs: &ExportPrefs, hook: &Option<Option<PathBuf>>, marked: bo
 fn show_export_preview(p: ExportPreview, window: &mut Window, cx: &mut App) {
     // The frame file is drawn again each time: drop the old picture.
     ImageSource::from(p.still.clone()).remove_asset(cx);
-    let lines = preview_lines(&p.prefs, &p.hook, p.marked);
+    let lines = preview_lines(&p.prefs, &p.hook, &p.intro, p.marked);
     let upright = p.prefs.mode() == Mode::Reels;
-    let play_list: Vec<(String, PathBuf)> = match &p.hook {
-        Some(Some(h)) => vec![("Hook".into(), h.clone()), (format!("{} · Full recap", p.title), p.joined.clone())],
-        _ => vec![(format!("{} · Full recap", p.title), p.joined.clone())],
+    // What plays: the hook and the intro the export puts first (when made for these chapters),
+    // then the joined video.
+    let mut play: Vec<(String, PathBuf)> = vec![];
+    if let Some(Some(h)) = &p.hook {
+        play.push(("Hook".into(), h.clone()));
+    }
+    if let Some(Some(i)) = &p.intro {
+        play.push((format!("{} · Intro", p.title), i.clone()));
+    }
+    play.push((format!("{} · Full recap", p.title), p.joined.clone()));
+    let play_label = match (matches!(p.hook, Some(Some(_))), matches!(p.intro, Some(Some(_)))) {
+        (true, true) => "Play hook + intro + video",
+        (true, false) => "Play hook + video",
+        (false, true) => "Play intro + video",
+        (false, false) => "Play",
     };
     let (title, manga_id, still) = (p.title, p.manga_id, p.still);
     window.open_dialog(cx, move |dialog, _, _| {
-        let list = play_list.clone();
+        let list = play.clone();
         let (t, mid) = (title.clone(), manga_id.clone());
         let picture = div()
             .flex()
@@ -1904,18 +1994,9 @@ fn show_export_preview(p: ExportPreview, window: &mut Window, cx: &mut App) {
             .gap(px(space::SM))
             .w_full()
             .child(btn("vid-preview-close", "Close", ButtonKind::Secondary).on_click(|_, w, cx| w.close_dialog(cx)))
-            .child(btn("vid-preview-play", if list.len() > 1 { "Play hook + video" } else { "Play" }, ButtonKind::Primary).icon(ph::PLAY).on_click(move |_, w, cx| {
+            .child(btn("vid-preview-play", play_label, ButtonKind::Primary).icon(ph::PLAY).on_click(move |_, w, cx| {
                 w.close_dialog(cx);
-                let target = if list.len() > 1 {
-                    let videos: Vec<mv_recap::media::ChapterVideo> = list.iter().map(|(label, video)| mv_recap::media::ChapterVideo { chapter_id: String::new(), number: None, label: label.clone(), video: video.clone(), thumbnail: None }).collect();
-                    let file = mv_recap::media::manga_dir(&mid).join("export_preview.m3u8");
-                    match std::fs::write(&file, mv_recap::media::playlist_m3u(&videos)) {
-                        Ok(()) => file,
-                        Err(_) => list[list.len() - 1].1.clone(),
-                    }
-                } else {
-                    list[0].1.clone()
-                };
+                let target = play_list(&mv_recap::media::manga_dir(&mid).join("export_preview.m3u8"), &list);
                 crate::phases::play_video(&format!("{t} · Export preview"), &target, w, cx);
             }));
         dialog
@@ -1923,7 +2004,7 @@ fn show_export_preview(p: ExportPreview, window: &mut Window, cx: &mut App) {
             .title(div().ramp(mv_ui::theme::ramp::SUBTITLE_2).text_color(Tokens::text_1()).child(format!("Export preview · {title}")))
             .child(picture)
             .child(div().flex().flex_col().gap(px(4.)).mt(px(space::MD)).children(lines.iter().map(|l| div().text_size(px(size::MD)).text_color(Tokens::text_2()).child(l.clone()))))
-            .child(div().mt(px(space::SM)).text_size(px(size::SM)).text_color(Tokens::text_3()).child("Play shows the joined chapter videos (and the hook); the watermark and size are applied when the file is saved, exactly as in the picture."))
+            .child(div().mt(px(space::SM)).text_size(px(size::SM)).text_color(Tokens::text_3()).child("Play shows the joined chapter videos (with the hook and the intro, when they were made for them); the watermark and size are applied when the file is saved, exactly as in the picture."))
             .footer(footer)
     });
 }
@@ -2013,22 +2094,65 @@ impl StudioPage {
         self.made_videos(g).into_iter().map(|(c, _)| c).collect()
     }
 
-    /// Plays every made chapter of `g` as one video. With the Video style locked, the chapters
-    /// that do not match it are re-edited first, then it plays; else it asks about chapters that
-    /// changed since they were rendered (`data::fresh`). See `style_view::style_gate`.
+    /// Plays every made chapter of `g` as one video, the manga's intro first when the Intro is on.
+    /// With the Video style locked, the chapters that do not match it are re-edited first, then
+    /// it plays; else it asks about chapters that changed since they were rendered
+    /// (`data::fresh`). See `style_view::style_gate`.
     pub(crate) fn play_full(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
         let group = g.clone();
         self.style_gate(g, style::Goal::Play, Box::new(move |this, window, cx| this.play_full_now(&group, window, cx)), window, cx);
     }
 
+    /// Play once the chapters are as they will be: with the Intro on (Play is always the whole
+    /// recap), the manga's intro is made (or the kept one reused) like an export makes it, each
+    /// step on the activity line, then the intro and the joined video play as one playlist. An
+    /// intro that cannot be made leaves the chapters to play alone, and a toast says why.
     fn play_full_now(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
-        let title = format!("{} · Full recap", g.title);
+        let (name, title) = (g.title.clone(), format!("{} · Full recap", g.title));
+        let intro = self.export_prefs.intro.then(|| self.intro_job_of(g, cx).ok_or("Studio's Python is not set up yet (finish Setup)"));
+        let list_file = mv_recap::media::manga_dir(&g.id).join("full_recap_play.m3u8");
         self.with_joined(
             g,
             "Preparing the full video",
-            move |this, j, _, window, cx| {
-                this.export_ended(window, cx);
-                crate::phases::play_video(&title, &j.path, window, cx);
+            move |this, j, r, window, cx| {
+                let job = match intro {
+                    Some(Ok(job)) => job,
+                    other => {
+                        this.export_ended(window, cx);
+                        if let Some(Err(why)) = other {
+                            toast::show(cx, Toast::info(format!("Playing without the intro: {why}")));
+                        }
+                        crate::phases::play_video(&title, &j.path, window, cx);
+                        return;
+                    }
+                };
+                let (r, ex) = (r.clone(), cx.background_executor().clone());
+                cx.spawn_in(window, async move |this, cx| {
+                    let made = intro::make_intro(job, &j, &r, &ex).await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.export_ended(window, cx);
+                        let opening = match made {
+                            Ok(it) => {
+                                let note = it.note();
+                                if !note.is_empty() {
+                                    toast::show(cx, Toast::info(format!("Playing with the intro{note}")));
+                                }
+                                Some(it.path)
+                            }
+                            Err(e) if e.to_string() == CANCELLED => {
+                                toast::show(cx, Toast::info("Play cancelled"));
+                                return;
+                            }
+                            Err(e) => {
+                                toast::show(cx, Toast::info(format!("Playing without the intro ({e:#})")));
+                                None
+                            }
+                        };
+                        let list: Vec<(String, PathBuf)> = opening.map(|p| (format!("{name} · Intro"), p)).into_iter().chain([(title.clone(), j.path.clone())]).collect();
+                        crate::phases::play_video(&title, &play_list(&list_file, &list), window, cx);
+                    });
+                })
+                .detach();
             },
             window,
             cx,
@@ -2037,8 +2161,9 @@ impl StudioPage {
 
     /// "Preview export": what the export will hold, from the same files: one frame of it drawn
     /// exactly as the export draws it (its size, the reel crop, the Look's watermark), whether
-    /// the hook plays first, and Play (the hook, when one was made for these videos, then the
-    /// joined video). Asks about changed chapters first, like Play and Export.
+    /// the hook and the intro play first, and Play (the hook and the intro, when they were made
+    /// for these videos, then the joined video). Asks about changed chapters first, like Play and
+    /// Export.
     pub(crate) fn preview_export(&mut self, g: &MangaGroup, window: &mut Window, cx: &mut Context<Self>) {
         let group = g.clone();
         let font = mark_font(self.setup.read(cx).env.as_ref());
@@ -2060,16 +2185,19 @@ impl StudioPage {
                 let at = (j.total * 0.15).min(90.);
                 cx.spawn_in(window, async move |this, cx| {
                     let (jj, s, mid) = (j.clone(), still.clone(), id.clone());
-                    let res = mv_ui::bg::blocking(move || -> Result<Option<Option<PathBuf>>> {
+                    type Kept = Option<Option<PathBuf>>;
+                    let res = mv_ui::bg::blocking(move || -> Result<(Kept, Kept)> {
                         export_still(&jj, prefs.mode(), &extras, at, &s)?;
-                        Ok((prefs.mode() == Mode::Whole && prefs.hook).then(|| kept_hook(&mid, &jj.path, prefs.hook_secs)))
+                        let whole = prefs.mode() == Mode::Whole;
+                        let hook = (whole && prefs.hook).then(|| kept_hook(&mid, &jj.path, prefs.hook_secs));
+                        Ok((hook, (whole && prefs.intro).then(|| intro::kept_intro(&mid, &jj.path))))
                     })
                     .await
                     .and_then(|r| r);
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.export_ended(window, cx);
                         match res {
-                            Ok(hook) => show_export_preview(ExportPreview { manga_id: id, title, still, joined: j.path.clone(), hook, prefs, marked }, window, cx),
+                            Ok((hook, intro)) => show_export_preview(ExportPreview { manga_id: id, title, still, joined: j.path.clone(), hook, intro, prefs, marked }, window, cx),
                             Err(e) if e.to_string() == CANCELLED => {}
                             Err(e) => toast::show(cx, Toast::error(format!("Could not preview the export: {e:#}"))),
                         }
@@ -2113,6 +2241,34 @@ impl StudioPage {
             });
         })
         .detach();
+    }
+
+    /// The character intro an export makes, when the choices ask for one (one video with the
+    /// Intro on) and Studio's Python is set up (else the export goes ahead without it).
+    fn intro_job(&self, g: &MangaGroup, prefs: ExportPrefs, cx: &mut Context<Self>) -> Option<intro::IntroJob> {
+        if prefs.mode() != Mode::Whole || !prefs.intro {
+            return None;
+        }
+        self.intro_job_of(g, cx)
+    }
+
+    /// What making the character intro of `g` needs; `None` when Studio's Python is not set up.
+    /// The cast's profiles are written with the model picked in the model button, like the hook.
+    fn intro_job_of(&self, g: &MangaGroup, cx: &mut Context<Self>) -> Option<intro::IntroJob> {
+        let env = self.setup.read(cx).env.clone()?;
+        let (python, layout) = (env.python.ok()?, env.scripts.ok()?);
+        let model = intro::profile_model(self.model(cx));
+        Some(intro::IntroJob {
+            manga_id: g.id.clone(),
+            manga_title: g.title.clone(),
+            chapters: g.chapters.clone(),
+            numbers: intro::chapter_numbers(&g.chapters),
+            model_name: model.as_ref().map(|m| m.1.clone()).unwrap_or_default(),
+            model: model.map(|m| m.0),
+            reg: ui_assistant::registry(cx),
+            python,
+            layout,
+        })
     }
 
     /// The hook an export of `videos` makes first, when the choices ask for one (one video with
@@ -2206,6 +2362,7 @@ impl StudioPage {
     #[allow(clippy::too_many_arguments)]
     fn export_now(&mut self, group: MangaGroup, prefs: ExportPrefs, dir: PathBuf, name: String, font: Option<PathBuf>, hook: Option<HookJob>, window: &mut Window, cx: &mut Context<Self>) {
         let g = group.clone();
+        let intro = self.intro_job(&group, prefs, cx);
         self.with_joined(
             &group,
             "Joining the chapters",
@@ -2216,7 +2373,7 @@ impl StudioPage {
                 let kept = if prefs.music { 0 } else { j.music_kept };
                 let ex = cx.background_executor().clone();
                 cx.spawn_in(window, async move |this, cx| {
-                    let (res, hook_note) = export_joined(j, hook, prefs, dir, name, font, r, ex).await;
+                    let (res, hook_note) = export_joined(j, hook, intro, prefs, dir, name, font, r, ex).await;
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.export_ended(window, cx);
                         match res {
@@ -2664,15 +2821,37 @@ mod tests {
     #[test]
     fn the_preview_says_what_the_export_holds() {
         let prefs = super::ExportPrefs { hook: true, ..Default::default() };
-        let l = super::preview_lines(&prefs, &Some(Some(PathBuf::from("h.mp4"))), true);
+        let l = super::preview_lines(&prefs, &Some(Some(PathBuf::from("h.mp4"))), &Some(Some(PathBuf::from("i.mp4"))), true);
         assert_eq!(l[0], "One video at source quality, with music.");
         assert!(l[1].starts_with("The hook plays first"));
-        assert!(l[2].contains("watermark is drawn"));
-        let l = super::preview_lines(&super::ExportPrefs { kind: 2, music: false, quality: Quality::P1080, ..prefs }, &None, false);
+        assert!(l[2].starts_with("The intro plays just before chapter 1"));
+        assert!(l[3].contains("watermark is drawn"));
+        let l = super::preview_lines(&super::ExportPrefs { kind: 2, music: false, quality: Quality::P1080, ..prefs }, &None, &None, false);
         assert_eq!(l[0], "Upright reels of up to a minute in 1080p, narration only (no music).");
-        assert_eq!(l[1], "No hook.");
-        assert!(l[2].starts_with("No watermark"));
-        assert!(super::preview_lines(&prefs, &Some(None), false)[1].starts_with("A hook is written and voiced when you export"));
+        assert_eq!((l[1].as_str(), l[2].as_str()), ("No hook.", "No intro."));
+        assert!(l[3].starts_with("No watermark"));
+        let l = super::preview_lines(&prefs, &Some(None), &Some(None), false);
+        assert!(l[1].starts_with("A hook is written and voiced when you export"));
+        assert!(l[2].contains("is made when you export"));
+        // The intro is the cast cards and the transition: no logo.
+        assert!(l[2].contains("cast cards") && !l[2].contains("logo"), "{}", l[2]);
+    }
+
+    #[test]
+    fn play_puts_the_intro_before_the_chapters() {
+        let d = tempfile::tempdir().unwrap();
+        let (file, intro, joined) = (d.path().join("full_recap_play.m3u8"), d.path().join("full_recap_intro.mp4"), d.path().join("full_recap.mp4"));
+        // One video plays as it is.
+        assert_eq!(super::play_list(&file, &[("Solo · Full recap".into(), joined.clone())]), joined);
+        assert!(!file.exists());
+        // The intro, then the joined chapters, as one playlist in the manga's folder.
+        let got = super::play_list(&file, &[("Solo · Intro".into(), intro.clone()), ("Solo · Full recap".into(), joined.clone())]);
+        assert_eq!(got, file);
+        let m3u = std::fs::read_to_string(&file).unwrap();
+        let at = |p: &PathBuf| m3u.find(&format!("\n{}\n", p.display())).unwrap();
+        assert!(m3u.starts_with("#EXTM3U\n#EXTINF:-1,Solo · Intro\n") && at(&intro) < at(&joined), "{m3u}");
+        // A playlist that cannot be written: the joined video alone.
+        assert_eq!(super::play_list(&d.path().join("missing").join("x.m3u8"), &[("I".into(), intro), ("V".into(), joined.clone())]), joined);
     }
 
     #[test]

@@ -578,7 +578,7 @@ impl PanelPrefs {
         let e = &self.export;
         json!({
             "locked": self.locked, "seen": self.seen, "open": self.open, "draft": self.draft,
-            "export": {"kind": e.kind, "parts": e.parts, "music": e.music, "hook": e.hook, "hook_secs": e.hook_secs, "quality": quality_key(e.quality)},
+            "export": {"kind": e.kind, "parts": e.parts, "music": e.music, "hook": e.hook, "hook_secs": e.hook_secs, "quality": quality_key(e.quality), "intro": e.intro},
         })
     }
 
@@ -598,6 +598,7 @@ impl PanelPrefs {
                 hook: e.get("hook").and_then(Value::as_bool).unwrap_or(d.hook),
                 hook_secs: n("hook_secs").map(|s| s as u32).filter(|s| HOOK_SECONDS.contains(s)).unwrap_or(d.hook_secs),
                 quality: e.get("quality").and_then(Value::as_str).and_then(|s| Quality::ALL.into_iter().find(|q| quality_key(*q) == s)).unwrap_or(d.quality),
+                intro: e.get("intro").and_then(Value::as_bool).unwrap_or(d.intro),
             },
         }
     }
@@ -916,7 +917,7 @@ mod tests {
         assert_eq!(PanelPrefs::load_from(&file), PanelPrefs::default());
         let mut p = PanelPrefs { locked: true, seen: true, open: true, ..Default::default() };
         p.draft.insert("motion".into(), json!(0.5));
-        p.export = ExportPrefs { kind: 1, parts: 4, music: false, hook: true, hook_secs: 45, quality: Quality::P1080 };
+        p.export = ExportPrefs { kind: 1, parts: 4, music: false, hook: true, hook_secs: 45, quality: Quality::P1080, intro: false };
         p.save_to(&file);
         let back = PanelPrefs::load_from(&file);
         assert_eq!(back, p);

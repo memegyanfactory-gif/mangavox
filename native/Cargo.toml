@@ -18,6 +18,10 @@ libloading = "0.8"
 raw-window-handle = "0.6"
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }
 
+# Vendored + patched (durable dht.json writes), see its Cargo.toml.
+[patch.crates-io]
+librqbit-dht = { path = "crates/mv-torrent/vendor/librqbit-dht" }
+
 [profile.dev]
 opt-level = 1
 

@@ -17,6 +17,7 @@
 
 mod engine;
 mod http;
+mod persist;
 
 pub use engine::{
     extract_info_hash, pick_file, AddOptions, AddedTorrent, Engine, EngineConfig, FileEntry,

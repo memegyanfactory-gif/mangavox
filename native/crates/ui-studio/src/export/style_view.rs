@@ -826,6 +826,12 @@ impl StudioPage {
                             cx.notify();
                         })))
                         .child(div().id("vs-hook-label").tooltip(tip("AI picks the most gripping moments, writes and voices a teaser, and puts it before chapter 1.")).child(muted("Hook")))
+                        .child(switch("vs-intro", prefs.intro).on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.export_prefs.intro = *on;
+                            this.save_export_prefs();
+                            cx.notify();
+                        })))
+                        .child(div().id("vs-intro-label").tooltip(tip("The main characters on cinematic cards with their names, each over a scene from the pages they appear in, then a ribbon transition into chapter 1.")).child(muted("Intro")))
                         .when(prefs.hook, |d| {
                             d.child(segmented("vs-hook-secs", HOOK_SECONDS.iter().map(|s| (None, format!("{s}s"))), HOOK_SECONDS.iter().position(|s| *s == prefs.hook_secs).unwrap_or(2)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
                                 this.export_prefs.hook_secs = HOOK_SECONDS[*ix];
