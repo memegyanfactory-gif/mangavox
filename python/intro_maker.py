@@ -57,8 +57,12 @@ import traceback
 import wave
 from itertools import combinations
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
+try:
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
+except ImportError as missing:  # a plain Python: the app runs the intro with one that has them
+    print(json.dumps({"ok": False, "message": f"the intro needs numpy and Pillow ({missing}): install the effects pack in Studio's Setup"}))
+    sys.exit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)

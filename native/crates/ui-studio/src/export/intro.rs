@@ -410,6 +410,23 @@ async fn render(py: mv_studio::PythonInterpreter, script: PathBuf, arg: String, 
     Ok((out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned()))
 }
 
+/// The Python the intro renders with: it needs numpy and Pillow, which Studio's own Python (a
+/// plain install: the video scripts don't need them) often lacks. The effects pack's Python has
+/// them, then the voice environment may, then Studio's own. Blocking (it asks each one).
+fn intro_python(studio: &mv_studio::PythonInterpreter, effects: Option<&Path>) -> Result<mv_studio::PythonInterpreter> {
+    let plain = |p: &Path| mv_studio::PythonInterpreter { program: p.to_string_lossy().into_owned(), prefix_args: vec![], version: String::new() };
+    let voice = mv_studio::python::venv_python(&mv_studio::python::mangavox_home());
+    let mut candidates: Vec<mv_studio::PythonInterpreter> = effects.filter(|p| p.is_file()).map(plain).into_iter().collect();
+    if voice.is_file() {
+        candidates.push(plain(&voice));
+    }
+    candidates.push(studio.clone());
+    candidates
+        .into_iter()
+        .find(|py| mv_studio::python::quiet_command(&py.program).args(&py.prefix_args).args(["-c", "import numpy, PIL"]).output().is_ok_and(|o| o.status.success()))
+        .ok_or_else(|| anyhow!("the intro needs numpy and Pillow, and no Python Studio uses has them: install the effects pack in Studio's Setup"))
+}
+
 /// What a manga's intro is made of, read off the UI thread.
 struct Gathered {
     /// The joined video's frame size and rate (the intro is made at them, to join it as it is).
@@ -622,8 +639,12 @@ pub(crate) async fn make_intro(mut job: IntroJob, j: &Joined, r: &Reporter, ex: 
     let args_file = work.0.join("args.json");
     std::fs::write(&args_file, serde_json::to_string(&spec)?).with_context(|| format!("write {}", args_file.display()))?;
     let script = job.layout.script("intro_maker.py").map_err(|e| anyhow!("{e}"))?;
-    let (py, dir, arg) = (job.python.clone(), job.layout.dir.clone(), args_file.to_string_lossy().into_owned());
     step(r, RENDER_FROM, "Starting the renderer");
+    let py = {
+        let (studio, effects) = (job.python.clone(), g.roto.clone());
+        mv_ui::bg::blocking(move || intro_python(&studio, effects.as_deref())).await??
+    };
+    let (dir, arg) = (job.layout.dir.clone(), args_file.to_string_lossy().into_owned());
     let since = SystemTime::now();
     // The intro renders under the heavy-work cap the export turn holds low: lifted meanwhile.
     mv_core::limits::throttle(None);
