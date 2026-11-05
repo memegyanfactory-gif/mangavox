@@ -3,15 +3,17 @@
 
   python hook_maker.py <args.json>
 
-args: {lines: [{text, image, focus?}], outro: {text, image}, voice, engine, speed, resolution,
+args: {lines: [{text, image, focus?, images?: [{image, focus?}]}], outro: {text, image, focus?},
+       voice, engine, speed, resolution,
        subtitles, score: {wav, start, seconds} | null, out, work_dir}
 
-The hook is one idea in a few short lines: a statement, a proof or two, and a teasing turn (the
-outro). Each line is voiced (tts_bridge.run_tts, one "page" per line, the outro last) and shown
-on its own panel, the one that proves it (see `edit_line`): the statement punches in with a
-shake, the proofs whip or flash in, and the outro fades through black onto the cover. It renders
-like a chapter video
-(video_generator, dynamic look, the chapter's caption style). With `score`, a slice of that
+The hook is the recap's cold open: a fast mini-scene (a showcase from late in the story, or the
+premise) in short lines, then the turn into the story (the outro). Each line is voiced
+(tts_bridge.run_tts, one "page" per line, the outro last) and shown over its pictures in turn
+(`images`, else its `image`; see `edit_line`), cut hard like a recap channel's opening: the first
+line punches in with a shake, later lines whip or flash in, and the outro fades through black
+onto its own picture (the hero, or the story's first moment; else the cover). It renders like a
+chapter video (video_generator, dynamic look, the chapter's caption style). With `score`, a slice of that
 chapter's score.wav from `start` plays under it, fading out over the last 1.5 s. The video is
 copied to `out`.
 
@@ -31,23 +33,51 @@ FLASH = ("fadewhite", 0.2)
 WHIPS = (("whipleft", 0.22), ("whipright", 0.22))
 TO_OUTRO = ("fadeblack", 0.6)
 PUNCH = 0.14
+# A picture within a line stays on screen at least this long (a short line shows fewer of them).
+MIN_SHOT = 1.2
+
+
+def split_words(text, n):
+    """`text` cut into at most `n` runs of about as many words each, in order."""
+    words = text.split()
+    n = max(1, min(n, len(words)))
+    out, start = [], 0
+    for k in range(n):
+        end = round(len(words) * (k + 1) / n)
+        if end > start:
+            out.append(" ".join(words[start:end]))
+        start = end
+    return out or [text]
 
 
 def edit_line(index, shot, secs, punch):
-    """The clip of line `index` (voiced in `secs`): the line on its own picture. It punches in
-    when `punch`, else whips in (flashes when gripping); the outro fades in through black.
-    Returns (the clips, each with its `offset` and `seconds` into the line's voice, and whether it
-    punched)."""
-    clip = {"text": shot["text"], "image": shot["image"], "focus": shot.get("focus"), "offset": 0.0, "seconds": secs, "layout": "single"}
-    if shot.get("layout"):
-        clip["transition"] = TO_OUTRO
-    else:
-        if punch:
-            clip["motion"] = "shake"
-            clip["amount"] = PUNCH
-        if index:
-            clip["transition"] = FLASH if punch else WHIPS[index % 2]
-    return [clip], punch
+    """The clips of line `index` (voiced in `secs`): the line over its pictures in turn, each
+    holding the words said while it shows (at least MIN_SHOT a picture), hard cuts between them.
+    The first picture punches in when `punch`, else whips in (flashes when gripping); the outro
+    fades in through black. Returns (the clips, each with its `offset` and `seconds` into the
+    line's voice, and whether it punched)."""
+    pics = [p for p in (shot.get("images") or []) if p.get("image") and os.path.isfile(p["image"])]
+    if not pics:
+        pics = [{"image": shot["image"], "focus": shot.get("focus")}]
+    parts = split_words(shot["text"], max(1, min(len(pics), int(secs // MIN_SHOT))))
+    total = sum(len(p.split()) for p in parts) or 1
+    clips, at = [], 0.0
+    for k, (pic, text) in enumerate(zip(pics, parts)):
+        seconds = secs - at if k == len(parts) - 1 else secs * len(text.split()) / total
+        clip = {"text": text, "image": pic["image"], "focus": pic.get("focus"), "offset": round(at, 3), "seconds": round(seconds, 3), "layout": "single"}
+        if k:
+            clip["cut"] = True
+        elif shot.get("layout"):
+            clip["transition"] = TO_OUTRO
+        else:
+            if punch:
+                clip["motion"] = "shake"
+                clip["amount"] = PUNCH
+            if index:
+                clip["transition"] = FLASH if punch else WHIPS[index % 2]
+        clips.append(clip)
+        at += seconds
+    return clips, punch
 
 
 def _score_slice(score, seconds, work_dir):
@@ -78,11 +108,11 @@ def make_hook(args):
     work_dir = args["work_dir"]
     out = args["out"]
     os.makedirs(work_dir, exist_ok=True)
-    shots = [{"text": (l.get("text") or "").strip(), "image": l.get("image"), "focus": l.get("focus")} for l in args.get("lines") or []]
+    shots = [{"text": (l.get("text") or "").strip(), "image": l.get("image"), "focus": l.get("focus"), "images": l.get("images")} for l in args.get("lines") or []]
     outro = args.get("outro") or {}
     if (outro.get("text") or "").strip():
-        # The closing line shows the cover whole, centred (never half of a side-by-side pair).
-        shots.append({"text": outro["text"].strip(), "image": outro.get("image"), "focus": None, "layout": "single"})
+        # The closing line shows its picture whole, centred (never half of a side-by-side pair).
+        shots.append({"text": outro["text"].strip(), "image": outro.get("image"), "focus": outro.get("focus"), "layout": "single"})
     shots = [s for s in shots if s["text"] and s["image"] and os.path.isfile(s["image"])]
     if not shots:
         raise RuntimeError("The hook has no lines with a picture")

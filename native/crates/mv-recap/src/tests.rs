@@ -382,12 +382,14 @@ async fn hook_is_written_from_candidates_with_a_json_retry() {
         ("Chapter 2".to_string(), vec!["Kaito betrays the guild.".to_string()]),
     ];
     let cands = pick_candidates(&chapters, MAX_CANDIDATES);
-    let fake = Fake::new(&["not json", r#"{"lines":[{"id":1,"text":"A blade is drawn."},{"id":2,"text":"A friend turns traitor."}],"outro":"Let's see how it begins."}"#]);
+    let fake = Fake::new(&["not json", r#"{"idea":"premise","lines":[{"ids":[1],"text":"A blade is drawn."},{"id":2,"text":"A friend turns traitor."}],"outro":"Let's see how it begins.","outro_id":0}"#]);
     let h = crate::hook::write_hook_with(&fake, &model(), "Test Manga", "STORY SO FAR: Ruko trains.\n", &cands, 20, &CancellationToken::new()).await.unwrap();
-    assert_eq!(h.lines, vec![(1, "A blade is drawn.".to_string()), (2, "A friend turns traitor.".to_string())]);
+    assert_eq!(h.lines, vec![HookLine::new(vec![1], "A blade is drawn."), HookLine::new(vec![2], "A friend turns traitor.")]);
+    assert_eq!(h.outro_id, Some(0));
     let seen = fake.seen.lock().unwrap();
     let user = &seen[0].messages[1].content;
-    assert!(user.contains("[2] (Chapter 2) Kaito betrays the guild."), "{user}");
+    assert!(user.contains("SCENE 1 (Chapter 1, where the story begins):\n[0] Ruko meets a stranger.\n[1] The stranger draws a blade!"), "{user}");
+    assert!(user.contains("SCENE 2 (Chapter 2):\n[2] Kaito betrays the guild."), "{user}");
     assert!(user.contains("about 52 words"));
     assert!(user.contains("STORY SO FAR: Ruko trains."), "the story is given as context");
     assert_eq!(seen.len(), 2, "one retry after the non-JSON answer");
@@ -468,7 +470,9 @@ async fn story_sees_the_whole_chapter_and_remembers_it() {
     assert!(!user.contains("CALL TO ACTION"), "minute 0 is no reminder mark");
     assert!(!sys.contains("\"hook\""));
     assert!(sys.contains("ONE CONTINUOUS STORY") && sys.contains("\"previously\"") && sys.contains("\"end of chapter\"") && sys.contains("sign-offs"), "{sys}");
-    assert!(sys.contains("One or two per chapter at most") && sys.contains("never in serious, sad or tense scenes"), "{sys}");
+    assert!(sys.contains("about one such aside a minute") && sys.contains("never in sad, tragic, horrifying or truly tense moments"), "{sys}");
+    assert!(sys.contains("Tell it scene by scene") && sys.contains("Compress, never list") && sys.contains("\"repeats\""), "{sys}");
+    assert!(!sys.contains("Every story page gets at least one segment"), "pages are told scene by scene, not one by one");
     let b = brain.lock().unwrap();
     assert_eq!(b.recaps[0].summary, "Ruko meets Kaito.");
     assert_eq!(b.recap_before("Chapter 2"), Some("Ruko meets Kaito."));
@@ -603,8 +607,10 @@ async fn later_chapters_continue_the_story_and_carry_planned_reminders() {
 #[test]
 fn length_follows_what_the_chapter_says_and_the_cast_flags_looks() {
     use crate::story::{cast_text, length_target};
-    // Seven words a line, forty a story page: chapter 1 of a recap channel's video runs ~1100 words.
-    assert_eq!((length_target(10, 0), length_target(141, 27), length_target(208, 10), length_target(2000, 30)), (250, 1100, 1450, 2500));
+    // Seven words a line, four a story page: a recap channel tells a chapter in ~1100 words (about
+    // five minutes), a 30-page chapter of 140 lines and a 100-slice webtoon chapter of 110 alike.
+    assert_eq!((length_target(10, 0), length_target(141, 27), length_target(208, 10), length_target(2000, 30)), (250, 1100, 1500, 2000));
+    assert_eq!(length_target(110, 103), 1200, "webtoon slices no longer inflate the target");
     let dir = tempfile::tempdir().unwrap();
     let mut b = Brain::load_in(dir.path().to_path_buf(), "m1", "T");
     for (name, n, aliases) in [("Mujin", 50, vec!["Brown-haired young man", "Muj"]), ("Bald elder with glasses", 9, vec![]), ("Crying bald boy", 1, vec![])] {
@@ -692,34 +698,156 @@ async fn cast_check_names_one_person_told_by_several_looks() {
     assert!(!story.contains("Fur-collared man buys"), "{story}");
 }
 
+/// A cast-checked chapter of `n` fight pages, each with two lines of Ruko's, saved for `ch`.
+fn talky_chapter(ch: &ChapterRef, n: usize) {
+    let line = |t: String| Line { speaker: Some("Ruko".into()), text: t, kind: "speech".into() };
+    let panel = |i: usize| Panel { characters: vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }], lines: vec![line(format!("Strike {i}!")), line(format!("Again {i}!"))], ..Default::default() };
+    let pages = (0..n).map(|i| PageRead { index: i, summary: format!("Ruko fights, page {}.", i + 1), scene: Scene { kind: "fight".into(), ..Default::default() }, panels: vec![panel(i)], ..Default::default() }).collect();
+    save_read(ch, &ChapterRead { pages, cast_checked: true, ..Default::default() }).unwrap();
+}
+
 #[tokio::test]
-async fn story_pages_left_out_are_written_before_saving() {
+async fn a_dropped_scene_is_written_but_pages_left_out_here_and_there_are_cut() {
     let dir = tempfile::tempdir().unwrap();
-    let ch = chapter(dir.path(), 3);
+    let ch = chapter(dir.path(), 10);
     let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
-    let line = |t: &str| Line { speaker: Some("Ruko".into()), text: t.into(), kind: "speech".into() };
-    let panel = |lines: Vec<Line>| Panel { characters: vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }], lines, ..Default::default() };
-    let scene = Scene { kind: "fight".into(), ..Default::default() };
-    let read = ChapterRead {
-        pages: vec![
-            PageRead { index: 0, summary: "Ruko draws.".into(), scene: scene.clone(), panels: vec![panel(vec![line("Draw!")])], ..Default::default() },
-            PageRead { index: 1, summary: "Ruko strikes without a word.".into(), scene: scene.clone(), panels: vec![panel(vec![])], ..Default::default() },
-            PageRead { index: 2, summary: "Ruko wins.".into(), scene, panels: vec![panel(vec![line("Done.")])], ..Default::default() },
-        ],
-        cast_checked: true,
-        ..Default::default()
-    };
-    save_read(&ch, &read).unwrap();
+    talky_chapter(&ch, 10);
+    // Page 2 is left out on its own (the telling compressed it); pages 4-9 are a whole dropped stretch.
     let llm = Fake::new(&[
-        r#"{"title":"T","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"Ruko wins."}]}"#,
-        r#"{"segments":[{"page":2,"panel":1,"text":"One silent strike ends it."},{"page":3,"text":"not asked for"}]}"#,
+        r#"{"title":"T","summary_so_far":"s","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"He presses on."},{"page":10,"panel":1,"text":"Ruko wins."}]}"#,
+        r#"{"segments":[{"page":6,"panel":1,"text":"Six brutal exchanges later, the duel turns."},{"page":2,"text":"not asked for"}],"repeats":[]}"#,
     ]);
     let out = write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
     let segs: Vec<(usize, &str)> = out[0].1.segments.iter().map(|s| (s.page, s.text.as_str())).collect();
-    assert_eq!(segs, vec![(0, "Ruko draws."), (1, "One silent strike ends it."), (2, "Ruko wins.")]);
+    assert_eq!(segs, vec![(0, "Ruko draws."), (2, "He presses on."), (5, "Six brutal exchanges later, the duel turns."), (9, "Ruko wins.")]);
     let seen = llm.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "one call for the chapter, one for the dropped stretch");
     let fill = &seen[1].messages[1].content;
-    assert!(fill.contains("leaves out story pages 2.") && fill.contains("LINE BEFORE: Ruko draws.") && fill.contains("LINE AFTER: Ruko wins.") && fill.contains("Ruko strikes without a word."), "{fill}");
+    assert!(fill.contains("whole stretches of the story: pages 4-9.") && fill.contains("GAP AT PAGES 4-9") && fill.contains("LINE BEFORE: He presses on.") && fill.contains("LINE AFTER: Ruko wins."), "{fill}");
+    assert!(fill.contains("Ruko fights, page 6.") && !fill.contains("Ruko fights, page 2."), "only the dropped stretch is asked for: {fill}");
+    assert!(fill.contains("STORY SO FAR (before this chapter):"), "{fill}");
+}
+
+#[tokio::test]
+async fn pages_that_retell_the_story_so_far_are_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 10);
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    brain.lock().unwrap().set_recap("Chapter 0", "Ruko fought his way through eight rounds.");
+    talky_chapter(&ch, 10);
+    // A prologue told again: pages 1-8 retell the story so far, and only 9-10 are new.
+    let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"s","segments":[{"page":9,"panel":1,"text":"Then a new rival walks in."},{"page":10,"panel":1,"text":"Ruko grins."}],"repeats":["1-7", 8, 42]}"#]);
+    let logged = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = logged.clone();
+    let progress: ProgressFn = Arc::new(move |p| {
+        if let Progress::Log(s) = p {
+            log.lock().unwrap().push(s);
+        }
+    });
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&ch), &[], &[], &brain, &progress, &CancellationToken::new()).await.unwrap();
+    assert_eq!(out[0].1.segments.iter().map(|s| s.page).collect::<Vec<_>>(), vec![8, 9]);
+    let logs = logged.lock().unwrap().clone();
+    assert!(logs.iter().any(|l| l.contains("pages 1-8 retell the story so far")), "{logs:?}");
+    let seen = llm.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "a repeat is no hole: nothing more is asked");
+    let user = &seen[0].messages[1].content;
+    assert!(user.contains("STORY SO FAR:\nRuko fought his way through eight rounds."), "{user}");
+}
+
+/// A panel crop for `page` of 9x8 flat blocks whose shades come from `seed`: the same seed is the
+/// same picture, another seed another picture.
+fn art(ch: &ChapterRef, page: usize, seed: u32) {
+    let dir = panels_for(ch);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shade = |bx: u32, by: u32| {
+        let mut h = seed.wrapping_mul(0x9E37_79B9) ^ bx.wrapping_mul(0x85EB_CA6B) ^ by.wrapping_mul(0xC2B2_AE35);
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x7FEB_352D);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x846C_A68B);
+        h ^= h >> 16;
+        (h >> 24) as u8
+    };
+    image::RgbImage::from_fn(90, 80, |x, y| {
+        let v = shade(x / 10, y / 10);
+        image::Rgb([v, v, v])
+    })
+    .save(dir.join(format!("p{page:04}_00.jpg")))
+    .unwrap();
+}
+
+/// Chapter `n` of a run, in its own folder, with `pages` talky pages.
+fn nth_chapter(root: &Path, n: usize, pages: usize) -> ChapterRef {
+    let mut ch = chapter(&root.join(format!("c{n}")), pages);
+    ch.chapter_id = format!("c{n}");
+    ch.label = format!("Chapter {n}");
+    talky_chapter(&ch, pages);
+    ch
+}
+
+fn logs_into(logged: &Arc<Mutex<Vec<String>>>) -> ProgressFn {
+    let log = logged.clone();
+    Arc::new(move |p| {
+        if let Progress::Log(s) = p {
+            log.lock().unwrap().push(s);
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_chapter_that_is_the_one_before_again_is_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let (a, b) = (nth_chapter(dir.path(), 1, 6), nth_chapter(dir.path(), 2, 6));
+    // Another group's upload of the same chapter: the same pictures, page for page.
+    for p in 0..6 {
+        art(&a, p, p as u32);
+        art(&b, p, p as u32);
+    }
+    let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"Ruko wins.","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"He presses on."},{"page":6,"panel":1,"text":"Ruko wins."}]}"#]);
+    let logged = Arc::new(Mutex::new(vec![]));
+    let out = write_story_with(&llm, &model(), &[a, b], &[], &[], &brain, &logs_into(&logged), &CancellationToken::new()).await.unwrap();
+    assert_eq!(out.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["c1"]);
+    assert_eq!(llm.seen.lock().unwrap().len(), 1, "nothing is asked about the copy");
+    let logs = logged.lock().unwrap().clone();
+    assert!(logs.iter().any(|l| l.contains("Chapter 2: its pages are the pages of Chapter 1 again")), "{logs:?}");
+}
+
+#[tokio::test]
+async fn pages_replaying_the_chapter_before_are_never_told_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let (a, b) = (nth_chapter(dir.path(), 1, 6), nth_chapter(dir.path(), 2, 10));
+    for p in 0..6 {
+        art(&a, p, p as u32);
+    }
+    // Chapter 2 opens on chapter 1's last three pages, then goes on with new ones.
+    for p in 0..10 {
+        art(&b, p, if p < 3 { p as u32 + 3 } else { 100 + p as u32 });
+    }
+    let llm = Fake::new(&[
+        r#"{"title":"T","summary_so_far":"Ruko wins.","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"He presses on."},{"page":6,"panel":1,"text":"Ruko wins."}]}"#,
+        r#"{"title":"T2","summary_so_far":"s","segments":[{"page":4,"panel":1,"text":"A new rival arrives."},{"page":7,"panel":1,"text":"They clash."},{"page":10,"panel":1,"text":"Ruko grins."}]}"#,
+    ]);
+    let logged = Arc::new(Mutex::new(vec![]));
+    let out = write_story_with(&llm, &model(), &[a, b], &[], &[], &brain, &logs_into(&logged), &CancellationToken::new()).await.unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[1].1.segments.iter().map(|s| s.page).collect::<Vec<_>>(), vec![3, 6, 9]);
+    let logs = logged.lock().unwrap().clone();
+    assert!(logs.iter().any(|l| l.contains("Chapter 2: pages 1-3 repeat Chapter 1")), "{logs:?}");
+    let seen = llm.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "no hole is asked about: the replayed pages are left out on purpose");
+    let user = &seen[1].messages[1].content;
+    assert!(!user.contains("Ruko fights, page 1.") && !user.contains("Ruko fights, page 3.") && user.contains("Ruko fights, page 4."), "{user}");
+}
+
+#[test]
+fn repeats_are_read_as_pages_and_ranges() {
+    use crate::story::parse_repeats;
+    let v = serde_json::json!({"repeats": [3, "5-7", "9", "12 – 13", "x", 0, "8-4", 40]});
+    assert_eq!(parse_repeats(&v, &(0..20).collect::<Vec<_>>()), vec![2, 4, 5, 6, 8, 11, 12]);
+    assert_eq!(parse_repeats(&v, &[4, 5]), vec![4, 5], "only pages of the part asked for");
+    assert!(parse_repeats(&serde_json::json!({"segments": []}), &[0]).is_empty());
 }
 
 #[test]

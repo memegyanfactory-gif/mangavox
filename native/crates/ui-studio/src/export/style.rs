@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(back, p);
         assert_eq!(back.export.mode(), crate::export::Mode::Parts(4));
         let odd = PanelPrefs::from_json(&json!({"export": {"kind": 9, "parts": 5, "hook_secs": 7, "quality": "8K"}}));
-        assert_eq!((odd.export.kind, odd.export.parts, odd.export.hook_secs, odd.export.quality), (2, 6, 30, Quality::Source));
+        assert_eq!((odd.export.kind, odd.export.parts, odd.export.hook_secs, odd.export.quality), (2, 6, 60, Quality::Source));
         std::fs::write(&file, "{nope").unwrap();
         assert_eq!(PanelPrefs::load_from(&file), PanelPrefs::default());
     }

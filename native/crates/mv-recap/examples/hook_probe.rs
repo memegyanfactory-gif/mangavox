@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use mv_ai::{AiProviderId, CancellationToken, Registry};
-use mv_recap::hook::{pick_candidates, story_context, write_hook, MAX_CANDIDATES};
+use mv_recap::hook::{candidates_text, pick_candidates, story_context, write_hook, MAX_CANDIDATES};
 use mv_recap::{Brain, ModelChoice};
 
 fn main() -> anyhow::Result<()> {
@@ -25,19 +25,22 @@ fn main() -> anyhow::Result<()> {
     let cands = pick_candidates(&chapters, MAX_CANDIDATES);
     let story = story_context(&brain, &chapters.last().map(|c| c.0.clone()).unwrap_or_default());
     std::fs::create_dir_all(&scratch)?;
-    let mut dump = story.clone();
-    for c in &cands {
-        dump += &format!("[{}] ({}) {}\n", c.id, c.chapter, c.text);
-    }
-    std::fs::write(scratch.join("candidates.txt"), dump)?;
+    std::fs::write(scratch.join("candidates.txt"), format!("{story}\n{}", candidates_text(&cands)))?;
     let reg = Arc::new(Registry::new(mv_core::paths::config(), scratch.join("ws")));
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let h = rt.block_on(write_hook(reg, model, &brain.manga_title, &story, &cands, seconds, CancellationToken::new()))?;
     let flat: Vec<&String> = chapters.iter().flat_map(|c| c.1.iter()).collect();
+    let over = |id: usize| flat.get(id).map(|s| s.as_str()).unwrap_or("?");
     println!("IDEA: {}\nWORDS: {} (candidates {})\n", h.idea, h.words(), cands.len());
-    for (id, text) in &h.lines {
-        println!("[{id}] {text}\n      shown over: {}", flat.get(*id).map(|s| s.as_str()).unwrap_or("?"));
+    for l in &h.lines {
+        println!("{:?} {}", l.ids, l.text);
+        for id in &l.ids {
+            println!("      shown over [{id}]: {}", over(*id));
+        }
     }
-    println!("OUTRO (cover): {}", h.outro);
+    match h.outro_id {
+        Some(id) => println!("OUTRO over [{id}] {}: {}", over(id), h.outro),
+        None => println!("OUTRO (cover): {}", h.outro),
+    }
     Ok(())
 }

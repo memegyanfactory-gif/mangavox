@@ -53,6 +53,7 @@ pub(crate) fn feel_icon(style: &str) -> Ph {
         "Warm" => ph::HEART,
         "Cinematic" => ph::FILM_SLATE,
         "Normal narration" => ph::MICROPHONE,
+        "Banter" => ph::SMILEY_WINK,
         "Classic" => ph::BOOK_OPEN,
         "Old-timer" => ph::CLOCK_COUNTER_CLOCKWISE,
         "Charm" => ph::SPARKLE,

@@ -134,7 +134,7 @@ fn tools() -> Vec<ToolDef> {
                     "manga": s("Manga title or id"),
                     "kind": { "type": "string", "enum": ["whole", "parts", "reels"] },
                     "parts": { "type": "number", "description": "Number of parts (2, 3, 4, 6, 8 or 10)" },
-                    "hook": { "type": "boolean", "description": "AI teaser before chapter 1 (whole only)" },
+                    "hook": { "type": "boolean", "description": "AI cold open before chapter 1 (whole only; on unless false)" },
                     "hook_seconds": { "type": "number", "description": "15, 20, 30, 45 or 60" },
                     "music": { "type": "boolean", "description": "Keep the background music (default true)" },
                     "folder": s("Output folder (optional)"),
@@ -571,9 +571,10 @@ pub(crate) fn export_prefs(a: &Map<String, Value>) -> Result<ExportPrefs, String
         let n = n.round() as usize;
         p.parts = *export::PART_COUNTS.iter().min_by_key(|c| c.abs_diff(n)).unwrap_or(&6);
     }
-    p.hook = bool_arg(a, "hook").unwrap_or(false) && p.kind == 0;
+    // The cold open is on unless asked off, and only ever before one whole video.
+    p.hook = bool_arg(a, "hook").unwrap_or(p.hook) && p.kind == 0;
     if let Some(s) = num_arg(a, "hook_seconds") {
-        p.hook_secs = *export::HOOK_SECONDS.iter().min_by_key(|c| c.abs_diff(s.round() as u32)).unwrap_or(&30);
+        p.hook_secs = *export::HOOK_SECONDS.iter().min_by_key(|c| c.abs_diff(s.round() as u32)).unwrap_or(&p.hook_secs);
     }
     p.music = bool_arg(a, "music").unwrap_or(true);
     Ok(p)
@@ -942,6 +943,9 @@ mod tests {
     fn export_choices_snap_to_what_the_card_offers() {
         let mut a = Map::new();
         assert_eq!(export_prefs(&a).unwrap().mode(), Mode::Whole);
+        assert!(export_prefs(&a).unwrap().hook, "a whole video opens cold unless asked not to");
+        a.insert("hook".into(), json!(false));
+        assert!(!export_prefs(&a).unwrap().hook);
         a.insert("kind".into(), json!("parts"));
         a.insert("parts".into(), json!(5));
         a.insert("hook".into(), json!(true));

@@ -154,7 +154,9 @@ pub(crate) struct ExportPrefs {
     pub kind: usize,
     pub parts: usize,
     pub music: bool,
-    /// A teaser before chapter 1 (one video only).
+    /// The cold open before chapter 1 (one video only): a showcase from late in the story, or the
+    /// premise, ending on the question the recap answers. On by default, a minute long, as the top
+    /// recap channels open.
     pub hook: bool,
     pub hook_secs: u32,
     pub quality: Quality,
@@ -165,7 +167,7 @@ pub(crate) struct ExportPrefs {
 
 impl Default for ExportPrefs {
     fn default() -> Self {
-        ExportPrefs { kind: 0, parts: 6, music: true, hook: false, hook_secs: 30, quality: Quality::Source, intro: true }
+        ExportPrefs { kind: 0, parts: 6, music: true, hook: true, hook_secs: 60, quality: Quality::Source, intro: true }
     }
 }
 
@@ -1666,18 +1668,29 @@ async fn wait_for<T: Send + 'static>(task: tokio::task::JoinHandle<T>, r: &Repor
     }
 }
 
-/// The `hook_maker.py` arguments for `script` over `chapters` (each with its beats): each line on
-/// the panel of its beat (the one that proves it), the outro on the cover. `None` when no line has
-/// a picture.
+/// The `hook_maker.py` arguments for `script` over `chapters` (each with its beats): each line over
+/// the pictures of its beats in turn (cut fast, like a recap channel's cold open), the turn into
+/// the story over its own picture, else the cover. `None` when no line has a picture.
 pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Vec<Beat>)], script: &mv_recap::hook::HookScript, resolution: &str, work: &Path) -> Option<Value> {
     let flat: Vec<(usize, &Beat)> = chapters.iter().enumerate().flat_map(|(c, (_, beats))| beats.iter().map(move |b| (c, b))).collect();
-    let lines: Vec<(usize, &Beat, &String)> = script.lines.iter().filter_map(|(id, text)| flat.get(*id).filter(|(_, b)| b.image.is_some()).map(|(c, b)| (*c, *b, text))).collect();
+    let shot = |id: &usize| flat.get(*id).filter(|(_, b)| b.image.is_some()).copied();
+    let lines: Vec<(usize, Vec<&Beat>, &String)> = script
+        .lines
+        .iter()
+        .filter_map(|l| {
+            let shots: Vec<(usize, &Beat)> = l.ids.iter().filter_map(shot).collect();
+            Some((shots.first()?.0, shots.into_iter().map(|(_, b)| b).collect(), &l.text))
+        })
+        .collect();
     lines.first()?;
     // The music of the most gripping line's moment.
-    let (loud_chapter, loud_beat, _) = lines.iter().max_by(|a, b| mv_recap::hook::beat_score(a.2).total_cmp(&mv_recap::hook::beat_score(b.2)))?;
+    let (loud_chapter, loud_beats, _) = lines.iter().max_by(|a, b| mv_recap::hook::beat_score(a.2).total_cmp(&mv_recap::hook::beat_score(b.2)))?;
+    let loud_beat = loud_beats.first()?;
     let (last, _) = chapters.last()?;
-    // The manga's cover, else its first page or panel.
-    let opening = job.cover.as_ref().map(|p| p.to_string_lossy().into_owned()).or_else(|| chapters.iter().find_map(|(_, beats)| beats.iter().find_map(|b| b.image.clone())).or_else(|| {
+    // The turn's own picture (the hero, or the story's first moment), else the manga's cover, else
+    // its first page or panel.
+    let turn = script.outro_id.as_ref().and_then(shot).map(|(_, b)| b);
+    let opening = turn.and_then(|b| b.image.clone()).or_else(|| job.cover.as_ref().map(|p| p.to_string_lossy().into_owned())).or_else(|| chapters.iter().find_map(|(_, beats)| beats.iter().find_map(|b| b.image.clone())).or_else(|| {
         let first = &chapters.first()?.0;
         let mut pages: Vec<PathBuf> = std::fs::read_dir(&first.pages_dir).ok()?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["jpg", "jpeg", "png", "webp"].contains(&x.to_ascii_lowercase().as_str()))).collect();
         pages.sort();
@@ -1689,8 +1702,13 @@ pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Ve
     let score = score.is_file().then(|| json!({"wav": score.to_string_lossy(), "start": loud_beat.start, "seconds": job.seconds}));
     Some(json!({
         "idea": script.idea,
-        "lines": lines.iter().map(|(_, b, text)| json!({"text": text, "image": b.image, "focus": b.focus})).collect::<Vec<_>>(),
-        "outro": {"text": script.outro, "image": opening},
+        "lines": lines.iter().map(|(_, beats, text)| json!({
+            "text": text,
+            "image": beats[0].image,
+            "focus": beats[0].focus,
+            "images": beats.iter().map(|b| json!({"image": b.image, "focus": b.focus})).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "outro": {"text": script.outro, "image": opening, "focus": turn.map(|b| b.focus.clone()).unwrap_or(Value::Null)},
         "voice": voice,
         "engine": engine,
         "speed": mv_recap::Prefs::load().speed,
@@ -2562,7 +2580,7 @@ impl StudioPage {
             btn("vid-hook", format!("Hook {} s", prefs.hook_secs), ButtonKind::Ghost)
                 .small()
                 .icon(ph::LIGHTNING)
-                .tooltip("A teaser of the most gripping moments plays before chapter 1. Open the Video style panel to change or turn it off")
+                .tooltip("A cold open of the most jaw-dropping scene plays before chapter 1. Open the Video style panel to change or turn it off")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.style.prefs.open = true;
                     this.style.prefs.seen = true;

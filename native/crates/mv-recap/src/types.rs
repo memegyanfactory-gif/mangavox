@@ -142,7 +142,7 @@ pub struct Transcript {
 }
 
 pub const STYLES: &[&str] =
-    &["Happy", "Warm", "Cinematic", "Normal narration", "Classic", "Old-timer", "Charm", "Exotic", "Depth", "Hard", "Soft"];
+    &["Happy", "Warm", "Cinematic", "Normal narration", "Banter", "Classic", "Old-timer", "Charm", "Exotic", "Depth", "Hard", "Soft"];
 
 /// One voice-over passage. `page` and `panel` are 0-based (panel = index into `PageRead::panels`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

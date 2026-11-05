@@ -16,6 +16,7 @@ mod manual;
 pub mod media;
 mod panels;
 mod read;
+mod repeats;
 mod reset;
 mod store;
 mod story;

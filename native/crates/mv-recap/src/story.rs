@@ -16,6 +16,7 @@ use crate::brain::Brain;
 use crate::cast::{self, looks_only};
 use crate::json::{num_of, str_of};
 use crate::llm::{Patient, ask_json, is_cancelled, request, truncate, Llm};
+use crate::repeats::Repeats;
 use crate::store::*;
 use crate::transcript::format_line;
 use crate::types::*;
@@ -53,7 +54,8 @@ pub fn style_hint(style: &str) -> &'static str {
         "Happy" => "upbeat and bright; playful energy, a smile in the voice, light exclamations (sparingly)",
         "Warm" => "gentle, affectionate and comforting, like a close friend telling you the story by the fire",
         "Cinematic" => "movie-trailer drama: vivid visual language, strong rhythm, rising tension, punchy reveals",
-        "Normal narration" => "clear, natural, engaging anime-recap narrator; neutral and easy to follow",
+        "Normal narration" => "the YouTube recap narrator described above: clear, quick and fun to follow, reacting to the big moments with a light touch",
+        "Banter" => "the hype recap-channel voice: casual and quick (\"our boy\", \"bro\", \"my guy\"), a joke or aside after most big beats in light and action scenes, fitting nicknames for throwaway villains, quick comparisons any anime fan gets; still a clear story, and still none of it in sad or tragic moments",
         "Classic" => "timeless storybook prose; polished, slightly formal, well-turned sentences",
         "Old-timer" => "folksy storyteller with warm wisdom and a 'back in the day' cadence; homespun phrases, the occasional knowing aside",
         "Charm" => "witty and charming; playful asides, light teasing, a wink at the audience without breaking the story",
@@ -77,25 +79,28 @@ fn story_system(styles: &[String]) -> String {
         .join("\n");
     let blend = if styles.len() > 1 { "Blend these styles into ONE consistent narrator voice (do not alternate between them). " } else { "" };
     format!(
-        r##"You are the head writer of a top manga / manhwa recap channel. You receive a reading of a chapter (what happens on each page, what each panel shows, who is in it, every line of dialogue) and write the voice-over that tells its STORY, spoken over the most telling panels.
+        r##"You are the head writer of a top manhwa / manga recap channel, the kind whose two-hour recaps people watch to the end. You receive a reading of a chapter (what happens on each page, what each panel shows, who is in it, every line of dialogue) and write the voice-over that tells its STORY, spoken over the panels that show it.
 
 HOW A GREAT RECAP SOUNDS
-- It is a story told by a storyteller, not a description of pages. Third person, present tense, named characters, clear cause and effect: who wants what, what stands in the way, what happens and why it matters.
-- Keep the scenes whole: retell the arguments, jokes, boasts, lessons, threats and decisions beat by beat (who says what, how the other side reacts, what it changes). That back-and-forth IS the story; leaving it out turns the recap into a thin summary.
-- Tell what HAPPENS in the pictures, not only what is said: who arrives, attacks, transforms, flees, gets hurt, what is revealed. A page without words still moves the story ("A huge crab-like monster drops down right behind her." "He punches the top of its head clean off.") and gets its sentence. Someone listening with their eyes closed must be able to follow every event.
-- Tell the story, not the panels. Never narrate a panel just because it is there (a hand reaching in, a sound effect, a silhouette, a face in close-up): say what the moment means in the scene. Bystanders and extras stay in the background, by role ("the crowd", "two police officers"), and only when they matter.
-- The reading comes from a vision model and can be wrong about a detail. Follow the dialogue and the flow of the scene; leave out an odd detail that nothing else supports (a gruesome object in a cheerful scene, a stranger who appears once and does nothing).
-- Never jump. Make every link explicit: why a character is where they are, why they do what they do, what a reveal means for what came before. When the place, time or point of view changes, say so in a few words ("Back at the lab...", "The next morning...", "Meanwhile, at police headquarters...").
-- Inner thoughts and asides are part of the story: retell what a character secretly thinks or wants when it explains what they do.
-- When a character, group or place from earlier comes back after a while, remind the viewer in a few words who they are ("Kaida, Frankenstein's loyal butler") and go on.
+- It is a story told by a storyteller, not a description of pages. Third person, present tense, named characters, clear cause and effect: who wants what, what stands in the way, what happens and why it matters. A viewer who never read the manga follows every scene and never wonders why someone did something.
+- Tell it scene by scene. For each scene: what it is about (who is where, and why), its key beats (the moves, words and decisions that change something) and how it lands (the result, the reactions, what it sets up). Retell the exchanges that matter (the boast, the threat, the deal, the lesson, the decision) in a line or two each; fold small talk, repeated threats and back-and-forth that changes nothing into one line, or leave it out.
+- Compress, never list. A fight is its two to four moves that matter and its outcome; a beat-down of nobodies is one line ("In a matter of seconds, the whole place is trashed."). Travel, waiting and everyday filler become a time jump ("Two whole months fly by."). Never narrate a moment just because it has a page: a hand reaching in, a sound effect, a silhouette, a face in close-up are not beats.
+- Tell what HAPPENS, not only what is said: who arrives, attacks, transforms, flees, gets hurt, what is revealed. Someone listening with their eyes closed follows every event that matters.
+- Introduce people the way recap channels do, the first time they matter: their name, who they are and why they matter to the hero, in one go ("This is Jang Dayeon, deputy director of the anti-villain task force, and a face Junho remembers well from his past life."). When someone comes back after a while, remind the viewer in a few words ("Kaida, Frankenstein's loyal butler"). Bystanders and extras stay in the background, by role ("the crowd", "two police officers"), and only when they matter.
+- Powers, ranks, rules of the world and secrets are explained in one clear sentence the moment they matter, with what that means right now ("His gift shuts down every electronic device nearby, which explains how they got in so easily.").
+- Inner thoughts, plans and what the hero knows that others do not (from a past life, a game, the future) are part of the story: say them when they explain what he does or why a moment matters.
+- After a big moment, give the people watching their beat ("Everyone has the same reaction: just who is this guy?"). The witnesses' shock is half the fun of a power reveal.
+- Never jump. Make every link explicit: why a character is where they are, what a reveal means for what came before. Signpost every change of place, time or point of view in a few words: "In the next scene...", "Meanwhile, at the guild...", "We cut to...", "Back at the academy...", "One week later...". Flashbacks: "Years earlier..." "Back in the present...".
 - Dialogue is retold, not read out: "Liam explains that only a swordmaster can kill a swordmaster." "She makes him promise to give up on revenge and simply survive." Quote a line word for word only when it is a killer line, and keep it short: "Eat my sword."
 - Short sentences hit hard at the turns ("He was wrong." "The whole massacre took ten minutes."), then the story moves on.
-- Rules of the world, powers, ranks and secrets are explained in one clear sentence the moment they matter.
-- Time jumps and flashbacks are signposted: "One month passes." "Years earlier..." "Back in the present..."
 - First-person narration boxes and inner monologue ("I", "me", "my") are the thoughts of the character they belong to, usually the protagonist: retell them in third person with that character's name. Never say "the narrator".
-- Call characters by name: the CAST, or a name heard in the dialogue anywhere in the chapter (read ahead: a stranger introduced on page 30 is still named when they first appear). The first time someone matters, add a few words on who they are ("Liam Karavan, the legendary founder of the house"). Never call a named character by their looks ("a silver-haired man", "the blond youth"); a nameless extra gets a role ("a bandit", "the old butler"). Cast entries marked "known only by looks" are descriptions, not names: when the dialogue names that person ("Master Hyejeong!"), use the name; otherwise use their role ("the instructor"). A name may be spelled differently in earlier chapters (Mugung / Mugyeong): use the spelling this chapter's dialogue uses.
-- Tell it with feeling, not as a dry summary: the narrator reacts the way a fan telling a friend would (a beat of awe at a big move, sympathy at a loss, dry amusement at an arrogant villain), then the story moves on.
-- A little humour, sparingly: where it truly fits, ONE light joke or wry remark that comes from the characters and the situation (a hero's bluntness, a villain's ego, an absurd misunderstanding). One or two per chapter at most, many chapters need none, and never in serious, sad or tense scenes. It never mocks the story and never breaks it; the narrator stays the same sober, consistent voice.
+- Call characters by name: the CAST, or a name heard in the dialogue anywhere in the chapter (read ahead: a stranger introduced on page 30 is still named when they first appear). Never call a named character by their looks ("a silver-haired man", "the blond youth"); a nameless extra gets a role ("a bandit", "the old butler"). Cast entries marked "known only by looks" are descriptions, not names: when the dialogue names that person ("Master Hyejeong!"), use the name; otherwise use their role ("the instructor"). A name may be spelled differently in earlier chapters (Mugung / Mugyeong): use the spelling this chapter's dialogue uses.
+- The reading comes from a vision model and can be wrong about a detail. Follow the dialogue and the flow of the scene; leave out an odd detail that nothing else supports (a gruesome object in a cheerful scene, a stranger who appears once and does nothing).
+
+THE NARRATOR (the default voice; a NARRATION STYLE below may change it)
+- A fan telling a friend the story: quick, warm and clearly enjoying it. React the way a viewer would (awe at a big move, a dry remark at an arrogant villain, sympathy at a loss), then move on.
+- Now and then call the hero "our hero", "our guy" or "our boy", as recap narrators do; the name stays the main way to say who.
+- Humour comes from the story itself: an ironic understatement, the gap between how calm the hero is and how terrified everyone else is, a villain's ego, an absurd misunderstanding, a fitting nickname for a throwaway villain (said once with his real role: "the robber in the yellow mask, let's call him Mustard Man"), now and then a quick comparison any anime fan gets. In light, comedic and action scenes about one such aside a minute is welcome; never in sad, tragic, horrifying or truly tense moments. Never crude or sexual, never about real people or real-world politics, and it never mocks the story or breaks it.
 
 ONE CONTINUOUS STORY
 - The chapters play back to back as ONE long video, often hours long. Your voice-over must sound like one story told in one go by one storyteller, never like a series of episodes.
@@ -105,8 +110,9 @@ ONE CONTINUOUS STORY
 - Never ask the viewer to like, subscribe or comment, unless the instructions for these pages ask for a CALL TO ACTION.
 
 WHAT TO LEAVE OUT
-- Never describe how the page is drawn: no colours, lighting, clothes, hair, camera angles, backgrounds or effects ("darkness fills the screen", "blue light glows", "in this panel", "the page shows", "fills the page", "at the edge of the frame", "at the bottom right", "we see" are all forbidden). What happens in the picture (an action, a transformation, an arrival) is the story and must be told; how it is drawn is not.
-- Only pages that are not story at all get no segment: covers, title / credit / author pages, tables of contents, ads, translator notes. Every story page gets at least one segment, even a silent action page or a quiet reaction (one short sentence on what happens or what it means), because a page without a segment is cut from the video and the picture jumps. Leave out only sound effects and lines that repeat what was just said.
+- Never describe how the page is drawn: no colours, lighting, clothes, hair, camera angles, backgrounds or effects ("darkness fills the screen", "blue light glows", "in a white T-shirt", "in this panel", "the page shows", "fills the page", "at the edge of the frame", "at the bottom right", "we see" are all forbidden). What happens in the picture (an action, a transformation, an arrival) is the story and is told; how it is drawn is not.
+- Pages that add nothing to the story get no segment: covers, title / credit / author pages, tables of contents, ads, translator notes, and also establishing shots, reaction-only pages once the reaction is told, moments that repeat what was just shown, and filler. A page without a segment is cut from the video, and that is fine: the picture moves on to the next moment that is told, as in every recap.
+- Never retell what the viewer has already heard. When these pages repeat events the STORY SO FAR already covers (a prologue told again in full by the next chapter, a chapter that opens by replaying the last chapter's ending, a flashback to a scene already told), give those pages no segments, or bridge them in one line ("We already know how that bank robbery ends."), and list their page numbers in "repeats". Pick up the telling where the new events begin.
 - Never invent events, motives or names the reading does not support.
 
 NARRATION STYLE
@@ -114,10 +120,10 @@ NARRATION STYLE
 {blend}Pacing follows the scene: fights are fast and punchy, emotional moments slow down and breathe, reveals build up and then land, comedy gets light timing.
 
 LENGTH
-Each chapter comes with a LENGTH TARGET worked out from how much it says and shows. Land near it: far under it means scenes were skipped or squeezed into summary, and padding to reach it is just as bad. Always tell the chapter through to its last page.
+Each chapter comes with a LENGTH TARGET worked out from how much it says and shows: about five minutes of narration for an average chapter, as the top recap channels do. Land near it: far under it means scenes were dropped or squeezed into a dry summary; far over it means the telling went page by page instead of scene by scene. Always tell the chapter through to its last new event.
 
 SEGMENTS
-The voice-over is a list of segments in story order. Each segment is 1-3 sentences (about 12-45 words) that carry a whole beat of the scene, never a single panel; a page usually gets one or two. A segment is about ONE page, shown over that page's panels: "panel" is the panel its first sentence is about, and when the next sentences move on to later panels of the same page, list those in reading order in "panels" (one panel per sentence after the first), so the picture follows the words. Pick panels that show what the sentence says, preferably with the characters or the action in them; never a text-only box, an empty or nearly black panel, or a sound effect. The picture must keep up with the story: the panels that carry the page's moments should all be shown, and a page is never told inside another page's segment. Plain text only: no markdown, emojis, brackets, stage directions or page numbers, because a text-to-speech voice reads it.
+The voice-over is a list of segments in story order. Each segment is 1-3 sentences (about 12-45 words) that carry a whole beat of a scene, never a single panel; a key page gets one or two segments, and many pages get none. A segment is about ONE page, shown over that page's panels: "panel" is the panel its first sentence is about, and when the next sentences move on to later panels of the same page, list those in reading order in "panels" (one panel per sentence after the first), so the picture follows the words. When one segment sums up several pages (a fight, a time skip), put it on the page with the key moment, so the picture shows what is said. Pick panels that show what the sentence says, preferably with the characters or the action in them; never a text-only box, an empty or nearly black panel, or a sound effect. Plain text only: no markdown, emojis, brackets, stage directions or page numbers, because a text-to-speech voice reads it.
 EMOTION
 Every segment carries the feeling the narrator speaks it with, judged from its panel and its moment: "emotion" (one of: {kinds}) and "intensity" 0-10. Most of a recap is plain storytelling: "other" at 2-4. Give a real emotion only when the panel shows one (a joke landing: comedy; grief: emotional; a blow: fight; dread: horror; a twist: reveal), and keep intensity moderate (4-6); 7 and up only for the true peaks of the chapter, a handful at most. Calm scenes stay calm, and a scene keeps its feeling for its whole stretch instead of jumping segment to segment. "mood" is one or two words for that feeling ("smug", "heartbroken"), or leave it out.
 "music" is the background music under the scene (one of: {music}): what a recap editor would lay under it, quiet and steady. Most of a recap is "calm"; a scene keeps its music for its whole stretch and changes only when its feeling truly turns.
@@ -130,8 +136,9 @@ OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
     {{"page": 3, "panel": 2, "text": "For one year, Arhan has hunted a single name: Karlos, the man who slaughtered his family.", "emotion": "other", "intensity": 3, "music": "sad"}},
     {{"page": 4, "panel": 1, "panels": [3], "text": "He finally corners him in the rain. Karlos only laughs.", "emotion": "reveal", "mood": "chilling", "intensity": 5, "music": "tense", "sfx": "rain", "sfx_strength": 1}},
     {{"page": 7, "panel": 1, "text": "...", "emotion": "fight", "intensity": 8, "music": "action", "sfx": "gunshot", "sfx_strength": 2}}
-  ]}}
-"page", "panel" and "panels" use the numbers shown in the reading (all start at 1). Segments must be in story order."##,
+  ],
+  "repeats": []}}
+"page", "panel" and "panels" use the numbers shown in the reading (all start at 1). Segments must be in story order. "repeats" lists the pages left out because they retell what the story so far already told (page numbers as in the reading), or stays empty."##,
         sfx = SFX_NAMES.join(", "),
         music = MUSIC_CUES.join(", "),
         kinds = TONE_KINDS.join(", "),
@@ -250,37 +257,127 @@ fn story_pages(read: &ChapterRead, transcript: Option<&Transcript>, pages: &[usi
     pages.iter().filter_map(|i| read.pages.iter().find(|p| p.index == *i)).filter(|p| story_page(p, transcript)).count()
 }
 
-/// Words a recap spends on `pages` story pages saying `lines` lines: about seven per line, and at
-/// least forty per story page for what is shown, as the recap channels do (~1100 words for a
-/// 30-page chapter of 140 lines), rounded to 50.
+/// Words a recap spends on `pages` story pages saying `lines` lines: about seven a line and four a
+/// story page for what is shown, as the top recap channels do (about 1,100 words, five minutes, for
+/// a 30-page chapter of 140 lines or a webtoon chapter of 110 lines on 100 slices), rounded to 50.
+/// The telling goes scene by scene, so many pages are told in passing or not at all.
 pub(crate) fn length_target(lines: usize, pages: usize) -> usize {
-    let words = (lines * 7).max(pages * 40) as f64;
-    ((words / 50.).round() as usize * 50).clamp(250, 2500)
+    let words = (lines * 7 + pages * 4) as f64;
+    ((words / 50.).round() as usize * 50).clamp(250, 2000)
 }
 
-/// Story pages of `content` that no segment tells: the video would cut them and the picture jump.
-fn untold_pages(read: &ChapterRead, transcript: Option<&Transcript>, content: &[usize], segs: &[StorySegment]) -> Vec<usize> {
-    content
-        .iter()
-        .copied()
-        .filter(|i| !segs.iter().any(|s| s.page == *i))
-        .filter(|i| read.pages.iter().find(|p| p.index == *i).is_some_and(|p| story_page(p, transcript)))
-        .collect()
-}
+/// A run of untold story pages is a dropped scene (not a compressed one) when it holds at least
+/// this share of the chapter's spoken lines, and at least [`HOLE_MIN_LINES`] of them...
+const HOLE_LINE_SHARE: f64 = 0.2;
+const HOLE_MIN_LINES: usize = 8;
+/// ...or at least this share of its story pages, and at least [`HOLE_MIN_PAGES`] of them.
+const HOLE_PAGE_SHARE: f64 = 0.25;
+const HOLE_MIN_PAGES: usize = 6;
 
-/// The request for the segments of story pages `missing` the voice-over left out: each gap with
-/// the lines spoken around it, so the new segments slot in and the telling flows.
-fn fill_prompt(read: &ChapterRead, transcript: Option<&Transcript>, brain: &Brain, segs: &[StorySegment], missing: &[usize]) -> String {
-    let mut s = format!(
-        "The voice-over of this chapter leaves out story pages {}. The video cuts a page without narration, so the picture jumps and the story has holes. Write the segments for THESE pages only (at least one each; a silent action page gets one short sentence on what happens), so each gap flows from the line before it to the line after it. Same voice, same rules, no repeats of the lines around the gap. Reply with JSON only: {{\"segments\": [{{\"page\": N, \"panel\": N, \"text\": \"...\", \"emotion\": \"other\", \"intensity\": 3, \"music\": \"calm\"}}]}}\n",
-        missing.iter().map(|p| (p + 1).to_string()).collect::<Vec<_>>().join(", ")
-    );
-    for &m in missing {
-        let before = segs.iter().filter(|g| g.page < m).last().map(|g| g.text.as_str()).unwrap_or("(the chapter starts here)");
-        let after = segs.iter().find(|g| g.page > m).map(|g| g.text.as_str()).unwrap_or("(the chapter ends here)");
-        s += &format!("\nGAP AT PAGE {}\nLINE BEFORE: {before}\nLINE AFTER: {after}\n", m + 1);
+/// Runs of story pages of `content` that no segment tells, apart from the `repeats` the writer
+/// left out on purpose (they retell the story so far), big enough to be a dropped scene: a stretch
+/// with a fifth of the chapter's lines or a quarter of its story pages. A page or a few left out
+/// are the telling going scene by scene; the video cuts them.
+pub(crate) fn story_holes(read: &ChapterRead, transcript: Option<&Transcript>, content: &[usize], segs: &[StorySegment], repeats: &[usize]) -> Vec<Vec<usize>> {
+    let (all_lines, all_pages) = (spoken_lines(read, transcript, content), story_pages(read, transcript, content));
+    let mut runs: Vec<Vec<usize>> = vec![];
+    let mut cur: Vec<usize> = vec![];
+    for &i in content {
+        if segs.iter().any(|s| s.page == i) || repeats.contains(&i) {
+            if !cur.is_empty() {
+                runs.push(std::mem::take(&mut cur));
+            }
+        } else if read.pages.iter().find(|p| p.index == i).is_some_and(|p| story_page(p, transcript)) {
+            cur.push(i);
+        }
     }
-    s += &format!("\nREADING OF THE MISSING PAGES:\n\n{}", digest(read, transcript, brain, missing));
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    runs.retain(|run| {
+        let lines = spoken_lines(read, transcript, run);
+        lines >= HOLE_MIN_LINES && lines as f64 >= all_lines as f64 * HOLE_LINE_SHARE || run.len() >= HOLE_MIN_PAGES && run.len() as f64 >= all_pages as f64 * HOLE_PAGE_SHARE
+    });
+    runs
+}
+
+/// The chapter read before `ch`: the one before it in the manga's reading order when `manga` has
+/// it, else the one before it in this run.
+fn chapter_before<'a>(manga: &'a [ChapterRef], run: &'a [ChapterRef], ch: &ChapterRef) -> Option<&'a ChapterRef> {
+    let same = |c: &ChapterRef| !c.chapter_id.is_empty() && c.chapter_id == ch.chapter_id || c.output_dir == ch.output_dir;
+    for list in [manga, run] {
+        if let Some(i) = list.iter().position(same) {
+            return i.checked_sub(1).map(|i| &list[i]);
+        }
+    }
+    None
+}
+
+/// `pages` (sorted) as runs of consecutive pages.
+fn runs_of(pages: &[usize]) -> Vec<Vec<usize>> {
+    let mut runs: Vec<Vec<usize>> = vec![];
+    for &p in pages {
+        match runs.last_mut() {
+            Some(r) if r.last().is_some_and(|l| l + 1 == p) => r.push(p),
+            _ => runs.push(vec![p]),
+        }
+    }
+    runs
+}
+
+/// Page runs as the reading numbers them: "4-9, 12".
+fn page_ranges(runs: &[Vec<usize>]) -> String {
+    runs.iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| if r.len() == 1 { (r[0] + 1).to_string() } else { format!("{}-{}", r[0] + 1, r[r.len() - 1] + 1) })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The pages an answer lists in "repeats" (numbers, or "4-9" ranges, as the reading numbers them)
+/// that are among `chunk_pages`, 0-based.
+pub(crate) fn parse_repeats(v: &Value, chunk_pages: &[usize]) -> Vec<usize> {
+    let mut out = vec![];
+    for r in v.get("repeats").and_then(Value::as_array).into_iter().flatten() {
+        let (a, b) = match r {
+            Value::Number(n) => match n.as_f64() {
+                Some(x) => (x, x),
+                None => continue,
+            },
+            Value::String(s) => {
+                let mut it = s.split(['-', '–']).map(|x| x.trim().parse::<f64>());
+                match (it.next(), it.next()) {
+                    (Some(Ok(a)), None) => (a, a),
+                    (Some(Ok(a)), Some(Ok(b))) => (a, b),
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        if a < 1.0 || b < a || b - a > 2000.0 {
+            continue;
+        }
+        out.extend((a as usize..=b as usize).map(|p| p - 1).filter(|p| chunk_pages.contains(p)));
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The request for the stretches of story `holes` the voice-over left out: each with the lines
+/// spoken around it, so the new segments slot in and the telling flows.
+fn fill_prompt(read: &ChapterRead, transcript: Option<&Transcript>, brain: &Brain, segs: &[StorySegment], holes: &[Vec<usize>]) -> String {
+    let mut s = format!(
+        "The voice-over of this chapter leaves out whole stretches of the story: pages {}. Tell what happens there in the same voice, scene by scene and compressed (a stretch may need only one to three segments on its key pages; not every page needs one), so the telling flows from the line before each gap to the line after it. If a stretch only retells what the story so far already told, give it no segments and list its pages in \"repeats\". Same rules, no repeats of the lines around the gaps. Reply with JSON only: {{\"segments\": [{{\"page\": N, \"panel\": N, \"text\": \"...\", \"emotion\": \"other\", \"intensity\": 3, \"music\": \"calm\"}}], \"repeats\": []}}\n",
+        page_ranges(holes)
+    );
+    for run in holes.iter().filter(|r| !r.is_empty()) {
+        let (a, b) = (run[0], run[run.len() - 1]);
+        let before = segs.iter().filter(|g| g.page < a).last().map(|g| g.text.as_str()).unwrap_or("(the chapter starts here)");
+        let after = segs.iter().find(|g| g.page > b).map(|g| g.text.as_str()).unwrap_or("(the chapter ends here)");
+        s += &format!("\nGAP AT PAGES {}\nLINE BEFORE: {before}\nLINE AFTER: {after}\n", page_ranges(std::slice::from_ref(run)));
+    }
+    s += &format!("\nREADING OF THE MISSING PAGES:\n\n{}", digest(read, transcript, brain, &holes.concat()));
     s
 }
 
@@ -464,10 +561,11 @@ fn story_request(model: &ModelChoice, system: &str, prompt: String, ch: &Chapter
     req
 }
 
-/// The pages of `chunk` after the last one the answer narrated, when a real share of what the
-/// chunk says (over 15% of its lines) is still untold: the writer stopped early.
-fn untold(read: &ChapterRead, transcript: Option<&Transcript>, chunk: &[usize], segs: &[StorySegment]) -> Option<Vec<usize>> {
-    let reached = segs.iter().map(|s| s.page).max()?;
+/// The pages of `chunk` after the last one the answer narrated (or left out as a repeat of the
+/// story so far), when a real share of what the chunk says (over 15% of its lines) is still
+/// untold: the writer stopped early.
+fn untold(read: &ChapterRead, transcript: Option<&Transcript>, chunk: &[usize], segs: &[StorySegment], repeats: &[usize]) -> Option<Vec<usize>> {
+    let reached = segs.iter().map(|s| s.page).chain(repeats.iter().copied()).max()?;
     let rest: Vec<usize> = chunk.iter().copied().filter(|p| *p > reached).collect();
     let (all, left) = (spoken_lines(read, transcript, chunk), spoken_lines(read, transcript, &rest));
     (!rest.is_empty() && left * 100 > all * 15).then_some(rest)
@@ -540,6 +638,29 @@ pub(crate) async fn write_story_with(
             .map_err(|e| anyhow!(e))?;
             save_read(ch, &read)?;
         }
+        // Pages that repeat the chapter before it (the same art again: a chapter opening on the
+        // last one's ending, a prologue told again) are never told twice. A chapter that is the
+        // chapter before again (another group's upload of it) is left out whole.
+        let repeated: Vec<usize> = match chapter_before(manga, chapters, ch) {
+            Some(prev) => {
+                let (this_dir, prev_dir) = (panels_dir(ch), panels_dir(prev));
+                match tokio::task::spawn_blocking(move || crate::repeats::repeats_between(&this_dir, &prev_dir)).await.unwrap_or(Repeats::None) {
+                    Repeats::Chapter => {
+                        progress(Progress::Log(format!(
+                            "{}: its pages are the pages of {} again (the same chapter from another source), so it is left out of the story. Untick one of the two for the recap.",
+                            ch.label, prev.label
+                        )));
+                        continue;
+                    }
+                    Repeats::Pages(pages) => {
+                        progress(Progress::Log(format!("{}: pages {} repeat {}, so they are left out.", ch.label, page_ranges(&runs_of(&pages)), prev.label)));
+                        pages
+                    }
+                    Repeats::None => vec![],
+                }
+            }
+            None => vec![],
+        };
         // Who is who first, so one person is never told as several strangers.
         let before = brain.lock().unwrap().clone();
         match cast::check_cast(llm, model, ch, &mut read, &before, &so_far, cancel).await {
@@ -562,7 +683,7 @@ pub(crate) async fn write_story_with(
         }
         let transcript = load_transcript(ch);
         let snapshot = brain.lock().unwrap().clone();
-        let content: Vec<usize> = read.pages.iter().filter(|p| has_content(p, transcript.as_ref())).map(|p| p.index).collect();
+        let content: Vec<usize> = read.pages.iter().filter(|p| has_content(p, transcript.as_ref()) && !repeated.contains(&p.index)).map(|p| p.index).collect();
         let mut story = Story { styles: styles.to_vec(), model: label.clone(), ..Default::default() };
         let sizes: Vec<(usize, usize)> = content.iter().map(|&i| (i, digest(&read, transcript.as_ref(), &snapshot, &[i]).len())).collect();
         let mut parts: std::collections::VecDeque<(Vec<usize>, bool)> = plan_parts(&sizes, part_budget(model)).into_iter().map(|p| (p, false)).collect();
@@ -570,6 +691,10 @@ pub(crate) async fn write_story_with(
         let mut done = 0;
         let mut follow_ups = 0;
         let very_start = so_far.is_empty();
+        // The story as it stood before this chapter, and the pages the writer left out because they
+        // retell it (a prologue told again, a chapter opening on the last one's ending).
+        let told_before = so_far.clone();
+        let mut repeats: Vec<usize> = vec![];
         let target = |pages: &[usize]| length_target(spoken_lines(&read, transcript.as_ref(), pages), story_pages(&read, transcript.as_ref(), pages));
         // The subscribe reminder this chapter carries, if a mark of the manga's running time falls
         // in it: at that share of its content pages, asked of the part that holds it.
@@ -612,7 +737,7 @@ pub(crate) async fn write_story_with(
             }
             prompt += &format!("\nREADING OF {}:\n\n{}", if n_parts == 1 && !carry_on { "THE CHAPTER" } else { "THESE PAGES" }, digest(&read, transcript.as_ref(), &snapshot, chunk));
             prompt += match (first, very_start) {
-                (true, true) => "Nothing has been told yet: these pages begin the story. Open it the way a great storyteller would, with one strong, story-driven first line (who the hero is, or what is at stake), then tell the pages in order. Do not jump ahead to later events and do not introduce the video or the manga. Set up the world and the hero clearly (who they are, what they want, what the world's rules are), because everything after builds on it. Include a good \"title\". ",
+                (true, true) => "Nothing has been told yet: these pages begin the story. Open with the hero, the way the recap channels do: one or two strong lines on who they are and what makes their story worth following (\"Arhan was once the strongest swordsman alive. Now he cannot even lift a sword.\"), then tell the pages in order. Do not jump ahead to later events and do not introduce the video or the manga. Set up the world and the hero clearly (who they are, what they want, what the world's rules are), because everything after builds on it. Include a good \"title\". ",
                 (true, false) => "The viewer has just heard the story so far, with no break: continue it seamlessly from where it stands, as the same telling. No recap of earlier events, no re-introducing what the viewer already knows, no \"previously\" or \"now, in chapter ...\". Include a good \"title\". ",
                 _ => "Carry straight on from the last lines already spoken. Keep the \"title\" the same as before or leave it empty. ",
             };
@@ -643,16 +768,21 @@ pub(crate) async fn write_story_with(
                         story.title = str_of(&v, "title");
                     }
                     let seg = parse_segments(&v, chunk, &read);
-                    if seg.is_empty() {
+                    let rep = parse_repeats(&v, chunk);
+                    if seg.is_empty() && rep.len() < chunk.len() {
                         progress(Progress::Log(format!("{}: pages {}-{} came back without usable segments.", ch.label, chunk[0] + 1, chunk[chunk.len() - 1] + 1)));
                     }
+                    if !rep.is_empty() {
+                        progress(Progress::Log(format!("{}: pages {} retell the story so far, so they are left out.", ch.label, page_ranges(&runs_of(&rep)))));
+                    }
                     // The writer stopped before the end of its pages: ask for the rest (twice at most).
-                    if let Some(rest) = untold(&read, transcript.as_ref(), chunk, &seg).filter(|_| follow_ups < 2) {
+                    if let Some(rest) = untold(&read, transcript.as_ref(), chunk, &seg, &rep).filter(|_| follow_ups < 2) {
                         follow_ups += 1;
                         progress(Progress::Log(format!("{}: the story stopped at page {}; writing the rest.", ch.label, rest[0])));
                         parts.push_front((rest, true));
                     }
                     story.segments.extend(seg);
+                    repeats.extend(rep);
                     let s = str_of(&v, "summary_so_far");
                     if !s.is_empty() {
                         so_far = truncate(&s, 2500);
@@ -675,14 +805,23 @@ pub(crate) async fn write_story_with(
             progress(Progress::Log(format!("{}: no narration produced.", ch.label)));
             continue;
         }
-        // Story pages the writer left out would be cut from the video: ask for them once.
-        let missing = untold_pages(&read, transcript.as_ref(), &content, &story.segments);
-        if !missing.is_empty() {
-            progress(Progress::Log(format!("{}: {} story pages had no narration; writing them.", ch.label, missing.len())));
-            let prompt = format!("MANGA: {}\nCHAPTER: {} (for your reference only, never say it)\n\nCAST:\n{}\n{}\n{}", snapshot.manga_title, ch.label, cast_text(&snapshot), who_is_who(&read), fill_prompt(&read, transcript.as_ref(), &snapshot, &story.segments, &missing));
+        // A whole stretch of story the writer dropped (not compressed, not a repeat) is a hole in
+        // the story: ask for it once. Pages left out here and there are cut from the video.
+        let holes = story_holes(&read, transcript.as_ref(), &content, &story.segments, &repeats);
+        if !holes.is_empty() {
+            progress(Progress::Log(format!("{}: pages {} had no narration; writing them.", ch.label, page_ranges(&holes))));
+            let prompt = format!(
+                "MANGA: {}\nCHAPTER: {} (for your reference only, never say it)\n\nCAST:\n{}\n{}\nSTORY SO FAR (before this chapter):\n{}\n\n{}",
+                snapshot.manga_title,
+                ch.label,
+                cast_text(&snapshot),
+                who_is_who(&read),
+                if told_before.is_empty() { "(this is the very beginning of the recap)" } else { &told_before },
+                fill_prompt(&read, transcript.as_ref(), &snapshot, &story.segments, &holes)
+            );
             match ask_json(llm, story_request(model, &system, prompt, ch), cancel).await {
                 Ok(Ok(v)) => {
-                    story.segments.extend(parse_segments(&v, &missing, &read));
+                    story.segments.extend(parse_segments(&v, &holes.concat(), &read));
                     story.segments.sort_by_key(|s| s.page);
                 }
                 Ok(Err(_)) => progress(Progress::Log(format!("{}: the missing pages came back without usable segments.", ch.label))),
