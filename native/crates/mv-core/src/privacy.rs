@@ -155,8 +155,16 @@ pub fn pending() -> Option<Session> {
 }
 
 /// The session has been handled (cleared or kept): forget its record.
+/// While private mode is on again (a phone can turn it back on while the PC's offer is still
+/// open) the record belongs to the live session, so answering the old offer must not delete it.
 pub fn finish() {
-    Record::shared().remove();
+    finish_at(&Record::shared(), active());
+}
+
+fn finish_at(rec: &Record, live: bool) {
+    if !live {
+        rec.remove();
+    }
 }
 
 fn note(e: Entry) {
@@ -315,6 +323,17 @@ pub fn human_bytes(b: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn answering_an_old_offer_keeps_a_live_sessions_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Record::at(dir.path().join("private-session.jsonl"));
+        rec.append(&Entry::Started { at: 1 }).unwrap();
+        finish_at(&rec, true);
+        assert!(rec.load().is_some(), "private mode is on again: keep the record");
+        finish_at(&rec, false);
+        assert_eq!(rec.load(), None, "idle: the answered offer forgets it");
+    }
 
     #[test]
     fn record_round_trips() {

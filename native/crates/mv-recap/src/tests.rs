@@ -973,3 +973,5 @@ fn a_caption_page_keeps_the_last_action_picture() {
     let img = |i: usize| beats["beats"][i]["panel_image"].as_str().unwrap().to_string();
     assert!(img(1).ends_with("p0000_00.jpg"), "the caption-only page shows the last action panel: {}", img(1));
 }
+
+mod story_retry_tests;

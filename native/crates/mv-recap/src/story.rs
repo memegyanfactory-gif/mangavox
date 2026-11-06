@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::brain::Brain;
 use crate::cast::{self, looks_only};
 use crate::json::{num_of, str_of};
-use crate::llm::{Patient, ask_json, is_cancelled, request, truncate, Llm};
+use crate::llm::{Patient, ask_story_json, is_cancelled, request, truncate, Llm};
 use crate::repeats::Repeats;
 use crate::store::*;
 use crate::transcript::format_line;
@@ -47,6 +47,14 @@ pub(crate) fn plan_parts(pages: &[(usize, usize)], budget: usize) -> Vec<Vec<usi
     }
     parts.retain(|p| !p.is_empty());
     parts
+}
+
+/// Puts a part that failed back at the front of `parts` as its two halves. The halves keep what the
+/// part was (a carry-on stays one), so the pages done so far are counted once.
+pub(crate) fn split_part(parts: &mut std::collections::VecDeque<(Vec<usize>, bool)>, chunk: &[usize], carry_on: bool) {
+    let (a, b) = chunk.split_at(chunk.len() / 2);
+    parts.push_front((b.to_vec(), carry_on));
+    parts.push_front((a.to_vec(), carry_on));
 }
 
 pub fn style_hint(style: &str) -> &'static str {
@@ -615,6 +623,8 @@ pub(crate) async fn write_story_with(
     let system = story_system(styles);
     let label = format!("{}/{}", model.provider.as_str(), model.model);
     let mut results: Vec<(String, Story)> = vec![];
+    // Chapters the AI answered for but that ended with no narration at all.
+    let mut empty: Vec<String> = vec![];
     let mut so_far = String::new();
     let mut timeline = Timeline::load(manga, chapters);
 
@@ -687,7 +697,8 @@ pub(crate) async fn write_story_with(
         let mut story = Story { styles: styles.to_vec(), model: label.clone(), ..Default::default() };
         let sizes: Vec<(usize, usize)> = content.iter().map(|&i| (i, digest(&read, transcript.as_ref(), &snapshot, &[i]).len())).collect();
         let mut parts: std::collections::VecDeque<(Vec<usize>, bool)> = plan_parts(&sizes, part_budget(model)).into_iter().map(|p| (p, false)).collect();
-        let n_parts = parts.len();
+        // Grows when a part that failed is split in two.
+        let mut n_parts = parts.len();
         let mut done = 0;
         let mut follow_ups = 0;
         let very_start = so_far.is_empty();
@@ -744,6 +755,8 @@ pub(crate) async fn write_story_with(
             if last {
                 prompt += "The story goes on after these pages: tell them through to the last page and end on its last beat, so what comes next flows straight on. No wrap-up, no cliffhanger line, no \"end of chapter\", \"to be continued\" or sign-off. ";
             }
+            // Kept so a part that is split and asked again still carries its reminder.
+            let reminder_before = reminder;
             if let Some(at) = reminder.filter(|at| !carry_on && (done..done + chunk.len()).contains(at)) {
                 prompt += &call_to_action((at - done) as f64 / chunk.len() as f64);
                 reminder = None;
@@ -751,15 +764,16 @@ pub(crate) async fn write_story_with(
             prompt += "First list for yourself the scenes of these pages, then write the voice-over through to the last page. Reply with the JSON object only.";
 
             let req = story_request(model, &system, prompt, ch);
-            let answer = match ask_json(llm, req, cancel).await {
+            let answer = match ask_story_json(llm, req, cancel).await {
                 Ok(a) => a,
                 Err(e) if is_cancelled(&e) => {
                     progress(Progress::Failed("Cancelled".into()));
                     return Err(e);
                 }
                 Err(e) => {
-                    progress(Progress::Failed(format!("{}: {e}", ch.label)));
-                    return Err(e);
+                    let msg = format!("{}: the AI did not answer after three tries ({e:#}). Try the chapter again.", ch.label);
+                    progress(Progress::Failed(msg.clone()));
+                    return Err(anyhow!(msg));
                 }
             };
             match answer {
@@ -769,6 +783,15 @@ pub(crate) async fn write_story_with(
                     }
                     let seg = parse_segments(&v, chunk, &read);
                     let rep = parse_repeats(&v, chunk);
+                    // A part that gave nothing usable is tried again in two halves, so a bad moment for
+                    // one long answer does not cost the chapter.
+                    if seg.is_empty() && rep.len() < chunk.len() && chunk.len() > 1 {
+                        progress(Progress::Log(format!("{}: pages {}-{} came back without usable segments; trying them in two halves.", ch.label, chunk[0] + 1, chunk[chunk.len() - 1] + 1)));
+                        split_part(&mut parts, chunk, carry_on);
+                        n_parts += 1;
+                        reminder = reminder_before;
+                        continue;
+                    }
                     if seg.is_empty() && rep.len() < chunk.len() {
                         progress(Progress::Log(format!("{}: pages {}-{} came back without usable segments.", ch.label, chunk[0] + 1, chunk[chunk.len() - 1] + 1)));
                     }
@@ -788,9 +811,16 @@ pub(crate) async fn write_story_with(
                         so_far = truncate(&s, 2500);
                     }
                 }
+                Err(raw) if chunk.len() > 1 => {
+                    progress(Progress::Log(format!("{}: the AI's answer for pages {}-{} was not a story ({}); trying them in two halves.", ch.label, chunk[0] + 1, chunk[chunk.len() - 1] + 1, truncate(&raw, 160))));
+                    split_part(&mut parts, chunk, carry_on);
+                    n_parts += 1;
+                    reminder = reminder_before;
+                    continue;
+                }
                 Err(raw) => {
                     // Never leave a hole in the story: the chapter fails and shows as an issue to retry.
-                    let msg = format!("{}: the AI's answer for pages {}-{} was not a story ({})", ch.label, chunk[0] + 1, chunk[chunk.len() - 1] + 1, truncate(&raw, 160));
+                    let msg = format!("{}: the AI could not tell page {} even on its own; its answer was not a story ({}). Try the chapter again.", ch.label, chunk[0] + 1, truncate(&raw, 160));
                     progress(Progress::Failed(msg.clone()));
                     return Err(anyhow!(msg));
                 }
@@ -803,6 +833,7 @@ pub(crate) async fn write_story_with(
 
         if story.segments.is_empty() {
             progress(Progress::Log(format!("{}: no narration produced.", ch.label)));
+            empty.push(ch.label.clone());
             continue;
         }
         // A whole stretch of story the writer dropped (not compressed, not a repeat) is a hole in
@@ -819,7 +850,7 @@ pub(crate) async fn write_story_with(
                 if told_before.is_empty() { "(this is the very beginning of the recap)" } else { &told_before },
                 fill_prompt(&read, transcript.as_ref(), &snapshot, &story.segments, &holes)
             );
-            match ask_json(llm, story_request(model, &system, prompt, ch), cancel).await {
+            match ask_story_json(llm, story_request(model, &system, prompt, ch), cancel).await {
                 Ok(Ok(v)) => {
                     story.segments.extend(parse_segments(&v, &holes.concat(), &read));
                     story.segments.sort_by_key(|s| s.page);
@@ -846,7 +877,11 @@ pub(crate) async fn write_story_with(
     }
 
     if results.is_empty() {
-        let msg = "No story could be written. Read the chapters first, then try again.".to_string();
+        let msg = if empty.is_empty() {
+            "No story could be written. Read the chapters first, then try again.".to_string()
+        } else {
+            format!("{}: the AI wrote nothing for this chapter. Try again, or pick another AI model.", empty.join(", "))
+        };
         progress(Progress::Failed(msg.clone()));
         return Err(anyhow!(msg));
     }

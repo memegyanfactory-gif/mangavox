@@ -353,10 +353,10 @@ def plan_video(video, clips, w, h, total, ass_filter=None, codec=None, out=None)
     card = video.get("chapter_card")
     if card:
         bar = vg.letterbox_bar(w, h) if (look or {}).get("letterbox") else 0
-        n = round(vg.CARD_OUT * FPS)
-        x, y = vg.chapter_card_motion(card, w, h, bar)
-        alpha = fade_in(n, vg.CARD_IN, round(vg.CARD_EASE * 0.7, 3)) * fade_out(n, vg.CARD_OUT - vg.CARD_FADE, vg.CARD_FADE)
-        plan["card"] = {"src": card[0], "on": [0, n], "pos": [pack(even(series(x, n))), pack(even(series(y, n)))], "alpha": pack(alpha, 4)}
+        # The badge is a PNG sequence with its fade, pop and ring baked in: frame i of it goes
+        # at a fixed place on the chapter's frame i.
+        x, y = vg.chapter_card_pos(w, h, bar)
+        plan["card"] = {"src": card[0], "on": [0, int(card[1])], "pos": [int(x), int(y)]}
     return plan
 
 

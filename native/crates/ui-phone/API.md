@@ -131,7 +131,8 @@ Known limits (design tradeoffs, not bugs):
   watcher enqueues each downloading chapter once it is saved. Shown in `/api/activity` as kind `studio`.
 - `/api/manga/<id>` also returns `"source"`, `"in_library"`, `"favorite"`.
 - `GET /api/privacy` -> `{ "private" }`; `POST /api/privacy` body `{ "on" }` -> `{ "private" }`: the desktop's private
-  mode (one switch for the PC and every phone). Turning it off opens the clean-up offer on the PC. While it is on,
+  mode (one switch for the PC and every phone). `on` is the wanted state, checked again on the PC's UI thread, so
+  a request for the state it already has changes nothing (it never flips it back). Turning it off opens the clean-up offer on the PC. While it is on,
   nothing the phone reads or watches is recorded (no history, resume points, Continue Reading / Watching, taste),
   exactly as on the desktop, and the phone keeps no reading places or last page of its own. `/api/activity` carries
   `"private"` too, so a phone follows a switch made on the PC.
@@ -151,13 +152,32 @@ Known limits (design tradeoffs, not bugs):
    `cover_thumb_16x9.jpg` / `cover_local_16x9.jpg` in its Studio folder).
 - Until `mv_recap::media::chapter_media` builds, the module reads these files itself with the same meaning.
 
+### History (api_history.rs)
+- `GET /api/history?kind=manga|watch&type=&offset=&limit=` -> `{ "kind", "items": [item], "total": n, "next": offset|null, "private": bool }`,
+  newest first, same data as the desktop History pages (manga: one entry per manga; watch: one resume point per title).
+  `limit` 1..100 (default 30); `next` is the `offset` of the following page, `null` at the end; `total` counts every
+  entry of that kind. `type` (watch only): `anime` | `movie` | `series`, empty = all. 400 for any other `kind` / `type`.
+  Manga item: `{ "kind": "manga", "key", "manga_id", "chapter_id", "title", "chapter": "Ch. 12 - Title", "cover": url|null,
+  "page": n, "at": unix ms|null }` (open `#/read/<chapter_id>`). Watch item: `{ "kind": "anime"|"movie"|"series", "key",
+  "media_id", "mal" (anime) | "imdb" (movie, series), "title", "poster": http(s) url|null (load it through `/api/img`),
+  "season": n|null, "episode": n|null, "position", "duration" (seconds), "progress": 0..1, "completed", "at": unix ms }`.
+  Entries the desktop cannot open (an unknown media id) are left out. Showing history works in private mode; nothing is recorded.
+- `POST /api/history/remove` `{ "kind": "manga"|"watch", "id": item.key }` -> `{}`: the desktop's remove button (the
+  manga's reading entry / the title's resume point and play events). Removing is permanent (no Undo on the phone).
+
 ### Activity (activity.rs)
 - `GET /api/activity` -> `{ "now": unix ms (PC clock), "busy": n, "manga": [card], "events": [event], "private" }`, read-only,
   `no-store`. One card per manga: `{ "id", "title", "cover": url|null, "state", "tasks": [task] }`; a task is
   `{ "key", "kind": "download"|"generate"|"voice"|"read"|"export", "label", "state":
   "running"|"limit"|"waiting"|"paused"|"failed"|"done", "line", "progress": 0..1, "at", "total" (chapters; 0 =
   not counted), "steps": [{ "name": "Read".."Video", "state": "pending"|"skipped"|"running"|"done"|"failed" }]
-  (Generate), "resume_at": unix s|null (AI limit), "error", "cancel": [job ids for /api/studio/jobs/<id>/cancel] }`.
+  (Generate), "resume_at": unix s|null (AI limit), "error", "cancel": [job ids for /api/studio/jobs/<id>/cancel],
+  "eta": null | { "secs": u64|null, "text", "done_at": unix ms (PC clock)|null } }`. `eta` is set on a `generate`
+  task that still has chapters to make (null on everything else): the time until all of that manga's queued
+  chapters are done, counting the work queued ahead of it, learned from how long each step really took on this PC.
+  `secs` is null and `text` is "Estimating time left…" until there is a measured basis; otherwise `text` is
+  e.g. "About 2 h 10 min left", "About 45 min left" or "Less than a minute left", and when the queue is on hold
+  "About 2 h left once resumed" (then `done_at` is null). `done_at` = now + secs on the PC clock.
   Sources: the download queue (ui-manga), the Generate queue and Python jobs (ui-studio pipeline / service),
   Studio's AI run, exports and joins. Finished tasks stay 30 min. `events` (last 40, oldest first):
   `{ "id", "at", "manga_id", "title", "kind", "label", "state": "done"|"failed"|"limit", "text" }`, logged on
@@ -182,7 +202,19 @@ Known limits (design tradeoffs, not bugs):
   `A = { "id": "<mal id>", "mal", "kind": "anime", "title","year","description","genres":[..],"score",
          "poster","background","episodes": n|null, "format": "TV"|"Movie"|.., "status" }`
 - `GET /api/anime/search?q=` -> `[A]`
-- `GET /api/anime/<mal>` -> `A + { "episodes_list": [{ "episode","title","thumbnail"|null,"aired"|null,"filler": bool }], "next_page": n|null }`
+- `GET /api/anime/<mal>` -> `A + { "episodes_list": [{ "episode","title","thumbnail"|null,"aired"|null,"filler": bool }], "next_page": n|null,
+  "seasons": [{ "mal_id": "<mal id>", "label": "Season 2", "title", "episodes": n|null, "year": n|null, "current": bool }],
+  "seasons_pending": bool }`
+  `seasons` lists the show's numbered seasons (TV, TV short and ONA entries joined by sequel / prequel
+  relations; movies, OVAs and specials left out) in air order; `label` is "Season N" (or "Season N Part 2" for a
+  split season); `current` marks the entry asked for. It is `[]` when the show has one season or the entry is not
+  one of them (a movie). Opening a later season directly returns the whole list with that one `current`. Every
+  season is its own MAL entry: its `mal_id` goes into `/api/anime/<mal>`, `/api/anime/<mal>/episodes`,
+  `/api/anime/play` and `POST /api/watch` (`kind: "anime"`) with episode numbers counted from 1 in that season
+  (sources are looked up with that season's own Kitsu id, or the IMDb season and episode worked out from the
+  earlier seasons' episode counts). The list needs AniList. The response waits 2 seconds for it at most; when it is
+  still loading, `seasons` is `[]` and `seasons_pending` is `true`: ask again a few seconds later (cached for
+  hours). `seasons_pending: false` with `[]` means one season (or the lookup failed).
 - `GET /api/anime/<mal>/episodes?page=n` -> `{ "episodes": [...], "next_page": n|null }` (100 per page)
 - `POST /api/anime/play` body `{ "mal","title","episode"? }` -> `{}` : plays on the PC (like /api/movies/play).
 
@@ -201,7 +233,8 @@ Known limits (design tradeoffs, not bugs):
    Safari cannot play the `url` stream of a remux / transcode); `url` stays for older apps.
    A source may also be a video file on the PC when the PC's own source list has one (never a phone-sent
    path): played `direct` with Range or through HLS.
-   Up to 3 sources are tried within 90 s (torrents wait for metadata). Errors: 400 bad ids, 404 no
+   Up to 3 sources are tried within 90 s, 40 s each (torrents wait for metadata; one with no peers is
+   dropped for the next; sources with 0 seeders go last, then thin swarms). Errors: 400 bad ids, 404 no
    sources / no addons, 503 `"Install FFmpeg on your PC to watch this on your phone"`, 504 nothing
    started in time, 502 otherwise. Records a "play" event (Continue Watching on the PC).
    A device keeps at most 3 sessions; a 4th stops the oldest.

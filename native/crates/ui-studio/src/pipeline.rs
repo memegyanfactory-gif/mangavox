@@ -796,6 +796,41 @@ fn hand_on(id: u64, dirty: bool, next: usize, lane: &tokio::sync::mpsc::Unbounde
     }
 }
 
+/// How long a failed AI step rests before its one automatic retry.
+const STEP_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+/// A failed Read or Story is tried once more by itself, unless the failure is not a hiccup: a missing
+/// setup (retrying cannot fix it) or a usage limit (those are waited out inside the step).
+/// A redone Read is not retried: it would read every page again, not just the ones that failed.
+fn worth_retrying(step: Step, redo: bool, error: &str) -> bool {
+    let setup = [NO_MODEL, NO_SETUP, NO_READ, NO_STORY];
+    (step == Step::Story || (step == Step::Read && !redo)) && !setup.iter().any(|s| error.starts_with(s)) && !mv_ai::limit::is_limit(error)
+}
+
+/// Sleeps for `total` while the item is still meant to run; false when it stopped meanwhile.
+async fn rest_while_running(id: u64, total: Duration) -> bool {
+    let tick = Duration::from_secs(1);
+    let mut left = total;
+    while left > Duration::ZERO {
+        if !still_running(id) {
+            return false;
+        }
+        tokio::time::sleep(tick.min(left)).await;
+        left = left.saturating_sub(tick);
+    }
+    still_running(id)
+}
+
+/// A step that failed goes into the app log with its chapter and reason, so the cause can still be
+/// found after the queue is cleared. `retrying`: it is about to be tried once more.
+fn log_failure(item: &QueueItem, step: Step, error: &str, retrying: bool) {
+    let what = if retrying { "failed, trying once more" } else { "failed" };
+    mv_core::logging::global().warn(
+        "studio",
+        &format!("{} step {what}: {} / {}: {}", step.label(), item.chapter.manga_title, item.chapter.label(), error),
+    );
+}
+
 /// The item is still meant to run (not paused, removed, or held with the queue).
 fn still_running(id: u64) -> bool {
     read(|q| !q.paused && q.get(id).is_some_and(|i| i.state == ItemState::Running))
@@ -848,8 +883,26 @@ async fn run_steps(id: u64, steps: std::ops::Range<usize>, mut dirty: bool) -> O
             }
             tokio::time::sleep(EXPORT_WAIT).await;
         }
+        let redo = item.force == Some(step.index());
+        clock_start(id, step);
         edit(|q| q.set_step(id, step, StepState::Running));
-        let out = run_step(id, &item, step, &facts, dirty, item.force == Some(step.index())).await;
+        let mut out = run_step(id, &item, step, &facts, dirty, redo).await;
+        // The AI steps get one more go after a short rest: what fails there is usually a hiccup
+        // (the AI program exiting, a busy server), and what is already saved is kept.
+        if let Outcome::Failed(e) = &out {
+            if worth_retrying(step, redo, e) {
+                log_failure(&item, step, e, true);
+                clock_stop(id);
+                if rest_while_running(id, STEP_RETRY_WAIT).await {
+                    clock_start(id, step);
+                    out = run_step(id, &item, step, &facts, dirty, redo).await;
+                } else {
+                    // Paused, removed or stopped while resting: that is a stop, not a failure.
+                    out = Outcome::Stopped;
+                }
+            }
+        }
+        let took = clock_stop(id);
         touch(|q| {
             if let Some(it) = q.get_mut(id) {
                 it.job = None;
@@ -857,6 +910,12 @@ async fn run_steps(id: u64, steps: std::ops::Range<usize>, mut dirty: bool) -> O
         });
         match out {
             Outcome::Done => {
+                // Only a step that really ran long enough counts towards the time estimates.
+                if let Some(secs) = took {
+                    let units = step_units(step, &facts, redo, dirty);
+                    let manga = item.chapter.manga_id.clone();
+                    let _ = blocking(move || crate::eta::record(&manga, step.index(), secs, units)).await;
+                }
                 // What a step made is new, so the steps built from it are made again. The
                 // transcript only fills a gap (the story is written from the read).
                 dirty |= step != Step::Transcript;
@@ -871,6 +930,7 @@ async fn run_steps(id: u64, steps: std::ops::Range<usize>, mut dirty: bool) -> O
                 return None;
             }
             Outcome::Failed(e) => {
+                log_failure(&item, step, &e, false);
                 edit(|q| {
                     q.set_step(id, step, StepState::Failed);
                     if let Some(it) = q.get_mut(id) {
@@ -1045,6 +1105,156 @@ async fn music_step(ch: ChapterRef, reg_model: Option<(Arc<Registry>, Option<Mod
     }
 }
 
+// ---------------------------------------------------------------- time left
+
+/// When a step started running, to measure how long it really works.
+struct Clock {
+    step: usize,
+    since: std::time::Instant,
+    /// `run::waited()` at the start: AI usage-limit waits since then are not work.
+    waited: Duration,
+}
+
+static CLOCKS: Mutex<Vec<(u64, Clock)>> = Mutex::new(Vec::new());
+
+fn clock_start(id: u64, step: Step) {
+    let mut g = CLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(i, _)| *i != id);
+    g.push((id, Clock { step: step.index(), since: std::time::Instant::now(), waited: run::waited() }));
+}
+
+/// Seconds a step has really worked: its running time without the AI usage-limit waits (only the
+/// AI steps wait for those).
+fn worked(c: &Clock) -> f64 {
+    let wait = if c.step < AI_STEPS { run::waited().saturating_sub(c.waited) } else { Duration::ZERO };
+    c.since.elapsed().saturating_sub(wait).as_secs_f64()
+}
+
+/// Seconds the step really worked, or `None` when it was too short to be a measurement.
+fn clock_stop(id: u64) -> Option<f64> {
+    let clock = {
+        let mut g = CLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let at = g.iter().position(|(i, _)| *i == id)?;
+        g.remove(at).1
+    };
+    Some(worked(&clock)).filter(|s| *s >= 1.0)
+}
+
+/// Pages a step goes through: all of them, except a read that carries on from pages already read
+/// and narration that only voices the clips still missing. `dirty` is whether an earlier step just
+/// made something new (that makes the narration start over, like `run_step` does).
+fn step_units(step: Step, facts: &Facts, redo: bool, dirty: bool) -> f64 {
+    let total = facts.status.total_pages.max(1);
+    let left = |done: usize| total.saturating_sub(done).max(1);
+    let n = match step {
+        Step::Read if !redo => left(facts.status.read_pages),
+        Step::Audio if !(dirty || redo || facts.voice_changed) && facts.status.audio_files > 0 => left(facts.status.audio_files),
+        _ => total,
+    };
+    n as f64
+}
+
+/// What an item still has to make, worked out from the files when it was first seen.
+#[derive(Clone, Debug, PartialEq)]
+struct Needs {
+    until: usize,
+    force: Option<usize>,
+    todo: [bool; STEPS],
+    units: [f64; STEPS],
+}
+
+/// Which of the item's steps the runner will really run (the others are skipped), the way
+/// `run_steps` decides: a step that makes something new forces the ones after it.
+fn needs_from(it: &QueueItem, f: &Facts) -> Needs {
+    let (mut todo, mut units, mut dirty) = ([false; STEPS], [0.; STEPS], false);
+    for step in Step::ALL.iter().copied().filter(|s| s.index() <= it.until) {
+        let i = step.index();
+        let redo = it.force == Some(i);
+        units[i] = step_units(step, f, redo, dirty);
+        match it.steps[i] {
+            StepState::Done => dirty |= step != Step::Transcript,
+            StepState::Skipped => {}
+            _ => {
+                if plan(step, f, &it.format, dirty || redo).is_ok() {
+                    todo[i] = true;
+                    dirty |= step != Step::Transcript;
+                }
+            }
+        }
+    }
+    Needs { until: it.until, force: it.force, todo, units }
+}
+
+static NEEDS: Mutex<Vec<(u64, Needs)>> = Mutex::new(Vec::new());
+
+/// The needs of every item still to run (reads the files of items not seen before: blocking).
+fn needs_of(q: &Queue) -> Vec<(u64, Needs)> {
+    let unseen: Vec<QueueItem> = {
+        let mut g = NEEDS.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|(id, _)| q.get(*id).is_some_and(|i| i.state.active()));
+        let unseen: Vec<QueueItem> = q.items.iter().filter(|i| i.state.active() && !g.iter().any(|(id, n)| *id == i.id && n.until == i.until && n.force == i.force)).cloned().collect();
+        unseen
+    };
+    let fresh: Vec<(u64, Needs)> = unseen.iter().map(|it| (it.id, needs_from(it, &Facts::load(&it.chapter.chref())))).collect();
+    let mut g = NEEDS.lock().unwrap_or_else(|e| e.into_inner());
+    for (id, n) in fresh {
+        g.retain(|(i, _)| *i != id);
+        g.push((id, n));
+    }
+    g.clone()
+}
+
+/// One queue item as the estimate sees it (`None` once it is finished or failed). `needs`: what
+/// the files said it has to make; without it every step not yet made counts. `running`: the
+/// running step and the seconds it has worked; `waiting`: seconds the AI still waits for a limit.
+fn work_of(it: &QueueItem, needs: Option<&Needs>, running: Option<(usize, f64)>, waiting: f64) -> Option<crate::eta::Work> {
+    if !it.state.active() {
+        return None;
+    }
+    let mut todo = [false; STEPS];
+    for (i, t) in todo.iter_mut().enumerate().take(it.until.min(STEPS - 1) + 1) {
+        *t = match it.steps[i] {
+            StepState::Done | StepState::Skipped => false,
+            StepState::Running | StepState::Failed => true,
+            StepState::Pending => needs.is_none_or(|n| n.todo[i]),
+        };
+    }
+    let running = running
+        .filter(|(s, _)| it.state == ItemState::Running && todo[*s])
+        .map(|(step, elapsed)| crate::eta::Running { step, elapsed, wait_left: if step < AI_STEPS { waiting } else { 0. } });
+    Some(crate::eta::Work {
+        manga: it.chapter.manga_id.clone(),
+        todo,
+        units: needs.map_or([1.; STEPS], |n| n.units),
+        started: it.state == ItemState::Running,
+        running,
+        render_only: it.renders_only(),
+        held: it.state == ItemState::Paused,
+    })
+}
+
+/// Time left for every manga in the queue and for the whole queue, from the queue and the measured
+/// step times as they are now. The first call for a chapter reads its files, so call this off the
+/// UI thread.
+pub fn eta() -> crate::eta::Report {
+    let q = snapshot();
+    let needs = needs_of(&q);
+    let hist = crate::eta::history();
+    let clocks: Vec<(u64, usize, f64)> = CLOCKS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(id, c)| (*id, c.step, worked(c))).collect();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let ai_wait = run::snapshot().filter(|r| r.running()).and_then(|r| Some((r.chapter_id?, r.waiting?.1)));
+    let works: Vec<crate::eta::Work> = q
+        .items
+        .iter()
+        .filter_map(|it| {
+            let running = clocks.iter().find(|c| c.0 == it.id).map(|c| (c.1, c.2));
+            let waiting = ai_wait.as_ref().filter(|(ch, _)| *ch == it.chapter.id).map_or(0., |(_, until)| (*until - now).max(0) as f64);
+            work_of(it, needs.iter().find(|(id, _)| *id == it.id).map(|(_, n)| n), running, waiting)
+        })
+        .collect();
+    crate::eta::estimate(&works, q.paused, &|manga, step| hist.rate(manga, step))
+}
+
 // ---------------------------------------------------------------- activity (read-only)
 
 /// Studio's AI run (Read, Story, a page rewrite: `run`, private to this crate) as plain data,
@@ -1198,7 +1408,7 @@ mod waiting_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan, Added, Facts, ItemState, QChapter, Queue, StepState};
+    use super::{needs_from, plan, step_units, work_of, Added, Facts, ItemState, QChapter, Queue, StepState};
     use mv_recap::{PhaseStatus, Step};
 
     fn ch(id: &str) -> QChapter {
@@ -1366,6 +1576,51 @@ mod tests {
         assert_eq!(back.claim_next(), None);
         back.resume_all();
         assert!(back.claim_next().is_some());
+    }
+
+    #[test]
+    fn needs_follow_the_files_and_what_the_earlier_steps_make() {
+        let mut q = Queue::default();
+        q.add(ch("a"), Step::Video, None, "landscape", None);
+        // Read, transcript and story exist: only the voice, music and video are left.
+        let status = PhaseStatus { read_pages: 10, total_pages: 10, transcript: true, story: true, ..Default::default() };
+        let f = Facts { status, music_on: true, ..Default::default() };
+        let n = needs_from(&q.items[0], &f);
+        assert_eq!(n.todo, [false, false, false, true, true, true]);
+        // Nothing exists: everything runs, but the transcript is the read's own fill-in.
+        let n = needs_from(&q.items[0], &Facts { status: PhaseStatus { total_pages: 10, ..Default::default() }, ..Default::default() });
+        assert_eq!(n.todo, [true, false, true, true, false, true], "music off is skipped");
+        assert_eq!(n.units[0], 10.0);
+        // A half-read chapter only counts the pages still to read.
+        let part = Facts { status: PhaseStatus { read_pages: 4, total_pages: 10, ..Default::default() }, ..Default::default() };
+        assert_eq!(needs_from(&q.items[0], &part).units[0], 6.0);
+    }
+
+    #[test]
+    fn work_counts_only_what_is_left() {
+        let mut q = Queue::default();
+        q.add(ch("a"), Step::Audio, None, "landscape", None);
+        let id = q.claim_next().unwrap();
+        q.set_step(id, Step::Read, StepState::Done);
+        q.set_step(id, Step::Transcript, StepState::Skipped);
+        q.set_step(id, Step::Story, StepState::Running);
+        let w = work_of(&q.items[0], None, Some((2, 5.0)), 0.0).unwrap();
+        assert_eq!(w.todo, [false, false, true, true, false, false], "up to Audio; Music and Video are not asked for");
+        assert!(w.started && w.running.is_some_and(|r| r.step == 2 && r.elapsed == 5.0));
+        // A step that is not the running one has no clock.
+        assert!(work_of(&q.items[0], None, Some((0, 5.0)), 0.0).unwrap().running.is_none());
+        q.items[0].state = ItemState::Done;
+        assert!(work_of(&q.items[0], None, None, 0.0).is_none());
+    }
+
+    #[test]
+    fn narration_counts_only_the_clips_still_missing() {
+        let part = Facts { status: PhaseStatus { total_pages: 10, audio_files: 8, ..Default::default() }, ..Default::default() };
+        assert_eq!(step_units(Step::Audio, &part, false, false), 2.0);
+        assert_eq!(step_units(Step::Audio, &part, true, false), 10.0, "a redo voices everything");
+        assert_eq!(step_units(Step::Audio, &part, false, true), 10.0, "a new story voices everything");
+        let none = Facts { status: PhaseStatus { total_pages: 10, ..Default::default() }, ..Default::default() };
+        assert_eq!(step_units(Step::Audio, &none, false, false), 10.0);
     }
 
     #[test]

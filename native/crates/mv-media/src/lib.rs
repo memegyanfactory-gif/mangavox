@@ -8,9 +8,11 @@ pub mod episode_art;
 pub mod error;
 pub mod image_cache;
 pub mod jikan;
+pub mod seasons;
 pub mod skip_times;
 pub mod stremio;
 pub mod stream_utils;
+pub mod title_match;
 pub mod types;
 mod util;
 

@@ -84,6 +84,8 @@ pub struct Sources {
     pub manga: HashMap<String, (String, bool)>,
     /// Chapter id -> manga id, for AI runs and Python jobs.
     pub chapters: HashMap<String, String>,
+    /// Time left for the Generate queue, per manga (worked out where the queues are read).
+    pub eta: ui_studio::eta::Report,
 }
 
 // ---------------------------------------------------------------- output
@@ -94,6 +96,23 @@ pub struct StepChip {
     pub name: &'static str,
     /// "pending", "skipped", "running", "done" or "failed".
     pub state: &'static str,
+}
+
+/// Time left for a Generate task (the same numbers as the desktop).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TaskEta {
+    /// Seconds left; null while it is still being estimated.
+    pub secs: Option<u64>,
+    /// "About 2 h 10 min left", "Estimating time left…", "About 2 h left once resumed".
+    pub text: String,
+    /// When it should be done, unix milliseconds on the PC; null while estimating or on hold.
+    pub done_at: Option<u64>,
+}
+
+impl TaskEta {
+    fn new(line: ui_studio::eta::Line, now_ms: u64) -> Self {
+        Self { secs: line.secs, text: line.text(), done_at: line.done_at_ms(now_ms) }
+    }
 }
 
 /// One kind of work on one manga.
@@ -121,6 +140,8 @@ pub struct Task {
     pub error: Option<String>,
     /// Job ids `/api/studio/jobs/{id}/cancel` takes to stop this work.
     pub cancel: Vec<String>,
+    /// Generate while chapters are still to make: the time left; null for everything else.
+    pub eta: Option<TaskEta>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -239,7 +260,7 @@ fn step_state(s: StepState) -> &'static str {
 }
 
 fn task(key: String, kind: &'static str, label: &'static str, state: &'static str, line: String, progress: f32) -> Task {
-    Task { key, kind, label, state, line, progress: progress.clamp(0., 1.), at: 0, total: 0, steps: vec![], resume_at: None, error: None, cancel: vec![] }
+    Task { key, kind, label, state, line, progress: progress.clamp(0., 1.), at: 0, total: 0, steps: vec![], resume_at: None, error: None, cancel: vec![], eta: None }
 }
 
 // ---------------------------------------------------------------- runs
@@ -411,6 +432,9 @@ fn generate_task(manga_id: &str, items: &[&QueueItem], src: &Sources) -> Task {
     t.total = total;
     t.steps = steps;
     t.cancel = active.iter().map(|i| format!("p{}", i.id)).collect();
+    if !active.is_empty() {
+        t.eta = src.eta.of(manga_id).map(|l| TaskEta::new(l, wall_ms()));
+    }
     if failed > 0 && t.error.is_none() {
         t.error = Some(format!("{failed} chapter{} failed", plural(failed)));
     }
@@ -744,6 +768,8 @@ async fn gather() -> Sources {
     tokio::task::spawn_blocking(move || {
         let q = pipeline::snapshot();
         let mut s = Sources { downloads, queue: q.items, held: q.paused, interrupted: q.interrupted, jobs: service::snapshot(), ai: pipeline::ai_activity(), exports: pipeline::exports(), joins: crate::api_studio::recap_activity(), chains: crate::studio_chain::activity(), ..Default::default() };
+        // Reads the chapters' files the first time it sees them, so it runs here, off the server's threads.
+        s.eta = pipeline::eta();
         lookup(&mut s);
         s
     })
@@ -906,6 +932,25 @@ mod tests {
         let mut ok = dl("a");
         (ok.finished, ok.done) = (true, 4);
         assert_eq!((download_task(&ok).state, download_task(&ok).line.as_str()), ("done", "4 chapters saved for offline reading"));
+    }
+
+    #[test]
+    fn generate_carries_the_time_left() {
+        use ui_studio::eta::{Line, Report};
+        let mut src = Sources { queue: vec![item(1, "a", ItemState::Running, 3), item(2, "b", ItemState::Queued, 0)], ..Default::default() };
+        // Nothing measured yet: still estimating, with no finish time.
+        src.eta = Report { manga: HashMap::from([("a".to_string(), Line { secs: None, paused: false })]), ..Default::default() };
+        let cards = build(&src, &mut Runs::new());
+        let e = card(&cards, "a").tasks[0].eta.clone().unwrap();
+        assert_eq!((e.secs, e.text.as_str(), e.done_at), (None, "Estimating time left…", None));
+        assert!(card(&cards, "b").tasks[0].eta.is_none(), "a manga the estimate does not know has none");
+        src.eta.manga.insert("a".to_string(), Line { secs: Some(7500), paused: false });
+        let cards = build(&src, &mut Runs::new());
+        let e = card(&cards, "a").tasks[0].eta.clone().unwrap();
+        assert_eq!((e.secs, e.text.as_str()), (Some(7500), "About 2 h 5 min left"));
+        assert!(e.done_at.is_some());
+        let json = serde_json::to_value(&card(&cards, "a").tasks[0]).unwrap();
+        assert_eq!(json["eta"]["secs"], 7500);
     }
 
     #[test]

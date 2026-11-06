@@ -19,6 +19,91 @@ use crate::pipeline::{self, ItemState, QueueItem, StepState};
 use crate::run::RunKind;
 use crate::widgets::{card, phase_icon};
 
+/// How often the time left is worked out again while Generate has work (it only needs minutes).
+const ETA_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bookkeeping for the page's time-left estimate.
+#[derive(Default)]
+pub(crate) struct EtaState {
+    /// A worker is computing it.
+    busy: bool,
+    /// The queue version and moment it was last computed for.
+    at: Option<(u64, std::time::Instant)>,
+}
+
+impl StudioPage {
+    /// Keeps `self.eta` fresh while Generate has work: when the queue changed, and every few
+    /// seconds so the time counts down. The work (it reads the chapters' files the first time) runs
+    /// off the UI thread; with nothing queued it is cleared and nothing runs.
+    pub(crate) fn eta_check(&mut self, cx: &mut Context<Self>) {
+        if self.queue.active() == 0 {
+            if !self.eta.manga.is_empty() || self.eta.total.secs.is_some() {
+                self.eta = Default::default();
+                self.eta_state.at = None;
+                cx.notify();
+            }
+            return;
+        }
+        let version = pipeline::version();
+        let due = self.eta_state.at.is_none_or(|(v, t)| v != version || t.elapsed() >= ETA_EVERY);
+        if self.eta_state.busy || !due {
+            return;
+        }
+        self.eta_state.busy = true;
+        self.eta_state.at = Some((version, std::time::Instant::now()));
+        cx.spawn(async move |this, cx| {
+            let report = mv_ui::bg::blocking(pipeline::eta).await;
+            let _ = this.update(cx, |page, cx| {
+                page.eta_state.busy = false;
+                if let Ok(report) = report {
+                    if report != page.eta {
+                        page.eta = report;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The manga with chapters still to make, in queue order, and their time left.
+    pub(crate) fn eta_by_manga(&self) -> Vec<(String, crate::eta::Line)> {
+        let mut seen: Vec<&str> = vec![];
+        let mut out = vec![];
+        for it in self.queue.items.iter().filter(|i| i.state.active()) {
+            let id = it.chapter.manga_id.as_str();
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            if let Some(line) = self.eta.of(id) {
+                out.push((it.chapter.manga_title.clone(), line));
+            }
+        }
+        out
+    }
+
+    /// The Generate card's time left: one line for one manga, a line per manga and the total for
+    /// several.
+    fn eta_block(&self) -> Option<Div> {
+        let lines = self.eta_by_manga();
+        let text = |t: String| div().flex_none().text_size(px(size::XS)).text_color(Tokens::text_2()).child(t);
+        let name = |t: String| div().flex_1().min_w_0().truncate().text_size(px(size::XS)).text_color(Tokens::text_3()).child(t);
+        match lines.as_slice() {
+            [] => None,
+            [(_, line)] => Some(div().child(text(line.text()))),
+            many => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(many.iter().map(|(title, line)| div().flex().items_center().gap(px(space::SM)).child(name(title.clone())).child(text(line.text()))))
+                    .child(div().flex().items_center().gap(px(space::SM)).child(name("Everything".into())).child(text(self.eta.total.text()))),
+            ),
+        }
+    }
+}
+
 /// The chapter number a card shows: the chapter's own, else the first number in its title or
 /// label ("Ch. 12.5 - The Duel" -> "12.5", after "ch" when there is one). `None` without one.
 pub(crate) fn chapter_no(number: Option<f64>, title: Option<&str>) -> Option<String> {
@@ -343,6 +428,7 @@ impl StudioPage {
                             })))
                         }),
                 )
+                .children(self.eta_block().filter(|_| active > 0))
                 .when(q.paused && q.interrupted && active > 0, |d| {
                     d.child(inline_alert(AlertKind::Info, "Paused when MangaVox closed", format!("{active} chapter{} still to make.", plural(active))).action(
                         "Resume",

@@ -90,6 +90,9 @@ const API_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/manga/m1/studio"),
     ("GET", "/api/privacy"),
     ("POST", "/api/privacy"),
+    ("GET", "/api/history?kind=manga"),
+    ("GET", "/api/history?kind=watch&type=anime&offset=30&limit=30"),
+    ("POST", "/api/history/remove"),
     // Unknown routes and methods.
     ("GET", "/api/nope"),
     ("GET", "/api"),
@@ -119,6 +122,7 @@ fn body_for(path: &str) -> &'static str {
         "/api/manga/m1/library" | "/api/manga/m1/favorite" => r#"{"on":true}"#,
         // Off while it is off: answered without the app window (there is none in the tests).
         "/api/privacy" => r#"{"on":false}"#,
+        "/api/history/remove" => r#"{"kind":"manga","id":"m1"}"#,
         "/api/manga/m1/download" | "/api/manga/m1/studio" => r#"{"chapters":["c1"]}"#,
         _ => "{}",
     }
@@ -430,7 +434,7 @@ async fn revoked_devices_are_locked_out_at_once() {
 async fn state_changes_need_the_csrf_header_and_same_origin() {
     let _g = setup();
     let cookie = pair().await;
-    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress", "/api/sources/mangadex/open", "/api/manga/m1/library", "/api/manga/m1/favorite", "/api/manga/m1/download", "/api/manga/m1/studio", "/api/privacy", "/api/cloud/invite"];
+    let paths = ["/api/logout", "/api/screen/input", "/api/mouse", "/api/pc/open", "/api/movies/play", "/api/anime/play", "/api/watch", "/api/watch/abc/progress", "/api/watch/abc/stop", "/api/studio/generate", "/api/studio/jobs/s1/cancel", "/api/manga/m1/refresh", "/api/chapter/c1/progress", "/api/sources/mangadex/open", "/api/manga/m1/library", "/api/manga/m1/favorite", "/api/manga/m1/download", "/api/manga/m1/studio", "/api/privacy", "/api/history/remove", "/api/cloud/invite"];
     for path in paths {
         let body = body_for(path);
         let base = || req("POST", path, PEER).header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json");

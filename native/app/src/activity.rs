@@ -13,6 +13,8 @@ use ui_studio::pipeline::{self, ExportActivity, ItemState, QueueItem};
 const POLL: Duration = Duration::from_millis(500);
 /// A run that made every chapter closes its card after this long.
 const AUTO_HIDE: Duration = Duration::from_secs(6);
+/// While a run is going, the time left is worked out again this often so it counts down.
+const ETA_EVERY: Duration = Duration::from_secs(5);
 
 /// One queue chapter, reduced to what a card shows.
 #[derive(Clone, Debug, PartialEq)]
@@ -151,6 +153,9 @@ pub struct StudioRuns {
     runs: HashMap<String, Run>,
     /// Pipeline and job versions last read.
     seen: Option<(u64, u64)>,
+    /// Time left per manga, and when it was last worked out.
+    eta: ui_studio::eta::Report,
+    eta_at: Option<Instant>,
     /// A queue read is running in the background.
     reading: bool,
     /// Exports running, each card's place in the stack, and the ones closed from their card.
@@ -168,7 +173,7 @@ impl StudioRuns {
                 break;
             }
         });
-        StudioRuns { items: vec![], held: false, interrupted: false, runs: HashMap::new(), seen: None, reading: false, exports: vec![], export_orders: HashMap::new(), hidden_exports: HashSet::new(), _poll: poll }
+        StudioRuns { items: vec![], held: false, interrupted: false, runs: HashMap::new(), seen: None, eta: Default::default(), eta_at: None, reading: false, exports: vec![], export_orders: HashMap::new(), hidden_exports: HashSet::new(), _poll: poll }
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
@@ -185,7 +190,9 @@ impl StudioRuns {
             cx.notify();
         }
         let seen = Some((pipeline::version(), ui_studio::service::version()));
-        if seen != self.seen {
+        // A run going: look again now and then, so the time left counts down.
+        let ticking = self.runs.values().any(|r| r.ended.is_none()) && self.eta_at.is_none_or(|t| t.elapsed() >= ETA_EVERY);
+        if seen != self.seen || ticking {
             // Read off the UI thread: the queue's lock is also held while the pipeline saves
             // the queue to disk, and every player frame would wait behind a slow write.
             if !self.reading {
@@ -196,12 +203,23 @@ impl StudioRuns {
                         (q.items.iter().map(item).collect::<Vec<Item>>(), q.paused, q.interrupted)
                     })
                     .await;
+                    // The cards show first; the time left comes right after, because the first
+                    // time for a chapter it reads that chapter's files.
                     let _ = this.update(cx, |s, cx| {
-                        s.reading = false;
                         if let Ok((items, held, interrupted)) = read {
                             s.seen = seen;
                             let changed = items != s.items || (held, interrupted) != (s.held, s.interrupted);
                             (s.items, s.held, s.interrupted) = (items, held, interrupted);
+                            s.retrack(changed, cx);
+                        }
+                    });
+                    let eta = mv_ui::bg::blocking(pipeline::eta).await;
+                    let _ = this.update(cx, |s, cx| {
+                        s.reading = false;
+                        if let Ok(eta) = eta {
+                            s.eta_at = Some(Instant::now());
+                            let changed = eta != s.eta;
+                            s.eta = eta;
                             s.retrack(changed, cx);
                         }
                     });
@@ -323,6 +341,12 @@ impl StudioRuns {
             None if paused && self.interrupted => "Paused when MangaVox closed".into(),
             None if paused => "Paused".into(),
             None => "Waiting for the chapters before it".into(),
+        };
+        // The time left always leads, so a long state ("Paused when MangaVox closed") never
+        // pushes it out of the card.
+        let line = match self.eta.of(manga_id).map(|l| l.text()) {
+            Some(left) => format!("{left} · {line}"),
+            None => line,
         };
         let at = if t.running.is_some() { (t.done + 1).min(t.total) } else { t.done };
         let toggle: Box<dyn Fn()> = if !paused {

@@ -8,10 +8,11 @@ use gpui_kit::*;
 use mv_core::cache::DataCache;
 use mv_core::repo::media::PlaybackState;
 use mv_media::episode_art;
+use mv_media::seasons::{self, Season};
 use mv_media::types::{AnimeEpisode, AnimeSearchResult};
 use mv_ui::theme::{icon as isz, radius, ramp};
 use mv_ui::toast::{self, Toast};
-use mv_ui::{bg, btn, empty_view, error_view, focus_ring_shadow, icon, menu_button, ph, size, skeleton, skeleton_line, ButtonKind, Interactive, MenuItem, Ph, RampExt, Tokens};
+use mv_ui::{bg, btn, empty_view, error_view, filter_chip, focus_ring_shadow, icon, menu_button, navigate, ph, size, skeleton, skeleton_line, ButtonKind, Interactive, MenuItem, Ph, RampExt, Route, Tokens};
 
 use crate::common::{
     all_watched, announce_completed, announce_list_toggle, cached, completion_due, fetch, fetch_cached, fraction, in_progress, in_watchlist, jikan, list_epoch, mark_completed,
@@ -27,6 +28,9 @@ pub struct AnimeDetail {
     mal_id: String,
     title: String,
     details: Load<AnimeSearchResult>,
+    /// Every numbered season of the show, in air order (empty until known, or when it has just
+    /// the one). Each is its own MAL entry with its own episodes, sources and progress.
+    seasons: Vec<Season>,
     episodes: Load<Vec<AnimeEpisode>>,
     /// Jikan page (100 episodes) the list starts at; the range picker jumps between them.
     first_page: u32,
@@ -127,6 +131,15 @@ fn more_after(last: Option<i64>, total: Option<u32>) -> bool {
     total.is_none_or(|t| last < t)
 }
 
+/// Where `mal_id` sits in the season list, only when there is something to switch between:
+/// a show with one season, or an entry that is not a numbered season (a movie), shows no chips.
+fn season_index(seasons: &[Season], mal_id: &str) -> Option<usize> {
+    if seasons.len() < 2 {
+        return None;
+    }
+    seasons.iter().position(|s| s.mal_id == mal_id)
+}
+
 fn retry_sources(v: &mut AnimeDetail, window: &mut Window, cx: &mut Context<AnimeDetail>) {
     let ep = v.sel.unwrap_or(1);
     v.lookup(ep, false, window, cx);
@@ -143,10 +156,12 @@ fn close_inline(v: &mut AnimeDetail) {
 impl AnimeDetail {
     pub fn new(mal_id: String, title: String, cx: &mut Context<Self>) -> Self {
         let details = Self::fetch_details(&mal_id, &title, cx);
+        let seasons = Self::fetch_seasons(&mal_id, cx);
         let mut page = Self {
             mal_id,
             title,
             details,
+            seasons,
             episodes: Load::Loading,
             first_page: 1,
             page: 1,
@@ -206,6 +221,53 @@ impl AnimeDetail {
             Load::Loading => crate::common::seen_title(mal_id).map_or(Load::Loading, Load::Ready),
             d => d,
         }
+    }
+
+    /// The show's seasons: the cached list at once, refreshed once a day. AniList has no
+    /// season list, so this follows the sequel chain from this entry (a few requests, cached for
+    /// every entry of the franchise). A failure leaves the page without chips.
+    fn fetch_seasons(mal_id: &str, cx: &mut Context<Self>) -> Vec<Season> {
+        let id = mal_id.to_string();
+        let found = fetch_cached(
+            cx,
+            format!("anime:seasons:{mal_id}"),
+            DAY,
+            async move { seasons::seasons_for(&id).await.map(|list| list.as_ref().clone()).map_err(|e| e.to_string()) },
+            |v: &mut Self, l| {
+                if let Load::Ready(list) = l {
+                    v.seasons = list;
+                }
+            },
+        );
+        match found {
+            Load::Ready(list) => list,
+            _ => Vec::new(),
+        }
+    }
+
+    /// Chips above the episodes, one per season, the one on screen selected. A season opens
+    /// as its own page (its episodes, sources and progress), so nothing of another season shows.
+    fn season_chips(&self) -> Option<Div> {
+        let at = season_index(&self.seasons, &self.mal_id)?;
+        let chips = self.seasons.iter().enumerate().map(|(i, s)| {
+            let (mal_id, title) = (s.mal_id.clone(), s.title.clone());
+            let label = match s.episodes {
+                Some(n) => format!("{} · {n} episodes", s.label),
+                None => s.label.clone(),
+            };
+            filter_chip(("season", i), label, i == at).on_click(move |_, w, cx| {
+                if i != at {
+                    navigate(Route::AnimeDetail { mal_id: mal_id.clone(), title: title.clone() }, w, cx);
+                }
+            })
+        });
+        Some(div().flex().flex_wrap().items_center().gap(px(8.)).mb(px(16.)).children(chips))
+    }
+
+    /// "Season 2" for the hero tags, when the show has more than one.
+    fn season_label(&self) -> Option<String> {
+        let at = season_index(&self.seasons, &self.mal_id)?;
+        Some(self.seasons[at].label.clone())
     }
 
     fn reload_details(&mut self, cx: &mut Context<Self>) {
@@ -531,7 +593,7 @@ impl AnimeDetail {
             };
             return look::billboard("anime-detail-hero", height, None, None).child(copy);
         };
-        let tags = [d.anime_type.clone(), d.status.clone(), d.episode_count.filter(|_| !movie).map(|n| format!("{n} episodes")), d.duration_minutes.map(|m| format!("{m} min"))];
+        let tags = [self.season_label(), d.anime_type.clone(), d.status.clone(), d.episode_count.filter(|_| !movie).map(|n| format!("{n} episodes")), d.duration_minutes.map(|m| format!("{m} min"))];
         let quality = streams::quality_tags(&self.streams);
         let next = self.next();
         let panel = if self.inline { None } else { self.panel(cx) };
@@ -855,6 +917,7 @@ impl AnimeDetail {
         div()
             .px(px(EDGE))
             .mb(px(40.))
+            .children(self.season_chips())
             .child(
                 div()
                     .flex()
@@ -920,8 +983,24 @@ impl Render for AnimeDetail {
 
 #[cfg(test)]
 mod tests {
-    use super::{more_after, next_up, NextUp};
+    use super::{more_after, next_up, season_index, NextUp};
+    use mv_media::seasons::Season;
     use mv_core::repo::media::PlaybackState;
+
+    fn season(mal: &str, n: u32) -> Season {
+        Season { mal_id: mal.into(), label: format!("Season {n}"), title: format!("Show {n}"), episodes: Some(12), year: None }
+    }
+
+    #[test]
+    fn chips_show_only_for_a_season_among_several() {
+        let all = [season("1", 1), season("2", 2), season("3", 3)];
+        assert_eq!(season_index(&all, "2"), Some(1));
+        // A movie of the franchise is not one of the seasons.
+        assert_eq!(season_index(&all, "99"), None);
+        // One season: nothing to switch between.
+        assert_eq!(season_index(&all[..1], "1"), None);
+        assert_eq!(season_index(&[], "1"), None);
+    }
 
     #[test]
     fn no_continue_past_the_last_episode() {

@@ -292,9 +292,20 @@ async fn privacy() -> Json<Value> {
 /// the session created.
 async fn set_privacy(raw: axum::body::Bytes) -> ApiResult<Json<Value>> {
     let b: OnBody = body(&raw)?;
-    if b.on != mv_core::privacy::active() {
-        crate::bridge::on_ui(|w, cx| mv_ui::nav::toggle_private(w, cx)).await.map_err(ApiError::unavailable)?;
+    // Checked again on the UI thread, where the toggle runs: the PC (or another phone) may have
+    // flipped it since this request was read, and a blind toggle would then undo it.
+    let want = b.on;
+    // Already in the wanted state: nothing to do, and no app window is needed to say so.
+    if mv_core::privacy::active() == want {
+        return Ok(Json(json!({ "private": want })));
     }
+    crate::bridge::on_ui(move |w, cx| {
+        if mv_core::privacy::active() != want {
+            mv_ui::nav::toggle_private(w, cx);
+        }
+    })
+    .await
+    .map_err(ApiError::unavailable)?;
     Ok(Json(json!({ "private": mv_core::privacy::active() })))
 }
 

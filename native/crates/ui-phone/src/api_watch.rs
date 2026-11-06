@@ -42,8 +42,9 @@ const IDLE: Duration = Duration::from_secs(30 * 60);
 const MAX_PER_DEVICE: usize = 3;
 /// How long `POST /api/watch` may look for a source that opens (torrent metadata, probing).
 const OPEN_BUDGET: Duration = Duration::from_secs(90);
-/// One source gets at most this long before the next is tried.
-const PER_SOURCE: Duration = Duration::from_secs(60);
+/// One source gets at most this long before the next is tried. Opening a live torrent takes a
+/// few seconds, so a source still silent after this has few or no peers.
+const PER_SOURCE: Duration = Duration::from_secs(40);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Sources tried before giving up.
 const MAX_TRIES: usize = 3;
@@ -597,8 +598,12 @@ fn rank_for_phone(list: Vec<(PlayRequest, AnimeTorrentStream)>) -> Vec<PlayReque
         if has(&["hdr", "hdr10", "dv", "dovi"]) {
             p += 1;
         }
-        if s.seeders.is_some_and(|n| n < 3) {
-            p += 2;
+        // Nobody sharing it is tried last; a thin swarm after the healthy ones.
+        match s.seeders {
+            Some(0) => p += 8,
+            Some(n) if n < 3 => p += 2,
+            Some(n) if n < 8 => p += 1,
+            _ => {}
         }
         p
     };
@@ -1219,6 +1224,13 @@ mod tests {
         let s = |title: &str, src: &str| (PlayRequest { title: "t".into(), source: src.into(), file_idx: None, imdb_id: None, mal_id: None, season: None, episode: None }, AnimeTorrentStream { title: title.into(), seeders: Some(50), info_hash: src.into(), ..Default::default() });
         let ranked = rank_for_phone(vec![s("Movie 2160p HDR REMUX", "a"), s("Movie 1080p x265 10bit", "b"), s("Movie 1080p x264", "c")]);
         assert_eq!(ranked.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(), ["c", "b", "a"]);
+    }
+
+    #[test]
+    fn phone_tries_sources_with_seeders_before_dead_ones() {
+        let s = |src: &str, seeders: Option<u64>| (PlayRequest { title: "t".into(), source: src.into(), file_idx: None, imdb_id: None, mal_id: None, season: None, episode: None }, AnimeTorrentStream { title: "Movie 1080p x264".into(), seeders, info_hash: src.into(), ..Default::default() });
+        let ranked = rank_for_phone(vec![s("dead", Some(0)), s("thin", Some(5)), s("unknown", None), s("busy", Some(80))]);
+        assert_eq!(ranked.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(), ["unknown", "busy", "thin", "dead"]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use futures::future::BoxFuture;
 use mv_ai::{emit_noop, AiEffort, AiMessage, AiProviderId, AiStepRequest, CancellationToken, Registry};
 use serde_json::Value;
 
-use crate::json::extract_json;
+use crate::json::{extract_whole_json, salvage_json};
 use crate::types::{ModelChoice, Progress, ProgressFn};
 
 pub(crate) trait Llm: Send + Sync {
@@ -123,23 +123,78 @@ fn low_effort_model(m: &ModelChoice) -> String {
     m.model.clone()
 }
 
+/// How long to wait before a failed model call is sent again (the 1st and 2nd retry).
+fn backoff(retry: usize) -> std::time::Duration {
+    if cfg!(test) {
+        return std::time::Duration::from_millis(1);
+    }
+    std::time::Duration::from_secs(if retry == 0 { 4 } else { 12 })
+}
+
+/// One model call that survives a hiccup: a CLI that exits, a timeout, an overloaded server, an
+/// empty answer or a provider message in place of an answer is sent again twice, after a short wait
+/// that cancelling cuts short. Only the last failure is returned.
+async fn call_with_retries(llm: &dyn Llm, req: &AiStepRequest, cancel: &CancellationToken) -> Result<String> {
+    let mut retry = 0;
+    loop {
+        let failure = match llm.step(req.clone(), cancel.clone()).await {
+            Ok(text) if text.trim().is_empty() => anyhow!("the AI sent an empty answer"),
+            // A provider talking about itself is a failure, never text to store as a reading.
+            Ok(text) => match mv_ai::limit::provider_error_in(&text) {
+                Some(e) => anyhow!(e),
+                None => return Ok(text),
+            },
+            Err(e) if is_cancelled(&e) => return Err(e),
+            Err(e) => e,
+        };
+        if retry >= 2 || cancel.is_cancelled() {
+            return Err(failure);
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("cancelled"),
+            _ = tokio::time::sleep(backoff(retry)) => {}
+        }
+        retry += 1;
+    }
+}
+
 /// Ask for JSON; on unparseable output retry once with a nudge. `Ok(Err(raw))` = still not JSON.
+/// A reply that was cut off is not used here: a half page reading would silently drop panels.
 pub(crate) async fn ask_json(llm: &dyn Llm, req: AiStepRequest, cancel: &CancellationToken) -> Result<std::result::Result<Value, String>> {
-    let raw = llm.step(req.clone(), cancel.clone()).await?;
-    if let Some(v) = extract_json(&raw) {
+    ask_json_with(llm, req, cancel, false).await
+}
+
+/// [`ask_json`] for the story: an answer that was cut off keeps what it said (the story then asks
+/// for the pages it is missing) instead of failing the part.
+pub(crate) async fn ask_story_json(llm: &dyn Llm, req: AiStepRequest, cancel: &CancellationToken) -> Result<std::result::Result<Value, String>> {
+    ask_json_with(llm, req, cancel, true).await
+}
+
+async fn ask_json_with(llm: &dyn Llm, req: AiStepRequest, cancel: &CancellationToken, salvage: bool) -> Result<std::result::Result<Value, String>> {
+    let raw = call_with_retries(llm, &req, cancel).await?;
+    if let Some(v) = extract_whole_json(&raw) {
         return Ok(Ok(v));
     }
     let mut retry = req;
     retry.request_id.push_str("-retry");
     retry.messages.push(AiMessage::assistant(raw.clone()));
     retry.messages.push(AiMessage::user("Your previous answer was not valid JSON. Reply with JSON only."));
-    let raw2 = llm.step(retry, cancel.clone()).await?;
-    let raw2 = if raw2.trim().is_empty() { raw } else { raw2 };
-    // A provider talking about itself is a failure, never text to store as a reading.
-    if let Some(e) = mv_ai::limit::provider_error_in(&raw2) {
-        bail!(e);
+    // A nudge that cannot be answered leaves the first reply to be judged.
+    let raw2 = match call_with_retries(llm, &retry, cancel).await {
+        Ok(t) => t,
+        Err(e) if is_cancelled(&e) => return Err(e),
+        Err(_) => raw.clone(),
+    };
+    if let Some(v) = extract_whole_json(&raw2) {
+        return Ok(Ok(v));
     }
-    Ok(extract_json(&raw2).ok_or(raw2))
+    // Cut off mid-way: what was said is kept, the caller asks for what is missing.
+    if salvage {
+        if let Some(v) = salvage_json(&raw2).or_else(|| salvage_json(&raw)) {
+            return Ok(Ok(v));
+        }
+    }
+    Ok(Err(raw2))
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {

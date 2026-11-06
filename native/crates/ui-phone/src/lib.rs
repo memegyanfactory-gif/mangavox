@@ -22,6 +22,7 @@ use mv_ui::Route;
 pub mod api_anime;
 mod api_browse;
 mod api_chapter_media;
+mod api_history;
 pub mod api_img;
 pub mod api_manga;
 pub mod api_media;

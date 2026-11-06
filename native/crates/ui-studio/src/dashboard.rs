@@ -242,6 +242,8 @@ impl StudioPage {
             (None, _) => format!("{active} chapter{} waiting", plural(active)),
         };
         let p = if total > 0 { q.items.iter().map(|i| i.progress()).sum::<f32>() / total as f32 } else { 0. };
+        // The time left for everything queued ("About 3 h 20 min left · ").
+        let eta_note = if self.eta.manga.is_empty() { String::new() } else { format!("{} · ", self.eta.total.text()) };
         // Length of one manga's made videos, the ones its Export joins: the open manga's, else
         // the one generating now (cached by file time, so it is cheap per frame).
         let manga = self.dash_manga.clone().or_else(|| running.or_else(|| q.items.iter().find(|i| i.state.active())).map(|i| i.chapter.manga_id.clone()));
@@ -297,7 +299,7 @@ impl StudioPage {
                         .flex_1()
                         .min_w(px(200.))
                         .child(div().truncate().text_size(px(size::SM)).font_weight(FontWeight::MEDIUM).text_color(Tokens::text_1()).child(text))
-                        .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!("{done} of {total} chapter{} made · picks you add now join the queue", plural(total)))),
+                        .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!("{done} of {total} chapter{} made · {}picks you add now join the queue", plural(total), eta_note))),
                 )
                 .child(timer)
                 .child(if q.paused {
@@ -442,6 +444,11 @@ impl StudioPage {
             (_, d) if d == n => (Tokens::success(), "All made".to_string()),
             _ => (Tokens::text_2(), format!("{done}/{n} made")),
         };
+        // While the manga has chapters queued or running: how long they still take.
+        let eta_line = self.eta.of(&g.id).filter(|_| working > 0).map(|l| {
+            let text = l.text();
+            div().id(("dash-manga-eta", i)).truncate().text_size(px(size::XS)).text_color(Tokens::text_3()).tooltip(tip(text.clone())).child(text)
+        });
         let more = (ticked.is_none() && self.deleting.is_empty()).then(|| {
             let (weak, ids) = (cx.entity().downgrade(), vec![g.id.clone()]);
             overflow_menu(
@@ -481,6 +488,7 @@ impl StudioPage {
                     )
                     .children(more),
             )
+            .children(eta_line)
             .when_some(ticked, |d, on| {
                 d.child(
                     checkbox(("dash-manga-check", i), on)

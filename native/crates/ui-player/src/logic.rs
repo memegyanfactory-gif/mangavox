@@ -609,6 +609,29 @@ pub const HEAD_MAX_WAIT: Duration = Duration::from_secs(20);
 pub const STALL_FALLBACK: Duration = Duration::from_secs(25);
 /// The magnet's file list (metadata) has not arrived after this long: try the next source.
 pub const METADATA_FALLBACK: Duration = Duration::from_secs(30);
+/// No data at all for this long and no other source to move on to: stop and say so instead of
+/// showing "Finding peers" for ever.
+pub const NO_DATA_GIVE_UP: Duration = Duration::from_secs(60);
+
+/// What the loader says while a torrent has not started yet, in plain words. `peers` is `None`
+/// while the torrent's file list is still being fetched (no count exists yet); `head` is the
+/// share of the file's start that is in (0..=1); `waited` is the time since this source began
+/// while `peers` is `None`, and since its torrent became ready otherwise (the fallback's clock).
+pub fn finding_status(peers: Option<u32>, head: f64, waited: Duration, has_alternate: bool) -> String {
+    let secs = waited.as_secs();
+    match peers {
+        None if has_alternate && waited >= METADATA_FALLBACK - Duration::from_secs(8) => "Nobody is sharing this source, trying the next one…".into(),
+        None if secs >= 8 => format!("Still looking for peers… {secs}s"),
+        None => "Finding peers… getting the torrent's file list".into(),
+        Some(0) if has_alternate && head <= 0.0 && waited >= STALL_FALLBACK - Duration::from_secs(8) => "Nobody is sharing this source, trying the next one…".into(),
+        Some(0) if secs >= 8 => format!("Still looking for peers… {secs}s"),
+        Some(0) => "Finding peers…".into(),
+        Some(n) => {
+            let who = if n == 1 { "1 peer".to_string() } else { format!("{n} peers") };
+            format!("Connecting to {who}… buffering {:.0}%", head.clamp(0.0, 1.0) * 100.0)
+        }
+    }
+}
 
 /// What the loader knows about a torrent that is ready (metadata in) but not opened yet.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -634,6 +657,8 @@ pub enum StartStep {
     Load,
     /// Give up on this source and try the next one.
     Fallback,
+    /// Nothing arrived for a long time and there is no other source: show the error.
+    GiveUp,
 }
 
 /// How much of the head the player waits for (smaller files: all of it).
@@ -659,7 +684,10 @@ pub fn start_step(p: &StartProgress) -> StartStep {
     if p.has_alternate && p.since_progress >= STALL_FALLBACK {
         return StartStep::Fallback;
     }
-    // No other source: keep waiting (the loader offers "Try another source" after a while).
+    if !p.has_alternate && p.head_bytes == 0 && p.since_progress >= NO_DATA_GIVE_UP {
+        return StartStep::GiveUp;
+    }
+    // No other source yet: keep waiting (the loader offers "Try another source" after a while).
     StartStep::Wait
 }
 
@@ -805,6 +833,32 @@ mod tests {
         // Still checking files already on disk: wait, whatever the clocks say.
         let checking = StartProgress { checking: true, ..progress(0, 100, 100, 0, true) };
         assert_eq!(start_step(&checking), StartStep::Wait);
+    }
+
+    #[test]
+    fn a_source_nobody_shares_ends_with_an_error_when_it_is_the_only_one() {
+        assert_eq!(start_step(&progress(0, 61, 61, 0, false)), StartStep::GiveUp);
+        assert_eq!(start_step(&progress(0, 61, 61, 4, false)), StartStep::GiveUp);
+        // Some of the head is in: keep going.
+        assert_eq!(start_step(&progress(1000, 61, 30, 4, false)), StartStep::Wait);
+        // With another source the fallback comes first.
+        assert_eq!(start_step(&progress(0, 61, 61, 0, true)), StartStep::Fallback);
+    }
+
+    #[test]
+    fn loader_words_say_what_is_happening() {
+        let s = Duration::from_secs;
+        assert_eq!(finding_status(None, 0.0, s(2), true), "Finding peers… getting the torrent's file list");
+        assert_eq!(finding_status(None, 0.0, s(12), false), "Still looking for peers… 12s");
+        assert_eq!(finding_status(None, 0.0, s(25), true), "Nobody is sharing this source, trying the next one…");
+        assert_eq!(finding_status(Some(0), 0.0, s(3), true), "Finding peers…");
+        assert_eq!(finding_status(Some(0), 0.0, s(10), true), "Still looking for peers… 10s");
+        assert_eq!(finding_status(Some(0), 0.0, s(20), true), "Nobody is sharing this source, trying the next one…");
+        assert_eq!(finding_status(Some(0), 0.0, s(20), false), "Still looking for peers… 20s");
+        // Data already in (a cached torrent): never claim nobody is sharing it.
+        assert_eq!(finding_status(Some(0), 0.2, s(20), true), "Still looking for peers… 20s");
+        assert_eq!(finding_status(Some(1), 0.25, s(5), true), "Connecting to 1 peer… buffering 25%");
+        assert_eq!(finding_status(Some(12), 0.5, s(5), false), "Connecting to 12 peers… buffering 50%");
     }
 
     #[test]

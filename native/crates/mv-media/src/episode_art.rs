@@ -200,6 +200,18 @@ fn absolute_to_season(order: &[(u32, u32)], n: u32) -> Option<(u32, u32)> {
     order.get(n as usize - 1).copied()
 }
 
+/// The IMDb stills that belong to one MAL entry: from `offset` (the episodes of the earlier
+/// seasons) on, and for a later season no longer than its own `count` when that is known, so a
+/// season-2 entry is never compared against, or given, season-1 stills.
+fn season_window(all: &[(Option<String>, String)], offset: u32, count: Option<u32>) -> &[(Option<String>, String)] {
+    if offset == 0 {
+        return all;
+    }
+    let from = (offset as usize).min(all.len());
+    let to = count.filter(|&c| c > 0).map_or(all.len(), |c| (from + c as usize).min(all.len()));
+    &all[from..to]
+}
+
 /// Give every episode without a thumbnail its own still where one can be found.
 /// `expected_total` is the MAL episode count (`None` while airing). Never fails.
 pub async fn fill_thumbnails(mal_id: &str, episodes: &mut [AnimeEpisode], expected_total: Option<u32>) {
@@ -216,9 +228,16 @@ pub async fn fill_thumbnails(mal_id: &str, episodes: &mut [AnimeEpisode], expect
         return;
     }
     let Some(stills) = imdb_stills(mal_id).await else { return };
+    // The IMDb series holds every season: this entry's episodes start `offset` stills in. When
+    // that cannot be told (an earlier season has no episode count), no still is better than the
+    // wrong one.
+    let Ok(jikan) = JikanClient::shared() else { return };
+    let Some(imdb) = jikan.imdb_id(mal_id).await else { return };
+    let Some(offset) = crate::seasons::imdb_offset(mal_id, &imdb).await else { return };
+    let stills = season_window(&stills, offset, expected_total);
     // A title comparison is decisive and holds for every page of the show; pages without
     // titles (later pages, AniList fallback) reuse it.
-    let verdict = match titles_agree(episodes, &stills) {
+    let verdict = match titles_agree(episodes, stills) {
         Some(v) => {
             verdicts().lock().unwrap_or_else(|e| e.into_inner()).insert(mal_id.to_string(), v);
             v
@@ -264,6 +283,23 @@ mod tests {
         assert_eq!(absolute_to_season(&order, 4), Some((2, 1)));
         assert_eq!(absolute_to_season(&order, 9), None);
         assert_eq!(absolute_to_season(&[], 1), None);
+    }
+
+    #[test]
+    fn later_seasons_read_their_own_stills() {
+        let all: Vec<_> = (0..37).map(|i| (None, format!("still{i}"))).collect();
+        // First season: the whole list, as before.
+        assert_eq!(season_window(&all, 0, Some(25)).len(), 37);
+        // Season 2 of 12 episodes starts after the 25 of season 1.
+        let s2 = season_window(&all, 25, Some(12));
+        assert_eq!((s2.len(), s2[0].1.as_str()), (12, "still25"));
+        // Airing: to the end of the list. Past the end: nothing.
+        assert_eq!(season_window(&all, 25, None).len(), 12);
+        assert!(season_window(&all, 99, Some(12)).is_empty());
+        // The window is checked like a whole series: 12 of 12 agree, season 1's 37 would not.
+        let eps: Vec<_> = (1..=12).map(|i| ep(i, None)).collect();
+        assert!(lines_up(&eps, s2, Some(12)));
+        assert!(!lines_up(&eps, &all, Some(12)));
     }
 
     #[test]

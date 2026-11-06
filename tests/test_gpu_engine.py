@@ -128,18 +128,21 @@ class VideoPlanTests(unittest.TestCase):
         with self.assertRaises(gt.Unsupported):
             gt.plan_video(self.video(("hblur", 0.5)), [{}, {}], 2560, 1440, 6.0)
 
-    def test_the_card_drops_in_and_fades(self):
-        v = dict(self.video(("fade", 0.5)), chapter_card=("card.png", 800, 180))
+    def test_the_badge_is_a_baked_sequence_at_a_fixed_place(self):
+        v = dict(self.video(("fade", 0.5)), chapter_card=("chapter_badge_%04d.png", 190, 84))
         card = gt.plan_video(v, [{}, {}], 2560, 1440, 8.0)["card"]
+        self.assertEqual(card["src"], "chapter_badge_%04d.png")
         self.assertEqual(card["on"], [0, round(vg.CARD_OUT * 30)])
-        self.assertEqual(card["alpha"][0], 0.0)
-        self.assertEqual(max(card["alpha"]), 1.0)
-        # Top right: it glides in from beyond the right edge, rests CARD_MARGIN in, glides out.
-        xs = card["pos"][0]
-        rest = (2560 - round(vg.CARD_MARGIN * 1440 / 1080) - 800) & ~1
-        self.assertGreaterEqual(xs[0], 2560)
-        self.assertEqual(xs[round(3.0 * 30)], rest)
-        self.assertTrue(all(v % 2 == 0 for v in xs))
+        # Its fade, pop and ring are in the frames: nothing but a place is planned, top right and even.
+        self.assertNotIn("alpha", card)
+        x, y = card["pos"]
+        self.assertEqual((x, y), vg.chapter_card_pos(2560, 1440, 0))
+        self.assertEqual((x % 2, y % 2), (0, 0))
+        d, pad, _, margin = vg.badge_geometry(2560, 1440)
+        self.assertLessEqual(abs(x + pad + d - (2560 - margin)), 1)
+        # Under a letterbox bar it sits below it.
+        v["look"] = {"letterbox": True}
+        self.assertGreater(gt.plan_video(v, [{}, {}], 2560, 1440, 8.0)["card"]["pos"][1], y)
 
     def test_the_lookup_table_is_the_lutyuv_one(self):
         look = gt.plan_look({}, {"grade": True, "color": None}, 2560, 1440, 30)

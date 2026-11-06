@@ -3,6 +3,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_core::cache::DataCache;
 use mv_media::episode_art;
+use mv_media::seasons;
 use mv_media::stream_utils::stream_resource_id;
 use mv_media::types::AnimeTorrentStream;
 use mv_ui::nav::PlayRequest;
@@ -129,12 +130,16 @@ pub(crate) async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) 
     let (season, episode) = (base.season.unwrap_or(1), base.episode.unwrap_or(1));
     let mut ids = vec![];
     if let Some(imdb) = &base.imdb_id {
-        // Anime count episodes from 1 across the show; IMDb may split them into seasons.
-        let (s, e) = match &mal {
-            Some(_) if !movie => episode_art::imdb_episode(imdb, episode).await.unwrap_or((season, episode)),
-            _ => (season, episode),
+        // An anime season counts its episodes from 1, while IMDb holds every season in one
+        // series: the earlier seasons' episodes are added first, so season 2 episode 3 is not
+        // asked for as season 1 episode 3. A season that cannot be placed is left to Kitsu.
+        let placed = match &mal {
+            Some(mal) if !movie => seasons::imdb_episode_of(mal, imdb, episode).await,
+            _ => Some((season, episode)),
         };
-        ids.extend(stream_resource_id(imdb, movie, s, e));
+        if let Some((s, e)) = placed {
+            ids.extend(stream_resource_id(imdb, movie, s, e));
+        }
     }
     // Kitsu ids number anime episodes like MAL, and anime addons index far more releases by them.
     if let Some(mal) = &mal {
@@ -152,8 +157,15 @@ pub(crate) async fn lookup(mut base: PlayBase, movie: bool, kind: &'static str) 
 /// Cache key for a title's links; includes the enabled addons so installing one refetches.
 pub(crate) fn stream_key(base: &PlayBase, kind: &str) -> String {
     let addons: Vec<String> = registry().stream_addons(kind).into_iter().map(|m| format!("{}@{}", m.id, m.version)).collect();
-    let id = base.imdb_id.clone().or_else(|| base.mal_id.as_ref().map(|m| format!("mal{m}"))).unwrap_or_default();
-    format!("streams2:{kind}:{id}:{}:{}:{}", base.season.unwrap_or(0), base.episode.unwrap_or(0), addons.join(","))
+    // An anime season is its own MAL entry, but all seasons can share one IMDb id: the MAL id
+    // always goes into the key, or season 2 would reuse season 1's links. ("streams3": links
+    // cached before seasons were told apart may belong to the wrong season.)
+    let id = match (&base.mal_id, &base.imdb_id) {
+        (Some(m), _) => format!("mal{m}"),
+        (None, Some(i)) => i.clone(),
+        (None, None) => String::new(),
+    };
+    format!("streams3:{kind}:{id}:{}:{}:{}", base.season.unwrap_or(0), base.episode.unwrap_or(0), addons.join(","))
 }
 
 /// Look up sources for `base`. With `autoplay` the best-ranked source starts playing at once;

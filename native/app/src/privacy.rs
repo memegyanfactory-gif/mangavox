@@ -90,18 +90,28 @@ fn offer(session: Session, restarted: bool, window: &mut Window, cx: &mut App) {
     window
         .spawn(cx, async move |cx| {
             let res = mv_ui::bg::blocking(move || DiskProbe::load(&session).map(|p| (privacy::plan(&session, &p), session))).await;
-            let _ = cx.update(|window, cx| match res {
-                Ok(Ok((plan, _))) if plan.is_empty() && plan.studio_kept.is_empty() => {
-                    privacy::finish();
-                    if !restarted {
-                        toast::show(cx, Toast::info("Private mode is off. Nothing from the session was kept.").icon(ph::EYE));
-                    }
-                }
-                Ok(Ok((plan, session))) => open(plan, session, restarted, window, cx),
-                Ok(Err(e)) | Err(e) => toast::show(cx, Toast::error(format!("Could not check what the private session saved. {e:#}"))),
+            let _ = cx.update(|window, cx| {
+                // Whatever the answer, the page shows the state as it is now (off, unless a phone
+                // turned it on again meanwhile).
+                window.refresh();
+                after_probe(res, restarted, window, cx)
             });
         })
         .detach();
+}
+
+/// What the probe found: nothing to clear, the offer, or why it could not be made.
+fn after_probe(res: anyhow::Result<anyhow::Result<(CleanPlan, Session)>>, restarted: bool, window: &mut Window, cx: &mut App) {
+    match res {
+        Ok(Ok((plan, _))) if plan.is_empty() && plan.studio_kept.is_empty() => {
+            privacy::finish();
+            if !restarted {
+                toast::show(cx, Toast::info("Private mode is off. Nothing from the session was kept.").icon(ph::EYE));
+            }
+        }
+        Ok(Ok((plan, session))) => open(plan, session, restarted, window, cx),
+        Ok(Err(e)) | Err(e) => toast::show(cx, Toast::error(format!("Could not check what the private session saved. {e:#}"))),
+    }
 }
 
 /// The dialog's state: what can be cleared and which parts are ticked.

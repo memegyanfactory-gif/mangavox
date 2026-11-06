@@ -964,6 +964,12 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.map_err(|e| e.to_string())
 }
 
+/// The first few search results as `Title (id)`, for a "no exact match" message.
+fn closest(rows: &[mv_media::types::AnimeSearchResult]) -> String {
+    let names: Vec<String> = rows.iter().take(4).map(|r| format!("{} ({})", r.title, r.id)).collect();
+    if names.is_empty() { "nothing".into() } else { names.join(", ") }
+}
+
 fn compact(a: &mv_media::types::AnimeSearchResult) -> Value {
     json!({
         "id": a.id, "imdbId": a.imdb_id, "title": a.title, "year": a.year, "type": a.anime_type,
@@ -1054,7 +1060,14 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
             }
             let c = mv_media::jikan::JikanClient::shared().map_err(|e| e.to_string())?;
             let rows = c.search_anime(query, 1, None).await.map_err(|e| e.to_string())?;
-            let hit = rows.iter().find(|r| !id.is_empty() && r.id == id).or_else(|| rows.first()).ok_or_else(|| format!("No anime found for \"{query}\""))?;
+            // The exact id, else a strict title match (season and part markers must agree);
+            // never just the first result, which is often a different season or a spin-off.
+            let want = mv_media::title_match::Want { titles: vec![query], year: None, format: None };
+            let hit = rows
+                .iter()
+                .find(|r| !id.is_empty() && r.id == id)
+                .or_else(|| mv_media::title_match::best_match(&want, &rows))
+                .ok_or_else(|| format!("No anime matched \"{query}\" exactly. Closest: {}. Retry with one of these titles or its id.", closest(&rows)))?;
             nav(Route::AnimeDetail { mal_id: hit.id.clone(), title: hit.title.clone() }, json!({ "ok": true, "opened": hit.title }))
         }
         "search_movies" => {
@@ -1108,7 +1121,8 @@ pub async fn execute(name: &str, args: &Map<String, Value>) -> ToolResult {
             if cat != "movie" && cat != "series" {
                 if let Ok(c) = mv_media::jikan::JikanClient::shared() {
                     if let Ok(rows) = c.search_anime(title, 1, None).await {
-                        if let Some(hit) = rows.first() {
+                        let want = mv_media::title_match::Want { titles: vec![title], year: None, format: None };
+                        if let Some(hit) = mv_media::title_match::best_match(&want, &rows) {
                             return nav(
                                 Route::AnimeDetail { mal_id: hit.id.clone(), title: hit.title.clone() },
                                 json!({ "ok": true, "opened": hit.title, "note": "Opened the title page; the user presses play there." }),

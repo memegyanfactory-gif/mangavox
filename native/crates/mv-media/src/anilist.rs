@@ -7,7 +7,7 @@
 //!   after `Retry-After` (capped), up to 3 times.
 //! - Media fetched by MAL id is cached for 10 minutes, so details + episodes cost one request.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 
 use crate::error::{MediaError, Result};
 use crate::jikan::Limiter;
+use crate::seasons::{Link, SeasonNode};
 use crate::types::{AnimeEpisode, AnimeSearchResult};
 use crate::util::non_empty;
 
@@ -168,6 +169,101 @@ struct MediaData {
 #[derive(Deserialize)]
 struct GqlResponse<T> {
     data: Option<T>,
+}
+
+// ── Season graph (relations between entries) ──
+
+/// What the season list reads from one entry; relations point at the next and previous seasons.
+const SEASON_FIELDS: &str = "id idMal title { romaji english } format episodes seasonYear \
+startDate { year month day } nextAiringEpisode { episode } \
+relations { edges { relationType(version: 2) node { id idMal type format } } }";
+/// Most entries one franchise lookup reads, so a sprawling franchise cannot run away.
+const MAX_SEASON_NODES: usize = 40;
+/// Most requests one franchise lookup makes (one per step along the sequel chain).
+const MAX_SEASON_ROUNDS: usize = 12;
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(default, rename_all = "camelCase")]
+struct AniSeasonMedia {
+    id: u64,
+    id_mal: Option<u64>,
+    title: AniTitle,
+    format: Option<String>,
+    episodes: Option<u32>,
+    season_year: Option<i32>,
+    start_date: Option<AniFullDate>,
+    next_airing_episode: Option<AniNextEpisode>,
+    relations: Option<AniRelations>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+struct AniFullDate {
+    year: Option<i32>,
+    month: Option<u32>,
+    day: Option<u32>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+struct AniRelations {
+    edges: Vec<AniRelationEdge>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(default, rename_all = "camelCase")]
+struct AniRelationEdge {
+    relation_type: Option<String>,
+    node: Option<AniRelationNode>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+struct AniRelationNode {
+    id: u64,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SeasonPageData {
+    #[serde(rename = "Page")]
+    page: Option<SeasonPageMedia>,
+}
+
+#[derive(Deserialize)]
+struct SeasonPageMedia {
+    #[serde(default)]
+    media: Vec<AniSeasonMedia>,
+}
+
+fn season_node(m: &AniSeasonMedia) -> SeasonNode {
+    let english = non_empty(m.title.english.clone());
+    let romaji = non_empty(m.title.romaji.clone());
+    let titles: Vec<String> = english.iter().chain(romaji.iter()).cloned().collect();
+    // Announced total, else what has aired so far.
+    let aired = m.next_airing_episode.as_ref().map(|n| n.episode.saturating_sub(1));
+    let date = m.start_date.as_ref();
+    let year = date.and_then(|d| d.year).filter(|&y| y != 0);
+    SeasonNode {
+        anilist_id: m.id,
+        mal_id: m.id_mal.filter(|&id| id != 0),
+        title: titles.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
+        titles,
+        format: m.format.clone(),
+        episodes: m.episodes.filter(|&n| n > 0).or(aired.filter(|&n| n > 0)),
+        year: m.season_year.filter(|&y| y != 0).or(year),
+        start: year.map(|y| (y, date.and_then(|d| d.month).unwrap_or(0), date.and_then(|d| d.day).unwrap_or(0))),
+        links: m
+            .relations
+            .iter()
+            .flat_map(|r| r.edges.iter())
+            .filter_map(|e| {
+                let node = e.node.as_ref()?;
+                Some(Link { relation: e.relation_type.clone().unwrap_or_default(), anilist_id: node.id, is_anime: node.kind.as_deref().is_none_or(|k| k == "ANIME") })
+            })
+            .collect(),
+    }
 }
 
 // ── Mapping ──
@@ -714,6 +810,70 @@ impl AniListClient {
         let media = self.media_by_mal(mal_id).await?;
         Ok(synth_episodes(mal_id, &media, page))
     }
+
+    /// Every entry joined to MAL entry `mal_id` by sequel / prequel relations, and the AniList id
+    /// of `mal_id` itself. One request per step along the chain (all entries of a step share one
+    /// request), at most 12 requests and 40 entries.
+    pub async fn season_nodes(&self, mal_id: &str) -> Result<(u64, Vec<SeasonNode>)> {
+        let mal: u64 = mal_id
+            .trim()
+            .parse()
+            .map_err(|_| MediaError::NotFound(format!("anime {mal_id}")))?;
+        let query = format!(
+            "query($mal: [Int], $ids: [Int]) {{ Page(page: 1, perPage: 50) {{ \
+             media(idMal_in: $mal, id_in: $ids, type: ANIME) {{ {SEASON_FIELDS} }} }} }}"
+        );
+        let mut nodes: HashMap<u64, SeasonNode> = HashMap::new();
+        let mut asked: HashSet<u64> = HashSet::new();
+        let mut start: Option<u64> = None;
+        let mut by_ids: Vec<u64> = Vec::new();
+        // Set when a sequel link was left unfollowed because the chain got too long.
+        let mut cut_short = false;
+        for round in 0..MAX_SEASON_ROUNDS {
+            let mut vars = Map::new();
+            if round == 0 {
+                vars.insert("mal".into(), json!([mal]));
+            } else if by_ids.is_empty() {
+                break;
+            } else {
+                vars.insert("ids".into(), json!(by_ids));
+            }
+            let data: SeasonPageData = self.query(&query, Value::Object(vars)).await?;
+            let found = data.page.map(|p| p.media).unwrap_or_default();
+            if round == 0 && found.is_empty() {
+                return Err(MediaError::NotFound(format!("anime {mal_id}")));
+            }
+            for m in &found {
+                if round == 0 && m.id_mal == Some(mal) {
+                    start = Some(m.id);
+                }
+                asked.insert(m.id);
+                nodes.entry(m.id).or_insert_with(|| season_node(m));
+            }
+            by_ids.clear();
+            for link in nodes.values().flat_map(|n| n.links.iter()) {
+                let room = nodes.len() + by_ids.len() < MAX_SEASON_NODES;
+                let chain = link.is_anime && crate::seasons::is_chain_relation(&link.relation);
+                if chain && !room && !asked.contains(&link.anilist_id) {
+                    cut_short = true;
+                }
+                if chain && room && asked.insert(link.anilist_id) {
+                    by_ids.push(link.anilist_id);
+                }
+            }
+        }
+        // Rounds ran out with entries still to fetch: a partial list would number the seasons and
+        // count the earlier episodes wrong, so give none (callers then fall back to Kitsu).
+        if cut_short || !by_ids.is_empty() {
+            return Err(MediaError::NotFound(format!("the whole season chain of anime {mal_id} (too long)")));
+        }
+        let start = start
+            .ok_or_else(|| MediaError::NotFound(format!("anime {mal_id}")))?;
+        let mut all: Vec<SeasonNode> = nodes.into_values().collect();
+        // A stable order, so the same franchise always builds the same list.
+        all.sort_by_key(|n| n.anilist_id);
+        Ok((start, all))
+    }
 }
 
 #[cfg(test)]
@@ -858,6 +1018,33 @@ mod tests {
         assert_eq!(civil_year_month(20_745), (2026, 10));
         // 2024-02-29
         assert_eq!(civil_year_month(19_782), (2024, 2));
+    }
+
+    #[test]
+    fn season_entries_keep_chain_links_only_for_anime() {
+        let raw = r#"{"data": {"Page": {"media": [{
+            "id": 100, "idMal": 200, "title": {"romaji": "Shingeki no Kyojin Season 2", "english": null},
+            "format": "TV", "episodes": null, "seasonYear": 2017,
+            "startDate": {"year": 2017, "month": 4, "day": 1},
+            "nextAiringEpisode": {"episode": 6},
+            "relations": {"edges": [
+                {"relationType": "PREQUEL", "node": {"id": 99, "idMal": 100, "type": "ANIME", "format": "TV"}},
+                {"relationType": "ADAPTATION", "node": {"id": 5, "idMal": 5, "type": "MANGA", "format": "MANGA"}},
+                {"relationType": "SEQUEL", "node": {"id": 101, "idMal": null, "type": "ANIME", "format": "TV"}},
+                {"relationType": "SEQUEL", "node": null}
+            ]}
+        }]}}}"#;
+        let r: GqlResponse<SeasonPageData> = serde_json::from_str(raw).unwrap();
+        let m = &r.data.unwrap().page.unwrap().media[0];
+        let n = season_node(m);
+        assert_eq!((n.anilist_id, n.mal_id), (100, Some(200)));
+        assert_eq!(n.title, "Shingeki no Kyojin Season 2");
+        // Still airing with no announced total: the episodes aired so far.
+        assert_eq!(n.episodes, Some(5));
+        assert_eq!(n.start, Some((2017, 4, 1)));
+        assert_eq!(n.year, Some(2017));
+        let chain: Vec<_> = n.links.iter().filter(|l| l.is_anime && crate::seasons::is_chain_relation(&l.relation)).map(|l| l.anilist_id).collect();
+        assert_eq!(chain, [99, 101]);
     }
 
     /// Live check against graphql.anilist.co and arm.haglund.dev.

@@ -345,6 +345,10 @@ pub struct StudioPage {
     pub(crate) style: crate::export::style_view::StyleUi,
     pub(crate) queue: crate::pipeline::Queue,
     seen_queue: u64,
+    /// Time left per manga for the Activity queue and the Dashboard, worked out off the UI thread
+    /// (see `eta_check`).
+    pub(crate) eta: crate::eta::Report,
+    pub(crate) eta_state: crate::queue_view::EtaState,
     /// Every issue, worked out once per frame; and the ones the user dismissed.
     pub(crate) issues: Vec<crate::issues::Issue>,
     pub(crate) dismissed: HashSet<String>,
@@ -501,6 +505,8 @@ impl StudioPage {
             style,
             queue: crate::pipeline::snapshot(),
             seen_queue: crate::pipeline::version(),
+            eta: Default::default(),
+            eta_state: Default::default(),
             issues: vec![],
             dismissed: HashSet::new(),
             lib_open: true,
@@ -722,6 +728,7 @@ impl StudioPage {
                     this.auto_export_check(window, cx);
                     changed = true;
                 }
+                this.eta_check(cx);
                 this.video_poll(cx);
                 // Exports report through shared state: keep their Activity cards moving.
                 if !crate::pipeline::exports().is_empty() {

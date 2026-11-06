@@ -186,9 +186,9 @@ class Engine:
         uv = self.F.interpolate(uv, size=(self.h, self.w), mode="bilinear", align_corners=False)[0]
         return self.torch.stack([ya[0], uv[0], uv[1]]), (ya[1:2] / 255).clamp(0, 1)
 
-    def sequence_frame(self, pattern, j, flip=False):
-        """Frame j of a PNG sequence (flares, bursts: drawn small), scaled to the frame (bicubic)."""
-        # Kept small (a few MB a frame; scaled up they would be 60), scaled each time they show.
+    def small_frame(self, pattern, j):
+        """Frame j of a PNG sequence as it is drawn: YUV plus alpha 0..255 as a 4th channel, kept
+        (the last few sequences) so a frame is read once."""
         seq = self.sequences.get(pattern)
         if seq is None:
             seq = self.sequences[pattern] = {}
@@ -200,6 +200,12 @@ class Engine:
             a = np.asarray(Image.open(pattern % j).convert("RGBA"))
             t = self.torch.from_numpy(np.ascontiguousarray(a)).to(self.dev).permute(2, 0, 1).float()
             small = seq[j] = self.torch.cat([self.to_yuv(t[:3]), t[3:4]])
+        return small
+
+    def sequence_frame(self, pattern, j, flip=False):
+        """Frame j of a PNG sequence (flares, bursts: drawn small), scaled to the frame (bicubic)."""
+        # Kept small (a few MB a frame; scaled up they would be 60), scaled each time they show.
+        small = self.small_frame(pattern, j)
         f = self.F.interpolate(small[None], size=(self.h, self.w), mode="bicubic", align_corners=False)[0]
         yuv, alpha = f[:3].clamp(0, 255), (f[3:4] / 255).clamp(0, 1)
         if flip:
@@ -626,10 +632,9 @@ def render(plan):
             if a <= g < b:
                 e.blend(img, yuv, al, px, py)
         if card and card["on"][0] <= g < card["on"][1]:
-            yuv, al = e.image(card["src"])
-            i = g - card["on"][0]
-            a = at(card["alpha"], i)
-            e.blend(img, yuv, al * a if al is not None else a, int(at(card["pos"][0], i)), int(at(card["pos"][1], i)))
+            # The badge's own frame i (small, drawn as it is: its fade, pop and ring are in it).
+            small = e.small_frame(card["src"], g - card["on"][0])
+            e.blend(img, small[:3], small[3:4] / 255, int(card["pos"][0]), int(card["pos"][1]))
         return img
 
     # Frames come back to the CPU through pinned buffers, copied without waiting: the next frame is

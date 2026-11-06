@@ -66,5 +66,8 @@ iframe#app {
   height: calc(100% - env(safe-area-inset-top) - env(safe-area-inset-bottom));
   border: 0; background: var(--bg);
 }
+/* Once the app says it handles the safe areas itself, the frame fills the whole screen so its
+   bars reach the real edges (a shrunken frame left a band of plain background under the tab bar). */
+body.edge iframe#app { inset: 0; width: 100%; height: 100%; }
 body.in-app { padding: 0; }
 body.in-app .card { display: none; }

@@ -17,6 +17,52 @@ const PROPS = new Set(['value', 'checked', 'disabled', 'hidden', 'muted', 'indet
 // the session and the service worker: being locked out or forgetting the phone is its job.
 const CLOUD = location.pathname.startsWith('/mangavox/') && window.parent !== window;
 const toConnector = mv => window.parent.postMessage({ mv }, location.origin);
+
+/**
+ * Safe areas when this app runs in a frame of the connector page. Browsers give the notch and
+ * gesture-bar insets to the top page, and the frame may sit inset from the screen edge, so the
+ * tab bar either floated above the real bottom or sat under the gesture bar. The frame is
+ * same-origin with the top page: measure the insets there, subtract the gap between the frame
+ * and each screen edge, and use the rest as our own --sat/--sab/--sal/--sar. This stays right
+ * whether the connector shrinks the frame by the insets (older page) or fills the screen.
+ */
+function syncFrameInsets() {
+  const root = document.documentElement;
+  const names = ['--sat', '--sab', '--sal', '--sar'];
+  try {
+    const top = window.top, fe = window.frameElement;
+    if (top === window || !fe) throw new Error('not framed');
+    // Fill the screen ourselves (inline beats an older connector stylesheet that shrinks the frame).
+    if (CLOUD) fe.style.cssText += ';inset:0;width:100%;height:100%';
+    const probe = top.document.createElement('div');
+    probe.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;'
+      + 'padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)';
+    top.document.body.appendChild(probe);
+    const cs = top.getComputedStyle(probe);
+    const ins = [cs.paddingTop, cs.paddingBottom, cs.paddingLeft, cs.paddingRight].map(v => parseFloat(v) || 0);
+    probe.remove();
+    const r = fe.getBoundingClientRect();
+    const gap = [r.top, top.innerHeight - r.bottom, r.left, top.innerWidth - r.right];
+    names.forEach((n, i) => root.style.setProperty(n, Math.max(0, ins[i] - Math.max(0, gap[i])) + 'px'));
+  } catch {
+    names.forEach(n => root.style.removeProperty(n)); // not framed: the plain env() values apply
+  }
+}
+if (window.parent !== window) {
+  let pending = 0;
+  // Insets settle a moment after a rotation or the browser bars moving, so look again shortly.
+  let late = 0;
+  const soon = () => {
+    cancelAnimationFrame(pending); pending = requestAnimationFrame(syncFrameInsets);
+    clearTimeout(late); late = setTimeout(syncFrameInsets, 350);
+  };
+  syncFrameInsets();
+  ['resize', 'orientationchange', 'pageshow', 'focus'].forEach(e => addEventListener(e, soon));
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') soon(); });
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', soon);
+  // Tell a connector that understands it to let the frame reach the screen edges (older ones ignore it).
+  try { window.parent.postMessage({ mv: 'edge' }, location.origin); } catch { /* no connector */ }
+}
 const REACH_PC = CLOUD
   ? 'Make sure MangaVox is running on your PC with From anywhere turned on.'
   : 'Make sure MangaVox is running on your PC and this phone is on the same Wi‑Fi.';
@@ -564,6 +610,9 @@ const Priv = (() => {
   const label = () => on ? 'Private mode is on: nothing you read or watch is recorded. Tap to turn it off' : 'Private mode: nothing you read or watch is recorded';
   function paintBtn(b) {
     b.classList.toggle('on', on);
+    // Said in words too (as on the PC), so the state never rests on the tint alone.
+    const word = b.querySelector('span');
+    if (word) word.textContent = on ? 'Private on' : 'Private';
     b.setAttribute('aria-pressed', String(on));
     b.setAttribute('aria-label', label());
     b.title = label();
@@ -638,6 +687,7 @@ const ROUTES = [
   ['studio', 'studio', /^\/studio$/, viewStudio],
   ['activity', 'activity', /^\/activity$/, viewActivity],
   ['more', 'more', /^\/more$/, viewMore],
+  ['history', 'more', /^\/history$/, viewHistory],
   ['listen', 'more', /^\/listen$/, viewListen],
   ['remote', 'more', /^\/remote$/, viewRemote],
   ['touchpad', 'more', /^\/touchpad$/, viewTouchpad],
@@ -806,7 +856,8 @@ function viewLibrary(ctx) {
     const recent = list.filter(m => m.last_read_at).slice(0, 12);
     if (recent.length) {
       root.append(h('section', { class: 'sec', 'aria-label': 'Continue reading' },
-        h('h2', { class: 'sec-h' }, 'Continue reading'),
+        h('div', { class: 'sec-row' }, h('h2', { class: 'sec-h' }, 'Continue reading'),
+          h('a', { class: 'see-all', href: histHref('manga') }, 'See all')),
         h('div', { class: 'hscroll' }, recent.map(contCard))));
     }
     const grid = h('div', { class: 'grid' });
@@ -830,7 +881,7 @@ function viewLibrary(ctx) {
       .finally(() => refreshBtn.classList.remove('busy'));
   }
   ctx.refresh = load;
-  setActions(refreshBtn);
+  setActions(histBtn('manga'), refreshBtn);
   load();
 }
 
@@ -2436,6 +2487,7 @@ function viewMovies(ctx) {
     empty: 'The catalog is still loading on your PC. Try again in a moment.',
     open: openMovie, play: playMovie,
   });
+  setActions(histBtn('watch'));
 }
 
 function detailShell(p, s, it) {
@@ -2527,16 +2579,21 @@ function viewAnime(ctx) {
     open: openAnime,
     play: it => startWatch({ kind: 'anime', mal: malOf(it), title: it.title, episode: 1, bg: it.background || it.poster }),
   });
+  setActions(histBtn('watch', 'anime'));
 }
+/** The season picked for a show, by the id the sheet was opened with, so Back from the player returns to it. */
+const animeSeasonPick = new Map();
 function openAnime(it) {
   openSheet((p, s) => {
     const body = detailShell(p, s, it);
     const reopen = () => openAnime(it);
-    const mal = malOf(it);
+    const root = malOf(it);
+    // Every season is its own MAL entry: its episodes, sources and watched state all go by that id.
+    let mal = animeSeasonPick.get(root) || root, seasons = [], shown = it, tok = 0;
     let eps = [], nextPage = null, loadingMore = false, err = null;
-    const base = { mal, title: it.title, bg: it.background || it.poster };
-    const watchEp = (n, t) => startWatch({ ...base, kind: 'anime', episode: n, ept: t }, reopen);
-    const pcEp = n => playOnPc('anime', { ...base, episode: n, label: it.title + ' · Episode ' + n });
+    const base = () => ({ mal, title: shown.title || it.title, bg: it.background || it.poster });
+    const watchEp = (n, t) => startWatch({ ...base(), kind: 'anime', episode: n, ept: t }, reopen);
+    const pcEp = n => playOnPc('anime', { ...base(), episode: n, label: base().title + ' · Episode ' + n });
     const list = h('div');
     const moreBtn = h('button', { class: 'btn ghost block more-eps', type: 'button', onclick: loadMore }, 'More episodes');
     function row(e) {
@@ -2549,8 +2606,9 @@ function openAnime(it) {
       if (loadingMore || nextPage == null) return;
       loadingMore = true; moreBtn.classList.add('busy'); moreBtn.disabled = true;
       try {
-        const r = await api('/api/anime/' + enc(mal) + '/episodes?page=' + enc(nextPage));
-        if (s.closed) return;
+        const at = mal, my = tok;
+        const r = await api('/api/anime/' + enc(at) + '/episodes?page=' + enc(nextPage));
+        if (s.closed || my !== tok) return;
         const add2 = arr(r.episodes);
         eps = eps.concat(add2);
         list.append(...add2.map(row));
@@ -2570,6 +2628,53 @@ function openAnime(it) {
         watchEp(n, known && known.title);
       } }, inp, h('button', { class: 'btn sm', type: 'submit' }, icon('play'), 'Play'));
     }
+    // The chips live in their own box, so a late season list can appear without redrawing the episodes.
+    const seasonBox = h('div');
+    function paintSeasons() { const c = seasonChips(); seasonBox.replaceChildren(...(c ? [c] : [])); }
+    function seasonChips() {
+      if (seasons.length < 2) return null;
+      const chips = seasons.map(x => {
+        const on = String(x.mal_id) === mal;
+        const b = h('button', { class: 'chip', type: 'button', 'aria-pressed': String(on), title: x.title || x.label, onclick: () => pickSeason(String(x.mal_id)) }, x.label || 'Season');
+        if (on) requestAnimationFrame(() => { if (b.isConnected && b.scrollIntoView) b.scrollIntoView({ block: 'nearest', inline: 'center' }); });
+        return b;
+      });
+      return h('div', { class: 'seasons', role: 'group', 'aria-label': 'Seasons' }, h('div', { class: 'hscroll' }, chips));
+    }
+    function pickSeason(id) {
+      if (id === mal) return;
+      mal = id;
+      if (id === root) animeSeasonPick.delete(root); else animeSeasonPick.set(root, id);
+      const x = seasons.find(v => String(v.mal_id) === id) || {};
+      eps = []; nextPage = null; err = null;
+      // A "More episodes" reply for the old season is dropped, so free the button for the new one.
+      loadingMore = false; moreBtn.classList.remove('busy'); moreBtn.disabled = false;
+      shown = { ...it, title: x.title || it.title, episodes: x.episodes, year: x.year, description: '', format: '' };
+      draw(shown, false);
+      load();
+    }
+    let lateTry = false;
+    function lateSeasons(at) {
+      if (s.closed || at !== mal || seasons.length) return;
+      api('/api/anime/' + enc(at)).then(d => {
+        if (s.closed || arr(d.seasons).length < 2) return;
+        seasons = arr(d.seasons); paintSeasons();
+      }).catch(() => {});
+    }
+    function load() {
+      const at = mal, my = ++tok;
+      api('/api/anime/' + enc(at))
+        .then(d => {
+          if (s.closed || my !== tok) return;
+          if (arr(d.seasons).length > 1) seasons = arr(d.seasons);
+          // The PC may still be looking the seasons up (it gives up waiting after 6 s): ask once more.
+          else if (!seasons.length && !lateTry) { lateTry = true; setTimeout(() => lateSeasons(at), 7000); }
+          eps = arr(d.episodes_list); nextPage = d.next_page ?? null;
+          shown = { ...it, ...d, episodes: d.episodes ?? shown.episodes };
+          draw(shown, true);
+        })
+        .catch(e => { if (s.closed || my !== tok) return; err = e.status === 404 ? '' : 'Couldn’t load the episode list: ' + e.message; draw(shown, true); });
+    }
     function draw(d, full) {
       const count = Number(d.episodes) || 0;
       if (full && !eps.length && count > 0 && !err) eps = Array.from({ length: Math.min(count, 500) }, (_, i) => ({ episode: i + 1 }));
@@ -2577,15 +2682,17 @@ function openAnime(it) {
       const movie = /movie/i.test(String(d.format || ''));
       list.replaceChildren(...eps.map(row));
       moreBtn.hidden = nextPage == null;
+      paintSeasons();
       body.replaceChildren(
         h('div', { class: 'md-hero' }, art(d.background || d.poster, W.hero, '', null, true), h('div', { class: 'hero-in' }, h('h2', null, d.title || ''))),
         h('div', { class: 'md-body' },
           metaLine({ ...d, kind: 'anime' }),
+          seasonBox,
           h('div', { class: 'md-acts' },
             h('button', { class: 'btn primary block', type: 'button', onclick: () => watchEp(first, eps[0] && eps[0].title) }, icon('play'), movie || count === 1 ? 'Play' : 'Play episode ' + first),
             h('div', { class: 'row' },
               h('button', { class: 'btn', type: 'button', onclick: () => pcEp(first) }, icon('pc'), 'Play on PC'),
-              h('button', { class: 'btn', type: 'button', onclick: () => openPc({ page: 'anime', mal, title: d.title }) }, icon('info'), 'Open on PC'))),
+              h('button', { class: 'btn', type: 'button', onclick: () => openPc({ page: 'anime', mal, title: d.title || it.title }) }, icon('info'), 'Open on PC'))),
           clampP(d.description),
           !full && h('div', null, h('div', { class: 'skel skel-line', style: { width: '60%' } }), h('div', { class: 'skel skel-line', style: { width: '45%' } })),
           err && h('p', { class: 'muted small' }, err),
@@ -2595,9 +2702,7 @@ function openAnime(it) {
           eps.length > 1 && moreBtn));
     }
     draw(it, false);
-    api('/api/anime/' + enc(mal))
-      .then(d => { if (s.closed) return; eps = arr(d.episodes_list); nextPage = d.next_page ?? null; draw({ ...it, ...d, episodes: d.episodes ?? it.episodes }, true); })
-      .catch(e => { if (s.closed) return; err = e.status === 404 ? '' : 'Couldn’t load the episode list: ' + e.message; draw(it, true); });
+    load();
   }, { cls: 'tall', label: it.title || 'Details' });
 }
 
@@ -3766,6 +3871,27 @@ function notifyBox() {
   return box;
 }
 
+/** Same wording as the PC's time-left text ("About 3 h 20 min"), so a local countdown reads the same. */
+function etaPhrase(secs) {
+  if (secs < 60) return 'Less than a minute';
+  const round = (x, g) => Math.floor((x + g / 2) / g) * g;
+  let mins = Math.floor((secs + 30) / 60);
+  if (mins >= 1440) {
+    const hrs = round(mins, 60) / 60, d = Math.floor(hrs / 24), hh = hrs % 24;
+    return hh ? 'About ' + d + ' d ' + hh + ' h' : 'About ' + d + ' d';
+  }
+  if (mins >= 180) mins = round(mins, 10); else if (mins >= 10) mins = round(mins, 5);
+  const hh = Math.floor(mins / 60), mm = mins % 60;
+  return !hh ? 'About ' + mm + ' min' : !mm ? 'About ' + hh + ' h' : 'About ' + hh + ' h ' + mm + ' min';
+}
+/** The time-left text of a task. While it runs and the PC gave a finish time, it counts down on the
+ *  phone between polls; `off` is the PC clock minus this phone's clock. */
+function etaText(e, off) {
+  if (!e) return '';
+  if (e.secs == null || e.done_at == null) return e.text || '';
+  return etaPhrase(Math.max(0, Math.round((e.done_at - (Date.now() + off)) / 1000))) + ' left';
+}
+
 function viewActivity(ctx) {
   setTitle('Activity');
   const sum = h('div', { class: 'act-sum', hidden: true });
@@ -3783,7 +3909,7 @@ function viewActivity(ctx) {
   const cards = new Map(); // manga id -> its card parts (kept, so covers do not reload)
   const lastPct = new Map(); // task key -> last width, so a rebuilt bar glides from it
   const armed = new Map(); // task key -> until when its Cancel waits for the second tap
-  let lastData = null, evKey = '';
+  let lastData = null, evKey = '', clockOff = 0;
 
   function cancelBtn(t) {
     const on = (armed.get(t.key) || 0) > Date.now();
@@ -3818,6 +3944,7 @@ function viewActivity(ctx) {
         h('b', null, t.label),
         count && h('span', { class: 'atask-n' }, count)),
       h('div', { class: 'atask-l' }, t.line),
+      t.eta ? h('div', { class: 'atask-eta', 'data-eta': t.key }, icon('clock'), h('span', null, etaText(t.eta, clockOff))) : null,
       h('div', { class: 'pbar' + (t.state === 'waiting' ? ' indet' : '') }, bar),
       steps.length ? h('div', { class: 'steps', role: 'list', 'aria-label': 'Steps' }, steps.map(s =>
         h('span', { class: 'step ' + s.state, role: 'listitem', title: s.name + ': ' + s.state }, h('i'), h('span', null, STEP_TXT[s.name] || s.name)))) : null,
@@ -3846,10 +3973,22 @@ function viewActivity(ctx) {
     k.chip.className = 'state-chip ' + c.state;
     k.chip.textContent = STATE_TXT[c.state] || c.state;
     // Rebuilt only when a task changed; the countdown to an AI limit ticks either way.
-    const json = JSON.stringify(c.tasks) + '|' + [...armed].filter(([, u]) => u > Date.now()).map(([key]) => key).join();
+    k.tasks = arr(c.tasks);
+    const json = JSON.stringify(k.tasks.map(t => ({ ...t, eta: t.eta ? 1 : 0 }))) + '|' + [...armed].filter(([, u]) => u > Date.now()).map(([key]) => key).join();
     if (json !== k.json) { k.json = json; k.body.replaceChildren(...arr(c.tasks).map(t => taskEl(t, now))); }
     else for (const s of k.body.querySelectorAll('[data-until]')) s.textContent = resumeIn(+s.dataset.until - now / 1000);
+    tickEta(k);
   }
+
+  /** Writes each task's time left; runs on every poll and every few seconds in between. */
+  function tickEta(k) {
+    for (const el of k.body.querySelectorAll('[data-eta]')) {
+      const t = arr(k.tasks).find(x => x.key === el.dataset.eta);
+      const sp = el.lastChild, txt = etaText(t && t.eta, clockOff);
+      if (sp && sp.textContent !== txt) sp.textContent = txt;
+    }
+  }
+  const etaTimer = setInterval(() => { for (const k of cards.values()) tickEta(k); }, 5000);
 
   /** Puts `els` into `list` in order, moving only what is out of place. */
   function place(list, els) {
@@ -3867,6 +4006,7 @@ function viewActivity(ctx) {
     errBox.replaceChildren();
     lastData = d;
     const now = +d.now || Date.now();
+    clockOff = d.now ? +d.now - Date.now() : 0;
     const ms = arr(d.manga);
     const live = ms.filter(c => ACTIVE(c.state)), over = ms.filter(c => !ACTIVE(c.state));
     for (const id of [...cards.keys()]) if (!ms.some(c => c.id === id)) cards.delete(id);
@@ -3907,7 +4047,7 @@ function viewActivity(ctx) {
   const refreshBtn = iconBtn('refresh', 'Refresh activity', () => { refreshBtn.classList.add('busy'); Act.poll().finally(() => refreshBtn.classList.remove('busy')); });
   setActions(refreshBtn);
   ctx.refresh = () => Act.poll();
-  ctx.onLeave(() => { unsub(); Act.fast(false); });
+  ctx.onLeave(() => { unsub(); clearInterval(etaTimer); Act.fast(false); });
   if (Act.data()) draw(Act.data(), null);
   Act.fast(true);
   Act.markSeen();
@@ -3978,6 +4118,7 @@ function viewMore(ctx) {
     h('div', { class: 'more-hd' }, h('img', { src: '/icon.png', alt: '', width: '56', height: '56' }), h('div', null, h('b', null, 'MangaVox'), hdSub)),
     group('Media',
       h('div', { class: 'cells' },
+        cell('#/history', 'clock', 'History', 'What you read and watched, newest first'),
         cell('#/listen', 'headphones', 'Listen', 'Narration audio and recap videos'),
         cell('#/remote', 'remote', 'Remote control', 'See and control MangaVox on your PC'),
         cell('#/touchpad', 'mouse', 'Touchpad', 'Use this phone as your PC’s mouse and keyboard'))),
@@ -3995,6 +4136,200 @@ function viewMore(ctx) {
     appV.textContent = [m.app || 'MangaVox', m.version].filter(Boolean).join(' ');
     hdSub.textContent = subLine();
   }).catch(() => {});
+}
+
+/* ======================================================================
+   History: what you read and watched, newest first (GET /api/history)
+   ====================================================================== */
+const HIST_PAGE = 30;
+const HIST_KINDS = [['manga', 'Reading', 'book'], ['watch', 'Watching', 'tv']];
+const HIST_TYPES = [['', 'All'], ['anime', 'Anime'], ['movie', 'Movies'], ['series', 'Series']];
+const HIST_TYPE_NAME = { anime: 'Anime', movie: 'Movie', series: 'Series' };
+
+/** Day heading for a time in ms: Today, Yesterday, This week, Earlier (by the phone's calendar day). */
+function histDay(ms) {
+  if (typeof ms !== 'number' || !isFinite(ms)) return 'Earlier';
+  const day = t => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); };
+  const days = Math.round((day(Date.now()) - day(ms)) / 86400000);
+  return days <= 0 ? 'Today' : days === 1 ? 'Yesterday' : days <= 6 ? 'This week' : 'Earlier';
+}
+/** "14m left", "1h 4m left", "Almost done"; empty when nothing was played yet. */
+function histLeft(pos, dur) {
+  if (!(dur > 0) || !(pos > 0)) return '';
+  const m = Math.round(Math.max(dur - pos, 0) / 60), hh = Math.floor(m / 60), mm = m % 60;
+  return hh ? hh + 'h' + (mm ? ' ' + mm + 'm' : '') + ' left' : mm ? mm + 'm left' : 'Almost done';
+}
+/** The line under the title: the chapter, or the episode and how far it got. */
+function histSub(it) {
+  if (it.kind === 'manga') return it.chapter || '';
+  const ep = it.kind === 'series' && it.episode != null ? 'S' + (it.season == null ? 1 : it.season) + ' · E' + it.episode
+    : it.kind === 'anime' && it.episode != null ? 'Episode ' + it.episode : '';
+  const state = it.completed ? 'Watched' : histLeft(it.position, it.duration) || 'Started';
+  return [ep, state].filter(Boolean).join(' · ');
+}
+/** Open an entry: the reader at its chapter, or the player at its episode. */
+function histOpen(it) {
+  if (it.kind === 'manga') { location.hash = '#/read/' + enc(it.chapter_id); return; }
+  const base = { title: it.title, bg: it.poster };
+  if (it.kind === 'anime') startWatch({ ...base, kind: 'anime', mal: it.mal, episode: it.episode || 1 });
+  else if (it.kind === 'series' && it.episode != null) startWatch({ ...base, kind: 'series', imdb: it.imdb, season: it.season == null ? 1 : it.season, episode: it.episode });
+  else if (it.kind === 'series') openMovie({ imdb: it.imdb, id: it.imdb, kind: 'series', title: it.title, poster: it.poster });
+  else startWatch({ ...base, kind: 'movie', imdb: it.imdb });
+}
+/** The hash that opens History on a segment (used by the "See all" links and buttons). */
+const histHref = (kind, type) => '#/history?k=' + (kind === 'watch' ? 'watch' : 'manga') + (kind === 'watch' ? '&t=' + enc(type || '') : '');
+/** Loaded pages kept for a minute, so Back from a row returns to the same place instead of page 1. */
+const histCache = new Map();
+const HIST_KEEP_MS = 60000;
+const histBtn = (kind, type) => iconBtn('clock', 'History', () => { location.hash = histHref(kind, type); });
+
+function viewHistory(ctx, q) {
+  setTitle('History');
+  setBack('#/more');
+  const st = { kind: LS.get('mv.hist.kind', 'manga'), type: LS.get('mv.hist.type', ''), items: [], next: 0, total: 0, busy: false, err: null, loaded: false, priv: false, seq: 0 };
+  if (q && HIST_KINDS.some(k => k[0] === q.get('k'))) st.kind = q.get('k');
+  if (q && q.get('t') != null && HIST_TYPES.some(t => t[0] === q.get('t'))) st.type = q.get('t');
+  if (!HIST_KINDS.some(k => k[0] === st.kind)) st.kind = 'manga';
+  if (!HIST_TYPES.some(t => t[0] === st.type)) st.type = '';
+
+  const cacheKey = () => st.kind + '|' + (st.kind === 'watch' ? st.type : '');
+  const save = () => { if (st.loaded && !st.err) histCache.set(cacheKey(), { at: Date.now(), items: st.items, next: st.next, total: st.total, priv: st.priv }); };
+  const refreshBtn = iconBtn('refresh', 'Refresh history', () => load(true));
+  const body = h('div', { class: 'hist-body' });
+  const typeBox = h('div', { class: 'hist-types' }, segmented(HIST_TYPES, st.type, v => { st.type = v; LS.set('mv.hist.type', v); load(true); scrollTo(0, 0); }, 'Kind of title'));
+  const top = h('div', { class: 'hist-top' },
+    segmented(HIST_KINDS, st.kind, v => { st.kind = v; LS.set('mv.hist.kind', v); typeBox.hidden = v !== 'watch'; load(true); scrollTo(0, 0); }, 'Reading or watching'),
+    typeBox);
+  typeBox.hidden = st.kind !== 'watch';
+  view.append(h('div', { class: 'page hist' }, top, body));
+  setActions(refreshBtn);
+  ctx.refresh = () => load(true);
+
+  // Loads the next page when the end of the list scrolls near; "Load more" does the same by hand.
+  const io = 'IntersectionObserver' in window
+    ? new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) more(); }, { rootMargin: '600px 0px' }) : null;
+  ctx.onLeave(() => { save(); if (io) io.disconnect(); });
+  function more() { if (ctx.alive && st.loaded && st.next != null && !st.busy && !st.err) load(false); }
+
+  async function load(reset) {
+    if (st.busy && !reset) return;
+    if (reset) { st.seq++; st.items = []; st.next = 0; st.total = 0; st.loaded = false; }
+    st.err = null;
+    const seq = st.seq;
+    st.busy = true;
+    refreshBtn.classList.add('busy');
+    paint();
+    const p = new URLSearchParams({ kind: st.kind, offset: String(st.next || 0), limit: String(HIST_PAGE) });
+    if (st.kind === 'watch' && st.type) p.set('type', st.type);
+    try {
+      const d = await api('/api/history?' + p);
+      if (!ctx.alive || seq !== st.seq) return;
+      // An offset can drift if history changed between pages, so never show a title twice.
+      const seen = new Set(st.items.map(x => x.key));
+      st.items = st.items.concat(arr(d.items).filter(x => !seen.has(x.key)));
+      st.next = d.next == null ? null : d.next | 0;
+      st.total = d.total | 0;
+      st.priv = !!d.private;
+      st.loaded = true;
+    } catch (e) {
+      if (!ctx.alive || seq !== st.seq || e.status === 401) return;
+      st.err = e;
+    } finally {
+      if (seq === st.seq) { st.busy = false; refreshBtn.classList.remove('busy'); if (ctx.alive) paint(); }
+    }
+  }
+
+  const skelRows = () => h('div', { class: 'hist-list', 'aria-busy': 'true' }, Array.from({ length: 6 }, () =>
+    h('div', { class: 'hrow' }, h('div', { class: 'cov skel' }),
+      h('div', { class: 'hrow-b' }, h('div', { class: 'skel skel-line', style: { width: '70%' } }), h('div', { class: 'skel skel-line', style: { width: '45%' } })))));
+
+  function empty() {
+    if (st.kind === 'manga') {
+      return stateBox('book', 'Nothing read yet', 'Chapters you read show up here, so you can pick up where you left off.',
+        h('a', { class: 'btn primary', href: '#/library' }, icon('book'), 'Open library'));
+    }
+    const scoped = st.type ? ' of this kind' : '';
+    return stateBox('tv', 'Nothing watched yet', 'Anything you play' + scoped + ' shows up here, so you can pick up where you left off.',
+      h('a', { class: 'btn primary', href: '#/anime' }, icon('tv'), 'Browse anime'),
+      h('a', { class: 'btn', href: '#/movies' }, icon('film'), 'Browse movies'));
+  }
+
+  function row(it) {
+    const thumb = it.kind === 'manga' ? cover(it.cover, it.title) : art(it.poster, W.poster, 'cov', initials(it.title));
+    const showBar = it.kind !== 'manga' && !it.completed && it.progress > 0;
+    const when = [it.kind !== 'manga' && st.type === '' ? HIST_TYPE_NAME[it.kind] : '', ago(it.at)].filter(Boolean).join(' · ');
+    const el = h('div', { class: 'hrow' });
+    const main = h('button', { class: 'hrow-main', type: 'button', onclick: () => histOpen(it), 'aria-label': (it.kind === 'manga' ? 'Continue ' : 'Play ') + it.title + ', ' + histSub(it) },
+      thumb,
+      h('div', { class: 'hrow-b' },
+        h('div', { class: 'hrow-t' }, it.title),
+        h('div', { class: 'hrow-s' }, histSub(it)),
+        showBar && h('div', { class: 'pbar sm', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(Math.round(it.progress * 100)) }, h('i', { style: { width: Math.round(it.progress * 100) + '%' } })),
+        h('div', { class: 'hrow-w' }, when)));
+    // Removing is permanent, so the first tap only arms the button (like Forget this phone).
+    let armed = false, armT;
+    const rm = h('button', { class: 'hrow-x', type: 'button', 'aria-label': 'Remove ' + it.title + ' from history' }, icon('close'));
+    const disarm = () => { armed = false; rm.classList.remove('confirm'); rm.replaceChildren(icon('close')); };
+    rm.addEventListener('click', async () => {
+      if (!armed) { armed = true; rm.classList.add('confirm'); rm.replaceChildren('Remove?'); armT = setTimeout(disarm, 3000); return; }
+      clearTimeout(armT);
+      rm.disabled = true;
+      try {
+        await post('/api/history/remove', { kind: it.kind === 'manga' ? 'manga' : 'watch', id: it.key });
+        st.items = st.items.filter(x => x !== it);
+        st.total = Math.max(0, st.total - 1);
+        // The server pages by offset into a list that is now one shorter.
+        if (st.next != null) st.next = Math.max(0, st.next - 1);
+        if (it.kind === 'manga') invalidate('/api/library');
+        histCache.delete(cacheKey());
+        toast('Removed from history', 'ok');
+        if (!ctx.alive) return;
+        if (!st.items.length && st.next != null) load(true); else paint();
+      } catch (e) { rm.disabled = false; disarm(); if (e.status !== 401) toast(e.message, 'err'); }
+    });
+    el.append(main, rm);
+    return el;
+  }
+
+  function footer() {
+    if (st.err) {
+      return h('div', { class: 'hist-more' }, h('p', { class: 'muted small' }, (st.err.offline ? 'Can’t reach your PC.' : 'Couldn’t load more.')),
+        h('button', { class: 'btn sm', type: 'button', onclick: () => load(false) }, icon('refresh'), 'Try again'));
+    }
+    if (st.next == null) return null;
+    const btn = h('button', { class: 'btn sm' + (st.busy ? ' busy' : ''), type: 'button', disabled: st.busy, onclick: () => load(false) }, st.busy ? 'Loading' : 'Load more');
+    return h('div', { class: 'hist-more' }, btn);
+  }
+
+  function paint() {
+    if (io) io.disconnect();
+    if (!st.loaded) {
+      body.replaceChildren(st.err ? errorState(st.err, () => load(true)) : skelRows());
+      return;
+    }
+    if (!st.items.length) { body.replaceChildren(empty()); return; }
+    const groups = [];
+    for (const it of st.items) {
+      const g = histDay(it.at);
+      let last = groups[groups.length - 1];
+      if (!last || last.g !== g) groups.push(last = { g, items: [] });
+      last.items.push(it);
+    }
+    const foot = footer();
+    body.replaceChildren(
+      ...[st.priv && h('p', { class: 'hist-note muted small' }, 'Private mode is on: nothing new is being saved to history.'),
+        ...groups.map(g => h('section', { class: 'hist-day', 'aria-label': g.g },
+          h('h2', { class: 'hist-h' }, g.g), h('div', { class: 'hist-list' }, g.items.map(row)))),
+        foot].filter(Boolean));
+    if (io && foot && !st.busy && !st.err) io.observe(foot);
+  }
+
+  const kept = histCache.get(cacheKey());
+  if (kept && Date.now() - kept.at < HIST_KEEP_MS) {
+    Object.assign(st, { items: kept.items.slice(), next: kept.next, total: kept.total, priv: kept.priv, loaded: true });
+    paint();
+    ctx.restoreScroll();
+  } else load(true);
 }
 
 /* ======================================================================

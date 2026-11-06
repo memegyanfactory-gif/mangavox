@@ -2658,19 +2658,23 @@ def apply_edit_clips(items, clips):
     return out
 
 
-# The chapter card: the chapter's number and title in the top right corner as it starts, in the
-# captions' font and the opening scene's mood colour. It glides in from the right edge at CARD_IN,
-# holds about five seconds, and slides back out by CARD_OUT (seconds on the chapter's clock). The
-# look's "chapter_card" switch (Studio's Look) turns it off. A full recap joins the chapters as
-# they are, so each chapter change carries its own.
+# The chapter badge: a small circle in the top right corner as a chapter starts, with the chapter's
+# number in it and a thin ring around it that fills clockwise like a loading ring, so it is on
+# screen for CARD_SHOW seconds and then gone (seconds on the chapter's clock). Nothing else: no
+# word, no title. The look's "chapter_card" switch (Studio's Look) turns it off. A full recap
+# joins the chapters as they are, so each chapter change carries its own.
 CARD_IN = 0.35
-CARD_OUT = 6.4
-CARD_EASE = 0.6
-CARD_FADE = 0.6
-CARD_ACCENT = (255, 188, 108)
-# The card's top right corner sits this far in from the frame's (at 1080 rows), clear of the
-# edge glow.
-CARD_MARGIN = 72
+CARD_SHOW = 6.0
+CARD_OUT = CARD_IN + CARD_SHOW
+# It pops in over CARD_POP (fading up while growing from CARD_START_SCALE) and fades over the last CARD_FADE.
+CARD_POP = 0.3
+CARD_FADE = 0.35
+CARD_START_SCALE = 0.85
+# The circle's size and its distance from the frame's top and right edges, as shares of the short side.
+CARD_SIZE = 0.06
+CARD_MARGIN = 0.04
+# Drawn this many times larger and scaled down, so the edges and the digits come out smooth.
+CARD_SUPER = 4
 # Words that mark a scanlation or upload tag rather than a chapter title.
 CARD_JUNK = re.compile(r"(?i)\b(scans?|scanlat\w*|translat(?:ion|ions|ed|or|ors)|fansubs?|raws?|tl|mtl)\b")
 _CARD_OPEN, _CARD_CLOSE = "([{【「『（", ")]}】」』）"
@@ -2744,143 +2748,142 @@ def chapter_card_on(config, look):
     return config.get("chapter_card", True) is not False and (look or {}).get("chapter_card", True) is not False
 
 
-def card_font(config=None, output_dir=None):
-    """The card's display font: the captions' own (the caption style's), so the card belongs to
-    the video's look; Anton when it cannot be found."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    try:
-        try:
-            import caption_engine as ce
-        except ImportError:
-            from . import caption_engine as ce
-        settings = ce.resolve_settings(config or {}, output_dir)
-        path = ce.font(ce.get_style(settings.get("style")).get("font")).path
-        if os.path.isfile(path):
-            return path
-    except Exception:
-        pass
-    return os.path.join(here, "fonts", "Anton-Regular.ttf")
-
-
-def make_chapter_card(w, h, chapter, work_dir, accent=CARD_ACCENT, font=None):
-    """The chapter card (chapter_card_text) as an RGBA PNG sized for a w x h frame, or None when
-    there is nothing to name. Returns (path, card width, card height).
-
-    A broadcast-style title for the top right corner: the chapter's number large in the display
-    `font` (the captions' own, card_font) over a slanted stroke of the scene's `accent` colour,
-    and beside it a tracked "CHAPTER" in the accent over a hairline rule and the title in a clean
-    weight. No box: the type carries it, with a soft shadow only so it reads over a bright page."""
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+def chapter_badge_number(chapter):
+    """The chapter's number as the badge shows it ("2", "12", "12.5", "104"), or None when the
+    chapter has none (a one-shot): then there is no badge at all. It is chapter_card_text's
+    number, so a title like "Chapter 5" gives it too."""
     text = chapter_card_text(chapter)
-    if not text:
+    number = text[0][len("CHAPTER"):].strip() if text else ""
+    return number if re.fullmatch(r"\d+(?:\.\d+)?", number) else None
+
+
+def badge_geometry(w, h):
+    """(circle diameter, shadow room around it, canvas side, margin) in pixels for a w x h frame.
+    The first three are even, so the circle sits on the same pixels in the 4:2:0 picture of
+    either renderer."""
+    k = min(w, h)
+    d = max(16, round(CARD_SIZE * k)) & ~1
+    pad = (max(4, round(0.14 * d)) + 1) & ~1
+    return d, pad, d + 2 * pad, round(CARD_MARGIN * k)
+
+
+def badge_ring_width(d):
+    """The ring's thickness in pixels: thin, about a 16th of the circle."""
+    return max(2, round(d / 16))
+
+
+def badge_state(i):
+    """(opacity, scale, ring progress) of the badge on frame i of the chapter: nothing before
+    CARD_IN, then it pops in, the ring fills until the fade starts, and it is gone by CARD_OUT."""
+    t = i / FPS
+    pop = min(1.0, max(0.0, (t - CARD_IN) / CARD_POP))
+    ease = 1 - (1 - pop) ** 3
+    fade = min(1.0, max(0.0, (CARD_OUT - t) / CARD_FADE))
+    # Full when the fade starts, so the badge fades away as a completed ring.
+    progress = min(1.0, max(0.0, (t - CARD_IN) / (CARD_SHOW - CARD_FADE)))
+    return ease * fade, CARD_START_SCALE + (1 - CARD_START_SCALE) * ease, progress
+
+
+def _badge_base(number, d, pad, size):
+    """The badge's still part at CARD_SUPER times the size: a soft shadow, the dark disc, the
+    ring's faint track and the number in white, fitted inside the ring with room to spare."""
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+    q = CARD_SUPER
+    box = (pad * q, pad * q, (pad + d) * q - 1, (pad + d) * q - 1)
+    disc = Image.new("L", (size * q, size * q), 0)
+    ImageDraw.Draw(disc).ellipse(box, fill=255)
+    # The shadow only shows round the disc, so the translucent disc itself stays clean.
+    shade = disc.filter(ImageFilter.GaussianBlur(max(2.0, 0.06 * d * q))).point(lambda v: int(v * 0.55))
+    shade = ImageChops.subtract(ImageChops.offset(shade, 0, round(0.03 * d * q)), disc)
+    img = Image.new("RGBA", disc.size, (0, 0, 0, 0))
+    img.paste(Image.new("RGBA", disc.size, (0, 0, 0, 255)), mask=shade)
+    img.paste(Image.new("RGBA", disc.size, (10, 10, 14, 199)), mask=disc)
+    # The track and the number go on by compositing, so they sit over the disc and do not cut holes in it.
+    marks = Image.new("RGBA", disc.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(marks)
+    draw.ellipse(box, outline=(255, 255, 255, 64), width=badge_ring_width(d) * q)
+    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Inter-Bold.ttf")
+    room = 0.54 * d * q
+    px = max(8, round(0.46 * d * q))
+    font = ImageFont.truetype(font_path, px)
+    while px > 8 and draw.textlength(number, font=font) > room:
+        px -= 2
+        font = ImageFont.truetype(font_path, px)
+    l, t, r, b = draw.textbbox((0, 0), number, font=font)
+    mid = (pad + d / 2) * q
+    draw.text((mid - (l + r) / 2, mid - (t + b) / 2), number, font=font, fill=(255, 255, 255, 255))
+    return Image.alpha_composite(img, marks)
+
+
+def _badge_ring(base, d, pad, progress):
+    """`base` with the white progress arc on it: from 12 o'clock, clockwise, `progress` of the way round."""
+    from PIL import Image, ImageDraw
+    if progress <= 0:
+        return base
+    q = CARD_SUPER
+    box = (pad * q, pad * q, (pad + d) * q - 1, (pad + d) * q - 1)
+    ring = badge_ring_width(d) * q
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    white = (255, 255, 255, 255)
+    if progress >= 1:
+        draw.ellipse(box, outline=white, width=ring)
+    else:
+        end = -90 + 360 * progress
+        draw.arc(box, -90, end, fill=white, width=ring)
+        # Round ends, so the arc reads as a stroke and not a cut.
+        mid, r = (pad + d / 2) * q, (box[2] - box[0] - ring) / 2
+        for deg in (-90, end):
+            x, y = mid + r * math.cos(math.radians(deg)), mid + r * math.sin(math.radians(deg))
+            draw.ellipse((x - ring / 2, y - ring / 2, x + ring / 2, y + ring / 2), fill=white)
+    return Image.alpha_composite(base, layer)
+
+
+def make_chapter_card(w, h, chapter, work_dir):
+    """The chapter badge as a PNG sequence for a w x h frame, or None when the chapter has no
+    number. Returns (ffmpeg input pattern, frame count, side of the square frames): frame i is
+    the chapter's i-th frame (badge_state: nothing before CARD_IN, then it pops in, the ring
+    fills and it fades by CARD_OUT), with alpha, scale and ring all baked in, so both renderers
+    only lay frame i at chapter_card_pos."""
+    from PIL import Image
+    number = chapter_badge_number(chapter)
+    if not number:
         return None
-    kicker, title = text
-    number = kicker[len("CHAPTER"):].strip()
-    accent = tuple(int(c) for c in accent)
-    k = min(w, h) / 1080
-    here = os.path.dirname(os.path.abspath(__file__))
-    display = font if font and os.path.isfile(font) else os.path.join(here, "fonts", "Anton-Regular.ttf")
-    f_num = ImageFont.truetype(display, max(24, round(124 * k)))
-    f_kick = ImageFont.truetype(display, max(10, round(30 * k)))
-    f_title = ImageFont.truetype(os.path.join(here, "fonts", "Inter-Bold.ttf"), max(12, round(33 * k)))
-    probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
-    track = 0.2 * f_kick.size
+    d, pad, size, _ = badge_geometry(w, h)
+    base = _badge_base(number, d, pad, size)
+    count = round(CARD_OUT * FPS)
+    pattern = os.path.join(work_dir, "chapter_badge_%04d.png")
+    blank = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    for i in range(count):
+        opacity, scale, progress = badge_state(i)
+        if opacity <= 0.002:
+            frame = blank
+        else:
+            side = max(2, round(size * scale))
+            small = _badge_ring(base, d, pad, progress).resize((side, side), Image.LANCZOS)
+            frame = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            frame.paste(small, ((size - side) // 2, (size - side) // 2))
+            frame.putalpha(frame.getchannel("A").point(lambda v: round(v * opacity)))
+        frame.save(pattern % i, compress_level=1)
+    return pattern, count, size
 
-    def width(s, f, tr=0.0):
-        return sum(probe.textlength(c, font=f) for c in s) + tr * max(0, len(s) - 1)
 
-    label = "CHAPTER"
-    shown = number.zfill(2) if number.isdigit() else number
-    nl, nt, nr, nb = probe.textbbox((0, 0), shown, font=f_num) if shown else (0, 0, 0, 0)
-    num_w, num_h = nr - nl, nb - nt
-    gap = round(26 * k) if shown else 0
-    # A long title is cut at a word with an ellipsis (one long word, at a letter).
-    room = 0.46 * w - num_w - gap
-    if title and width(title, f_title) > room:
-        words = title.split()
-        while len(words) > 1 and width(" ".join(words) + "…", f_title) > room:
-            words.pop()
-        title = " ".join(words)
-        while len(title) > 1 and width(title + "…", f_title) > room:
-            title = title[:-1]
-        title = title.rstrip() + "…"
-    kl, kt, kr, kb = probe.textbbox((0, 0), label, font=f_kick)
-    tl, tt, tr, tb = probe.textbbox((0, 0), title, font=f_title) if title else (0, 0, 0, 0)
-    kick_w = width(label, f_kick, track)
-    text_w = round(max(kick_w, tr - tl))
-    rule_gap, rule = round(10 * k), max(1, round(2 * k))
-    text_h = (kb - kt) + (2 * rule_gap + rule + (tb - tt) if title else 0)
-    body_h = max(num_h, text_h)
-    pad = round(24 * k)
-    slant = round(0.21 * num_h) if shown else 0
-    cw = pad * 2 + text_w + gap + num_w + slant + round(0.12 * num_w)
-    ch = pad * 2 + body_h + round(0.08 * num_h)
-    shapes = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-    nx = pad + text_w + gap
-    ny = pad + (body_h - num_h) // 2
-    # A slanted plate of ink behind it all (cut at the stroke's angle), so the white type reads
-    # over a white page too.
-    lean = max(slant, round(0.16 * ch))
-    p0, p1 = round(pad * 0.35), ch - round(pad * 0.35)
-    ImageDraw.Draw(shapes).polygon([(round(pad * 0.35) + lean, p0), (cw - round(pad * 0.2), p0), (cw - round(pad * 0.2) - lean, p1),
-                                    (round(pad * 0.35), p1)], fill=(10, 10, 14, 200))
-    if shown:
-        # The number's stroke: a slanted band of the accent through its lower half, set a
-        # little right of the figure, like a marker swept under it.
-        y0, y1 = ny + round(0.46 * num_h), ny + num_h + round(0.08 * num_h)
-        x0, x1 = nx - round(0.08 * num_w), nx + num_w + round(0.12 * num_w)
-        ImageDraw.Draw(shapes).polygon([(x0 + slant, y0), (x1 + slant, y0), (x1, y1), (x0, y1)], fill=accent + (235,))
-    type_layer = Image.new("RGBA", shapes.size, (0, 0, 0, 0))
-    td = ImageDraw.Draw(type_layer)
-    # The text column, right-aligned against the number.
-    tx = nx - gap if shown else pad + text_w
-    ty = pad + (body_h - text_h) // 2
-    x = tx - kick_w
-    for c in label:
-        td.text((x - kl, ty - kt), c, font=f_kick, fill=accent + (255,))
-        x += probe.textlength(c, font=f_kick) + track
-    if title:
-        ry = ty + (kb - kt) + rule_gap
-        td.rectangle([tx - text_w, ry, tx, ry + rule - 1], fill=(255, 255, 255, 150))
-        td.text((tx - (tr - tl) - tl, ry + rule + rule_gap - tt), title, font=f_title, fill=(250, 248, 244, 255))
-    if shown:
-        td.text((nx - nl, ny - nt), shown, font=f_num, fill=(250, 248, 244, 255))
-    both = Image.alpha_composite(shapes, type_layer)
-    # A soft shadow under it all, only so it reads over a bright page.
-    shadow = Image.new("RGBA", both.size, (0, 0, 0, 0))
-    shadow.putalpha(both.getchannel("A").point(lambda v: int(v * 0.55)))
-    img = Image.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(max(1.5, 5 * k))), both)
-    out = os.path.join(work_dir, "chapter_card.png")
-    img.save(out)
-    return out, img.width, img.height
+def chapter_card_pos(w, h, bar):
+    """Where the badge's frames go: the circle's top right corner CARD_MARGIN in from the
+    frame's (below any letterbox bar), the frame itself a shadow's room wider; fixed, no glide."""
+    d, pad, _, margin = badge_geometry(w, h)
+    return (w - margin - d - pad) & ~1, max(0, bar + margin - pad) & ~1
 
 
 def chapter_card_graph(card, w, h, bar, src, out, label, a):
-    """The chapter card (make_chapter_card's (path, width, height)) from stream `label` over
-    [src] into [out], for a part starting at frame `a` of the chapter: the card's frames run on
-    the chapter's clock from there, so it moves the same whichever part it falls in."""
-    n = round(CARD_OUT * FPS)
-    x, y = chapter_card_motion(card, w, h, bar)
+    """The badge's frames (make_chapter_card's sequence, input stream `label`, read from frame
+    `a` on) over [src] into [out], for a part starting at frame `a` of the chapter: the frames
+    keep the chapter's clock, so it looks the same whichever part it falls in."""
+    x, y = chapter_card_pos(w, h, bar)
     return (
-        f"[{label}]format=yuva420p,setparams=colorspace=bt470bg:range=tv,loop=loop={n - 1}:size=1,"
-        f"settb=AVTB,setpts=N/({FPS}*TB),trim=start_frame={a},setpts=(N+{a})/({FPS}*TB),"
-        f"fade=in:st={CARD_IN}:d={CARD_EASE * 0.7:.3f}:alpha=1,fade=out:st={CARD_OUT - CARD_FADE}:d={CARD_FADE}:alpha=1[{out}_c];"
-        f"[{src}][{out}_c]overlay=x='{x}':y='{y}':format=yuv420:eof_action=pass[{out}]"
+        f"[{label}]format=yuva420p,setparams=colorspace=bt470bg:range=tv,settb=AVTB,setpts=(N+{a})/({FPS}*TB)[{out}_c];"
+        f"[{src}][{out}_c]overlay=x={x}:y={y}:format=yuv420:eof_action=pass[{out}]"
     )
-
-
-def chapter_card_motion(card, w, h, bar):
-    """Where the chapter card sits: its top right corner CARD_MARGIN in from the frame's (below
-    any letterbox bar). x is an expression of the chapter's time t: the card glides in from beyond
-    the right edge (easing out), holds, then slides back out (easing in) as it fades; y is fixed."""
-    _, cw, _ = card
-    k = min(w, h) / 1080
-    margin = round(CARD_MARGIN * k)
-    x0 = w - margin - cw
-    travel = cw + margin
-    ease_in = f"pow(max(0,1-(t-{CARD_IN})/{CARD_EASE}),3)"
-    ease_out = f"pow(max(0,(t-{CARD_OUT - CARD_FADE})/{CARD_FADE}),3)"
-    return f"{x0}+{travel}*min(1,{ease_in})+{travel}*{ease_out}", bar + round(44 * k)
 
 
 def overlay_graph(overlays, w, h, total, src, out, first_input, work_dir, t0=0.0):
@@ -3852,10 +3855,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     video["bursts"] = bursts
     if chapter_card_on(config, look):
         try:
-            # Themed to the video: the opening scene's mood colour, the captions' font.
-            accent = clips[0]["mood"]["edge"] if clips and clips[0]["mood"] else CARD_ACCENT
-            video["chapter_card"] = make_chapter_card(w, h, config.get("chapter"), video_dir, accent=accent,
-                                                      font=card_font(config, output_dir))
+            video["chapter_card"] = make_chapter_card(w, h, config.get("chapter"), video_dir)
         except Exception as e:
             print(f"[video] Could not make the chapter card: {e}", file=sys.stderr)
     if look.get("particles") and not mood_on:
@@ -4298,15 +4298,15 @@ def _finalize_video_with_audio_mix_and_captions(
             graph.append("[vraw]null[vx]")
         card = video.get("chapter_card")
         overlay_inputs, overlays = overlay_graph(
-            video.get("overlays"), w, h, total, "vx", "vc" if card and a < round(CARD_OUT * FPS) else "vo",
+            video.get("overlays"), w, h, total, "vx", "vc" if card and a < card[1] else "vo",
             len(labels) + extra.count("-i"), work, t0=t0,
         )
         graph.append(overlays)
-        if card and a < round(CARD_OUT * FPS):
-            # The chapter card over the opening seconds (under the captions).
+        if card and a < card[1]:
+            # The chapter badge over the opening seconds (under the captions).
             bar = letterbox_bar(w, h) if (video.get("look") or {}).get("letterbox") else 0
             graph.append(chapter_card_graph(card, w, h, bar, "vc", "vo", f"{len(labels) + extra.count('-i') + overlay_inputs.count('-i')}:v", a))
-            overlay_inputs = overlay_inputs + ["-i", card[0]]
+            overlay_inputs = overlay_inputs + ["-framerate", str(FPS), "-start_number", str(a), "-i", card[0]]
         if has_subs:
             from caption_engine import subtitles_filter
             graph.append(f"[vo]{subtitles_filter(ass_path)},setpts=PTS-STARTPTS,format=yuv420p[v]")

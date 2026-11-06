@@ -16,6 +16,7 @@ pub mod data;
 mod dashboard;
 mod delete;
 mod encode;
+pub mod eta;
 mod export;
 mod generate;
 mod issues;

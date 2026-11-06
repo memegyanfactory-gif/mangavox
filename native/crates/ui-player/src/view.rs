@@ -645,6 +645,12 @@ impl PlayerView {
                 let raw = format!("no data for {} s ({} peers)", p.since_progress.as_secs(), t.peers);
                 self.fallback("No one is sharing that source", raw, window, cx);
             }
+            logic::StartStep::GiveUp => {
+                // No other source is lined up, so this shows the error screen. The wording makes
+                // it the plain "No one is sharing this file right now" message.
+                let raw = format!("torrent metadata timeout: no data for {} s ({} peers)", p.since_progress.as_secs(), t.peers);
+                self.fallback("No one is sharing that source", raw, window, cx);
+            }
         }
     }
 
@@ -1114,8 +1120,22 @@ impl PlayerView {
         self.subs_requested = true;
         let Some(imdb) = self.req.imdb_id.clone().filter(|s| !s.is_empty()) else { return };
         let (season, episode) = (self.req.season, self.req.episode);
+        let mal = self.req.mal_id.clone().filter(|m| !m.is_empty());
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(subs)) = bg::run(async move { backend::subtitles(imdb, season, episode).await }).await {
+            let fetched = bg::run(async move {
+                // An anime season counts from 1 but IMDb holds every season in one series:
+                // place the episode first, and skip subtitles when it cannot be placed.
+                let (season, episode) = match (mal, episode) {
+                    (Some(mal), Some(ep)) => match mv_media::seasons::imdb_episode_of(&mal, &imdb, ep).await {
+                        Some((s, e)) => (Some(s), Some(e)),
+                        None => return Ok(Vec::new()),
+                    },
+                    _ => (season, episode),
+                };
+                backend::subtitles(imdb, season, episode).await
+            })
+            .await;
+            if let Ok(Ok(subs)) = fetched {
                 let _ = this.update(cx, |this, cx| {
                     this.add_subtitles(&subs);
                     cx.notify();
@@ -1866,10 +1886,10 @@ impl PlayerView {
                 (false, _) => "Opening stream".into(),
                 (true, Some(TorrentStats { checking: Some(c), .. })) => format!("Checking downloaded data {:.0}%", c * 100.0),
                 (true, Some(s)) if self.pending.is_some() => {
-                    let peers = if s.peers == 1 { "1 peer".to_string() } else { format!("{} peers", s.peers) };
-                    format!("Finding peers… {peers} · buffering {:.0}%", head.unwrap_or(0.0) * 100.0)
+                    // Judged from when the torrent became ready: that is the clock the fallback uses.
+                    logic::finding_status(Some(s.peers), head.unwrap_or(0.0), self.ready_at.elapsed(), !self.alternates.is_empty())
                 }
-                (true, _) => "Finding peers… getting the torrent's file list".into(),
+                (true, _) => logic::finding_status(None, 0.0, self.started.elapsed(), !self.alternates.is_empty()),
             }
         } else if self.snap.cache_pct > 0.0 {
             "Buffering".into()

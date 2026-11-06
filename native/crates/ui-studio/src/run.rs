@@ -108,6 +108,28 @@ pub fn resume_in(until: i64) -> String {
     }
 }
 
+/// Time the AI runs have spent waiting for a usage limit: finished waits, and when the current
+/// one began. Generate subtracts it from a step's time so a wait never counts as work.
+static WAITED: Mutex<(std::time::Duration, Option<std::time::Instant>)> = Mutex::new((std::time::Duration::ZERO, None));
+
+fn wait_begin() {
+    let mut w = WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    w.1.get_or_insert_with(std::time::Instant::now);
+}
+
+fn wait_end() {
+    let mut w = WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = w.1.take() {
+        w.0 += t.elapsed();
+    }
+}
+
+/// All the time spent waiting for an AI limit so far this session (a wait going on included).
+pub fn waited() -> std::time::Duration {
+    let w = WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    w.0 + w.1.map_or(std::time::Duration::ZERO, |t| t.elapsed())
+}
+
 static RUN: Mutex<Option<RunInfo>> = Mutex::new(None);
 static CANCEL: Mutex<Option<CancellationToken>> = Mutex::new(None);
 static VERSION: AtomicU64 = AtomicU64::new(0);
@@ -206,6 +228,7 @@ fn begin(kind: RunKind, model: String, chapters: usize) -> Option<CancellationTo
 }
 
 fn finish(res: anyhow::Result<()>, cancel: &CancellationToken) {
+    wait_end();
     update(|r| {
         r.state = match res {
             Ok(()) => RunState::Done,
@@ -252,12 +275,17 @@ fn progress_fn() -> mv_recap::ProgressFn {
             Progress::Waiting { message, until } => {
                 r.log(format!("Paused: {message}. Carrying on {} with the same page; nothing is skipped.", resume_in(until)));
                 r.waiting = Some((message, until));
+                wait_begin();
             }
             Progress::Resumed => {
                 r.waiting = None;
+                wait_end();
                 r.log("The AI answers again; carrying on.");
             }
-            Progress::Done | Progress::Failed(_) => r.waiting = None,
+            Progress::Done | Progress::Failed(_) => {
+                r.waiting = None;
+                wait_end();
+            }
         })
     })
 }

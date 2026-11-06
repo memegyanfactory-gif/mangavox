@@ -40,7 +40,7 @@ const clearCache = () => caches.delete('mv-tunnel-1').catch(() => {});
 /* ---------------- screens */
 
 function show({ title = 'MangaVox', lead = '', busy = false, choose = false, retry = null, forget = false, paste = false }) {
-  document.body.classList.remove('in-app');
+  document.body.classList.remove('in-app', 'edge');
   $('app').hidden = true;
   $('title').textContent = title;
   $('lead').textContent = lead;
@@ -348,6 +348,9 @@ function onAppMessage(ev) {
     forget();
   } else if (m === 'homescreen') {
     homeScreen(ev.data.link);
+  } else if (m === 'edge') {
+    // The app pads its own tab bar for the gesture bar, so the frame can reach the screen edge.
+    document.body.classList.add('edge');
   }
 }
 

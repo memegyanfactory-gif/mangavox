@@ -99,8 +99,12 @@ pub struct EngineConfig {
     pub upload_limit_bps: Option<u32>,
     /// Max peers per torrent.
     pub peer_limit: Option<usize>,
-    /// Give up on magnet metadata after this long.
+    /// Give up on checking files already on disk after this long.
     pub metadata_timeout: Duration,
+    /// Give up on finding peers that have a magnet's file list after this long. The search
+    /// restarts in rounds (see [`find_rounds`]) so a tracker or DHT lookup that went quiet
+    /// is asked again instead of being waited on for its full re-announce interval.
+    pub find_timeout: Duration,
     /// A released torrent (no open streams) keeps downloading this long, then
     /// is paused (kept in the session: instant resume, no re-check).
     pub linger: Duration,
@@ -128,6 +132,7 @@ impl EngineConfig {
             upload_limit_bps: Some(512 * 1024),
             peer_limit: Some(DEFAULT_PEER_LIMIT),
             metadata_timeout: Duration::from_secs(120),
+            find_timeout: Duration::from_secs(60),
             linger: Duration::from_secs(90),
             idle_ttl: Duration::from_secs(30 * 60),
             prefetch_ttl: Duration::from_secs(3 * 60),
@@ -274,6 +279,8 @@ struct Entry {
     last_active: Mutex<Instant>,
     /// Container-index warm-up streams (high priority first/last pieces).
     warmers: Mutex<Vec<Warmer>>,
+    /// A [`Registry::watch_peers`] task is running for this torrent.
+    watching: AtomicBool,
 }
 
 struct Warmer {
@@ -308,6 +315,9 @@ struct Registry {
     runtime: tokio::runtime::Handle,
     entries: Mutex<HashMap<String, Arc<Entry>>>,
     pending: Mutex<HashMap<String, PendingAdd>>,
+    /// The torrent the user most recently asked to play. A search for an earlier one that the
+    /// player gave up on may still finish later; it must not take over (pause) this one.
+    focus: Mutex<Option<String>>,
 }
 
 pub struct Engine {
@@ -342,6 +352,54 @@ pub fn pick_file(files: &[(String, u64)], requested: Option<usize>) -> Option<us
     };
     largest(&mut (0..files.len()).filter(|&i| is_video(&files[i].0)))
         .or_else(|| largest(&mut (0..files.len())))
+}
+
+/// A magnet's peer search is run in rounds of these lengths (the last one takes what is left of
+/// `total`): each round restarts the tracker and DHT lookups. Early rounds are short because a
+/// swarm that answers at all usually answers within seconds.
+const FIND_ROUND_SECS: [u64; 2] = [15, 20];
+
+pub fn find_rounds(total: Duration) -> Vec<Duration> {
+    let mut left = total;
+    let mut out = Vec::new();
+    for s in FIND_ROUND_SECS {
+        let d = Duration::from_secs(s);
+        if left <= d {
+            break;
+        }
+        out.push(d);
+        left -= d;
+    }
+    out.push(left);
+    out
+}
+
+/// Seconds after a play starts at which a torrent still without peers searches again.
+const PEER_RENEW_AFTER: [u64; 3] = [10, 25, 45];
+
+/// Nobody connected and nothing arrived: worth asking trackers and the DHT again.
+pub fn needs_peer_renewal(peers: u32, head_available: u64) -> bool {
+    peers == 0 && head_available == 0
+}
+
+/// Merges tracker lists into one without repeats (same address in different case or with a
+/// trailing slash counts as one); the first list's order is kept. Entries that are not
+/// `udp://`, `http://` or `https://` URLs are dropped.
+pub fn merge_trackers(lists: &[&[String]]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for t in lists.iter().flat_map(|l| l.iter()) {
+        let t = t.trim();
+        let Ok(u) = url::Url::parse(t) else { continue };
+        if !matches!(u.scheme(), "udp" | "http" | "https") || u.host_str().is_none() {
+            continue;
+        }
+        let key = format!("{}://{}:{}{}", u.scheme(), u.host_str().unwrap_or_default().to_ascii_lowercase(), u.port_or_known_default().unwrap_or(0), u.path().trim_end_matches('/'));
+        if seen.insert(key) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 /// Tail bytes warmed for the container index (MP4 `moov` at the end, MKV
@@ -483,6 +541,7 @@ impl Engine {
             runtime: tokio::runtime::Handle::current(),
             entries: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            focus: Mutex::new(None),
         });
         registry.adopt_restored().await;
         let server = StreamServer::start(registry.clone()).await?;
@@ -509,7 +568,7 @@ impl Engine {
         attempt: StartAttempt,
         persist: bool,
     ) -> Result<Arc<Session>> {
-        let trackers = cfg.trackers.iter().filter_map(|t| url::Url::parse(t).ok()).collect();
+        let trackers = merge_trackers(&[cfg.trackers.as_slice()]).iter().filter_map(|t| url::Url::parse(t).ok()).collect();
         // librqbit only ties its listener / DHT tasks to the session once the
         // session is fully built: if startup failed half-way (or this future
         // was dropped) they kept running and held their UDP ports for the rest
@@ -583,11 +642,18 @@ impl Engine {
         // re-checking their files hold the session's few "initialize" slots, and a new torrent
         // would queue behind them (minutes for big season packs) before it even starts.
         if let Ok(h) = source.info_hash() {
+            *self.registry.focus.lock().unwrap() = Some(h.clone());
             self.registry.pause_others(&h).await;
         }
         let entry = self.registry.clone().ensure(source, opts, true).await?;
         let hash = entry.handle.info_hash().as_string();
-        self.registry.pause_others(&hash).await;
+        // The caller moved on to another source while this one was still being found: keep
+        // the torrent (it lingers and is cleaned up) but do not pause the one now in use.
+        let wanted = self.registry.focus.lock().unwrap().as_deref().map_or(true, |f| f == hash);
+        if wanted {
+            self.registry.pause_others(&hash).await;
+            self.registry.watch_peers(&entry);
+        }
         let idx = entry.file_idx();
         Ok(AddedTorrent {
             stream_url: self.url_for(&hash, idx),
@@ -896,6 +962,131 @@ impl Registry {
         Ok(())
     }
 
+    /// One try at adding the torrent: for a magnet this resolves the file list from peers.
+    async fn add_once(&self, source: &Source, opts: &AddOptions, only: Option<Vec<usize>>) -> Result<AddTorrentResponse> {
+        let to_add = match source {
+            Source::Magnet(m) => AddTorrent::from_url(m.clone()),
+            Source::InfoHash(h) => AddTorrent::from_url(h.clone()),
+            Source::TorrentBytes(b) => AddTorrent::from_bytes(b.clone()),
+        };
+        let add_opts = AddTorrentOptions {
+            overwrite: true,
+            output_folder: opts.output_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            trackers: (!opts.extra_trackers.is_empty()).then(|| opts.extra_trackers.clone()),
+            // Select the requested file up front so nothing else is
+            // fetched while we pick (addon sources carry fileIdx).
+            only_files: only,
+            ..Default::default()
+        };
+        self.session.add_torrent(to_add, Some(add_opts)).await
+    }
+
+    /// Adds the torrent and waits for its file list, searching for peers in rounds: a round
+    /// that found nobody is dropped and started again, which asks every tracker and the DHT
+    /// afresh. Trackers otherwise answer "come back in 30 minutes" after one empty reply.
+    /// Gives up after `find_timeout` with a "metadata timeout" error the player words plainly.
+    async fn find_metadata(&self, source: &Source, opts: &AddOptions) -> Result<AddTorrentResponse> {
+        let total = self.cfg.find_timeout.min(self.cfg.metadata_timeout);
+        let rounds = find_rounds(total);
+        let n = rounds.len();
+        for (i, round) in rounds.into_iter().enumerate() {
+            let attempt = async {
+                let first = self.add_once(source, opts, opts.file_idx.map(|i| vec![i])).await;
+                match first {
+                    Err(e) if opts.file_idx.is_some() && format!("{e:#}").contains("out of range") => {
+                        self.add_once(source, opts, None).await
+                    }
+                    other => other,
+                }
+            };
+            match tokio::time::timeout(round, attempt).await {
+                Ok(res) => return res,
+                Err(_) if i + 1 < n => {
+                    log().log_with(
+                        mv_core::logging::Level::Info,
+                        "torrent",
+                        "no file list yet, searching for peers again",
+                        serde_json::json!({ "hash": short_hash(&source.info_hash().unwrap_or_default()), "round": i + 1, "of": n }),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        bail!("torrent metadata timeout after {total:?}")
+    }
+
+    /// Watches a played torrent that has no peers and no data, and asks for peers again at
+    /// [`PEER_RENEW_AFTER`]. A restarted torrent announces to every tracker and the DHT afresh;
+    /// without this a tracker that said "nobody" once is not asked again for half an hour.
+    fn watch_peers(self: &Arc<Self>, e: &Arc<Entry>) {
+        if e.watching.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let (reg, e) = (self.clone(), e.clone());
+        self.runtime.spawn(async move {
+            let hash = e.handle.info_hash().as_string();
+            let mut waited = Duration::ZERO;
+            for at in PEER_RENEW_AFTER {
+                let at = Duration::from_secs(at);
+                tokio::time::sleep(at.saturating_sub(waited)).await;
+                waited = at;
+                let current = reg.entries.lock().unwrap().get(&hash).is_some_and(|c| Arc::ptr_eq(c, &e));
+                if !current || e.handle.is_paused() || is_initializing(&e.handle) {
+                    break;
+                }
+                let idx = e.file_idx();
+                let (peers, connecting) = e
+                    .handle
+                    .stats()
+                    .live
+                    .map(|l| {
+                        let ps = &l.snapshot.peer_stats;
+                        (ps.live, ps.connecting > 0)
+                    })
+                    .unwrap_or((0, false));
+                let head = e.handle.available_from(idx, 0, HEAD_PROBE_BYTES);
+                if head > 0 {
+                    break; // data is flowing
+                }
+                // Handshakes in flight would be cut off by the restart: let them finish first.
+                if connecting || !needs_peer_renewal(peers, head) || e.active_streams.load(Ordering::Relaxed) > 0 {
+                    continue;
+                }
+                log().log_with(
+                    mv_core::logging::Level::Info,
+                    "torrent",
+                    "no peers yet, searching again",
+                    serde_json::json!({ "hash": short_hash(&hash), "afterSecs": at.as_secs() }),
+                );
+                if reg.session.pause(&e.handle).await.is_err() {
+                    break;
+                }
+                // Never leave it paused: nothing else would wake a torrent nobody streams yet.
+                let mut resumed = false;
+                for _ in 0..3 {
+                    if reg.session.unpause(&e.handle).await.is_ok() {
+                        resumed = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                if !resumed {
+                    log().log_with(
+                        mv_core::logging::Level::Warn,
+                        "torrent",
+                        "could not resume after searching for peers again",
+                        serde_json::json!({ "hash": short_hash(&hash) }),
+                    );
+                    break;
+                }
+                // The warm-up streams belonged to the torrent's previous run.
+                e.warmers.lock().unwrap().clear();
+                reg.start_warmers(&e, idx);
+            }
+            e.watching.store(false, Ordering::Relaxed);
+        });
+    }
+
     async fn select_files(&self, e: &Entry, idx: usize) {
         let mut set: HashSet<usize> = e.handle.only_files().unwrap_or_default().into_iter().collect();
         if set.len() == 1 && set.contains(&idx) {
@@ -921,32 +1112,7 @@ impl Registry {
         let handle = match self.session.get(TorrentIdOrHash::Hash(Id20::from_str(&hash).map_err(|e| anyhow!("{e}"))?)) {
             Some(h) => h,
             None => {
-                let to_add = |src: &Source| match src {
-                    Source::Magnet(m) => AddTorrent::from_url(m.clone()),
-                    Source::InfoHash(h) => AddTorrent::from_url(h.clone()),
-                    Source::TorrentBytes(b) => AddTorrent::from_bytes(b.clone()),
-                };
-                let make_opts = |only: Option<Vec<usize>>| AddTorrentOptions {
-                    overwrite: true,
-                    output_folder: opts.output_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    trackers: (!opts.extra_trackers.is_empty()).then(|| opts.extra_trackers.clone()),
-                    // Select the requested file up front so nothing else is
-                    // fetched while we pick (addon sources carry fileIdx).
-                    only_files: only,
-                    ..Default::default()
-                };
-                let add = async {
-                    let first = self.session.add_torrent(to_add(&source), Some(make_opts(opts.file_idx.map(|i| vec![i])))).await;
-                    match first {
-                        Err(e) if opts.file_idx.is_some() && format!("{e:#}").contains("out of range") => {
-                            self.session.add_torrent(to_add(&source), Some(make_opts(None))).await
-                        }
-                        other => other,
-                    }
-                };
-                let res = tokio::time::timeout(self.cfg.metadata_timeout, add)
-                    .await
-                    .map_err(|_| anyhow!("torrent metadata timeout after {:?}", self.cfg.metadata_timeout))??;
+                let res = self.find_metadata(&source, &opts).await?;
                 match res {
                     AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => h,
                     AddTorrentResponse::ListOnly(_) => bail!("unexpected list-only response"),
@@ -977,6 +1143,7 @@ impl Registry {
             active_streams: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             warmers: Mutex::new(Vec::new()),
+            watching: AtomicBool::new(false),
         });
         self.select_files(&entry, file_idx).await;
         self.start_warmers(&entry, file_idx);
@@ -1062,6 +1229,7 @@ impl Registry {
                     active_streams: AtomicUsize::new(0),
                     last_active: Mutex::new(Instant::now()),
                     warmers: Mutex::new(Vec::new()),
+                    watching: AtomicBool::new(false),
                 })
             });
         }
@@ -1296,6 +1464,33 @@ mod tests {
         let no_video = vec![f("x.bin", 5), f("y.dat", 50)];
         assert_eq!(pick_file(&no_video, None), Some(1));
         assert_eq!(pick_file(&[], None), None);
+    }
+
+    #[test]
+    fn peer_search_runs_in_rounds_that_add_up() {
+        let secs = |v: Vec<Duration>| v.into_iter().map(|d| d.as_secs()).collect::<Vec<_>>();
+        assert_eq!(secs(find_rounds(Duration::from_secs(60))), [15, 20, 25]);
+        assert_eq!(secs(find_rounds(Duration::from_secs(30))), [15, 15]);
+        assert_eq!(secs(find_rounds(Duration::from_secs(10))), [10]);
+        assert_eq!(secs(find_rounds(Duration::from_secs(15))), [15]);
+        assert_eq!(find_rounds(Duration::from_secs(45)).iter().sum::<Duration>(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn peers_are_asked_for_again_only_when_nothing_flows() {
+        assert!(needs_peer_renewal(0, 0));
+        assert!(!needs_peer_renewal(3, 0));
+        assert!(!needs_peer_renewal(0, 1024));
+    }
+
+    #[test]
+    fn trackers_merge_without_repeats() {
+        let a: Vec<String> = ["udp://Tracker.Example.com:1337/announce", "http://t.example.org/announce/", "ws://x.example/announce", "junk"].iter().map(|s| s.to_string()).collect();
+        let b: Vec<String> = ["udp://tracker.example.com:1337/announce", "http://t.example.org/announce", "https://t.example.org/announce", " udp://new.example:80/announce "].iter().map(|s| s.to_string()).collect();
+        let m = merge_trackers(&[&a, &b]);
+        assert_eq!(m, ["udp://Tracker.Example.com:1337/announce", "http://t.example.org/announce/", "https://t.example.org/announce", "udp://new.example:80/announce"]);
+        let defaults: Vec<String> = DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(merge_trackers(&[&defaults]).len(), defaults.len());
     }
 
     #[test]
@@ -1694,6 +1889,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = EngineConfig::new(dir.path().join("dl"));
         cfg.metadata_timeout = Duration::from_secs(90);
+        cfg.find_timeout = Duration::from_secs(90);
         let engine = Engine::new(cfg).await.unwrap();
         let magnet = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny&tr=udp%3A%2F%2Fexplodie.org%3A6969&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337";
         let added = engine.add(Source::parse(magnet).unwrap(), AddOptions::default()).await.unwrap();

@@ -333,9 +333,25 @@ pub async fn next_episode(req: PlayRequest) -> Result<PlayRequest> {
             mv_media::jikan::JikanClient::shared()?.imdb_id(&mal).await.ok_or_else(|| anyhow!("This title has no IMDb mapping"))?
         }
     };
-    let rid = stream_resource_id(&imdb, false, req.season.unwrap_or(1), ep + 1).ok_or_else(|| anyhow!("Invalid title id"))?;
+    let mut ids: Vec<String> = Vec::new();
+    match req.mal_id.clone().filter(|m| !m.is_empty()) {
+        // An anime season counts from 1 but IMDb holds every season in one series: place the
+        // next episode through the season list, and leave it to Kitsu when it cannot be placed.
+        Some(mal) => {
+            if let Some((s, e)) = mv_media::seasons::imdb_episode_of(&mal, &imdb, ep + 1).await {
+                ids.extend(stream_resource_id(&imdb, false, s, e));
+            }
+            if let Some(k) = mv_media::episode_art::kitsu_id(&mal).await {
+                ids.push(format!("kitsu:{k}:{}", ep + 1));
+            }
+        }
+        None => ids.extend(stream_resource_id(&imdb, false, req.season.unwrap_or(1), ep + 1)),
+    }
+    if ids.is_empty() {
+        return Err(anyhow!("Invalid title id"));
+    }
     let reg = REG.get_or_init(|| AddonRegistry::open(mv_core::paths::root().join("addons")));
-    let streams = reg.find_streams(&rid, "series").await;
+    let streams = reg.find_streams_any(&ids, "series").await;
     let s = streams.iter().find(|s| has_playable_link(s)).ok_or_else(|| anyhow!("No sources found for episode {}", ep + 1))?;
     Ok(PlayRequest {
         title: logic::next_title(&req.title, ep),
