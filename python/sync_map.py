@@ -201,6 +201,10 @@ def _build_beat_segments(segments, beats, offset=None):
             if sfx:
                 beat_seg["sfx"] = sfx
                 beat_seg["sfx_strength"] = _sfx_strength(pb.get("sfx_strength"))
+            # Series mode (beta): who says the line, and the character's name card on their first.
+            for k in ("speaker", "line_kind", "name_card"):
+                if pb.get(k):
+                    beat_seg[k] = pb[k]
             out.append(beat_seg)
             cursor = seg_end
 

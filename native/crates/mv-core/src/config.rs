@@ -91,6 +91,53 @@ impl Config {
         }
         Ok(())
     }
+
+    /// The saved [`RECAP_MUSIC_LEVEL`] (1, as rendered, when nothing was saved).
+    pub fn recap_music_level(&self) -> f64 {
+        music_level_of(self.get(RECAP_MUSIC_LEVEL).as_ref())
+    }
+
+    /// Saves [`RECAP_MUSIC_LEVEL`], kept to 0..=1 in whole percents.
+    pub fn set_recap_music_level(&self, level: f64) -> Result<()> {
+        let level = if level.is_finite() { (level.clamp(0.0, 1.0) * 100.0).round() / 100.0 } else { 1.0 };
+        self.set(RECAP_MUSIC_LEVEL, Value::from(level))
+    }
+}
+
+/// How loud a recap's background music plays, from 0 (off) to 1 (as Studio rendered it). Recap
+/// videos carry two sound tracks, "Narration + music" and "Narration only" (the same narration on
+/// both): the player mixes the two to this level while one plays, and Studio's exports bake it
+/// in, so what is heard while watching is what gets exported.
+pub const RECAP_MUSIC_LEVEL: &str = "recap.musicLevel";
+
+/// A stored [`RECAP_MUSIC_LEVEL`]: a number, kept to 0..=1; anything else (or nothing) is 1.
+pub fn music_level_of(v: Option<&Value>) -> f64 {
+    v.and_then(Value::as_f64).filter(|x| x.is_finite()).map(|x| x.clamp(0.0, 1.0)).unwrap_or(1.0)
+}
+
+/// The app's [`RECAP_MUSIC_LEVEL`] in whole percents once read (`u32::MAX`: not yet): the player
+/// sets it and Studio's export panel shows it every frame, without reading the file each time.
+static MUSIC_LEVEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// The app's recap music level (see [`RECAP_MUSIC_LEVEL`]).
+pub fn music_level() -> f64 {
+    use std::sync::atomic::Ordering;
+    match MUSIC_LEVEL.load(Ordering::Relaxed) {
+        u32::MAX => {
+            let level = Config::open_default().recap_music_level();
+            MUSIC_LEVEL.store((level * 100.0).round() as u32, Ordering::Relaxed);
+            level
+        }
+        p => p as f64 / 100.0,
+    }
+}
+
+/// Saves the app's recap music level (blocking: it writes the config file).
+pub fn save_music_level(level: f64) -> Result<()> {
+    let c = Config::open_default();
+    c.set_recap_music_level(level)?;
+    MUSIC_LEVEL.store((c.recap_music_level() * 100.0).round() as u32, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -129,5 +176,22 @@ mod tests {
         assert_eq!(c.get("trakt"), Some(json!({"token":"t","user":"u"})));
         c.remove("trakt").unwrap();
         assert_eq!(c.get("trakt"), None);
+    }
+
+    #[test]
+    fn recap_music_level_is_saved_in_whole_percents() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::at(dir.path().join("config.json"));
+        assert_eq!(c.recap_music_level(), 1.0, "as rendered until the viewer changes it");
+        c.set_recap_music_level(0.504).unwrap();
+        assert_eq!(c.recap_music_level(), 0.5);
+        assert_eq!(c.get(RECAP_MUSIC_LEVEL), Some(json!(0.5)));
+        c.set_recap_music_level(-3.0).unwrap();
+        assert_eq!(c.recap_music_level(), 0.0, "off");
+        c.set_recap_music_level(f64::NAN).unwrap();
+        assert_eq!(c.recap_music_level(), 1.0);
+        assert_eq!(music_level_of(Some(&json!(7))), 1.0);
+        assert_eq!(music_level_of(Some(&json!("loud"))), 1.0);
+        assert_eq!(music_level_of(None), 1.0);
     }
 }

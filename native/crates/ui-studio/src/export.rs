@@ -28,6 +28,96 @@ pub(crate) mod intro;
 
 /// The name generated videos give their music-free audio track.
 pub(crate) const NARRATION_ONLY: &str = "Narration only";
+/// The name of a joined video's music-free track when some chapters' narration had to be rebuilt
+/// for it (videos made before they carried their own): that narration is not sample-for-sample
+/// the one under the music, so the track can stand in for the music but not be mixed with it.
+const NARRATION_REBUILT: &str = "Narration only (rebuilt)";
+/// The track name of a chapter video made without music (its narration alone).
+const NARRATION: &str = "Narration";
+
+/// The music level (`mv_core::config::RECAP_MUSIC_LEVEL`, 0 off ..= 1 as rendered) an export with
+/// its music on uses: the one set with the player's music slider or the export's own.
+pub(crate) fn music_level(on: bool) -> f64 {
+    if on {
+        mv_core::config::music_level()
+    } else {
+        0.
+    }
+}
+
+/// The sound an export takes from a video that may carry the music-free track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Sound {
+    /// One track as it is (0: the main one, with the music).
+    Track(usize),
+    /// The music at `level` of its rendered loudness: the main track and the music-free one
+    /// (track `solo`) mixed `level : 1 - level`. The narration is the same on both, so it stays
+    /// as it is while the music (and its sound effects) scale by `level`.
+    Mix { level: f64, solo: usize },
+}
+
+impl Sound {
+    /// The sound for music `level` (0 off ..= 1 as rendered) from a video whose music-free track
+    /// is `solo` (when it has one), which can be mixed with its main track (`mixable`) or only
+    /// stand in for it.
+    pub(crate) fn of(level: f64, solo: Option<usize>, mixable: bool) -> Sound {
+        match solo {
+            Some(k) if level <= 0.005 => Sound::Track(k),
+            Some(k) if level < 0.995 && mixable => Sound::Mix { level, solo: k },
+            _ => Sound::Track(0),
+        }
+    }
+
+    /// Filter making `[out]` (48 kHz stereo) from input `input`'s sound.
+    pub(crate) fn graph(self, input: usize, out: &str) -> String {
+        const AF: &str = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+        match self {
+            Sound::Track(k) => format!("[{input}:a:{k}]{AF}[{out}]"),
+            Sound::Mix { level, solo } => format!("[{input}:a:0]{AF}[{out}_m];[{input}:a:{solo}]{AF}[{out}_n];[{out}_m][{out}_n]amix=inputs=2:weights={level:.2} {:.2}:normalize=0[{out}]", 1. - level),
+        }
+    }
+
+    /// What the export says about its sound: "with music", "with the music at 50%", "narration only".
+    pub(crate) fn describe(level: f64) -> String {
+        match (level * 100.).round() {
+            p if p <= 0. => "narration only (no music)".into(),
+            p if p >= 100. => "with music".into(),
+            p => format!("with the music at {p:.0}%"),
+        }
+    }
+}
+
+/// An export's sound from the joined video (input `input`): its track `-map`ped as it is (copied
+/// when `copy`, or through `extras.loudnorm`), or, mixed, a filter graph part making `[a]` that
+/// the caller adds to its own. (graph part, arguments)
+fn sound_args(sound: Sound, input: usize, extras: &Extras, copy: bool) -> (Option<String>, Vec<String>) {
+    match sound {
+        Sound::Track(k) => {
+            let mut a = vec!["-map".into(), format!("{input}:a:{k}")];
+            a.extend(extras.audio_args(copy));
+            (None, a)
+        }
+        Sound::Mix { .. } => {
+            let graph = match &extras.loudnorm {
+                Some(f) => format!("{};[am]{f}[a]", sound.graph(input, "am")),
+                None => sound.graph(input, "a"),
+            };
+            (Some(graph), ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"].map(String::from).to_vec())
+        }
+    }
+}
+
+/// `args` (a picture's, maybe with its own `-filter_complex`) with `graph` added to its filter.
+fn with_graph(mut args: Vec<String>, graph: Option<String>) -> Vec<String> {
+    let Some(g) = graph else { return args };
+    match args.iter().position(|a| a == "-filter_complex") {
+        Some(i) if i + 1 < args.len() => args[i + 1] = format!("{};{g}", args[i + 1]),
+        _ => {
+            args.splice(0..0, ["-filter_complex".to_string(), g]);
+        }
+    }
+    args
+}
 /// Longest reel, in seconds.
 pub(crate) const REEL_SECONDS: f64 = 60.0;
 /// Upright reel frame.
@@ -494,11 +584,13 @@ fn fit_blur(input: &str, out: &str, w: u32, h: u32) -> String {
     )
 }
 
-/// Track names for the joined video.
-fn track_tags(two: bool) -> Vec<String> {
+/// Track names for the joined video: the second (music-free) track only when `two`, named as
+/// rebuilt when some chapters' narration was (see [`NARRATION_REBUILT`]).
+fn track_tags(two: bool, rebuilt: bool) -> Vec<String> {
     let mut t = vec!["-metadata:s:a:0".into(), "title=Narration + music".into(), "-metadata:s:a:0".into(), "handler_name=Narration + music".into()];
     if two {
-        t.extend(["-metadata:s:a:1".into(), format!("title={NARRATION_ONLY}"), "-metadata:s:a:1".into(), format!("handler_name={NARRATION_ONLY}"), "-disposition:a:1".into(), "0".into()]);
+        let solo = if rebuilt { NARRATION_REBUILT } else { NARRATION_ONLY };
+        t.extend(["-metadata:s:a:1".into(), format!("title={solo}"), "-metadata:s:a:1".into(), format!("handler_name={solo}"), "-disposition:a:1".into(), "0".into()]);
     }
     t
 }
@@ -514,6 +606,8 @@ pub(crate) struct Joined {
     pub solo: bool,
     /// Chapters whose music is still on that track (their narration could not be rebuilt).
     pub music_kept: usize,
+    /// The two tracks can be mixed to set the music's level: no chapter's narration was rebuilt.
+    pub mixable: bool,
     /// The chapter videos it was joined from, in order (an export bakes its watermark into each
     /// of them once, see [`chapter_segment`], and joins those without re-encoding).
     pub files: Vec<PathBuf>,
@@ -606,9 +700,9 @@ pub(crate) fn rebuild_narration(video: &Path, secs: f64, out: &Path) -> Result<(
 
 /// Joins `files` (in order) into `out`, reusing it when it was made from the same files.
 /// Losslessly when every video matches, else re-encoded to the first one's frame. The joined
-/// video has a second "Narration only" track: each chapter's own, or for chapters made before
-/// videos carried one, its narration rebuilt from the chapter's audio clips (a chapter where
-/// that fails keeps its only track there).
+/// video has a second "Narration only" track: each chapter's own (a chapter made without music:
+/// its only track), or for chapters made with music before videos carried one, its narration
+/// rebuilt from the chapter's audio clips (a chapter where that fails keeps its only track there).
 pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined> {
     if files.is_empty() {
         bail!("No chapter has a video yet");
@@ -623,6 +717,7 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
                 boundaries: m["boundaries"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default(),
                 solo: m["solo"].as_bool().unwrap_or(false),
                 music_kept: m["music_kept"].as_u64().unwrap_or(0) as usize,
+                mixable: m["solo"].as_bool().unwrap_or(false) && m["rebuilt"].as_u64() == Some(0),
                 files: files.to_vec(),
             });
         }
@@ -647,16 +742,19 @@ pub(crate) fn join(files: &[PathBuf], out: &Path, r: &Reporter) -> Result<Joined
     std::fs::create_dir_all(&work)?;
     let res = join_into(files, &probes, total, &work, out, r);
     let _ = std::fs::remove_dir_all(&work);
-    let (solo, music_kept) = res?;
-    let _ = std::fs::write(&meta, serde_json::to_string(&json!({"v": JOIN_VERSION, "sources": key, "total": total, "boundaries": boundaries, "solo": solo, "music_kept": music_kept}))?);
-    Ok(Joined { path: out.to_path_buf(), total, boundaries, solo, music_kept, files: files.to_vec() })
+    let (solo, music_kept, rebuilt) = res?;
+    let _ = std::fs::write(&meta, serde_json::to_string(&json!({"v": JOIN_VERSION, "sources": key, "total": total, "boundaries": boundaries, "solo": solo, "music_kept": music_kept, "rebuilt": rebuilt}))?);
+    Ok(Joined { path: out.to_path_buf(), total, boundaries, solo, music_kept, mixable: solo && rebuilt == 0, files: files.to_vec() })
 }
 
-/// [`join`]'s work in `work`. Returns whether the second, music-free track was made, and how
-/// many chapters still have their music on it (no narration could be rebuilt for them).
-fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: &Path, r: &Reporter) -> Result<(bool, usize)> {
+/// [`join`]'s work in `work`. Returns whether the second, music-free track was made, how many
+/// chapters still have their music on it (no narration could be rebuilt for them), and for how
+/// many it was rebuilt.
+fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: &Path, r: &Reporter) -> Result<(bool, usize, usize)> {
     // The music-free track of each chapter: (extra input file, if rebuilt; its audio stream).
     let mut solos: Vec<(Option<PathBuf>, usize)> = vec![];
+    // Chapters made without music (their only track is the narration as it plays).
+    let mut silent = 0;
     for (i, (f, p)) in files.iter().zip(probes).enumerate() {
         r.set(0.15 * i as f32 / files.len() as f32, "Preparing the music-free sound");
         if r.cancelled() {
@@ -664,6 +762,12 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
         }
         if let Some(k) = p.solo() {
             solos.push((None, k));
+            continue;
+        }
+        // Nothing to rebuild, and the same sound on both tracks, so a music level mixes it as is.
+        if p.audio.len() == 1 && p.audio[0].1.trim().eq_ignore_ascii_case(NARRATION) {
+            solos.push((None, 0));
+            silent += 1;
             continue;
         }
         let wav = work.join(format!("{i:04}_narration.wav"));
@@ -689,7 +793,9 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
     for s in solos.iter_mut().filter(|s| s.1 == usize::MAX) {
         s.1 = 0;
     }
-    let solo = kept < files.len();
+    let rebuilt = solos.iter().filter(|s| s.0.is_some()).count();
+    // No chapter has music: one track, nothing to take out.
+    let solo = kept < files.len() && silent < files.len();
     let solo_params = |i: usize| if solos[i].0.is_some() { "aac/48000/2".to_string() } else { probes[i].audio[solos[i].1].0.clone() };
     let same = (0..files.len()).all(|i| probes[i].video == probes[0].video && probes[i].audio[0].0 == probes[0].audio[0].0 && (!solo || solo_params(i) == probes[0].audio[0].0));
     let tmp = out.with_extension("part.mp4");
@@ -716,7 +822,7 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
         let list = work.join("list.txt");
         std::fs::write(&list, concat_list(&parts))?;
         let mut args: Vec<String> = vec!["-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), list.to_string_lossy().into(), "-map".into(), "0".into(), "-c".into(), "copy".into()];
-        args.extend(track_tags(solo));
+        args.extend(track_tags(solo, rebuilt > 0));
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
         ffmpeg(&args, total, r, None, &mut |f| r.set(0.5 + 0.5 * f, "Joining the chapters"))?;
     } else {
@@ -761,12 +867,12 @@ fn join_into(files: &[PathBuf], probes: &[Probe], total: f64, work: &Path, out: 
             args.extend(["-map".into(), "[b]".into()]);
         }
         args.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "192k"].map(String::from));
-        args.extend(track_tags(solo));
+        args.extend(track_tags(solo, rebuilt > 0));
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
         ffmpeg(&args, total, r, None, &mut |f| r.set(0.15 + 0.85 * f, "Joining the chapters (re-encoding: they differ in size or sound)"))?;
     }
     finish(&tmp, out)?;
-    Ok((solo, kept))
+    Ok((solo, kept, if solo { rebuilt } else { 0 }))
 }
 
 // ------------------------------------------------------------------ watermark
@@ -1267,12 +1373,11 @@ pub(crate) fn hook_concat_graph(w: u32, h: u32, video: &str) -> String {
     )
 }
 
-/// Filter joining the hook's sound (input 0, track `hook_track`, padded or cut to its picture's
-/// `hook_secs` so the recap's sound starts with its picture) and the joined video's (input 1,
-/// track `track`) into `[a]`, run through `loudnorm` when given.
-pub(crate) fn hook_sound_graph(hook_track: usize, hook_secs: f64, track: usize, loudnorm: Option<&str>) -> String {
-    let af = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
-    let mut g = format!("[0:a:{hook_track}]{af},apad,atrim=0:{hook_secs:.3}[ha];[1:a:{track}]{af}[ja];[ha][ja]concat=n=2:v=0:a=1");
+/// Filter joining the hook's sound (input 0, as `hook` takes it, padded or cut to its picture's
+/// `hook_secs` so the recap's sound starts with its picture) and the joined video's (input 1, as
+/// `joined` takes it) into `[a]`, run through `loudnorm` when given.
+pub(crate) fn hook_sound_graph(hook: Sound, hook_secs: f64, joined: Sound, loudnorm: Option<&str>) -> String {
+    let mut g = format!("{};[h0]apad,atrim=0:{hook_secs:.3}[ha];{};[ha][ja]concat=n=2:v=0:a=1", hook.graph(0, "h0"), joined.graph(1, "ja"));
     match loudnorm {
         Some(f) => g.push_str(&format!("[j];[j]{f}[a]")),
         None => g.push_str("[a]"),
@@ -1289,11 +1394,12 @@ impl Drop for Remove<'_> {
     }
 }
 
-/// The hook (its sound track `hook_track`) and then the intro, as one short `w`x`h` video at `out`.
-fn join_opening(hook: &Path, hook_track: usize, intro: &Path, w: u32, h: u32, out: &Path, r: &Reporter) -> Result<()> {
+/// The hook (its sound as `hook_sound` takes it) and then the intro, as one short `w`x`h` video at
+/// `out`. The intro keeps its own sound (its music is the intro, not a bed under the narration).
+fn join_opening(hook: &Path, hook_sound: Sound, intro: &Path, w: u32, h: u32, out: &Path, r: &Reporter) -> Result<()> {
     let af = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
     let fit = |i: usize| format!("[{i}:v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{i}]");
-    let graph = format!("{};[0:a:{hook_track}]{af}[a0];{};[1:a:0]{af}[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]", fit(0), fit(1));
+    let graph = format!("{};{};{};[1:a:0]{af}[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]", fit(0), hook_sound.graph(0, "a0"), fit(1));
     let mut args: Vec<String> = vec!["-i".into(), hook.to_string_lossy().into(), "-i".into(), intro.to_string_lossy().into()];
     args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), "[a]".into()]);
     args.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "16", "-c:a", "aac", "-b:a", "256k", "-f", "mp4"].map(String::from));
@@ -1347,10 +1453,12 @@ fn finish(tmp: &Path, out: &Path) -> Result<()> {
 }
 
 /// Writes the export of `j` into `out_dir`: one file, or (for parts and reels) a folder of them,
-/// with the hook before it (one video) and the watermark over it as `extras` say.
-pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: &str, extras: &Extras, r: &Reporter) -> Result<Vec<PathBuf>> {
+/// with the hook before it (one video) and the watermark over it as `extras` say. `music` is the
+/// music's level (0 off ..= 1 as rendered, see [`music_level`]): the joined video's two tracks
+/// mixed to it, or its music-free track at 0.
+pub(crate) fn export(j: &Joined, mode: Mode, music: f64, out_dir: &Path, name: &str, extras: &Extras, r: &Reporter) -> Result<Vec<PathBuf>> {
     r.take_turn()?;
-    let track = if !music && j.solo { 1 } else { 0 };
+    let audio = Sound::of(music, j.solo.then_some(1), j.mixable);
     let src = j.path.to_string_lossy().to_string();
     let mark = Mark::prepare(extras.watermark.clone(), extras.font.as_deref())?;
     let cwd = mark.as_ref().and_then(|m| m.dir.clone());
@@ -1376,15 +1484,39 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         // The intro alone (no hook) joins as one more segment before chapter 1: it is rendered
         // at the chapters' size and frame rate, so the export still re-encodes nothing else.
         let files: Vec<PathBuf> = intro.iter().cloned().chain(j.files.iter().cloned()).collect();
-        if let Some(spec) = SegmentSpec::of(extras).filter(|_| hook.is_none() && track == 0 && uniform(&files)) {
+        if let Some(spec) = SegmentSpec::of(extras).filter(|_| hook.is_none() && audio != Sound::Track(1) && uniform(&files)) {
             let since = std::time::SystemTime::now();
             let dir = segment_dir(&j.path);
             let segs = segments(&dir, &files, &spec, r, 0.9)?;
             let list = dir.join("export_list.txt");
             std::fs::write(&list, concat_list(&segs))?;
             let mut args: Vec<String> = ["-f", "concat", "-safe", "0", "-i"].map(String::from).to_vec();
-            args.extend([list.to_string_lossy().into(), "-map".into(), "0:v:0".into(), "-map".into(), "0:a:0".into(), "-c:v".into(), "copy".into()]);
-            args.extend(extras.audio_args(true));
+            args.push(list.to_string_lossy().into());
+            match audio {
+                // The segments carry only the main track: the chapters' sound is mixed from the
+                // joined video (input 1, on the same clock), after the intro's own sound when the
+                // intro opens the video (its segment's length, as the join places chapter 1).
+                Sound::Mix { .. } => {
+                    args.extend(["-i".into(), src.clone()]);
+                    let joined = match intro.as_ref().map(|_| probe(&segs[0]).map(|p| p.duration)).transpose()? {
+                        Some(secs) => format!(
+                            "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=0:{secs:.3}[ia];{};[ia][ja]concat=n=2:v=0:a=1[am]",
+                            audio.graph(1, "ja")
+                        ),
+                        None => audio.graph(1, "am"),
+                    };
+                    let graph = match &extras.loudnorm {
+                        Some(f) => format!("{joined};[am]{f}[a]"),
+                        None => format!("{joined};[am]anull[a]"),
+                    };
+                    args.extend(["-filter_complex".into(), graph, "-map".into(), "0:v:0".into(), "-map".into(), "[a]".into(), "-c:v".into(), "copy".into()]);
+                    args.extend(["-c:a", "aac", "-b:a", "192k"].map(String::from));
+                }
+                _ => {
+                    args.extend(["-map".into(), "0:v:0".into(), "-map".into(), "0:a:0".into(), "-c:v".into(), "copy".into()]);
+                    args.extend(extras.audio_args(true));
+                }
+            }
             args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
             ffmpeg(&args, j.total, r, None, &mut |f| r.set(0.9 + 0.1 * f, "Saving the video"))?;
             let _ = std::fs::remove_file(&list);
@@ -1399,10 +1531,12 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         // The opening before chapter 1: the hook, then the intro, joined into one short video.
         let opening = out.with_extension("opening.mp4");
         let _opening = Remove(&opening);
+        // A hook is rendered like a chapter (its two tracks mix); the opening made from it and an
+        // intro alone carry one track.
         let hook: Option<PathBuf> = match (hook, intro) {
             (Some(hk), Some(it)) => {
-                let ht = if music { 0 } else { probe(&hk)?.solo().unwrap_or(0) };
-                join_opening(&hk, ht, &it, w, h, &opening, r)?;
+                let hs = Sound::of(music, probe(&hk)?.solo(), true);
+                join_opening(&hk, hs, &it, w, h, &opening, r)?;
                 Some(opening.clone())
             }
             (hk, it) => hk.or(it),
@@ -1413,12 +1547,12 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         let _sound = Remove(&sound);
         if let Some(hook) = hook {
             let hp = probe(hook)?;
-            let hook_track = if music { 0 } else { hp.solo().unwrap_or(0) };
+            let hook_audio = Sound::of(music, hp.solo(), true);
             total += hp.duration;
             // The sound first, on its own: quick (no picture to wait on), and then checked.
             let sargs: Vec<String> = vec![
                 "-i".into(), hook.to_string_lossy().into(), "-i".into(), src.clone(),
-                "-filter_complex".into(), hook_sound_graph(hook_track, hp.duration, track, extras.loudnorm.as_deref()),
+                "-filter_complex".into(), hook_sound_graph(hook_audio, hp.duration, audio, extras.loudnorm.as_deref()),
                 "-map".into(), "[a]".into(), "-vn".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(),
                 "-f".into(), "mp4".into(), sound.to_string_lossy().into(),
             ];
@@ -1440,24 +1574,39 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
         } else if let Some(m) = &mark {
             args = vec!["-i".into(), src.clone()];
             args.extend(m.inputs());
-            let graph = match &scale {
+            let mut graph = match &scale {
                 Some(sc) => format!("[0:v:0]{sc}[sc];{}", watermark_graph(&m.wm, "sc", "v", w, h, 1)),
                 None => watermark_graph(&m.wm, "0:v:0", "v", w, h, 1),
             };
-            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into(), "-map".into(), format!("0:a:{track}")]);
+            let (mix, audio_out) = sound_args(audio, 0, extras, true);
+            if let Some(g) = mix {
+                graph.push(';');
+                graph.push_str(&g);
+            }
+            args.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into()]);
             args.extend(extras.video_args());
-            args.extend(extras.audio_args(true));
+            args.extend(audio_out);
         } else if let Some(sc) = &scale {
-            args = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}"), "-vf", sc].map(String::from).to_vec();
+            args = vec!["-i".into(), src.clone()];
+            let (mix, audio_out) = sound_args(audio, 0, extras, true);
+            match mix {
+                Some(g) => args.extend(["-filter_complex".into(), format!("[0:v:0]{sc}[v];{g}"), "-map".into(), "[v]".into()]),
+                None => args.extend(["-map".into(), "0:v:0".into(), "-vf".into(), sc.clone()]),
+            }
             args.extend(extras.video_args());
-            args.extend(extras.audio_args(true));
+            args.extend(audio_out);
         } else {
-            args = ["-i", &src, "-map", "0:v:0", "-map", &format!("0:a:{track}")].map(String::from).to_vec();
+            args = vec!["-i".into(), src.clone()];
+            let (mix, audio_out) = sound_args(audio, 0, extras, true);
+            if let Some(g) = mix {
+                args.extend(["-filter_complex".into(), g]);
+            }
+            args.extend(["-map".into(), "0:v:0".into()]);
             match extras.codec {
                 Some(_) => args.extend(extras.video_args()),
                 None => args.extend(["-c:v".into(), "copy".into()]),
             }
-            args.extend(extras.audio_args(true));
+            args.extend(audio_out);
         }
         args.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), tmp.to_string_lossy().into()]);
         let (from, label) = if hook.is_some() { (0.4, "Saving the video with its hook") } else { (0., "Saving the video") };
@@ -1487,10 +1636,10 @@ pub(crate) fn export(j: &Joined, mode: Mode, music: bool, out_dir: &Path, name: 
             args.extend(m.inputs());
         }
         args.extend(["-t".into(), format!("{d:.3}")]);
-        args.extend(picture_args(mode, q, scale.as_deref(), size, mark.as_ref()));
-        args.extend(["-map".into(), format!("0:a:{track}")]);
+        let (mix, audio_out) = sound_args(audio, 0, extras, false);
+        args.extend(with_graph(picture_args(mode, q, scale.as_deref(), size, mark.as_ref()), mix));
         args.extend(extras.video_args());
-        args.extend(extras.audio_args(false));
+        args.extend(audio_out);
         args.extend(["-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"].map(String::from));
         args.push(tmp.to_string_lossy().into());
         let label = format!("{} {} of {n}", if mode == Mode::Reels { "Reel" } else { "Part" }, k + 1);
@@ -1860,10 +2009,16 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, intro: Optio
         },
         None => Ok(()),
     };
+    // The music at the level set with the music slider (an older joined recap can only keep it
+    // whole or leave it out: said in the result).
+    let music = music_level(prefs.music);
+    if j.solo && music > 0.005 && music < 0.995 && !j.mixable {
+        hook_note.push_str(" · the music is at its full level: some chapters were made before videos could change it (re-make them with Redo → Video)");
+    }
     let res = match res {
         Ok(()) => mv_ui::bg::blocking(move || {
             let extras = Extras { hook: hook_path, intro: intro_path, watermark: load_watermark(&video_look_path()), font, quality: prefs.quality, ..Extras::default() };
-            let out = export(&j, prefs.mode(), prefs.music, &dir, &name, &extras, &r);
+            let out = export(&j, prefs.mode(), music, &dir, &name, &extras, &r);
             if let Some(d) = hook_dir {
                 let _ = std::fs::remove_dir_all(d);
             }
@@ -1947,8 +2102,9 @@ fn play_list(file: &Path, list: &[(String, PathBuf)]) -> PathBuf {
     }
 }
 
-/// The export preview's lines under the picture: what is made, the hook, the intro, the watermark.
-fn preview_lines(prefs: &ExportPrefs, hook: &Option<Option<PathBuf>>, intro: &Option<Option<PathBuf>>, marked: bool) -> Vec<String> {
+/// The export preview's lines under the picture: what is made (with the music at `music`, its
+/// level), the hook, the intro, the watermark.
+fn preview_lines(prefs: &ExportPrefs, music: f64, hook: &Option<Option<PathBuf>>, intro: &Option<Option<PathBuf>>, marked: bool) -> Vec<String> {
     let what = match prefs.mode() {
         Mode::Whole => "One video".to_string(),
         Mode::Parts(n) => format!("{n} parts"),
@@ -1958,7 +2114,7 @@ fn preview_lines(prefs: &ExportPrefs, hook: &Option<Option<PathBuf>>, intro: &Op
         Quality::Source => "at source quality".to_string(),
         q => format!("in {}", q.label()),
     };
-    let mut out = vec![format!("{what} {size}, {}.", if prefs.music { "with music" } else { "narration only (no music)" })];
+    let mut out = vec![format!("{what} {size}, {}.", Sound::describe(if prefs.music { music } else { 0. }))];
     out.push(match hook {
         None => "No hook.".to_string(),
         Some(Some(_)) => "The hook plays first (the one the last export made for these chapters).".to_string(),
@@ -1977,7 +2133,7 @@ fn preview_lines(prefs: &ExportPrefs, hook: &Option<Option<PathBuf>>, intro: &Op
 fn show_export_preview(p: ExportPreview, window: &mut Window, cx: &mut App) {
     // The frame file is drawn again each time: drop the old picture.
     ImageSource::from(p.still.clone()).remove_asset(cx);
-    let lines = preview_lines(&p.prefs, &p.hook, &p.intro, p.marked);
+    let lines = preview_lines(&p.prefs, music_level(p.prefs.music), &p.hook, &p.intro, p.marked);
     let upright = p.prefs.mode() == Mode::Reels;
     // What plays: the hook and the intro the export puts first (when made for these chapters),
     // then the joined video.
@@ -2388,7 +2544,7 @@ impl StudioPage {
                 let r = r.clone();
                 let name = joined_name(&g, &j).unwrap_or(name);
                 // Chapters whose music could not be taken out (said in the result).
-                let kept = if prefs.music { 0 } else { j.music_kept };
+                let kept = if music_level(prefs.music) >= 0.995 { 0 } else { j.music_kept };
                 let ex = cx.background_executor().clone();
                 cx.spawn_in(window, async move |this, cx| {
                     let (res, hook_note) = export_joined(j, hook, intro, prefs, dir, name, font, r, ex).await;
@@ -2472,7 +2628,7 @@ impl StudioPage {
                         let enc = crate::encode::usable(p.gpu);
                         let codec = enc.pick(p.preset == crate::encode::Preset::Youtube4k).name();
                         let extras = Extras { watermark: load_watermark(&video_look_path()), font, ..p.extras(&enc) };
-                        export(&j, p.mode(), p.music, &dir, &name, &extras, &r).map(|files| (files, codec))
+                        export(&j, p.mode(), music_level(p.music), &dir, &name, &extras, &r).map(|files| (files, codec))
                     })
                     .await
                     .and_then(|r| r);
@@ -2839,16 +2995,18 @@ mod tests {
     #[test]
     fn the_preview_says_what_the_export_holds() {
         let prefs = super::ExportPrefs { hook: true, ..Default::default() };
-        let l = super::preview_lines(&prefs, &Some(Some(PathBuf::from("h.mp4"))), &Some(Some(PathBuf::from("i.mp4"))), true);
+        let l = super::preview_lines(&prefs, 1., &Some(Some(PathBuf::from("h.mp4"))), &Some(Some(PathBuf::from("i.mp4"))), true);
         assert_eq!(l[0], "One video at source quality, with music.");
         assert!(l[1].starts_with("The hook plays first"));
         assert!(l[2].starts_with("The intro plays just before chapter 1"));
         assert!(l[3].contains("watermark is drawn"));
-        let l = super::preview_lines(&super::ExportPrefs { kind: 2, music: false, quality: Quality::P1080, ..prefs }, &None, &None, false);
+        let l = super::preview_lines(&super::ExportPrefs { kind: 2, music: false, quality: Quality::P1080, ..prefs }, 0.5, &None, &None, false);
         assert_eq!(l[0], "Upright reels of up to a minute in 1080p, narration only (no music).");
         assert_eq!((l[1].as_str(), l[2].as_str()), ("No hook.", "No intro."));
         assert!(l[3].starts_with("No watermark"));
-        let l = super::preview_lines(&prefs, &Some(None), &Some(None), false);
+        // The music slider's level.
+        assert_eq!(super::preview_lines(&prefs, 0.5, &None, &None, false)[0], "One video at source quality, with the music at 50%.");
+        let l = super::preview_lines(&prefs, 1., &Some(None), &Some(None), false);
         assert!(l[1].starts_with("A hook is written and voiced when you export"));
         assert!(l[2].contains("is made when you export"));
         // The intro is the cast cards and the transition: no logo.
@@ -3106,11 +3264,15 @@ mod tests {
         let g = hook_concat_graph(1920, 1080, "v");
         assert!(g.starts_with("[0:v:0]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:"));
         assert!(g.ends_with("[hv][jv]concat=n=2:v=1:a=0[v]"), "the picture pass carries no sound: {g}");
-        let a = super::hook_sound_graph(1, 21.9, 0, None);
-        assert!(a.contains("[0:a:1]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=0:21.900[ha]"));
+        use super::Sound;
+        let a = super::hook_sound_graph(Sound::Track(1), 21.9, Sound::Track(0), None);
+        assert!(a.contains("[0:a:1]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[h0];[h0]apad,atrim=0:21.900[ha]"), "{a}");
         assert!(a.contains("[1:a:0]aresample=48000"));
         assert!(a.ends_with("[ha][ja]concat=n=2:v=0:a=1[a]"));
-        assert!(super::hook_sound_graph(0, 5., 1, Some("loudnorm=I=-14")).ends_with("concat=n=2:v=0:a=1[j];[j]loudnorm=I=-14[a]"));
+        assert!(super::hook_sound_graph(Sound::Track(0), 5., Sound::Track(1), Some("loudnorm=I=-14")).ends_with("concat=n=2:v=0:a=1[j];[j]loudnorm=I=-14[a]"));
+        // At a music level both sides mix their two tracks.
+        let m = super::hook_sound_graph(Sound::Mix { level: 0.5, solo: 1 }, 5., Sound::Mix { level: 0.5, solo: 1 }, None);
+        assert!(m.contains("[h0_m][h0_n]amix=inputs=2:weights=0.50 0.50:normalize=0[h0]") && m.contains("[ja_m][ja_n]amix=inputs=2:weights=0.50 0.50:normalize=0[ja]"), "{m}");
         assert_eq!((resolution_for(720), resolution_for(1080), resolution_for(1440), resolution_for(2160)), ("720p", "1080p", "1440p", "4k"));
     }
 
@@ -3147,9 +3309,9 @@ mod tests {
         let (hook, video) = (d.path().join("hook.mp4"), d.path().join("joined.mp4"));
         tiny_video(&hook, 2., 1, 2.);
         tiny_video(&video, 6., 2, 6.);
-        let j = super::Joined { path: video.clone(), total: 6., boundaries: vec![], solo: true, music_kept: 0, files: vec![video.clone()] };
+        let j = super::Joined { path: video.clone(), total: 6., boundaries: vec![], solo: true, music_kept: 0, mixable: true, files: vec![video.clone()] };
         let r = Job::new("test", "Test", "test").reporter();
-        for (music, loud) in [(true, None), (false, Some(super::loudness_filter(-14.)))] {
+        for (music, loud) in [(1., None), (0., Some(super::loudness_filter(-14.))), (0.5, None)] {
             let extras = Extras { hook: Some(hook.clone()), loudnorm: loud, codec: Some(["-c:v", "libx264", "-preset", "ultrafast"].map(String::from).to_vec()), ..Extras::default() };
             let files = export(&j, Mode::Whole, music, d.path(), "Out", &extras, &r).unwrap();
             let (picture, sound) = super::track_lengths(&files[0]).unwrap();
@@ -3208,13 +3370,134 @@ mod tests {
         };
         println!("watermark: {:?}", extras.watermark);
         // MV_EXPORT_MUSIC=1: the sound with the music (the default export; whole videos then join
-        // watermarked chapter segments instead of drawing over the joined video).
-        let music = std::env::var("MV_EXPORT_MUSIC").is_ok();
+        // watermarked chapter segments instead of drawing over the joined video); =0.5: the music
+        // at that level.
+        let music = std::env::var("MV_EXPORT_MUSIC").ok().map(|v| v.parse().unwrap_or(1.)).unwrap_or(0.);
         for mode in modes {
             let started = std::time::Instant::now();
             let files = export(&j, mode, music, &out, "Test", &extras, &r).unwrap();
             println!("{mode:?}: {:.1}s", started.elapsed().as_secs_f32());
             println!("{mode:?}: {} file(s)", files.len());
         }
+    }
+
+    #[test]
+    fn the_music_level_mixes_the_two_tracks_or_picks_one() {
+        use super::Sound;
+        assert_eq!(Sound::of(1., Some(1), true), Sound::Track(0));
+        assert_eq!(Sound::of(0., Some(1), true), Sound::Track(1));
+        assert_eq!(Sound::of(0.5, Some(1), true), Sound::Mix { level: 0.5, solo: 1 });
+        // An older joined recap (rebuilt narration) keeps the music whole unless it is off.
+        assert_eq!(Sound::of(0.5, Some(1), false), Sound::Track(0));
+        assert_eq!(Sound::of(0., Some(1), false), Sound::Track(1));
+        // Nothing to take the music out of.
+        assert_eq!(Sound::of(0., None, true), Sound::Track(0));
+        assert_eq!(Sound::of(f64::NAN, Some(1), true), Sound::Track(0));
+        assert_eq!(Sound::Track(1).graph(0, "a"), "[0:a:1]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a]");
+        assert_eq!(
+            Sound::Mix { level: 0.25, solo: 1 }.graph(2, "ja"),
+            "[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ja_m];[2:a:1]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ja_n];[ja_m][ja_n]amix=inputs=2:weights=0.25 0.75:normalize=0[ja]"
+        );
+        assert_eq!((Sound::describe(1.), Sound::describe(0.), Sound::describe(0.5)), ("with music".to_string(), "narration only (no music)".to_string(), "with the music at 50%".to_string()));
+        // A mix joins a picture's own filter, or brings one.
+        let pic = vec!["-filter_complex".to_string(), "[0:v:0]null[v]".into(), "-map".into(), "[v]".into()];
+        assert_eq!(super::with_graph(pic.clone(), Some("X[a]".into()))[1], "[0:v:0]null[v];X[a]");
+        assert_eq!(super::with_graph(vec!["-map".into(), "0:v:0".into()], Some("X[a]".into())), ["-filter_complex", "X[a]", "-map", "0:v:0"]);
+        assert_eq!(super::with_graph(pic.clone(), None), pic);
+    }
+
+    /// The sound's mean level (dB RMS), measured with ffmpeg.
+    fn rms_db(file: &std::path::Path) -> f64 {
+        let out = mv_studio::python::quiet_command("ffmpeg")
+            .args(["-hide_banner", "-nostats", "-i"])
+            .arg(file)
+            .args(["-map", "0:a:0", "-af", "astats=measure_perchannel=none:measure_overall=RMS_level", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        text.lines().find_map(|l| l.split("RMS level dB:").nth(1)).and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| panic!("no level in {text}"))
+    }
+
+    /// The joined video's tracks are two tones (300 Hz "with music", 400 Hz "narration only"), each
+    /// at ffmpeg's sine level: mixed half and half they come out 3 dB under either alone. Every way
+    /// an export takes the sound (copied picture, re-encoded chapter segments, parts, a hook first)
+    /// must mix it, and at 0 take the music-free track.
+    #[test]
+    fn exports_mix_the_music_to_its_level() {
+        if !have_ffmpeg() {
+            eprintln!("ffmpeg missing: skipped");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let (hook, video) = (d.path().join("hook.mp4"), d.path().join("joined.mp4"));
+        // The hook is rendered like a chapter: its two tracks mix too.
+        named_video(&hook, 2., &["Narration + music", "Narration only"]);
+        tiny_video(&video, 6., 2, 6.);
+        let one = rms_db(&video);
+        let j = super::Joined { path: video.clone(), total: 6., boundaries: vec![3.], solo: true, music_kept: 0, mixable: true, files: vec![video.clone()] };
+        let r = Job::new("test", "Test", "test").reporter();
+        let x264 = || Some(["-c:v", "libx264", "-preset", "ultrafast"].map(String::from).to_vec());
+        let cases: [(&str, Mode, Extras); 4] = [
+            ("copied picture", Mode::Whole, Extras::default()),
+            ("chapter segments", Mode::Whole, Extras { codec: x264(), ..Extras::default() }),
+            ("parts", Mode::Parts(2), Extras::default()),
+            ("hook first", Mode::Whole, Extras { hook: Some(hook.clone()), codec: x264(), ..Extras::default() }),
+        ];
+        for (what, mode, extras) in cases {
+            let out = d.path().join(what);
+            std::fs::create_dir_all(&out).unwrap();
+            let files = export(&j, mode, 0.5, &out, "Out", &extras, &r).unwrap();
+            for f in &files {
+                let level = rms_db(f);
+                assert!((level - (one - 3.01)).abs() < 0.6, "{what}: {level:.2} dB, want {:.2} (one track {one:.2})", one - 3.01);
+                let (picture, sound) = super::track_lengths(f).unwrap();
+                assert!(sound + 0.2 >= picture, "{what}: sound {sound} runs to the end of the picture {picture}");
+            }
+        }
+        // Off: the music-free track alone, as loud as one tone.
+        let out = d.path().join("off");
+        std::fs::create_dir_all(&out).unwrap();
+        let files = export(&j, Mode::Whole, 0., &out, "Out", &Extras::default(), &r).unwrap();
+        assert!((rms_db(&files[0]) - one).abs() < 0.6);
+    }
+
+    /// A tiny chapter video `secs` long whose sound tracks carry `names` (as Studio names them).
+    fn named_video(out: &std::path::Path, secs: f64, names: &[&str]) {
+        let tmp = out.with_extension("plain.mp4");
+        tiny_video(&tmp, secs, names.len(), secs);
+        let mut args: Vec<String> = ["-y", "-v", "error", "-i"].map(String::from).to_vec();
+        args.push(tmp.to_string_lossy().into());
+        args.extend(["-map", "0", "-c", "copy"].map(String::from));
+        for (k, n) in names.iter().enumerate() {
+            args.extend([format!("-metadata:s:a:{k}"), format!("title={n}"), format!("-metadata:s:a:{k}"), format!("handler_name={n}")]);
+        }
+        args.push(out.to_string_lossy().into());
+        assert!(mv_studio::python::quiet_command("ffmpeg").args(&args).status().unwrap().success());
+    }
+
+    /// A chapter made without music has only its narration: the joined video uses that track as
+    /// its music-free sound (nothing rebuilt), so the music level still mixes; with no music at
+    /// all there is no second track.
+    #[test]
+    fn joining_keeps_chapters_without_music_mixable() {
+        if !have_ffmpeg() {
+            eprintln!("ffmpeg missing: skipped");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.mp4"), d.path().join("b.mp4"));
+        named_video(&a, 3., &["Narration + music", "Narration only"]);
+        named_video(&b, 3., &["Narration"]);
+        let r = Job::new("test", "Test", "test").reporter();
+        let j = join(&[a.clone(), b.clone()], &d.path().join("full.mp4"), &r).unwrap();
+        assert!(j.solo && j.mixable && j.music_kept == 0, "{j:?}");
+        let tracks = super::probe(&j.path).unwrap().audio;
+        assert_eq!(tracks.iter().map(|t| t.1.as_str()).collect::<Vec<_>>(), ["Narration + music", "Narration only"]);
+        // Read back from its record, the same.
+        let again = join(&[a, b.clone()], &d.path().join("full.mp4"), &r).unwrap();
+        assert!(again.mixable);
+        let quiet = join(std::slice::from_ref(&b), &d.path().join("quiet.mp4"), &r).unwrap();
+        assert!(!quiet.solo && !quiet.mixable);
+        assert_eq!(super::probe(&quiet.path).unwrap().audio.len(), 1);
     }
 }

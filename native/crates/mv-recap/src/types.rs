@@ -171,6 +171,13 @@ pub struct StorySegment {
     /// as `kind` / `mood` / `intensity` for the narration voice, unless the user picked a `delivery`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tone: Option<Tone>,
+    /// Series mode (beta): the character who SAYS this passage in their own voice, by their name
+    /// in the cast. `None` is the narrator. See `series.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    /// Series mode: the speaker's line is a thought (inner voice), said softer.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub thought: bool,
 }
 
 /// A passage's emotion: a scene kind (the narration's `KINDS`), a word or two of mood and an
@@ -233,6 +240,10 @@ pub struct Story {
     pub title: String,
     pub segments: Vec<StorySegment>,
     pub model: String,
+    /// Written in Series mode (beta): a narrator who talks to the viewer and characters who
+    /// speak their own lines in their own voices.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub series: bool,
 }
 
 /// One downloaded chapter (mirrors the fields of `ui-studio`'s ChapterItem).
@@ -323,6 +334,9 @@ pub struct Prefs {
     pub open_groups: Vec<String>,
     /// Dashboard sections folded away ("video", "youtube", "chapters").
     pub dash_collapsed: Vec<String>,
+    /// Series mode (beta, the dashboard switch): stories are written like a TV series, with a
+    /// narrator talking to the viewer and every character voiced by their own cloned voice.
+    pub series_beta: bool,
 }
 
 impl Default for Prefs {
@@ -340,6 +354,7 @@ impl Default for Prefs {
             selected: vec![],
             open_groups: vec![],
             dash_collapsed: vec!["youtube".into()],
+            series_beta: false,
         }
     }
 }

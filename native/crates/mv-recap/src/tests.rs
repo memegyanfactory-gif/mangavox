@@ -214,8 +214,8 @@ fn export_formats() {
     std::fs::write(panel_path(&ch, 1, 0), b"x").unwrap();
     let story = Story {
         segments: vec![
-            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None },
-            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }), sfx: SfxCue::parse("boom", Some(3.0)), hook: false, panels: vec![], tone: None },
+            StorySegment { page: 1, panel: Some(0), text: "One.".into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None, ..Default::default() },
+            StorySegment { page: 1, panel: Some(5), text: "Two.".into(), delivery: Some(Delivery { kind: "fight".into(), intensity: 14 }), sfx: SfxCue::parse("boom", Some(3.0)), hook: false, panels: vec![], tone: None, ..Default::default() },
         ],
         ..Default::default()
     };
@@ -360,8 +360,8 @@ async fn story_chunks_and_saves() {
     let s = &out[0].1;
     assert_eq!(s.title, "Duel");
     assert_eq!(s.segments, vec![
-        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None },
-        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None },
+        StorySegment { page: 0, panel: Some(0), text: "Ruko draws.".into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None, ..Default::default() },
+        StorySegment { page: 1, panel: None, text: "Kaito speaks.".into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None, ..Default::default() },
     ]);
     let req = story.seen.lock().unwrap();
     assert_eq!(req.len(), 2, "the cast check, then the story");
@@ -400,7 +400,7 @@ fn saved_provider_messages_are_found() {
     use crate::store::provider_message_in;
     let note = "You've hit your session limit · resets 8am (Asia/Kolkata)";
     let read = |s: &str| ChapterRead { pages: vec![PageRead { index: 0, summary: s.into(), ..Default::default() }], ..Default::default() };
-    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None }], ..Default::default() };
+    let story = |s: &str| Story { segments: vec![StorySegment { page: 0, panel: None, text: s.into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None, ..Default::default() }], ..Default::default() };
     assert_eq!(provider_message_in(Some(&read(note)), Some(&story(note))), Some(Step::Read));
     assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story(note))), Some(Step::Story));
     assert_eq!(provider_message_in(Some(&read("Ruko draws.")), Some(&story("He has no limit to his rage."))), None);
@@ -441,7 +441,7 @@ fn export_skips_silent_pages_and_blank_panels() {
     let panel = |chars: bool| Panel { bbox: None, description: String::new(), characters: if chars { vec![CharacterSeen { name: "Ruko".into(), ..Default::default() }] } else { vec![] }, lines: vec![], ..Default::default() };
     let read = ChapterRead { pages: vec![PageRead { index: 1, panels: vec![panel(false), panel(true)], ..Default::default() }], ..Default::default() };
     save_read(&ch, &read).unwrap();
-    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None }], ..Default::default() };
+    let story = Story { segments: vec![StorySegment { page: 1, panel: Some(0), text: "Ruko wakes.".into(), delivery: None, sfx: None, hook: false, panels: vec![], tone: None, ..Default::default() }], ..Default::default() };
     export_for_pipeline(&ch, &story).unwrap();
     let beats: serde_json::Value = serde_json::from_slice(&std::fs::read(ch.output_dir.join("narration.studio.json")).unwrap()).unwrap();
     let b = beats["beats"].as_array().unwrap();
@@ -509,7 +509,7 @@ async fn old_stories_export_without_their_hook_segments() {
     let ch = chapter(dir.path(), 2);
     let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
     read_chapter_with(&Fake::new(&[PAGE1, PAGE2]), &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
-    let seg = |page: usize, hook: bool, text: &str| StorySegment { page, panel: Some(0), text: text.into(), delivery: None, sfx: None, hook, panels: vec![], tone: None };
+    let seg = |page: usize, hook: bool, text: &str| StorySegment { page, panel: Some(0), text: text.into(), delivery: None, sfx: None, hook, panels: vec![], tone: None, ..Default::default() };
     let saved = r#"{"title":"T","segments":[{"page":1,"panel":0,"text":"Kaito names himself.","hook":true},{"page":0,"panel":0,"text":"Ruko meets a stranger."},{"page":1,"panel":0,"text":"The stranger is Kaito."}]}"#;
     std::fs::write(chapter_dir(&ch).join("story.json"), saved).unwrap();
     let story = load_story(&ch).unwrap();

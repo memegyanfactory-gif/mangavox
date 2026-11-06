@@ -372,8 +372,10 @@ pub fn playlist_m3u(videos: &[ChapterVideo]) -> String {
 /// A manga's chapter videos joined into one (Studio's Play / Export make it, in its folder), with
 /// `full_recap.json` next to it saying what it was made from.
 pub const FULL_RECAP: &str = "full_recap.mp4";
-/// Bumped when the joined video's makeup changes, so an older one is made again.
-pub const JOIN_VERSION: u64 = 2;
+/// Bumped when the joined video's makeup changes, so an older one is made again. 3: a chapter made
+/// without music lends its own track as the music-free one (instead of a rebuilt narration), and
+/// the record says how many were rebuilt, so the music level knows whether the tracks mix.
+pub const JOIN_VERSION: u64 = 3;
 
 /// Where a manga's joined video is kept.
 pub fn full_recap_path(manga_id: &str) -> PathBuf {

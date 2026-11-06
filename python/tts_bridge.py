@@ -602,11 +602,43 @@ def _chatterbox_chunks(nt, cb, page, units, voice, strength, ref_sig, take=0):
     for ci, c in enumerate(nt.plan_chunks(units)):
         params = nt.chatterbox_params(c["kind"], c["intensity"], c["line_kind"], strength)
         seed = nt.segment_seed(page, ci, c["text"], take)
-        key = nt.cache_key(f"chatterbox-{cb.CHATTERBOX_VERSION}", voice, c["synth_text"], params, seed, ref_sig)
-        out.append({"text": c["synth_text"], "params": params, "seed": seed, "key": key,
-                    "pause_before_ms": c["pause_before_ms"], "kind": c["kind"], "intensity": c["intensity"],
-                    "shout": c["shout"], "boundary": c["boundary"]})
+        # Series mode: a character's line is spoken in that character's own cloned voice.
+        own = c.get("voice_ref") if c.get("voice_ref") and os.path.isfile(c["voice_ref"]) else None
+        sig = _reference_signature(own) if own else ref_sig
+        key = nt.cache_key(f"chatterbox-{cb.CHATTERBOX_VERSION}", voice, c["synth_text"], params, seed, sig)
+        chunk = {"text": c["synth_text"], "params": params, "seed": seed, "key": key,
+                 "pause_before_ms": c["pause_before_ms"], "kind": c["kind"], "intensity": c["intensity"],
+                 "shout": c["shout"], "boundary": c["boundary"]}
+        if own:
+            chunk["reference"] = os.path.abspath(own)
+            chunk["speaker"] = c.get("speaker")
+        out.append(chunk)
     return out
+
+
+def _make_cast_clips(cb, plan, log):
+    """Series mode: makes the reference clip of every character who speaks in the chapter and
+    has none yet (a Kokoro voice at a pitch, see chatterbox_tts.make_reference_clip). A
+    character whose clip cannot be made is said by the narrator's voice instead."""
+    wanted = {}
+    for p in plan:
+        for u in p["units"]:
+            ref = u.get("voice_ref")
+            if ref and ref not in wanted:
+                wanted[ref] = (u.get("voice_make_with") or "am_adam", float(u.get("voice_pitch") or 0.0), u.get("speaker"))
+    if not wanted:
+        return
+    made, failed = [], {}
+    for ref, (base, pitch, who) in wanted.items():
+        if os.path.isfile(ref):
+            continue
+        why = cb.make_reference_clip(ref, base, pitch)
+        if why:
+            failed[who or ref] = why
+            print(f"[tts] No voice clip for {who}: {why}; the narrator says their lines", file=sys.stderr)
+        else:
+            made.append(who)
+    log["cast"] = {"speakers": len(wanted), "made": made, "failed": failed}
 
 
 def _run_chatterbox(plan, audio_dir, voice, speed, strength, force_regen, progress_cb, log, reference=None, regen=(), takes=None):
@@ -620,6 +652,7 @@ def _run_chatterbox(plan, audio_dir, voice, speed, strength, force_regen, progre
     import narration_tts as nt
     import chatterbox_tts as cb
     reference = reference if reference and os.path.isfile(reference) else None
+    _make_cast_clips(cb, plan, log)
     ref_path = reference or cb.reference_path(voice)
     ref_sig = _reference_signature(ref_path) if ref_path else "builtin"
     cache_dir = os.path.join(audio_dir, ".tts-cache", "chatterbox")
@@ -656,7 +689,7 @@ def _run_chatterbox(plan, audio_dir, voice, speed, strength, force_regen, progre
                 keys.append(c["key"])
                 if c["key"] not in seen and not os.path.isfile(os.path.join(cache_dir, f"{c['key']}.wav")):
                     seen.add(c["key"])
-                    pending.append({k: c[k] for k in ("text", "params", "seed", "key")})
+                    pending.append({k: c[k] for k in ("text", "params", "seed", "key", "reference") if k in c})
             page_keys.append(keys)
         shown = 0
 
@@ -700,7 +733,7 @@ def _run_chatterbox(plan, audio_dir, voice, speed, strength, force_regen, progre
                 entry["reused"] = True
                 log["pages"].append(entry)
                 continue
-            request = [{k: c[k] for k in ("text", "params", "seed", "key", "pause_before_ms")} for c in chunks]
+            request = [{k: c[k] for k in ("text", "params", "seed", "key", "pause_before_ms", "reference") if k in c} for c in chunks]
             target = _voice_target(output_path)
             res = None
             try:

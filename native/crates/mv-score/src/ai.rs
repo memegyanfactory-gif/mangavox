@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
-use mv_ai::{emit_noop, AiMessage, AiStepRequest, CancellationToken, Registry};
+use mv_ai::{emit_noop, AiEffort, AiMessage, AiStepRequest, CancellationToken, Registry};
 use mv_recap::{extract_json, load_read, ChapterRef, ModelChoice};
 use serde_json::Value;
 
@@ -60,7 +60,9 @@ pub async fn spot(reg: Arc<Registry>, model: ModelChoice, ch: ChapterRef, cancel
         model: model.model.clone(),
         messages: vec![AiMessage::system(SYSTEM), AiMessage::user(format!("{} · {}\n\n{}", ch.manga_title, ch.label, pages.join("\n")))],
         tools: None,
-        effort: None,
+        // A cue sheet from page summaries needs little thinking: without an effort the CLI used its
+        // default (the most thinking), which cost far more than the answer itself.
+        effort: Some(AiEffort::Low),
         access: None,
         images: vec![],
         workspace: None,

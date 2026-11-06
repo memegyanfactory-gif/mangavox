@@ -29,6 +29,7 @@ mod restyle;
 mod page;
 mod phases;
 mod run;
+mod series_view;
 pub mod service;
 pub mod setup;
 mod setup_view;

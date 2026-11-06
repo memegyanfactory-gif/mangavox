@@ -14,6 +14,12 @@
 //! beat per panel, its sentences spread over them in order. When it names no panel, or that crop is blank (an empty or
 //! nearly black / white panel), the page's most telling panel is used instead: one with characters in
 //! it, the largest first.
+//!
+//! A Series-mode story (`series.rs`) also tags every beat with who says it: a character's line
+//! carries `speaker`, `line_kind` (`speech`, or `inner` for a thought) and the voice to clone (`voice_ref`, made
+//! from `voice_make_with` at `voice_pitch` semitones when missing), and the first line of each
+//! character in the chapter a `name_card`; the narrator's beats carry `line_kind: "narrator"`,
+//! which the narration keeps smooth and steady.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -113,6 +119,10 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
     // full recap export makes the one hook, before chapter 1).
     let said = |s: &&StorySegment| !s.text.trim().is_empty() && !s.hook;
 
+    // Series mode: every speaker's voice (new speakers are cast here), and who has spoken yet.
+    let voices = if story.series { crate::series::cast_story(ch, story) } else { vec![] };
+    let mut introduced: std::collections::HashSet<String> = Default::default();
+
     let mut last_shown: Option<(Value, Option<String>)> = None;
     for page in 0..page_count {
         let page_img = pages.get(page).map(|p| abs(p));
@@ -173,6 +183,21 @@ pub fn export_for_pipeline(ch: &ChapterRef, story: &Story) -> Result<()> {
                 if let Some(x) = s.sfx.as_ref().filter(|x| i == 0 && SFX_NAMES.contains(&x.name.as_str())) {
                     beat["sfx"] = json!(x.name);
                     beat["sfx_strength"] = json!(x.strength.clamp(1, 3));
+                }
+                if story.series {
+                    match s.speaker.as_ref().and_then(|n| voices.iter().find(|(k, _)| k == n)) {
+                        Some((_, v)) => {
+                            beat["speaker"] = json!(v.name);
+                            beat["line_kind"] = json!(if s.thought { "inner" } else { "speech" });
+                            beat["voice_ref"] = json!(v.clip.to_string_lossy());
+                            beat["voice_make_with"] = json!(v.base);
+                            beat["voice_pitch"] = json!(v.pitch);
+                            if i == 0 && introduced.insert(v.name.clone()) {
+                                beat["name_card"] = json!(v.name);
+                            }
+                        }
+                        None => beat["line_kind"] = json!("narrator"),
+                    }
                 }
                 beats.push(beat);
             }

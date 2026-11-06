@@ -96,8 +96,39 @@ def chatterbox_params(kind, intensity, line_kind: str = "narration", strength: f
     cfg_weight   = 0.5 for plain narration, lowered as the exaggeration rises (more exaggeration
                    speeds Chatterbox up; a lower cfg keeps the pace natural), 0.3 at least.
     temperature  = 0.75 for calm/flashback, 0.85 at a peak, else 0.8 (Chatterbox's own).
-    `strength` is the chapter's emotion strength (0..2): 0 is plain narration throughout."""
+    `strength` is the chapter's emotion strength (0..2): 0 is plain narration throughout.
+
+    Series mode (beta) lines:
+    narrator  = the series narrator: smooth and steady whatever the scene (0.45-0.55, low
+                temperature), so the cast carries the emotion.
+    speech    = a character's own line: acted out, from 0.55 and lifting further than the
+                narrator (up to 0.9, 0.95 at strength 2), so a battle cry, a sob or a taunt is
+                heard as one. `inner` is a character's thought in their own voice: 0.1 softer."""
     kind = normalize_kind(kind)
+    if line_kind == "narrator":
+        s = clamp(_num(strength, 1.0), 0.0, 2.0)
+        i = clamp(_num(intensity, DEFAULT_INTENSITY), 0.0, 10.0)
+        lift = clamp((i - NEUTRAL_UP_TO) / (FULL_AT - NEUTRAL_UP_TO), 0.0, 1.0)
+        exaggeration = clamp(0.47 + 0.08 * lift * min(s, 1.0), 0.42, 0.55)
+        return {"exaggeration": round(exaggeration, 3), "cfg_weight": 0.5, "temperature": 0.7,
+                "repetition_penalty": 1.2, "top_p": 1.0, "min_p": 0.05}
+    if line_kind in ("speech", "inner"):
+        s = clamp(_num(strength, 1.0), 0.0, 2.0)
+        i = clamp(_num(intensity, DEFAULT_INTENSITY), 0.0, 10.0)
+        # A character acts from a lower intensity than the narrator does (a line is said with feeling).
+        lift = clamp((i - 2.0) / (FULL_AT - 2.0), 0.0, 1.0)
+        top = 0.90 + 0.05 * max(0.0, s - 1.0)
+        exaggeration = clamp(0.55 + (EMOTION_LIFT.get(kind, 0.10) * 1.4 + 0.05) * lift * s, 0.45, top)
+        if line_kind == "inner":
+            exaggeration = max(0.42, exaggeration - 0.10)
+        return {
+            "exaggeration": round(exaggeration, 3),
+            "cfg_weight": round(clamp(0.50 - 0.5 * max(0.0, exaggeration - 0.50), 0.30, 0.50), 3),
+            "temperature": 0.85 if lift * s >= 0.7 else 0.8,
+            "repetition_penalty": 1.2,
+            "top_p": 1.0,
+            "min_p": 0.05,
+        }
     s = clamp(_num(strength, 1.0), 0.0, 2.0)
     i = clamp(_num(intensity, DEFAULT_INTENSITY), 0.0, 10.0)
     lift = clamp((i - NEUTRAL_UP_TO) / (FULL_AT - NEUTRAL_UP_TO), 0.0, 1.0)
@@ -277,6 +308,12 @@ def smooth(values: list, max_step: float = 2.0) -> list:
     return [round(clamp(v, 0.0, 10.0), 2) for v in out]
 
 
+# Series mode beat keys a unit carries to the voice: who speaks and the voice they are cloned from.
+SPEAKER_KEYS = ("speaker", "voice_ref", "voice_make_with", "voice_pitch")
+# Extra silence when the voice changes (narrator to a character, one character to another).
+SPEAKER_GAP_MS = 150
+
+
 def build_plan(segments: list, output_dir: str, strength: float = 1.0) -> list:
     """The emotion plan of a chapter: one entry per script segment, in order:
 
@@ -301,7 +338,7 @@ def build_plan(segments: list, output_dir: str, strength: float = 1.0) -> list:
         }
         units = []
         page_beats = [b for b in beats.get(page, []) if _squash(b.get("text"))]
-        styled = any(any(k in b for k in ("kind", "mood", "intensity")) for b in page_beats)
+        styled = any(any(k in b for k in ("kind", "mood", "intensity", "speaker", "line_kind")) for b in page_beats)
         if text and styled and _squash(" ".join(b["text"] for b in page_beats)) == _squash(text):
             for b in page_beats:
                 units.append({
@@ -313,6 +350,8 @@ def build_plan(segments: list, output_dir: str, strength: float = 1.0) -> list:
                     # A beat carries a kind only when the user picked the passage's delivery in
                     # Studio (mv_recap::export_for_pipeline).
                     "source": "delivery" if b.get("kind") else "narration.studio.json",
+                    # Series mode: who says it and the voice Chatterbox clones for them.
+                    **({k: b[k] for k in SPEAKER_KEYS if b.get(k) is not None}),
                 })
         elif text:
             units.append({**base, "text": text})
@@ -323,7 +362,9 @@ def build_plan(segments: list, output_dir: str, strength: float = 1.0) -> list:
         u["raw_intensity"] = u["intensity"]
         # The user's own direction is said as picked ("Intense · 9" stays 9); its neighbours
         # still ramp towards it through the smoothing.
-        u["intensity"] = round(clamp(_num(u["intensity"], s), 0.0, 10.0), 2) if u["source"] == "delivery" else s
+        # So is a character's own line in Series mode: the cast acts each line as written.
+        as_written = u["source"] == "delivery" or u.get("line_kind") in ("speech", "inner")
+        u["intensity"] = round(clamp(_num(u["intensity"], s), 0.0, 10.0), 2) if as_written else s
         u["strength"] = strength
     return plan
 
@@ -448,11 +489,14 @@ def plan_chunks(units: list, max_chars: int = 250) -> list:
                 pause = sentence_gap_ms(u["kind"], u["intensity"])
             if ci == 0 and normalize_kind(u["kind"]) == "reveal":
                 pause += REVEAL_LEAD_MS
+            if ci == 0 and ui > 0 and u.get("speaker") != units[ui - 1].get("speaker"):
+                pause += SPEAKER_GAP_MS
             intensity = u["intensity"]
             if c["shout"]:
                 intensity = min(10.0, intensity + 1.0)
             out.append({**c, "unit": ui, "kind": u["kind"], "mood": u.get("mood", ""), "intensity": intensity,
-                        "line_kind": u.get("line_kind", "narration"), "pause_before_ms": int(pause)})
+                        "line_kind": u.get("line_kind", "narration"), "pause_before_ms": int(pause),
+                        **{k: u[k] for k in SPEAKER_KEYS if u.get(k) is not None}})
             prev = c
     return out
 

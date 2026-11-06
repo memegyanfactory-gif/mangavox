@@ -862,11 +862,21 @@ impl StudioPage {
                     cx.notify();
                 }),
             ))
-            .child(toggle("vs-export-music", "Music in the export", "Off: narration only (the videos carry a music-free track).", prefs.music, cx.listener(|this, on: &bool, _, cx| {
-                this.export_prefs.music = *on;
-                this.save_export_prefs();
-                cx.notify();
-            })))
+            .child(toggle(
+                "vs-export-music",
+                // The level set with the player's music slider while a recap plays.
+                match (mv_core::config::music_level() * 100.).round() {
+                    p if prefs.music && p < 100. => format!("Music in the export · {p:.0}%"),
+                    _ => "Music in the export".to_string(),
+                },
+                "At the level set with the music slider while a recap plays. Off: narration only (the videos carry a music-free track).",
+                prefs.music,
+                cx.listener(|this, on: &bool, _, cx| {
+                    this.export_prefs.music = *on;
+                    this.save_export_prefs();
+                    cx.notify();
+                }),
+            ))
             .child(field(
                 "Quality",
                 segmented("vs-quality", Quality::ALL.iter().map(|q| (None, q.label())), Quality::ALL.iter().position(|q| *q == prefs.quality).unwrap_or(0))
@@ -989,7 +999,8 @@ fn field(label: &'static str, control: AnyElement) -> AnyElement {
 }
 
 /// A switch with its label (and a tooltip).
-fn toggle(id: &'static str, label: &'static str, hint: &'static str, on: bool, on_click: impl Fn(&bool, &mut Window, &mut App) + 'static) -> AnyElement {
+fn toggle(id: &'static str, label: impl Into<SharedString>, hint: impl Into<SharedString>, on: bool, on_click: impl Fn(&bool, &mut Window, &mut App) + 'static) -> AnyElement {
+    let (label, hint): (SharedString, SharedString) = (label.into(), hint.into());
     div()
         .flex()
         .items_center()

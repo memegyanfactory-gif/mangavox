@@ -428,7 +428,8 @@ pub(crate) fn parse_segments(v: &Value, chunk_pages: &[usize], read: &ChapterRea
         }
         let sfx = SfxCue::parse(&str_of(sv, "sfx"), num_of(sv, "sfx_strength"));
         let tone = tone_of(sv);
-        out.push(StorySegment { page, panel, text, delivery: None, sfx, hook: false, panels, tone });
+        let (speaker, thought) = crate::series::speaker_of(sv);
+        out.push(StorySegment { page, panel, text, delivery: None, sfx, hook: false, panels, tone, speaker, thought });
     }
     // Stable: keeps the model's order of the panels within a page.
     out.sort_by_key(|s| s.page);
@@ -620,7 +621,10 @@ pub(crate) async fn write_story_with(
     progress: &ProgressFn,
     cancel: &CancellationToken,
 ) -> Result<Vec<(String, Story)>> {
-    let system = story_system(styles);
+    // Series mode (beta, the dashboard switch) writes a narrator who talks to the viewer and
+    // gives the characters their own lines.
+    let series = crate::series::enabled();
+    let system = if series { crate::series::system(styles, &story_system(styles)) } else { story_system(styles) };
     let label = format!("{}/{}", model.provider.as_str(), model.model);
     let mut results: Vec<(String, Story)> = vec![];
     // Chapters the AI answered for but that ended with no narration at all.
@@ -694,7 +698,7 @@ pub(crate) async fn write_story_with(
         let transcript = load_transcript(ch);
         let snapshot = brain.lock().unwrap().clone();
         let content: Vec<usize> = read.pages.iter().filter(|p| has_content(p, transcript.as_ref()) && !repeated.contains(&p.index)).map(|p| p.index).collect();
-        let mut story = Story { styles: styles.to_vec(), model: label.clone(), ..Default::default() };
+        let mut story = Story { styles: styles.to_vec(), model: label.clone(), series, ..Default::default() };
         let sizes: Vec<(usize, usize)> = content.iter().map(|&i| (i, digest(&read, transcript.as_ref(), &snapshot, &[i]).len())).collect();
         let mut parts: std::collections::VecDeque<(Vec<usize>, bool)> = plan_parts(&sizes, part_budget(model)).into_iter().map(|p| (p, false)).collect();
         // Grows when a part that failed is split in two.

@@ -3566,6 +3566,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             "end_ms": int(round((timeline + duration) * 1000)),
             "audio_path": audio_path,
             "audio_offset_ms": int(round(audio_offset * 1000)),
+            # Series mode (beta): a character's first line brings up their name card.
+            **({"name_card": seg["name_card"]} if seg.get("name_card") else {}),
         })
         timeline += duration
         boundaries.append(timeline)
@@ -3737,10 +3739,17 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         _build_narration(clips, video_dir, narration)
         try:
             import captions
-            return captions.write_styled_captions(caption_segments, output_dir, w, h, config=config)
+            ass = captions.write_styled_captions(caption_segments, output_dir, w, h, config=config)
         except Exception as e:
             print(f"[video] Failed to generate styled captions: {e}", file=sys.stderr)
-            return None
+            ass = None
+        # Series mode (beta): the cast's name cards ride on the caption track (or one of their own).
+        try:
+            import name_cards
+            return name_cards.add_cards(ass, caption_segments, w, h, output_dir)
+        except Exception as e:
+            print(f"[video] Name cards skipped: {e}", file=sys.stderr)
+            return ass
 
     def make_edge():
         # The edge glow's loops for the finish (kept in the fx cache), drawn while clips render.

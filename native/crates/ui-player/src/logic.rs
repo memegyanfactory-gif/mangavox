@@ -79,13 +79,59 @@ pub fn format_speed(bytes_per_sec: f64) -> String {
     }
 }
 
+/// The name MangaVox gives a recap's main sound track.
+pub const WITH_MUSIC: &str = "Narration + music";
+/// The name of its music-free track. A joined recap whose older chapters had their narration
+/// rebuilt for it names the track "Narration only (rebuilt)": that narration is not
+/// sample-for-sample the one under the music, so that track can be switched to but not mixed.
+pub const NARRATION_ONLY: &str = "Narration only";
+
 /// MangaVox recaps with background music carry two audio tracks, "Narration + music" and
 /// "Narration only": their ids as (with music, narration only), so the music can be switched off.
 pub fn music_tracks(tracks: &[Track]) -> Option<(i64, i64)> {
     let audio: Vec<&Track> = tracks.iter().filter(|t| t.kind == crate::mpv::TrackKind::Audio).collect();
-    let solo = audio.iter().find(|t| t.title.trim().eq_ignore_ascii_case("Narration only"))?.id;
+    let solo = audio.iter().find(|t| t.title.trim().to_ascii_lowercase().starts_with(&NARRATION_ONLY.to_ascii_lowercase()))?.id;
     let full = audio.iter().find(|t| t.id != solo)?.id;
     Some((full, solo))
+}
+
+/// Whether the recap's two tracks (`pair`, from [`music_tracks`]) can be mixed: both made by
+/// Studio in one pass, the narration the same on each, so a mix changes only the music.
+pub fn music_mixable(tracks: &[Track], (full, solo): (i64, i64)) -> bool {
+    let named = |id: i64, name: &str| tracks.iter().any(|t| t.id == id && t.kind == crate::mpv::TrackKind::Audio && t.title.trim().eq_ignore_ascii_case(name));
+    named(full, WITH_MUSIC) && named(solo, NARRATION_ONLY)
+}
+
+/// mpv `lavfi-complex` that plays a recap's music at `level` (0 off ..= 1 as rendered): the
+/// with-music track `full` and the music-free one `solo` mixed `level : 1 - level`. The narration
+/// is identical on both, so it stays as it is while the music (and its effects) scale by `level`.
+pub fn music_graph((full, solo): (i64, i64), level: f64) -> String {
+    let l = clamp_music(level);
+    format!("[aid{full}][aid{solo}]amix=inputs=2:weights={l:.2} {:.2}:normalize=0[ao]", 1.0 - l)
+}
+
+/// A music level kept to 0..=1 (non-numbers: 1, as rendered).
+pub fn clamp_music(level: f64) -> f64 {
+    if level.is_finite() {
+        level.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// The music slider's level at `fraction` of its width, in 5 % steps (easy to land on 50 %).
+pub fn music_step(fraction: f64) -> f64 {
+    (clamp_music(fraction) * 20.0).round() / 20.0
+}
+
+/// "Music 50%", or "Music off" at 0.
+pub fn music_label(level: f64) -> String {
+    let p = (clamp_music(level) * 100.0).round();
+    if p <= 0.0 {
+        "Music off".into()
+    } else {
+        format!("Music {p:.0}%")
+    }
 }
 
 /// Human label for an mpv track: title, language, "external" hint.
@@ -188,12 +234,14 @@ pub struct PlaybackPrefs {
     pub subtitle_language: String,
     /// The viewer's last picks in the player (they win over the Settings language).
     pub memory: PlayerMemory,
+    /// Recaps' background music level (config `recap.musicLevel`, 0..=1; Studio's exports use it too).
+    pub music_level: f64,
 }
 
 impl Default for PlaybackPrefs {
     /// The Settings page defaults (ui-settings `Playback::default`).
     fn default() -> Self {
-        Self { auto_play: true, countdown: 20, pre_download_next: true, skip_intro: false, subtitle_language: "en".into(), memory: PlayerMemory::default() }
+        Self { auto_play: true, countdown: 20, pre_download_next: true, skip_intro: false, subtitle_language: "en".into(), memory: PlayerMemory::default(), music_level: 1.0 }
     }
 }
 
@@ -208,6 +256,7 @@ impl PlaybackPrefs {
             skip_intro: skip_intro.and_then(|v| v.as_bool()).unwrap_or(d.skip_intro),
             subtitle_language: subtitle_language.and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(d.subtitle_language),
             memory: d.memory,
+            music_level: d.music_level,
         }
     }
 }
@@ -591,7 +640,11 @@ pub fn parse_tracks(json: &str) -> Vec<Track> {
             };
             let text = |k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let flag = |k: &str| t.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
-            Some(Track { id: t.get("id")?.as_i64()?, kind, lang: text("lang"), title: text("title"), selected: flag("selected"), external: flag("external") })
+            // mpv 0.42 leaves an MP4 track's name (what ffmpeg's `title` writes) out of `title` and
+            // keeps it in the track's `metadata` as `name`, so recaps' "Narration only" was missed.
+            let named = t.get("metadata").and_then(|m| m.get("name").or_else(|| m.get("title"))).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let title = Some(text("title")).filter(|s| !s.trim().is_empty()).or(named).unwrap_or_default();
+            Some(Track { id: t.get("id")?.as_i64()?, kind, lang: text("lang"), title, selected: flag("selected"), external: flag("external") })
         })
         .collect()
 }
@@ -965,6 +1018,37 @@ mod tests {
         assert_eq!(music_tracks(&[audio(1, "Narration + music"), audio(2, "Narration only")]), Some((1, 2)));
         assert_eq!(music_tracks(&[audio(1, "English"), audio(2, "Japanese")]), None);
         assert_eq!(music_tracks(&[audio(1, "Narration only")]), None);
+        // Only Studio's own pair mixes; a rebuilt narration track can only be switched to.
+        let made = [audio(1, "Narration + music"), audio(2, "Narration only")];
+        assert!(music_mixable(&made, (1, 2)));
+        let rebuilt = [audio(1, "Narration + music"), audio(2, "Narration only (rebuilt)")];
+        assert_eq!(music_tracks(&rebuilt), Some((1, 2)));
+        assert!(!music_mixable(&rebuilt, (1, 2)));
+    }
+
+    /// mpv 0.42 reports a recap's track names under `metadata` (`name`), not `title`.
+    #[test]
+    fn track_names_come_from_metadata_when_title_is_missing() {
+        let json = r#"[{"id":1,"type":"video","selected":true},
+            {"id":1,"type":"audio","selected":true,"metadata":{"language":"und","handler_name":"Narration + music","name":"Narration + music"}},
+            {"id":2,"type":"audio","selected":false,"metadata":{"handler_name":"Narration only","name":"Narration only"}},
+            {"id":3,"type":"audio","title":"Commentary","metadata":{"name":"ignored"}},
+            {"id":4,"type":"audio","metadata":{"handler_name":"SoundHandler"}}]"#;
+        let t = parse_tracks(json);
+        let titles: Vec<&str> = t.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Narration + music", "Narration only", "Commentary", ""], "a generic handler name is not a title");
+        assert_eq!(music_tracks(&t[..2]), Some((1, 2)));
+        assert!(music_mixable(&t, (1, 2)));
+    }
+
+    #[test]
+    fn music_level_mixes_the_two_tracks() {
+        assert_eq!(music_graph((1, 2), 0.5), "[aid1][aid2]amix=inputs=2:weights=0.50 0.50:normalize=0[ao]");
+        assert_eq!(music_graph((1, 2), 1.0), "[aid1][aid2]amix=inputs=2:weights=1.00 0.00:normalize=0[ao]");
+        assert_eq!(music_graph((3, 4), -1.0), "[aid3][aid4]amix=inputs=2:weights=0.00 1.00:normalize=0[ao]");
+        assert_eq!(music_graph((1, 2), f64::NAN), music_graph((1, 2), 1.0));
+        assert_eq!((music_step(0.49), music_step(0.526), music_step(1.3), music_step(-0.2)), (0.5, 0.55, 1.0, 0.0));
+        assert_eq!((music_label(0.5), music_label(0.0), music_label(1.0)), ("Music 50%".to_string(), "Music off".to_string(), "Music 100%".to_string()));
     }
 
     #[test]

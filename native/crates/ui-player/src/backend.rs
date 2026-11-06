@@ -262,6 +262,7 @@ pub fn load_prefs() -> logic::PlaybackPrefs {
     let all = mv_core::config::Config::open_default().get_all();
     let mut prefs = logic::PlaybackPrefs::from_config(all.get("playback"), all.get("playback.skipIntro"), all.get("playback.subtitleLanguage"));
     prefs.memory = logic::PlayerMemory::from_json(all.get(MEMORY_KEY));
+    prefs.music_level = mv_core::config::music_level();
     prefs
 }
 
@@ -270,6 +271,13 @@ const MEMORY_KEY: &str = "player.memory";
 /// Remembers the viewer's audio / subtitle language, volume and speed for the next video.
 pub fn save_memory(memory: &logic::PlayerMemory) {
     let _ = mv_core::config::Config::open_default().set(MEMORY_KEY, memory.to_json());
+}
+
+/// Remembers recaps' music level for every recap played or exported from now on (blocking).
+pub fn save_music_level(level: f64) {
+    if let Err(e) = mv_core::config::save_music_level(level) {
+        mv_core::logging::global().warn("player", &format!("could not save the music level: {e:#}"));
+    }
 }
 
 /// Info hash of a torrent source before it is added, so the loader can show peer stats while

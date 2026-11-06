@@ -415,6 +415,71 @@ def _download(name: str, size: int, n: int, total: int) -> None:
     raise RuntimeError(f"{name} could not be downloaded: {last_err}. Run the setup again to resume.")
 
 
+def _pitch_shift(path: str, semitones: float) -> bool:
+    """Shifts a clip's pitch (and with it the voice's apparent size and age) in place, keeping
+    its length: resampled up or down, then time-stretched back."""
+    if abs(semitones) < 0.05:
+        return True
+    import wave
+    nt = _load_narration()
+    ff = nt.ffmpeg_binary()
+    if not ff:
+        return False
+    try:
+        with wave.open(path, "rb") as w:
+            sr = w.getframerate()
+    except Exception:
+        return False
+    r = 2.0 ** (float(semitones) / 12.0)
+    tmp = path + ".pitch.wav"
+    try:
+        res = subprocess.run([ff, "-y", "-v", "error", "-i", path, "-af", f"asetrate={sr * r:.0f},aresample={sr},atempo={1.0 / r:.5f}",
+                              "-ac", "1", tmp], capture_output=True, timeout=120, creationflags=_NO_WINDOW)
+        if res.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 2000:
+            return False
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+    finally:
+        if os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def make_reference_clip(ref: str, make_with: str, pitch: float = 0.0, text: str = REFERENCE_TEXT) -> str | None:
+    """A ~10 s reference clip for Chatterbox to clone, spoken by the local Kokoro voice
+    `make_with` (`kokoro_tts.py synthesize`) and shifted `pitch` semitones. Series mode makes
+    one per character this way, so a cast of fifty gets fifty different voices. Returns None
+    when it is there, else why it could not be made."""
+    if os.path.isfile(ref) and os.path.getsize(ref) > 20000:
+        return None
+    os.makedirs(os.path.dirname(ref) or ".", exist_ok=True)
+    args_path = ref + ".args.json"
+    with open(args_path, "w", encoding="utf-8") as f:
+        json.dump({"text": text, "output_path": ref, "voice": make_with or "am_adam", "speed": 0.95}, f)
+    kokoro_script = os.path.join(HERE, "kokoro_tts.py")
+    venv_py = os.path.join(BASE_DIR, "tts-venv", "Scripts", "python.exe") if os.name == "nt" else os.path.join(BASE_DIR, "tts-venv", "bin", "python3")
+    py = venv_py if os.path.isfile(venv_py) else sys.executable
+    try:
+        r = subprocess.run([py, kokoro_script, "synthesize", args_path], capture_output=True, text=True, timeout=600,
+                           cwd=HERE, creationflags=_NO_WINDOW)
+        if r.returncode != 0 or not os.path.isfile(ref):
+            return f"failed: {(r.stdout or r.stderr or '').strip()[-300:]}"
+        if not _pitch_shift(ref, pitch):
+            print(f"[chatterbox] could not shift {os.path.basename(ref)} by {pitch} semitones; using it as made", file=sys.stderr)
+        return None
+    except Exception as e:
+        return f"failed: {e}"
+    finally:
+        try:
+            os.remove(args_path)
+        except OSError:
+            pass
+
+
 def make_references(emit_progress=None) -> dict:
     """Makes the reference clips of voices that clone one, with a local Kokoro voice
     (`kokoro_tts.py synthesize`, which picks a Piper stand-in when Kokoro is missing)."""
@@ -762,10 +827,17 @@ def serve() -> int:
             if text and key and not os.path.isfile(os.path.join(cache_dir, f"{key}.wav")):
                 todo.append(c)
         info = []
-        made = synth_many([((c.get("text") or "").strip(), c.get("params"), int(c.get("seed", 0))) for c in todo])
-        for c, (x, retried) in zip(todo, made):
-            nt.write_wav(os.path.join(cache_dir, f"{c['key']}.wav"), x, sr)
-            info.append({"key": c["key"], "retried": retried, "raw_seconds": round(len(x) / sr, 2)})
+        # Series mode: a chunk may name its own voice (a character's clip); each voice's chunks
+        # are voiced together, in batches, with that voice loaded.
+        groups: dict = {}
+        for c in todo:
+            groups.setdefault(c.get("reference") or req.get("reference") or "", []).append(c)
+        for ref, cs in groups.items():
+            use_voice(req.get("voice"), ref or None)
+            made = synth_many([((c.get("text") or "").strip(), c.get("params"), int(c.get("seed", 0))) for c in cs])
+            for c, (x, retried) in zip(cs, made):
+                nt.write_wav(os.path.join(cache_dir, f"{c['key']}.wav"), x, sr)
+                info.append({"key": c["key"], "retried": retried, "raw_seconds": round(len(x) / sr, 2)})
         return {"voiced": len(info), "chunks": info, "elapsed": round(time.time() - t_all, 2),
                 "audio_seconds": round(sum(i["raw_seconds"] for i in info), 2), "fast": fast is not None,
                 "cooled_s": round(fast.guard.cooled_s, 1) if fast is not None else 0.0,
@@ -790,6 +862,7 @@ def serve() -> int:
                 x, _ = nt.read_wav(path)
                 cached = True
             else:
+                use_voice(req.get("voice"), c.get("reference") or req.get("reference"))
                 x, retried = synth_chunk(text, c.get("params"), int(c.get("seed", 0)))
                 if path:
                     nt.write_wav(path, x, sr)

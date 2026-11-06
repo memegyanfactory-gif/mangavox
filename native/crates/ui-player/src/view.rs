@@ -75,6 +75,8 @@ enum Menu {
 enum Drag {
     Seek,
     Volume,
+    /// Recaps' music slider: the level follows the mouse and is applied on release.
+    Music,
 }
 
 /// The following episode's stream lookup.
@@ -167,6 +169,11 @@ pub struct PlayerView {
     ov_bounds: Rc<Cell<Bounds<Pixels>>>,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     vol_bounds: Rc<Cell<Bounds<Pixels>>>,
+    music_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Recaps' background music level (0..=1, saved; Studio's exports use it too) and whether the
+    /// music button switched the music off for now (not saved, like mute).
+    music_level: f64,
+    music_off: bool,
     mpv: Option<Mpv>,
     phase: Phase,
     started: Instant,
@@ -322,6 +329,9 @@ impl PlayerView {
             ov_bounds: Rc::new(Cell::new(Bounds::default())),
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
+            music_bounds: Rc::new(Cell::new(Bounds::default())),
+            music_level: 1.0,
+            music_off: false,
             mpv: None,
             phase: Phase::Connecting,
             started: now,
@@ -763,6 +773,12 @@ impl PlayerView {
                 if let Some(s) = mem.speed {
                     let _ = m.set_now("speed", &format!("{s}"));
                 }
+                // Studio's recaps are files on this PC: their music plays at the saved level,
+                // mixed before each file starts. Streams never wait on that check.
+                self.music_level = self.prefs.music_level;
+                if matches!(logic::classify_source(&self.req.source), logic::SourceKind::File(_)) {
+                    m.watch_music(self.music_now());
+                }
                 self.resume_note = resume;
                 if let Some(t) = resume {
                     let _ = m.set_now("start", &format!("{t:.1}"));
@@ -884,7 +900,9 @@ impl PlayerView {
         if let Some(f) = &self.follower {
             f.sync();
         }
-        if !self.ticks.is_multiple_of(POLL_EVERY) {
+        // A recap held while its music mix is set up is polled every tick, so it starts at once.
+        let held = self.mpv.as_ref().is_some_and(|m| m.hook_pending());
+        if !self.ticks.is_multiple_of(POLL_EVERY) && !held {
             return;
         }
         self.polls = self.polls.wrapping_add(1);
@@ -1407,12 +1425,73 @@ impl PlayerView {
         }
     }
 
-    /// Recaps: background music off (the "Narration only" track) or back on.
+    /// Recaps: background music off or back on. A recap whose two tracks are mixed goes silent or
+    /// back to the saved level; one that is not (an older joined recap) switches between its
+    /// "Narration only" and "Narration + music" tracks, as before.
     fn toggle_music(&mut self, cx: &mut Context<Self>) {
         let Some((full, solo)) = logic::music_tracks(&self.tracks) else { return };
-        let off = self.tracks.iter().any(|t| t.id == solo && t.kind == TrackKind::Audio && t.selected);
-        self.select_track(TrackKind::Audio, Some(if off { full } else { solo }), cx);
-        self.flash(Some(ph::MUSIC_NOTES.fill()), if off { "Music on" } else { "Music off · narration only" });
+        if self.music_mix().is_none() {
+            let off = self.tracks.iter().any(|t| t.id == solo && t.kind == TrackKind::Audio && t.selected);
+            self.select_track(TrackKind::Audio, Some(if off { full } else { solo }), cx);
+            self.flash(Some(ph::MUSIC_NOTES.fill()), if off { "Music on" } else { "Music off · narration only" });
+            return;
+        }
+        // Dragged down to 0 already reads as off: the button brings the music back at half
+        // (the volume button does the same).
+        if !self.music_off && self.music_level <= 0.0 {
+            self.music_level = 0.5;
+            self.save_music_level();
+        } else {
+            self.music_off = !self.music_off;
+        }
+        self.apply_music(cx);
+        self.flash(Some(ph::MUSIC_NOTES.fill()), logic::music_label(self.music_now()));
+    }
+
+    /// The music level playing now: 0 while the music button has it off.
+    fn music_now(&self) -> f64 {
+        if self.music_off {
+            0.0
+        } else {
+            self.music_level
+        }
+    }
+
+    /// The recap tracks mixed in the file playing now (the music slider shows for those).
+    fn music_mix(&self) -> Option<(i64, i64)> {
+        self.mpv.as_ref()?.music_mixed()
+    }
+
+    /// Plays the music at [`Self::music_now`] (mpv rebuilds the mix: the sound pauses briefly).
+    fn apply_music(&mut self, cx: &mut Context<Self>) {
+        let level = self.music_now();
+        if let Some(m) = &self.mpv {
+            m.set_music_level(level);
+        }
+        cx.notify();
+    }
+
+    /// Saves the music level for every recap from now on (and Studio's exports).
+    fn save_music_level(&self) {
+        let level = self.music_level;
+        std::thread::spawn(move || backend::save_music_level(level));
+    }
+
+    /// The Audio menu on a recap whose tracks are mixed: "Narration only" turns the music off,
+    /// "Narration + music" back on; any other track is picked as usual.
+    fn pick_audio(&mut self, id: i64, cx: &mut Context<Self>) {
+        match self.music_mix() {
+            Some((full, solo)) if id == full || id == solo => {
+                if id == full && self.music_level <= 0.0 {
+                    self.music_level = 0.5;
+                    self.save_music_level();
+                }
+                self.music_off = id == solo;
+                self.apply_music(cx);
+                self.flash(Some(ph::MUSIC_NOTES.fill()), logic::music_label(self.music_now()));
+            }
+            _ => self.select_track(TrackKind::Audio, Some(id), cx),
+        }
     }
 
     fn set_speed(&mut self, s: f64, cx: &mut Context<Self>) {
@@ -1740,12 +1819,28 @@ impl PlayerView {
                 let f = logic::fraction_in(x, b.origin.x.as_f32(), b.size.width.as_f32());
                 self.set_volume(f * 130.0, cx);
             }
+            Some(Drag::Music) => {
+                // The handle follows the mouse; the sound changes on release (each change makes
+                // mpv rebuild the mix, a short pause in the sound).
+                let b = self.music_bounds.get();
+                let level = logic::music_step(logic::fraction_in(x, b.origin.x.as_f32(), b.size.width.as_f32()));
+                if level != self.music_level || self.music_off {
+                    self.music_level = level;
+                    self.music_off = false;
+                    self.flash(Some(ph::MUSIC_NOTES.fill()), logic::music_label(level));
+                    cx.notify();
+                }
+            }
             None => {}
         }
     }
 
     fn drag_end(&mut self, cx: &mut Context<Self>) {
         self.title_drag = None;
+        if self.drag == Some(Drag::Music) {
+            self.apply_music(cx);
+            self.save_music_level();
+        }
         if self.drag == Some(Drag::Seek) {
             if let Some(t) = self.scrub.take() {
                 // Exact seek on release.
@@ -2255,11 +2350,20 @@ impl PlayerView {
                 })
             })
             .when_some(logic::music_tracks(&self.tracks), |d, (_, solo)| {
-                let off = self.tracks.iter().any(|t| t.id == solo && t.kind == TrackKind::Audio && t.selected);
+                // Mixed recaps get a level slider beside the button; older ones only the switch.
+                let mixed = self.music_mix().is_some();
+                let off = if mixed { self.music_now() <= 0.0 } else { self.tracks.iter().any(|t| t.id == solo && t.kind == TrackKind::Audio && t.selected) };
                 d.child(
-                    ctl("music", if off { ph::MUSIC_NOTES.regular() } else { ph::MUSIC_NOTES.fill() }, BAR_PX, if off { "Turn the music on" } else { "Turn the music off (narration only)" }, None)
-                        .when(off, |c| c.opacity(0.55))
-                        .on_click(cx.listener(|this, _, _w, cx| this.toggle_music(cx))),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
+                        .child(
+                            ctl("music", if off { ph::MUSIC_NOTES.regular() } else { ph::MUSIC_NOTES.fill() }, BAR_PX, if off { "Turn the music on" } else { "Turn the music off (narration only)" }, None)
+                                .when(off, |c| c.opacity(0.55))
+                                .on_click(cx.listener(|this, _, _w, cx| this.toggle_music(cx))),
+                        )
+                        .when(mixed, |d| d.child(self.music_slider(cx))),
                 )
             })
             .child(
@@ -2434,6 +2538,41 @@ impl PlayerView {
             )
     }
 
+    /// Recaps' music level, beside the music button: drag to set it (saved, and used by Studio's
+    /// exports too), applied when the mouse is released.
+    fn music_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let level = self.music_now();
+        let frac = logic::clamp_music(level) as f32;
+        let bounds = self.music_bounds.clone();
+        div()
+            .id("music-level")
+            .w(px(72.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                    cx.stop_propagation();
+                    this.drag = Some(Drag::Music);
+                    this.drag_to(ev.position.x.as_f32(), cx);
+                }),
+            )
+            .tooltip(mv_ui::tip(format!("{} · saved for every recap and its export", logic::music_label(level))))
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(4.))
+                    .rounded(px(2.))
+                    .bg(Tokens::track())
+                    .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
+                    .child(div().absolute().top_0().left_0().h_full().w(relative(frac)).rounded(px(2.)).bg(Tokens::text_1()))
+                    .child(div().absolute().top(px(-4.)).left(relative(frac)).ml(px(-6.)).size(px(12.)).rounded_full().bg(Tokens::text_1())),
+            )
+    }
+
     fn menu_view(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
         let (w, h) = self.menu_size(menu);
         let list = |id: &'static str| div().id(id).flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).flex().flex_col();
@@ -2445,11 +2584,19 @@ impl PlayerView {
                 if tracks.is_empty() {
                     audio = audio.child(empty("No audio tracks yet"));
                 }
+                // A recap's two tracks play mixed (mpv marks both selected): the menu shows the
+                // music as on ("Narration + music") or off ("Narration only").
+                let mix = self.music_mix();
+                let silent = self.music_now() <= 0.0;
                 for t in tracks {
                     let id = t.id;
+                    let selected = match mix {
+                        Some((full, solo)) if id == full || id == solo => (id == solo) == silent,
+                        _ => t.selected,
+                    };
                     audio = audio.child(
-                        track_row(SharedString::from(format!("a{id}")), Some(ui::flag(logic::flag_country(&t.lang, &t.title))), logic::track_label(t), t.selected)
-                            .on_click(cx.listener(move |this, _, _w, cx| this.select_track(TrackKind::Audio, Some(id), cx))),
+                        track_row(SharedString::from(format!("a{id}")), Some(ui::flag(logic::flag_country(&t.lang, &t.title))), logic::track_label(t), selected)
+                            .on_click(cx.listener(move |this, _, _w, cx| this.pick_audio(id, cx))),
                     );
                 }
                 let subs: Vec<&Track> = self.tracks.iter().filter(|t| t.kind == TrackKind::Sub).collect();

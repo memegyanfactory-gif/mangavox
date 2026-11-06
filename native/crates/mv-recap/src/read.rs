@@ -304,29 +304,89 @@ pub(crate) fn pick_faces(brain: &Brain, recent: &[String]) -> Vec<(String, PathB
     cs.into_iter().take(MAX_FACE_ATTACHMENTS).map(|(c, p)| (c.name.clone(), p.clone())).collect()
 }
 
-pub(crate) fn roster_text(brain: &Brain, limit: usize) -> String {
+/// Characters the bank lists (most seen first), and how many of a character's other names: the
+/// latest ones, their newest names and looks. The older ones stay in the brain, which still
+/// matches them when a reading uses one (`Brain::observe`).
+const BANK_SIZE: usize = 40;
+const BANK_ALIASES: usize = 4;
+/// Characters new or renamed since a chapter's reading began, listed with each page.
+const BANK_NEW: usize = 12;
+
+/// One character in the bank: name, latest other names and what they look like / who they are.
+/// Traits (how a character behaves) are left out: they do not help to tell who is on a page, and
+/// they cost tokens with every page read.
+fn bank_line(c: &crate::types::Character) -> String {
+    let mut s = format!("- {}", c.name);
+    let aliases: Vec<&str> = c.aliases.iter().rev().take(BANK_ALIASES).map(String::as_str).collect();
+    if !aliases.is_empty() {
+        s += &format!(" (also called: {})", aliases.join(", "));
+    }
+    if !c.description.is_empty() {
+        s += &format!(": {}", truncate(&c.description, 140));
+    }
+    s
+}
+
+fn by_appearances(brain: &Brain) -> Vec<&crate::types::Character> {
     let mut cs: Vec<_> = brain.characters.iter().collect();
     cs.sort_by_key(|c| std::cmp::Reverse(c.appearances));
+    cs
+}
+
+pub(crate) fn roster_text(brain: &Brain, limit: usize) -> String {
+    let cs = by_appearances(brain);
     if cs.is_empty() {
         return "(none yet - every character you see is new)".into();
     }
-    cs.iter()
-        .take(limit)
-        .map(|c| {
-            let mut s = format!("- {}", c.name);
-            if !c.aliases.is_empty() {
-                s += &format!(" (also called: {})", c.aliases.join(", "));
-            }
-            if !c.description.is_empty() {
-                s += &format!(": {}", truncate(&c.description, 200));
-            }
-            if !c.traits.is_empty() {
-                s += &format!(" [traits: {}]", c.traits.join(", "));
-            }
-            s
-        })
+    cs.iter().take(limit).map(|c| bank_line(c)).collect::<Vec<_>>().join("\n")
+}
+
+/// The character bank as it stands when a chapter's reading starts. Its text goes in the system
+/// prompt, the same for every page of the chapter, so the provider reads it from its prompt cache
+/// instead of billing it in full with every page; each page adds only who is new ([`new_in_bank`]).
+pub(crate) struct Bank {
+    /// Every character the brain knew then: id to name.
+    all: std::collections::HashMap<String, String>,
+    /// The ones the text lists (the most seen).
+    listed: std::collections::HashSet<String>,
+    pub text: String,
+}
+
+pub(crate) fn chapter_bank(brain: &Brain) -> Bank {
+    Bank {
+        all: brain.characters.iter().map(|c| (c.id.clone(), c.name.clone())).collect(),
+        listed: by_appearances(brain).into_iter().take(BANK_SIZE).map(|c| c.id.clone()).collect(),
+        text: roster_text(brain, BANK_SIZE),
+    }
+}
+
+impl Bank {
+    /// Met or renamed since the bank was made.
+    fn is_new(&self, c: &crate::types::Character) -> bool {
+        self.all.get(&c.id) != Some(&c.name)
+    }
+
+    /// How many characters were met or renamed since (many: time to make the bank again).
+    pub(crate) fn newcomers(&self, brain: &Brain) -> usize {
+        brain.characters.iter().filter(|c| self.is_new(c)).count()
+    }
+}
+
+/// What a page adds to the bank: the characters met or renamed since it was made, and the ones
+/// seen on the page before (`recent`) that it does not list, most seen first.
+pub(crate) fn new_in_bank(brain: &Brain, bank: &Bank, recent: &[String]) -> String {
+    by_appearances(brain)
+        .into_iter()
+        .filter(|c| bank.is_new(c) || (!bank.listed.contains(&c.id) && recent.iter().any(|r| r.eq_ignore_ascii_case(&c.name))))
+        .take(BANK_NEW)
+        .map(bank_line)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The page reader's system prompt with the chapter's character bank.
+pub(crate) fn read_system(bank: &str) -> String {
+    format!("{READ_SYSTEM}\n\nCHARACTER BANK (reuse these exact names; a page may add characters met since):\n{bank}")
 }
 
 pub(crate) struct PagePrompt<'a> {
@@ -342,6 +402,10 @@ pub(crate) struct PagePrompt<'a> {
     pub strip_to: Option<usize>,
     /// The page before is attached (Image 2) for context.
     pub prev_image: bool,
+    /// The chapter's character bank (in the system prompt, see [`chapter_bank`]): the page lists
+    /// only who is new since, and who was on the page before (`recent`) when the bank does not.
+    pub bank: &'a Bank,
+    pub recent: &'a [String],
 }
 
 pub(crate) fn page_prompt(p: &PagePrompt) -> String {
@@ -371,7 +435,10 @@ pub(crate) fn page_prompt(p: &PagePrompt) -> String {
         s += &format!("\nSTORY MEMORY SO FAR (most recent last):\n{notes}\n");
     }
     s += &format!("\nPREVIOUS {}: {}\n", if p.strip_to.is_some() { "PART" } else { "PAGE" }, if p.prev_summary.is_empty() { "(this is the first page read)" } else { p.prev_summary });
-    s += &format!("\nCHARACTER BANK (reuse these exact names):\n{}\n", roster_text(p.brain, 40));
+    let new = new_in_bank(p.brain, p.bank, p.recent);
+    if !new.is_empty() {
+        s += &format!("\nNEW IN THE CHARACTER BANK SINCE THIS CHAPTER BEGAN (reuse these exact names too):\n{new}\n");
+    }
     s += if p.strip_to.is_some() { "\nATTACHED IMAGES:\nImage 1 = the strip part to read." } else { "\nATTACHED IMAGES:\nImage 1 = the page to read." };
     if p.prev_image {
         s += "\nImage 2 = the page BEFORE it, for context only: who is who, which scene and time this is (the present or a flashback), who is talking to whom. Never transcribe it; read only Image 1.";
@@ -484,6 +551,9 @@ pub(crate) async fn read_chapter_with(
     let mut flight = futures::stream::FuturesOrdered::new();
     let mut reading: Vec<usize> = vec![];
     let mut first_done = false;
+    // The character bank goes in the system prompt, the same for every page, so it is billed in
+    // full once and then read from the provider's prompt cache (see `chapter_bank`).
+    let mut bank = chapter_bank(&brain.lock().unwrap());
     loop {
         if cancel.is_cancelled() {
             progress(Progress::Failed("Cancelled".into()));
@@ -534,15 +604,20 @@ pub(crate) async fn read_chapter_with(
             let recent = recent_names(&read, i);
             let (prompt, faces) = {
                 let b = brain.lock().unwrap();
+                // Many characters joined since the bank was made (a new manga's first chapter):
+                // the bank is made again, so each page lists only a few newcomers.
+                if bank.newcomers(&b) > BANK_NEW {
+                    bank = chapter_bank(&b);
+                }
                 let faces = pick_faces(&b, &recent);
                 let strip_to = unit.stitched.then(|| unit.spans[unit.spans.len() - 1].page);
-                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces, strip_to, prev_image: before.is_some() });
+                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces, strip_to, prev_image: before.is_some(), bank: &bank, recent: &recent });
                 (prompt, faces)
             };
             let mut images = vec![send_path];
             images.extend(before);
             images.extend(faces.iter().map(|(_, p)| p.clone()));
-            let req = request(model, vec![AiMessage::system(READ_SYSTEM), AiMessage::user(prompt)], images, Some(ws));
+            let req = request(model, vec![AiMessage::system(read_system(&bank.text)), AiMessage::user(prompt)], images, Some(ws));
             flight.push_back(ask(unit.clone(), image, Some(req)));
         }
         if started {
@@ -721,4 +796,56 @@ fn upsert(read: &mut ChapterRead, page: PageRead) {
     read.pages.retain(|p| p.index != page.index);
     read.pages.push(page);
     read.pages.sort_by_key(|p| p.index);
+}
+
+#[cfg(test)]
+mod bank_tests {
+    use super::*;
+    use crate::types::Character;
+
+    fn person(name: &str, seen: u32, aliases: &[&str]) -> Character {
+        Character {
+            id: name.into(),
+            name: name.into(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            description: format!("{name} {}", "looks ".repeat(60)),
+            traits: vec!["smug".into(), "furious".into()],
+            appearances: seen,
+            ..Default::default()
+        }
+    }
+
+    /// The bank is sent once per chapter in the system prompt (cached by the provider), short: no
+    /// traits, the latest four other names, the description's start. Each page lists only who joined.
+    #[test]
+    fn the_bank_is_short_and_pages_list_only_newcomers() {
+        let mut b = Brain::default();
+        b.characters.push(person("Junho", 600, &["a", "b", "c", "d", "e", "f"]));
+        b.characters.push(person("Dahyun", 100, &[]));
+        let bank = chapter_bank(&b);
+        assert!(!bank.text.contains("smug") && !bank.text.contains("traits"), "{}", bank.text);
+        assert!(bank.text.starts_with("- Junho (also called: f, e, d, c): Junho looks"), "{}", bank.text);
+        assert!(bank.text.lines().all(|l| l.chars().count() < 200), "{}", bank.text);
+        let system = read_system(&bank.text);
+        assert!(system.starts_with(READ_SYSTEM) && system.contains("CHARACTER BANK") && system.contains("- Dahyun"));
+        assert_eq!(new_in_bank(&b, &bank, &[]), "", "nothing new on the next page");
+
+        // Met and renamed since: listed with the page, and counted towards making the bank again.
+        b.characters.push(person("Masked robber", 1, &[]));
+        b.characters[1].name = "Jung Dahyun".into();
+        let new = new_in_bank(&b, &bank, &[]);
+        assert!(new.contains("- Jung Dahyun") && new.contains("- Masked robber") && !new.contains("Junho"), "{new}");
+        assert_eq!(bank.newcomers(&b), 2);
+
+        // Someone the bank leaves out (not among the most seen) is listed when on the page before.
+        let mut many = Brain::default();
+        for k in 0..BANK_SIZE + 1 {
+            many.characters.push(person(&format!("C{k}"), 100 - k as u32, &[]));
+        }
+        let bank = chapter_bank(&many);
+        let last = format!("C{BANK_SIZE}");
+        assert!(!bank.text.contains(&format!("- {last} ")));
+        assert_eq!(new_in_bank(&many, &bank, &[]), "");
+        assert!(new_in_bank(&many, &bank, std::slice::from_ref(&last)).starts_with(&format!("- {last}")));
+    }
 }
