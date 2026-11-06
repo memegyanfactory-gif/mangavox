@@ -2,7 +2,7 @@
 //! requests, so it is ignored by default:
 //!
 //! ```text
-//! MV_LIVE_PAGE=D:\some\manga\page.jpg
+//! MV_LIVE_PAGE=D:\some\manga\page.jpg   (or several pages separated by ;)
 //! MV_LIVE_MODELS=antigravity:gemini-3.8-flash-high,claude-code:claude-sonnet-5-5,codex:default
 //! cargo test -p mv-recap live_providers -- --ignored --nocapture
 //! ```
@@ -35,11 +35,13 @@ fn models_from_env() -> Result<Vec<ModelChoice>, String> {
 }
 
 /// Read one page the way Studio does, on a temp chapter folder. `Ok` = a real reading came back.
-async fn check_read(reg: &Arc<Registry>, model: &ModelChoice, page: &std::path::Path, root: &std::path::Path) -> Result<String, String> {
+async fn check_read(reg: &Arc<Registry>, model: &ModelChoice, pages: &[PathBuf], root: &std::path::Path) -> Result<String, String> {
     let pages_dir = root.join("pages");
     std::fs::create_dir_all(&pages_dir).map_err(|e| e.to_string())?;
-    let ext = page.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "jpg".into());
-    std::fs::copy(page, pages_dir.join(format!("001.{ext}"))).map_err(|e| format!("cannot copy the page: {e}"))?;
+    for (n, page) in pages.iter().enumerate() {
+        let ext = page.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "jpg".into());
+        std::fs::copy(page, pages_dir.join(format!("{:03}.{ext}", n + 1))).map_err(|e| format!("cannot copy the page: {e}"))?;
+    }
     let ch = ChapterRef {
         chapter_id: "live".into(),
         manga_id: "live".into(),
@@ -58,15 +60,21 @@ async fn check_read(reg: &Arc<Registry>, model: &ModelChoice, page: &std::path::
     });
     let read = read_chapter_with(reg, model, &ch, &brain, &ReadOptions::default(), &progress, &CancellationToken::new()).await.map_err(|e| e.to_string())?;
     let logs = logs.lock().unwrap().join(" | ");
-    let Some(p) = read.pages.first() else { return Err(format!("no page was read. {logs}")) };
-    // A reply that was not JSON is stored as raw text: its scene stays empty.
-    if logs.contains("did not return valid JSON") || p.scene.kind.is_empty() {
-        return Err(format!("the answer was not a page reading: {}", p.summary));
+    if read.pages.len() != pages.len() {
+        return Err(format!("{} of {} pages were read. {logs}", read.pages.len(), pages.len()));
     }
-    if p.summary.trim().is_empty() && p.panels.is_empty() {
-        return Err("the reading has no summary and no panels".into());
+    for p in &read.pages {
+        // A reply that was not JSON is stored as raw text: its scene stays empty.
+        if p.scene.kind.is_empty() {
+            return Err(format!("page {}: the answer was not a page reading: {}", p.index + 1, p.summary));
+        }
+        if p.summary.trim().is_empty() && p.panels.is_empty() {
+            return Err(format!("page {}: the reading has no summary and no panels", p.index + 1));
+        }
     }
-    Ok(format!("{} panels, summary: {}", p.panels.len(), crate::llm::truncate(&p.summary, 80)))
+    let p = &read.pages[read.pages.len() - 1];
+    let lines: usize = read.pages.iter().flat_map(|p| &p.panels).map(|pn| pn.lines.len()).sum();
+    Ok(format!("{} pages, {lines} lines; last: {}", read.pages.len(), crate::llm::truncate(&p.summary, 80)))
 }
 
 /// One story-style call, built like `story_request` (medium effort), with a tiny prompt.
@@ -95,10 +103,11 @@ async fn read_and_story_work_on_every_installed_provider() {
         Ok(_) => return eprintln!("SKIP: set MV_LIVE_MODELS, e.g. antigravity:gemini-3.8-flash-high,claude-code:claude-sonnet-5-5"),
         Err(e) => panic!("MV_LIVE_MODELS: {e}"),
     };
-    let page = match std::env::var("MV_LIVE_PAGE").ok().map(PathBuf::from) {
-        Some(p) if p.is_file() => p,
-        _ => return eprintln!("SKIP: set MV_LIVE_PAGE to a manga page image (jpg, png or webp)"),
-    };
+    // One page, or several separated by `;` (read as one chapter, the way Studio reads it).
+    let pages: Vec<PathBuf> = std::env::var("MV_LIVE_PAGE").unwrap_or_default().split(';').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+    if pages.is_empty() || pages.iter().any(|p| !p.is_file()) {
+        return eprintln!("SKIP: set MV_LIVE_PAGE to a manga page image (jpg, png or webp), or several separated by ;");
+    }
     let tmp = tempfile::tempdir().expect("temp dir");
     // The registry as the app builds it: the app's config file (sign-ins, keys) and a workspace.
     let reg = Arc::new(Registry::new(mv_core::paths::config(), tmp.path().join("registry_ws")));
@@ -107,7 +116,7 @@ async fn read_and_story_work_on_every_installed_provider() {
         let label = format!("{}:{}", m.provider.as_str(), m.model);
         let root = tmp.path().join(format!("m{n}"));
         let t = Instant::now();
-        let read = check_read(&reg, m, &page, &root.join("read")).await;
+        let read = check_read(&reg, m, &pages, &root.join("read")).await;
         println!("{} read   {label} ({:.0}s) {}", if read.is_ok() { "PASS" } else { "FAIL" }, t.elapsed().as_secs_f32(), read.as_ref().map(|s| s.as_str()).unwrap_or_else(|e| e.as_str()));
         let t = Instant::now();
         let story = check_story(&reg, m, &root.join("story")).await;
@@ -120,4 +129,55 @@ async fn read_and_story_work_on_every_installed_provider() {
         }
     }
     assert!(failed.is_empty(), "{} check(s) failed:\n{}", failed.len(), failed.join("\n"));
+}
+
+/// Live check of the Studio switches on real pages (`MV_LIVE_PAGE`, several separated by `;`):
+/// Auto starting from `MV_LIVE_START` (a model that fails, e.g. one that cannot see pictures)
+/// must switch and read every page; Light read must pick a cheaper reader and read every page.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "sends real requests to the AI providers; set MV_LIVE_PAGE and MV_LIVE_START"]
+async fn auto_switch_and_light_read_work_live() {
+    let pages: Vec<PathBuf> = std::env::var("MV_LIVE_PAGE").unwrap_or_default().split(';').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+    let Some(start) = models_from_env_var("MV_LIVE_START").into_iter().next() else { return eprintln!("SKIP: set MV_LIVE_START=provider:model") };
+    if pages.is_empty() {
+        return eprintln!("SKIP: set MV_LIVE_PAGE");
+    }
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let reg = Arc::new(Registry::new(mv_core::paths::config(), tmp.path().join("registry_ws")));
+    for (name, light, auto) in [("auto", false, true), ("light", true, false)] {
+        let root = tmp.path().join(name);
+        let pages_dir = root.join("pages");
+        std::fs::create_dir_all(&pages_dir).unwrap();
+        for (n, p) in pages.iter().enumerate() {
+            std::fs::copy(p, pages_dir.join(format!("{:03}.jpg", n + 1))).unwrap();
+        }
+        let ch = ChapterRef { chapter_id: name.into(), manga_id: "live".into(), manga_title: "Live check".into(), label: "Chapter 1".into(), pages_dir, output_dir: root.join("out") };
+        let brain = Arc::new(Mutex::new(Brain::load_in(root.join("brain"), "live", "Live check")));
+        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let sink = logs.clone();
+        let progress: ProgressFn = Arc::new(move |p| {
+            if let Progress::Log(l) | Progress::Failed(l) = p {
+                println!("  [{}] {l}", if l.starts_with("Auto") || l.starts_with("Light") { "switch" } else { "log" });
+                sink.lock().unwrap().push(l);
+            }
+        });
+        let t = Instant::now();
+        let out = crate::auto::read_smart(reg.clone(), start.clone(), ch, brain, ReadOptions::default(), progress, CancellationToken::new(), light, auto).await;
+        let lines: usize = out.as_ref().map(|r| r.pages.iter().flat_map(|p| &p.panels).map(|pn| pn.lines.len()).sum()).unwrap_or(0);
+        println!("{} {name} ({:.0}s): {}", if out.as_ref().is_ok_and(|r| r.pages.len() == pages.len()) { "PASS" } else { "FAIL" }, t.elapsed().as_secs_f32(), match &out {
+            Ok(r) => format!("{} pages, {lines} lines", r.pages.len()),
+            Err(e) => format!("{e:#}"),
+        });
+    }
+}
+
+fn models_from_env_var(key: &str) -> Vec<ModelChoice> {
+    std::env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|item| {
+            let (p, m) = item.trim().split_once(':')?;
+            Some(ModelChoice { provider: serde_json::from_value(serde_json::Value::String(p.trim().into())).ok()?, model: m.trim().into() })
+        })
+        .collect()
 }

@@ -23,47 +23,33 @@ const FACE_PX: u32 = 192;
 pub(crate) const MIN_PANEL_AREA: f32 = 0.02;
 const SCENE_KINDS: &[&str] = &["fight", "dialogue", "emotional", "comedy", "action", "reveal", "calm", "flashback", "romance", "horror", "other"];
 
-const READ_SYSTEM: &str = r##"You are an expert manga reader and script supervisor. You look at one manga page (plus reference face crops of known characters) and produce an exact, structured transcript. A narrator will later retell the story from your output as an anime-style recap video, so accuracy and consistent character names matter more than anything else. You never invent dialogue and never skip a speech balloon. Do not run commands, open other files or write files: use only the attached images and answer directly.
+const READ_SYSTEM: &str = r##"You read manga pages (plus reference face crops of known characters) and write an exact, structured transcript. A narrator retells the story from it as a recap video, so accuracy and consistent character names matter most. Never invent dialogue, never skip a balloon. Use only the attached images: do not run commands or open files.
 
-Reply with STRICT JSON only: one JSON object, no markdown fences, no commentary before or after it. Schema (every key present; use "" / [] / null when empty):
-
-{
-  "summary": "1-2 sentences: what happens on this page, in plain English, using character names",
-  "scene": {
-    "kind": "fight|dialogue|emotional|comedy|action|reveal|calm|flashback|romance|horror|other",
-    "mood": "one or two words, e.g. tense, heartbroken, playful",
-    "intensity": 0-10 (0 = quiet, 10 = climax),
-    "tags": ["short tags such as 'sword duel', 'rain', 'confession', 'betrayal', 'training'"]
-  },
-  "memory": "ONE short sentence if a key plot event, reveal, relationship change or world fact happens on this page, else null",
-  "panels": [
-    {
-      "bbox": [x0, y0, x1, y1],
-      "description": "what is drawn: setting, action, expressions, camera angle (1-2 sentences)",
-      "characters": [
-        {
-          "name": "Ruko",
-          "was": null,
-          "face": [x0, y0, x1, y1],
-          "description": "only when first seen: age, hair, eyes, outfit, build, role",
-          "traits": ["only when first seen or newly revealed: personality words"]
-        }
-      ],
-      "lines": [
-        {"speaker": "Ruko", "kind": "speech", "text": "verbatim text of the balloon"}
-      ]
-    }
-  ]
-}
+Reply with STRICT JSON only (no fences, nothing before or after): {"pages":[PAGE, ...]}, one PAGE per page image, in the order given. Leave out any key whose value would be empty, null or []. PAGE:
+{"summary":"1-2 sentences: what happens, using names","scene":{"kind":"fight|dialogue|emotional|comedy|action|reveal|calm|flashback|romance|horror|other","mood":"1-2 words","intensity":0-10,"tags":["2-5 short tags"]},"memory":"one sentence, only for a key plot event, reveal, relationship change or world fact","panels":[{"bbox":[x0,y0,x1,y1],"description":"1-2 sentences: setting, action, expressions, camera angle","characters":[{"name":"Ruko","was":"old placeholder","face":[x0,y0,x1,y1],"description":"new characters only: age, hair, eyes, outfit, build, role","traits":["new characters only"]}],"lines":[{"speaker":"Ruko","kind":"speech|thought|narration|sfx","text":"verbatim balloon text"}]}]}
 
 Rules
-1. READING ORDER. Japanese manga reads right-to-left, top-to-bottom: the top-right panel is first, and within a row go right to left. If the page is a webtoon / vertical strip (the prompt says so) read strictly top-to-bottom. List panels in that order. Balloons inside a panel are also ordered by reading order.
-2. COORDINATES. All boxes are NORMALISED to the WHOLE page image: [x0, y0, x1, y1] with values between 0 and 1, origin at the top-left, x to the right, y downward. Panel bbox = the panel frame. Face box = the character's face only, tight (forehead to chin), also relative to the whole page, never to the panel. Omit "face" (null) when the face is hidden, tiny or turned away.
-3. LINES. Transcribe EVERY speech balloon, thought bubble, narration box and meaningful sound effect. kind is one of "speech", "thought", "narration", "sfx". Keep the original meaning; if the text is not English, translate it into natural English. Do not add stage directions. Merge a balloon that is split across several bubbles into one line. Narration boxes and sfx have speaker null. If you cannot tell who speaks, use null rather than guessing wildly; use the tail of the balloon, the facing direction and the roster to decide.
-4. CHARACTERS. A roster of known characters (the "character bank") is given with reference face crops attached after the page. Identify people by face, hair, eyes and outfit, matching them to the roster, and ALWAYS reuse the roster name exactly. Use a real name when it is written or spoken on the page. If someone is not in the roster and has no name yet, give a stable descriptive placeholder such as "Silver-haired swordsman" or "Girl with red ribbon" and reuse exactly the same placeholder next time you see them. If a character that is listed under a placeholder name is named on this page, return the real name in "name" and the old placeholder in "was" (otherwise "was" is null). Do not list background crowds. Only fill "description" and "traits" for a character who is new or whose details were missing; leave them empty for known characters.
-5. SCENE. Judge the depth of the page, not just the surface: fights, tension, grief, comedy beats, reveals, flashbacks. Pick the single best "kind", set intensity honestly (a quiet conversation is 1-3, a decisive blow or tearful goodbye is 8-10), and add 2-5 tags.
-6. SUMMARY continues the story: use the previous page (its summary, and its image when attached) for continuity and write what is new here. Say what HAPPENS, not only what is said: who arrives, attacks, transforms, flees, what object matters (look closely before naming anything gruesome: a flying object is a severed head only when it clearly is one). Keep a flashback a flashback until the page shows the return to the present. If the page is only a title, credits or an ad, say so in the summary and return an empty "panels" list.
-7. Never wrap the JSON in code fences. Never output anything but the JSON object."##;
+1. ORDER: Japanese manga reads right-to-left, top to bottom (top-right panel first); manhwa, webtoons and Western comics read left-to-right, a vertical strip strictly top to bottom. Panels and balloons in reading order.
+2. BOXES are normalised 0-1 to that page's whole image, origin top-left. Panel bbox = the panel frame. face = tight forehead-to-chin box; leave it out when the face is hidden, tiny or turned away.
+3. LINES: every speech balloon, thought bubble, narration box and meaningful sound effect. Write every line in English: translate any other language, sound effects too (꾸욱 -> "Press"). Merge one balloon split over several bubbles. Narration and sfx have no speaker; leave the speaker out rather than guess wildly (use the tail, facing direction and roster).
+4. CHARACTERS: match people by face, hair, eyes and outfit to the character bank and reference faces, and reuse bank names exactly. Use a real name when it is written or spoken. An unnamed newcomer gets a stable descriptive placeholder ("Silver-haired swordsman"), reused exactly next time. When a placeholder is named on the page, give the real name in "name" and the placeholder in "was". No background crowds.
+5. SCENE: the single best kind; honest intensity (quiet talk 1-3, decisive blow or tearful goodbye 8-10).
+6. SUMMARY continues the story from the page before: say what HAPPENS (arrivals, attacks, transformations, escapes, objects that matter), not only what is said. Keep a flashback a flashback until the page returns to the present. Look closely before naming anything gruesome. A title, credits or ad page: say so and leave out "panels"."##;
+
+/// Light read (see `ReadOptions::light`): the same answer shape, asked for only what a cheaper
+/// vision model gets right and the story needs: every line and its speaker, the scene, a short
+/// summary and the panel frames. No looks, traits, face boxes or panel descriptions.
+const LIGHT_READ_SYSTEM: &str = r##"You read manga pages and transcribe them. A narrator retells the story from your transcript, so every line must be exact. Never invent dialogue, never skip a balloon. Use only the attached images: do not run commands or open files.
+
+Reply with STRICT JSON only (no fences, nothing before or after): {"pages":[PAGE, ...]}, one PAGE per page image, in the order given. Leave out any key whose value would be empty. PAGE:
+{"summary":"1-2 sentences: what happens, using names","scene":{"kind":"fight|dialogue|emotional|comedy|action|reveal|calm|flashback|romance|horror|other","mood":"1-2 words","intensity":0-10},"panels":[{"bbox":[x0,y0,x1,y1],"characters":[{"name":"Ruko"}],"lines":[{"speaker":"Ruko","kind":"speech|thought|narration|sfx","text":"verbatim balloon text"}]}]}
+
+Rules
+1. ORDER: Japanese manga reads right-to-left (top-right panel first); manhwa, webtoons and Western comics left-to-right, a vertical strip top to bottom. Panels and balloons in reading order.
+2. bbox = the panel frame, normalised 0-1 to that page's whole image, origin top-left.
+3. LINES: every speech balloon, thought bubble, narration box and meaningful sound effect, in English (translate any other language, sound effects too). Narration and sfx have no speaker; leave the speaker out when unsure.
+4. NAMES: reuse the character bank's names exactly; a real name when written or spoken; otherwise a short stable description ("Silver-haired swordsman"), the same every time.
+5. A title, credits or ad page: say so in the summary and leave out "panels"."##;
 
 /// Pages read at the same time. Cloud models answer many requests at once; a CLI agent is a whole
 /// process per read that spends most of its ~7 s start-up idle, so more of them overlap well; a
@@ -71,8 +57,27 @@ Rules
 fn parallel_reads(provider: AiProviderId) -> usize {
     match provider {
         AiProviderId::Ollama | AiProviderId::Lmstudio | AiProviderId::Llamacpp => 2,
-        AiProviderId::ClaudeCode | AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::Opencode | AiProviderId::GrokCli | AiProviderId::Antigravity => 8,
+        // OpenCode's free models queue a burst behind their rate limit (8 at once hung for
+        // minutes); Antigravity answered empty under load. Fewer at once read through steadily.
+        AiProviderId::Opencode => 2,
+        AiProviderId::Antigravity => 4,
+        AiProviderId::ClaudeCode | AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::GrokCli => 8,
         _ => 10,
+    }
+}
+
+/// Pages (or strip parts) read in one call. Every call carries the same fixed cost: the instructions,
+/// the character bank, the reference faces and (on Claude Code) about 1,300 tokens of its own, so
+/// eight pages a call pay it once instead of eight times. Measured on a manhwa chapter with Claude
+/// Code: a page read alone took about 8,000 input and 530 output tokens, eight in one call about
+/// 1,800 and 300 each, with the same dialogue. Only readers that get the pictures inline (Claude
+/// Code and the API providers) read several: the other CLI agents open each picture as a file with
+/// a tool, and a local model has a small context and costs no tokens, so they read one at a time.
+pub(crate) fn batch_size(provider: AiProviderId) -> usize {
+    match provider {
+        AiProviderId::Ollama | AiProviderId::Lmstudio | AiProviderId::Llamacpp => 1,
+        AiProviderId::Codex | AiProviderId::GeminiCli | AiProviderId::Opencode | AiProviderId::GrokCli | AiProviderId::Antigravity => 1,
+        _ => 8,
     }
 }
 
@@ -272,7 +277,11 @@ pub(crate) fn prep_page(path: &Path, work: &Path, index: usize) -> Result<(PathB
     let (w, h) = image::image_dimensions(path).with_context(|| format!("cannot read image {}", path.display()))?;
     let webtoon = is_webtoon(w, h);
     // Claude scales anything past 1568 px down anyway, so larger pages only cost upload time.
-    let factor = if webtoon { (1600.0 / w as f32).min(7000.0 / h as f32) } else { 1568.0 / w.max(h) as f32 };
+    let fit = if webtoon { (1600.0 / w as f32).min(7000.0 / h as f32) } else { 1568.0 / w.max(h) as f32 };
+    // A picture costs tokens by its area (about one per 750 pixels), and balloon text stays sharp
+    // well below full size: a page is sent at most ~0.86 megapixels, but never under 600 px wide.
+    let budget = (SEND_PIXELS / (w as f32 * h as f32)).sqrt().max(SEND_MIN_WIDTH / w.max(1) as f32);
+    let factor = fit.min(budget);
     // Images go inline in the request, which caps their size: re-encode heavy files even when small enough.
     let heavy = std::fs::metadata(path).map(|m| m.len() > 3_000_000).unwrap_or(false);
     if factor >= 1.0 && !heavy {
@@ -286,20 +295,21 @@ pub(crate) fn prep_page(path: &Path, work: &Path, index: usize) -> Result<(PathB
     Ok((out, w, h))
 }
 
-/// Long side of the page-before image sent for context: enough to tell who is who, at a fraction of the cost.
-const CONTEXT_PX: u32 = 900;
-
-/// A small copy of the page before, in `work`, for the reader's context. `None` when it cannot be read.
-pub(crate) fn prep_context(path: &Path, work: &Path) -> Option<PathBuf> {
-    let img = image::open(path).ok()?;
-    let small = if img.width().max(img.height()) > CONTEXT_PX { img.resize(CONTEXT_PX, CONTEXT_PX, FilterType::Triangle) } else { img };
-    let out = work.join("page_before.jpg");
-    save_jpeg(&small, &out).ok()?;
-    Some(out)
-}
+/// Most pixels of a page sent to the reader (~1,150 tokens on Claude). Dialogue read the same at
+/// 640 px wide as at 800 on a manhwa chapter.
+const SEND_PIXELS: f32 = 860_000.0;
+/// Narrowest a page is shrunk to, so a tall strip part keeps readable text.
+const SEND_MIN_WIDTH: f32 = 600.0;
 
 pub(crate) fn is_webtoon(w: u32, h: u32) -> bool {
     h as f32 / w.max(1) as f32 >= 2.2
+}
+
+/// A page (or stitched strip part) of a read call. `image` (the picture its boxes refer to) is
+/// `None` when it could not be opened: its pages are stored as unreadable and not asked about.
+struct Slot {
+    unit: Unit,
+    image: Option<PathBuf>,
 }
 
 struct Assets {
@@ -432,71 +442,108 @@ pub(crate) fn new_in_bank(brain: &Brain, bank: &Bank, recent: &[String]) -> Stri
 }
 
 /// The page reader's system prompt with the chapter's character bank.
-pub(crate) fn read_system(bank: &str) -> String {
-    format!("{READ_SYSTEM}\n\nCHARACTER BANK (reuse these exact names; a page may add characters met since):\n{bank}")
+pub(crate) fn read_system(bank: &str, light: bool) -> String {
+    let rules = if light { LIGHT_READ_SYSTEM } else { READ_SYSTEM };
+    format!("{rules}\n\nCHARACTER BANK (reuse these exact names; a page may add characters met since):\n{bank}")
+}
+
+/// One page (or stitched strip part) of a read call.
+pub(crate) struct PageItem<'a> {
+    pub index: usize,
+    pub file: &'a str,
+    /// Size of the page (or strip part) image, in pixels.
+    pub size: (u32, u32),
+    /// Last page of a stitched strip part that starts at `index` (see `strip.rs`).
+    pub strip_to: Option<usize>,
 }
 
 pub(crate) struct PagePrompt<'a> {
     pub brain: &'a Brain,
     pub label: &'a str,
-    pub index: usize,
     pub total: usize,
-    pub file: &'a str,
-    pub size: (u32, u32),
+    /// The pages read in this call, in order: Image 1, Image 2...
+    pub items: &'a [PageItem<'a>],
+    /// The summary of the page before the first one.
     pub prev_summary: &'a str,
     pub faces: &'a [(String, PathBuf)],
-    /// Last page of a stitched strip part that starts at `index` (see `strip.rs`).
-    pub strip_to: Option<usize>,
-    /// The page before is attached (Image 2) for context.
-    pub prev_image: bool,
-    /// The chapter's character bank (in the system prompt, see [`chapter_bank`]): the page lists
+    /// The chapter's character bank (in the system prompt, see [`chapter_bank`]): the call lists
     /// only who is new since, and who was on the page before (`recent`) when the bank does not.
     pub bank: &'a Bank,
     pub recent: &'a [String],
 }
 
+/// How much of the story memory goes with each call (its latest part).
+const NOTES_CHARS: usize = 600;
+
 pub(crate) fn page_prompt(p: &PagePrompt) -> String {
-    let (w, h) = p.size;
-    let layout = if p.strip_to.is_some() || is_webtoon(w, h) {
+    let n = p.items.len();
+    let strip = p.items.iter().any(|it| it.strip_to.is_some());
+    let layout = if strip || p.items.iter().any(|it| is_webtoon(it.size.0, it.size.1)) {
         "WEBTOON / vertical strip: read strictly top-to-bottom, left-to-right."
     } else {
-        "Manga page: if this is Japanese manga read right-to-left (top-right panel first); if it is clearly left-to-right (Western comic / manhwa page) read left-to-right."
+        "Manga pages: if this is Japanese manga read right-to-left (top-right panel first); if it is clearly left-to-right (Western comic / manhwa) read left-to-right."
     };
     let title = if p.brain.manga_title.is_empty() { "(untitled)" } else { &p.brain.manga_title };
-    let mut s = match p.strip_to {
-        Some(last) => format!(
-            "MANGA: {title}\nCHAPTER: {} - part of a vertical strip covering pages {}-{} of {} ({w}x{h} px). The page files were stitched back together and cut only at gaps between panels, so every panel and balloon in this image is complete: never call anything cut off.\nLAYOUT: {layout}\n",
-            p.label,
-            p.index + 1,
-            last + 1,
-            p.total,
-        ),
-        None => format!("MANGA: {title}\nCHAPTER: {} - page {} of {} (file {}, {w}x{h} px)\nLAYOUT: {layout}\n", p.label, p.index + 1, p.total, p.file),
-    };
+    let last_page = p.items.last().map(|it| it.strip_to.unwrap_or(it.index)).unwrap_or(0);
+    let first_page = p.items.first().map(|it| it.index).unwrap_or(0);
+    let span = if first_page == last_page { format!("page {}", first_page + 1) } else { format!("pages {}-{}", first_page + 1, last_page + 1) };
+    let mut s = format!("MANGA: {title}\nCHAPTER: {} - {span} of {}\nLAYOUT: {layout}\n", p.label, p.total);
+    if strip {
+        s += "The strip parts were stitched back together from the page files and cut only at gaps between panels, so every panel and balloon in them is complete: never call anything cut off.\n";
+    }
     let notes: String = {
         let n = p.brain.notes.trim();
-        let skip = n.chars().count().saturating_sub(1200);
+        let skip = n.chars().count().saturating_sub(NOTES_CHARS);
         n.chars().skip(skip).collect()
     };
     if !notes.is_empty() {
         s += &format!("\nSTORY MEMORY SO FAR (most recent last):\n{notes}\n");
     }
-    s += &format!("\nPREVIOUS {}: {}\n", if p.strip_to.is_some() { "PART" } else { "PAGE" }, if p.prev_summary.is_empty() { "(this is the first page read)" } else { p.prev_summary });
+    s += &format!("\nTHE PAGE BEFORE: {}\n", if p.prev_summary.is_empty() { "(none: this is the first page read)" } else { p.prev_summary });
     let new = new_in_bank(p.brain, p.bank, p.recent);
     if !new.is_empty() {
         s += &format!("\nNEW IN THE CHARACTER BANK SINCE THIS CHAPTER BEGAN (reuse these exact names too):\n{new}\n");
     }
-    s += if p.strip_to.is_some() { "\nATTACHED IMAGES:\nImage 1 = the strip part to read." } else { "\nATTACHED IMAGES:\nImage 1 = the page to read." };
-    if p.prev_image {
-        s += "\nImage 2 = the page BEFORE it, for context only: who is who, which scene and time this is (the present or a flashback), who is talking to whom. Never transcribe it; read only Image 1.";
+    s += "\nIMAGES:";
+    for (k, it) in p.items.iter().enumerate() {
+        let (w, h) = it.size;
+        s += &match it.strip_to {
+            Some(last) => format!("\nImage {} = strip part covering pages {}-{} ({w}x{h} px).", k + 1, it.index + 1, last + 1),
+            None => format!("\nImage {} = page {} (file {}, {w}x{h} px).", k + 1, it.index + 1, it.file),
+        };
     }
-    let first_face = if p.prev_image { 3 } else { 2 };
-    for (i, (name, path)) in p.faces.iter().enumerate() {
-        let f = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-        s += &format!("\nImage {} = reference face of {} ({}).", i + first_face, name, f);
+    for (i, (name, _)) in p.faces.iter().enumerate() {
+        s += &format!("\nImage {} = reference face of {name}.", n + i + 1);
     }
-    s += "\n\nRead Image 1 now and reply with the JSON object only.";
+    s += &format!(
+        "\n\nRead {} and reply with the JSON object only: \"pages\" holds exactly {n} {}, one per page image, in order.",
+        if n == 1 { "Image 1".to_string() } else { format!("Images 1-{n}") },
+        if n == 1 { "entry" } else { "entries" }
+    );
     s
+}
+
+/// The answer of a call that read `n` pages, page by page: `{"pages": [...]}` (or a single page's
+/// object, the older shape, for one page). `None` for a page the answer left out: it is read again
+/// on its own. A reply that is not JSON is kept as the reading of a page read alone (its raw text),
+/// and makes every page of a bigger call be read again on its own.
+pub(crate) fn split_answer(answer: std::result::Result<Value, String>, n: usize) -> Vec<Option<std::result::Result<Value, String>>> {
+    let v = match answer {
+        Ok(v) => v,
+        Err(raw) if n == 1 => return vec![Some(Err(raw))],
+        Err(_) => return vec![None; n],
+    };
+    match v.get("pages").and_then(Value::as_array) {
+        Some(pages) => (0..n)
+            .map(|k| match pages.get(k) {
+                Some(p) => Some(Ok(p.clone())),
+                // One page asked, none given: an empty reading, not an endless re-read.
+                None if n == 1 => Some(Ok(Value::Object(Default::default()))),
+                None => None,
+            })
+            .collect(),
+        None => (0..n).map(|k| (k == 0).then(|| Ok(v.clone()))).collect(),
+    }
 }
 
 fn model_label(m: &ModelChoice) -> String {
@@ -582,103 +629,172 @@ pub(crate) async fn read_chapter_with(
     let total: usize = targets.iter().map(|u| u.spans.len()).sum();
     let mut finished = 0;
 
-    // Parts are read several at a time: each model call is slow (tens of seconds), so a new part
-    // starts as soon as any one finishes instead of waiting for a whole batch. Answers are still
-    // folded in page order, so each part sees the brain and summaries of everything before it.
-    // The first part goes alone so the brain has faces before parts are read side by side.
+    // Pages are read several to a call ([`batch_size`]) and calls several at a time: each call is
+    // slow (tens of seconds), so a new one starts as soon as any one finishes instead of waiting
+    // for a whole round. Answers are still folded in page order, so each call sees the brain and
+    // summaries of everything before it. The first call reads one page alone so the brain has
+    // faces before calls run side by side.
     let width = parallel_reads(model.provider);
-    let ask = move |unit: Unit, image: PathBuf, req: Option<AiStepRequest>| async move {
+    let per_call = batch_size(model.provider);
+    let ask = move |slots: Vec<Slot>, req: Option<AiStepRequest>| async move {
         let answer = match req {
             Some(r) => Some(ask_json(llm, r, cancel).await),
             None => None,
         };
-        (unit, image, answer)
+        (slots, answer)
     };
-    let mut queue = targets.iter();
+    let mut queue: std::collections::VecDeque<Unit> = targets.into_iter().collect();
+    // Pages a call's answer left out: read again, each on its own.
+    let mut alone: std::collections::VecDeque<Unit> = Default::default();
     let mut flight = futures::stream::FuturesOrdered::new();
     let mut reading: Vec<usize> = vec![];
     let mut first_done = false;
-    // The character bank goes in the system prompt, the same for every page, so it is billed in
-    // full once and then read from the provider's prompt cache (see `chapter_bank`).
+    // The character bank goes in the system prompt, the same for every call of the chapter; each
+    // call lists only who joined since (see `chapter_bank`).
     let mut bank = chapter_bank(&brain.lock().unwrap());
+    let file_of = |p: usize| pages[p].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    // Each call gets its own workspace (CLI agents clear their attachments when done), and each
+    // part its own folder for its prepared picture.
+    let ws_of = |u: &Unit| {
+        let p = u.first();
+        if u.stitched { work.join(format!("p{p:04}_{}", u.spans[0].y0)) } else { work.join(format!("p{p:04}")) }
+    };
     loop {
         if cancel.is_cancelled() {
             progress(Progress::Failed("Cancelled".into()));
             return Err(anyhow!("cancelled"));
         }
 
-        // 1. Start parts until the window is full: prepare the image and prompt, then ask.
+        // 1. Start calls until the window is full: prepare the pictures and prompt, then ask.
         let mut started = false;
         while flight.len() < if first_done { width } else { 1 } {
-            let Some(unit) = queue.next() else { break };
+            let units: Vec<Unit> = match alone.pop_front() {
+                Some(u) => vec![u],
+                None => {
+                    let take = if first_done { per_call } else { 1 }.min(queue.len());
+                    queue.drain(..take).collect()
+                }
+            };
+            if units.is_empty() {
+                break;
+            }
             started = true;
-            reading.extend(unit.pages());
-            let i = unit.first();
-            let file = pages[i].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-            // Each read gets its own workspace: CLI agents clear their attachments when done.
-            let ws = if unit.stitched { work.join(format!("p{i:04}_{}", unit.spans[0].y0)) } else { work.join(format!("p{i:04}")) };
-            std::fs::create_dir_all(&ws).context("create page workspace")?;
-            let (all, wk, u) = (pages.clone(), ws.clone(), unit.clone());
-            let prepped = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, u32, u32, Option<PathBuf>)> {
-                let image = if u.stitched {
-                    let out = wk.join("strip.jpg");
-                    strip::compose(&u, &all, &out)?;
-                    out
-                } else {
-                    all[i].clone()
-                };
-                let (send, w, h) = prep_page(&image, &wk, i)?;
-                let before = (!u.stitched && i > 0).then(|| prep_context(&all[i - 1], &wk)).flatten();
-                Ok((image, send, w, h, before))
+            let ws = ws_of(&units[0]);
+            let dirs: Vec<PathBuf> = units.iter().map(ws_of).collect();
+            for d in &dirs {
+                std::fs::create_dir_all(d).context("create page workspace")?;
+            }
+            let (all, us) = (pages.clone(), units.clone());
+            // Per part: (the image its boxes refer to, the copy sent, the copy's width and height).
+            let prepped: Vec<Result<(PathBuf, PathBuf, u32, u32)>> = tokio::task::spawn_blocking(move || {
+                us.iter()
+                    .zip(dirs)
+                    .map(|(u, wk)| {
+                        let p = u.first();
+                        let image = if u.stitched {
+                            let out = wk.join("strip.jpg");
+                            strip::compose(u, &all, &out)?;
+                            out
+                        } else {
+                            all[p].clone()
+                        };
+                        let (send, w, h) = prep_page(&image, &wk, p)?;
+                        Ok((image, send, w, h))
+                    })
+                    .collect()
             })
             .await
             .map_err(|e| anyhow!(e))?;
-            let (image, send_path, w, h, before) = match prepped {
-                Ok(x) => x,
-                Err(e) => {
-                    progress(Progress::Log(format!("Page {}: {e}", i + 1)));
-                    for s in unit.spans.iter().filter(|s| s.y0 == 0) {
-                        let file = pages[s.page].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-                        upsert(&mut read, PageRead { index: s.page, file, summary: format!("(unreadable image: {e})"), ..Default::default() });
+            let mut slots = vec![];
+            let mut sends = vec![];
+            for (unit, prep) in units.into_iter().zip(prepped) {
+                reading.extend(unit.pages());
+                match prep {
+                    Ok((image, send, w, h)) => {
+                        sends.push((send, w, h));
+                        slots.push(Slot { unit, image: Some(image) });
                     }
-                    flight.push_back(ask(unit.clone(), PathBuf::new(), None));
-                    continue;
+                    Err(e) => {
+                        progress(Progress::Log(format!("Page {}: {e}", unit.first() + 1)));
+                        for s in unit.spans.iter().filter(|s| s.y0 == 0) {
+                            upsert(&mut read, PageRead { index: s.page, file: file_of(s.page), summary: format!("(unreadable image: {e})"), ..Default::default() });
+                        }
+                        slots.push(Slot { unit, image: None });
+                    }
                 }
-            };
+            }
+            if sends.is_empty() {
+                flight.push_back(ask(slots, None));
+                continue;
+            }
+            let ready: Vec<&Unit> = slots.iter().filter(|s| s.image.is_some()).map(|s| &s.unit).collect();
+            let i = ready[0].first();
             // A part that starts inside page i continues the reading already stored for page i.
-            let upto = if unit.spans[0].y0 > 0 { i + 1 } else { i };
+            let upto = if ready[0].spans[0].y0 > 0 { i + 1 } else { i };
             let prev_summary = (0..upto).rev().find_map(|p| read.pages.iter().find(|x| x.index == p && !x.summary.is_empty())).map(|p| p.summary.clone()).unwrap_or_default();
             let recent = recent_names(&read, i);
+            let files: Vec<String> = ready.iter().map(|u| file_of(u.first())).collect();
+            let items: Vec<PageItem> = ready
+                .iter()
+                .zip(&sends)
+                .zip(&files)
+                .map(|((u, (_, w, h)), file)| PageItem { index: u.first(), file, size: (*w, *h), strip_to: u.stitched.then(|| u.spans[u.spans.len() - 1].page) })
+                .collect();
             let (prompt, faces) = {
                 let b = brain.lock().unwrap();
                 // Many characters joined since the bank was made (a new manga's first chapter):
-                // the bank is made again, so each page lists only a few newcomers.
+                // the bank is made again, so each call lists only a few newcomers.
                 if bank.newcomers(&b) > BANK_NEW {
                     bank = chapter_bank(&b);
                 }
                 let faces = pick_faces(&b, &recent);
-                let strip_to = unit.stitched.then(|| unit.spans[unit.spans.len() - 1].page);
-                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, index: i, total: pages.len(), file: &file, size: (w, h), prev_summary: &prev_summary, faces: &faces, strip_to, prev_image: before.is_some(), bank: &bank, recent: &recent });
+                let prompt = page_prompt(&PagePrompt { brain: &b, label: &ch.label, total: pages.len(), items: &items, prev_summary: &prev_summary, faces: &faces, bank: &bank, recent: &recent });
                 (prompt, faces)
             };
-            let mut images = vec![send_path];
-            images.extend(before);
+            drop(items);
+            drop(ready);
+            let mut images: Vec<PathBuf> = sends.into_iter().map(|(p, _, _)| p).collect();
             images.extend(faces.iter().map(|(_, p)| p.clone()));
-            let req = request(model, vec![AiMessage::system(read_system(&bank.text)), AiMessage::user(prompt)], images, Some(ws));
-            flight.push_back(ask(unit.clone(), image, Some(req)));
+            let req = request(model, vec![AiMessage::system(read_system(&bank.text, opts.light)), AiMessage::user(prompt)], images, Some(ws));
+            flight.push_back(ask(slots, Some(req)));
         }
         if started {
             progress(Progress::Reading { pages: reading.clone(), done: finished, total });
         }
 
         // 2. Fold in the next answer, in page order.
-        let Some((unit, image, answer)) = flight.next().await else { break };
+        let Some((slots, answer)) = flight.next().await else { break };
         first_done = true;
-        {
+        for s in &slots {
+            reading.retain(|p| !s.unit.spans.iter().any(|x| x.page == *p));
+        }
+        let first = slots[0].unit.first();
+        let answers = match answer {
+            None => vec![],
+            Some(Err(e)) if is_cancelled(&e) => {
+                save_read(ch, &read)?;
+                progress(Progress::Failed("Cancelled".into()));
+                return Err(e);
+            }
+            Some(Err(e)) => {
+                save_read(ch, &read)?;
+                return Err(fail(format!("Page {}: {e}", first + 1)));
+            }
+            Some(Ok(a)) => {
+                let parts = split_answer(a.clone(), slots.iter().filter(|s| s.image.is_some()).count());
+                // A model that cannot see pictures says so, or asks to be told what is on the page:
+                // that is no reading, and every other page would go the same way.
+                if blind_reply(&own_words(&a)) || parts.iter().flatten().any(|p| blind_reply(&own_words(p))) {
+                    save_read(ch, &read)?;
+                    return Err(fail(format!("The picked AI model ({}) can't see pictures, so it can't read pages. Pick one that can, like Claude, Gemini or Grok, for Read.", model.model)));
+                }
+                parts
+            }
+        };
+        let mut answers = answers.into_iter();
+        for Slot { unit, image } in slots {
             let i = unit.first();
-            reading.retain(|p| !unit.spans.iter().any(|s| s.page == *p));
-            let file_of = |p: usize| pages[p].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-            let Some(answer) = answer else {
+            let Some(image) = image else {
                 save_read(ch, &read)?;
                 for s in &unit.spans {
                     finished += 1;
@@ -686,24 +802,11 @@ pub(crate) async fn read_chapter_with(
                 }
                 continue;
             };
-            let answer = match answer {
-                Ok(a) => a,
-                Err(e) if is_cancelled(&e) => {
-                    save_read(ch, &read)?;
-                    progress(Progress::Failed("Cancelled".into()));
-                    return Err(e);
-                }
-                Err(e) => {
-                    save_read(ch, &read)?;
-                    return Err(fail(format!("Page {}: {e}", i + 1)));
-                }
+            let Some(answer) = answers.next().flatten() else {
+                progress(Progress::Log(format!("Page {}: left out of the answer; reading it again on its own.", i + 1)));
+                alone.push_back(unit);
+                continue;
             };
-            // A model that cannot see pictures says so, or asks to be told what is on the page:
-            // that is no reading, and every other page would go the same way.
-            if blind_reply(&own_words(&answer)) {
-                save_read(ch, &read)?;
-                return Err(fail(format!("The picked AI model ({}) can't see pictures, so it can't read pages. Pick one that can, like Claude, Gemini or Grok, for Read.", model.model)));
-            }
             let mut parsed = match answer {
                 Ok(v) => parse_page(&v, i, &file_of(i)),
                 Err(raw) => {
@@ -879,7 +982,7 @@ mod bank_tests {
         assert!(!bank.text.contains("smug") && !bank.text.contains("traits"), "{}", bank.text);
         assert!(bank.text.starts_with("- Junho (also called: f, e, d, c): Junho looks"), "{}", bank.text);
         assert!(bank.text.lines().all(|l| l.chars().count() < 200), "{}", bank.text);
-        let system = read_system(&bank.text);
+        let system = read_system(&bank.text, false);
         assert!(system.starts_with(READ_SYSTEM) && system.contains("CHARACTER BANK") && system.contains("- Dahyun"));
         assert_eq!(new_in_bank(&b, &bank, &[]), "", "nothing new on the next page");
 

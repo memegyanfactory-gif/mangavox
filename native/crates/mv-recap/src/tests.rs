@@ -314,10 +314,11 @@ async fn read_chapter_end_to_end_and_resume() {
     {
         let seen = llm.seen.lock().unwrap();
         assert_eq!(seen[0].images.len(), 1);
-        assert!(seen[1].images.len() >= 3, "the page, the page before it and faces");
+        assert!(seen[1].images.len() >= 2, "the page and faces, no copy of the page before");
         let prompt = &seen[1].messages.last().unwrap().content;
-        assert!(prompt.contains("Image 2 = the page BEFORE it") && prompt.contains("Image 3 = reference face of"), "{prompt}");
-        assert!(!seen[0].messages.last().unwrap().content.contains("the page BEFORE"), "the first page has none");
+        assert!(prompt.contains("Image 1 = page 2") && prompt.contains("Image 2 = reference face of"), "{prompt}");
+        assert!(prompt.contains("THE PAGE BEFORE: ") && !prompt.contains("first page read"), "{prompt}");
+        assert!(seen[0].messages.last().unwrap().content.contains("first page read"), "the first page has none");
         assert!(prompt.contains("Silver-haired swordsman"));
         assert_eq!(seen[1].workspace.as_ref().unwrap(), &chapter_dir(&ch).join("work").join("p0001"));
     }
@@ -345,11 +346,64 @@ async fn read_chapter_end_to_end_and_resume() {
     assert!(none.seen.lock().unwrap().is_empty());
     // single page re-read with garbage twice -> raw text stored, chapter not aborted
     let bad = Fake::new(&["nope", "still nope"]);
-    let opts = ReadOptions { force: false, pages: Some(vec![1]) };
+    let opts = ReadOptions { force: false, pages: Some(vec![1]), ..Default::default() };
     let r = read_chapter_with(&bad, &model(), &ch, &brain, &opts, &progress, &CancellationToken::new()).await.unwrap();
     assert_eq!(r.pages[1].summary, "still nope");
     assert!(r.pages[1].panels.is_empty());
     assert_eq!(r.pages[0].scene.kind, "fight");
+}
+
+/// After the first page, pages go several to a call (fewer tokens: the instructions, bank and faces
+/// are sent once per call), each answered in order; a page the answer leaves out is read alone.
+#[tokio::test]
+async fn pages_are_read_several_to_a_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = chapter(dir.path(), 4);
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let page = |s: &str| format!(r#"{{"summary":"{s}","scene":{{"kind":"dialogue"}},"panels":[{{"bbox":[0,0,1,0.5],"lines":[{{"speaker":"Ruko","text":"{s}"}}]}}]}}"#);
+    // Pages 2-4 in one call; its answer has only pages 2 and 3, so page 4 is asked again alone.
+    let batch = format!(r#"{{"pages":[{},{}]}}"#, page("Two"), page("Three"));
+    let llm = Fake::new(&[PAGE1, &batch, &page("Four")]);
+    let read = read_chapter_with(&llm, &model(), &ch, &brain, &ReadOptions::default(), &silent(), &CancellationToken::new()).await.unwrap();
+    let summaries: Vec<&str> = read.pages.iter().map(|p| p.summary.as_str()).collect();
+    assert_eq!(summaries, ["Ruko meets a stranger.", "Two", "Three", "Four"]);
+    assert_eq!(read.pages[2].panels[0].lines[0].text, "Three");
+    let seen = llm.seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    let prompt = &seen[1].messages.last().unwrap().content;
+    assert!(prompt.contains("Image 1 = page 2") && prompt.contains("Image 3 = page 4") && prompt.contains("exactly 3 entries"), "{prompt}");
+    assert!(seen[1].images.len() >= 4, "three pages and the faces met on page 1");
+    assert!(seen[2].messages.last().unwrap().content.contains("Image 1 = page 4"));
+}
+
+#[test]
+fn a_call_answer_is_split_page_by_page() {
+    let two = serde_json::json!({"pages": [{"summary": "a"}, {"summary": "b"}]});
+    let got = crate::read::split_answer(Ok(two), 3);
+    assert_eq!(got.len(), 3);
+    assert!(got[0].as_ref().unwrap().as_ref().unwrap()["summary"] == "a" && got[2].is_none());
+    // One page: the older single-page shape, a missing entry and raw text all still give a reading.
+    let one = serde_json::json!({"summary": "x"});
+    assert_eq!(crate::read::split_answer(Ok(one.clone()), 1), vec![Some(Ok(one))]);
+    assert!(crate::read::split_answer(Ok(serde_json::json!({"pages": []})), 1)[0].is_some());
+    assert_eq!(crate::read::split_answer(Err("raw".into()), 1), vec![Some(Err("raw".to_string()))]);
+    assert_eq!(crate::read::split_answer(Err("raw".into()), 2), vec![None, None]);
+}
+
+/// A page goes to the reader at most ~0.86 megapixels (tokens follow the area), never under 600 px wide.
+#[test]
+fn pages_are_sent_small() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.png");
+    image::RgbImage::new(1100, 1600).save(&path).unwrap();
+    let (sent, w, h) = prep_page(&path, dir.path(), 0).unwrap();
+    assert_eq!((w, h), (1100, 1600), "the original size is reported");
+    let (sw, sh) = image::image_dimensions(&sent).unwrap();
+    assert!(sw * sh <= 870_000 && sw >= 600, "{sw}x{sh}");
+    // A small page goes as it is.
+    let small = dir.path().join("small.png");
+    image::RgbImage::new(500, 700).save(&small).unwrap();
+    assert_eq!(prep_page(&small, dir.path(), 1).unwrap().0, small);
 }
 
 #[tokio::test]

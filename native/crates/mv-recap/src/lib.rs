@@ -5,6 +5,7 @@
 //! All async fns are `Send` and run on a tokio runtime (`mv_ui::bg::run`); blocking file/image work is
 //! moved to `spawn_blocking` internally. The LLM is reached through `mv_ai::Registry`.
 
+pub mod auto;
 mod brain;
 mod cast;
 pub mod cast_profile;
@@ -31,6 +32,7 @@ pub use export::export_for_pipeline;
 pub use json::extract_json;
 pub use llm::retry_now;
 pub use manual::{load_manual, reset_manual_page, set_manual_page, ManualPage, ManualPanels};
+pub use auto::{read_chapter_smart, write_story_anyway_smart, write_story_for_manga_smart};
 pub use read::read_chapter;
 pub use reset::{chapter_plan, reset_chapter, reset_phase, reset_plan, Footprint, ResetPlan, ResetReport, Step};
 pub use store::{

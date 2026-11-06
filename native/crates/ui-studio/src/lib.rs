@@ -5,6 +5,7 @@
 use gpui_kit::*;
 use mv_ui::Route;
 
+mod ai_switches;
 mod assist;
 mod auto_export;
 pub use auto_export::folder_for as auto_export_folder;

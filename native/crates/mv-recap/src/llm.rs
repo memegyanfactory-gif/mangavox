@@ -9,7 +9,7 @@ use futures::future::BoxFuture;
 use mv_ai::{emit_noop, AiEffort, AiMessage, AiStepRequest, CancellationToken, Registry};
 use serde_json::Value;
 
-use crate::json::{extract_whole_json, salvage_json};
+use crate::json::{close_brackets, extract_whole_json, salvage_json};
 use crate::types::{ModelChoice, Progress, ProgressFn};
 
 pub(crate) trait Llm: Send + Sync {
@@ -17,10 +17,30 @@ pub(crate) trait Llm: Send + Sync {
     fn step<'a>(&'a self, req: AiStepRequest, cancel: CancellationToken) -> BoxFuture<'a, Result<String>>;
 }
 
+/// Longest one model call may take. A CLI agent can hang (a free model queued behind its rate
+/// limit, a process that never answers): without a limit one page held up the chapter for good.
+const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const TIMED_OUT: &str = "the AI did not answer within 10 minutes";
+
+/// One call, stopped (its whole process tree) after [`STEP_TIMEOUT`]. `None`: it timed out.
+async fn run_timed(reg: &Registry, req: AiStepRequest, cancel: &CancellationToken) -> Option<mv_ai::AiStepResult> {
+    let token = cancel.child_token();
+    let run = reg.run_step_cancellable(req, emit_noop(), token.clone());
+    tokio::pin!(run);
+    tokio::select! {
+        r = &mut run => Some(r),
+        _ = tokio::time::sleep(STEP_TIMEOUT) => {
+            token.cancel();
+            let _ = run.await;
+            None
+        }
+    }
+}
+
 impl Llm for Arc<Registry> {
     fn step<'a>(&'a self, req: AiStepRequest, cancel: CancellationToken) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            let r = self.run_step_cancellable(req, emit_noop(), cancel).await;
+            let Some(r) = run_timed(self, req, &cancel).await else { bail!(TIMED_OUT) };
             if r.stopped {
                 bail!("cancelled");
             }
@@ -51,7 +71,7 @@ impl Llm for Patient {
         Box::pin(async move {
             let mut attempt = 0;
             loop {
-                let r = self.reg.run_step_cancellable(req.clone(), emit_noop(), cancel.clone()).await;
+                let Some(r) = run_timed(&self.reg, req.clone(), &cancel).await else { bail!(TIMED_OUT) };
                 if r.stopped {
                     bail!("cancelled");
                 }
@@ -64,6 +84,10 @@ impl Llm for Patient {
                         None => Ok(r.text),
                     };
                 };
+                // With the Auto switch on, another model carries on now instead of waiting (see `auto.rs`).
+                if crate::auto::auto_on() {
+                    bail!("usage limit: {}", r.error.unwrap_or(limit.message));
+                }
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
                 let wait = limit.wait_secs(attempt, now);
                 (self.progress)(Progress::Waiting { message: r.error.unwrap_or(limit.message), until: now + wait as i64 });
@@ -160,7 +184,7 @@ pub(crate) async fn ask_story_json(llm: &dyn Llm, req: AiStepRequest, cancel: &C
 
 async fn ask_json_with(llm: &dyn Llm, req: AiStepRequest, cancel: &CancellationToken, salvage: bool) -> Result<std::result::Result<Value, String>> {
     let raw = call_with_retries(llm, &req, cancel).await?;
-    if let Some(v) = extract_whole_json(&raw) {
+    if let Some(v) = extract_whole_json(&raw).or_else(|| close_brackets(&raw)) {
         return Ok(Ok(v));
     }
     let mut retry = req;
@@ -173,7 +197,7 @@ async fn ask_json_with(llm: &dyn Llm, req: AiStepRequest, cancel: &CancellationT
         Err(e) if is_cancelled(&e) => return Err(e),
         Err(_) => raw.clone(),
     };
-    if let Some(v) = extract_whole_json(&raw2) {
+    if let Some(v) = extract_whole_json(&raw2).or_else(|| close_brackets(&raw2)) {
         return Ok(Ok(v));
     }
     // Cut off mid-way: what was said is kept, the caller asks for what is missing.

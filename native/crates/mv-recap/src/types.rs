@@ -9,7 +9,7 @@ use crate::reset::Step;
 use serde::{Deserialize, Serialize};
 
 /// Which LLM does the work.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelChoice {
     pub provider: AiProviderId,
     pub model: String,
@@ -287,6 +287,9 @@ pub struct ReadOptions {
     pub force: bool,
     /// Only these 0-based pages (implies re-reading them).
     pub pages: Option<Vec<usize>>,
+    /// Light read: the text first (every line, who says it, the scene and the panel frames), with
+    /// no looks, traits or face boxes, for a cheaper vision model (see `auto.rs`).
+    pub light: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -354,6 +357,12 @@ pub struct Prefs {
     /// Series mode (beta, the dashboard switch): stories are written like a TV series, with a
     /// narrator talking to the viewer and every character voiced by their own cloned voice.
     pub series_beta: bool,
+    /// Light read (Studio switch, off by default): pages are read by a cheaper model that can see
+    /// pictures, for their text and the basics; the story is still written by the picked model.
+    pub light_read: bool,
+    /// Auto switch (off by default): when a step fails, other models (on this provider first, then
+    /// the other signed-in CLIs) are tested on one page and the first that passes takes over.
+    pub auto_switch: bool,
 }
 
 impl Default for Prefs {
@@ -372,6 +381,8 @@ impl Default for Prefs {
             open_groups: vec![],
             dash_collapsed: vec!["youtube".into()],
             series_beta: false,
+            light_read: false,
+            auto_switch: false,
         }
     }
 }

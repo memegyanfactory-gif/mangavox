@@ -308,7 +308,7 @@ pub fn start_read(reg: Arc<Registry>, model: ModelChoice, label: String, chapter
                 r.log(format!("{} · {}", ch.manga_title, ch.label));
             });
             let brain = brain(&ch.manga_id, &ch.manga_title);
-            let out = mv_recap::read_chapter(reg.clone(), model.clone(), ch.clone(), brain, ReadOptions { force, pages: None }, progress_fn(), cancel.clone()).await;
+            let out = mv_recap::read_chapter_smart(reg.clone(), model.clone(), ch.clone(), brain, ReadOptions { force, pages: None, ..Default::default() }, progress_fn(), cancel.clone()).await;
             match out {
                 Ok(read) => {
                     if let Err(e) = mv_recap::update_transcript(&ch, &read) {
@@ -368,7 +368,7 @@ pub async fn read_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch:
         r.log(format!("Generate · {} · {} with {label}", ch.manga_title, ch.label));
     });
     let brain = brain(&ch.manga_id, &ch.manga_title);
-    let res = match mv_recap::read_chapter(reg, model, ch.clone(), brain, ReadOptions { force, pages: None }, progress_fn(), cancel.clone()).await {
+    let res = match mv_recap::read_chapter_smart(reg, model, ch.clone(), brain, ReadOptions { force, pages: None, ..Default::default() }, progress_fn(), cancel.clone()).await {
         Ok(read) => mv_recap::update_transcript(&ch, &read).map(|_| ()),
         Err(e) => Err(e),
     };
@@ -408,7 +408,7 @@ pub async fn story_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch
     });
     let brain = brain(&ch.manga_id, &ch.manga_title);
     let manga = manga_chapters(&ch.manga_id).await;
-    let res = match mv_recap::write_story_for_manga(reg, model, vec![ch.clone()], manga, styles, brain, progress_fn(), cancel.clone()).await {
+    let res = match mv_recap::write_story_for_manga_smart(reg, model, vec![ch.clone()], manga, styles, brain, progress_fn(), cancel.clone()).await {
         Ok(stories) => match stories.into_iter().find(|(id, _)| *id == ch.chapter_id) {
             Some((_, story)) => mv_recap::export_for_pipeline(&ch, &story),
             // Another upload of the chapter before it: left out on purpose, nothing failed.
@@ -434,7 +434,7 @@ pub fn start_story_anyway(reg: Arc<Registry>, model: ModelChoice, label: String,
             r.chapter_pos = (1, 1);
         });
         let brain = brain(&ch.manga_id, &ch.manga_title);
-        let res = match mv_recap::write_story_anyway(reg, model, ch.clone(), styles, brain, progress_fn(), cancel.clone()).await {
+        let res = match mv_recap::write_story_anyway_smart(reg, model, ch.clone(), styles, brain, progress_fn(), cancel.clone()).await {
             Ok(stories) => match stories.into_iter().find(|(id, _)| *id == ch.chapter_id) {
                 Some((_, story)) => mv_recap::export_for_pipeline(&ch, &story),
                 None => Err(anyhow::anyhow!("The AI wrote no story for {}", ch.label)),
@@ -456,8 +456,8 @@ pub fn start_read_pages(reg: Arc<Registry>, model: ModelChoice, label: String, c
             r.chapter_pos = (1, 1);
         });
         let brain = brain(&ch.manga_id, &ch.manga_title);
-        let opts = ReadOptions { force: true, pages: Some(pages) };
-        let res = match mv_recap::read_chapter(reg, model, ch.clone(), brain, opts, progress_fn(), cancel.clone()).await {
+        let opts = ReadOptions { force: true, pages: Some(pages), ..Default::default() };
+        let res = match mv_recap::read_chapter_smart(reg, model, ch.clone(), brain, opts, progress_fn(), cancel.clone()).await {
             Ok(read) => mv_recap::update_transcript(&ch, &read).map(|_| ()),
             Err(e) => Err(e),
         };
@@ -492,7 +492,7 @@ pub fn start_story(reg: Arc<Registry>, model: ModelChoice, label: String, chapte
             });
             let brain = brain(&manga_id, &title);
             let manga = manga_chapters(&manga_id).await;
-            match mv_recap::write_story_for_manga(reg.clone(), model.clone(), chs.clone(), manga, styles.clone(), brain, progress_fn(), cancel.clone()).await {
+            match mv_recap::write_story_for_manga_smart(reg.clone(), model.clone(), chs.clone(), manga, styles.clone(), brain, progress_fn(), cancel.clone()).await {
                 Ok(stories) => {
                     for (id, story) in stories {
                         if let Some(ch) = chs.iter().find(|c| c.chapter_id == id) {

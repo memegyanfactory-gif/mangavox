@@ -63,7 +63,10 @@ pub fn start_cli(bin: &str, args: &[String], workspace: &Path) -> Result<Command
         c.args(args.iter().map(|a| if a == EMPTY_ARG { "" } else { a.as_str() }));
         c
     };
-    cmd.current_dir(workspace).env("NO_COLOR", "1").env("FORCE_COLOR", "0").kill_on_drop(true);
+    // `PWD` too: OpenCode (1.19) resolves `-f` attachments and its project folder from the `PWD`
+    // it inherits, not from the folder it runs in, so with the app's own `PWD` every page read
+    // failed with "File not found: .attach/...".
+    cmd.current_dir(workspace).env("PWD", workspace).env("NO_COLOR", "1").env("FORCE_COLOR", "0").kill_on_drop(true);
     Ok(cmd)
 }
 
@@ -128,6 +131,42 @@ pub async fn opencode_models(workspace: &Path) -> Vec<String> {
         .await
         .map(|o| o.lines().map(str::trim).filter(|l| re.is_match(l)).map(String::from).collect())
         .unwrap_or_default()
+}
+
+/// The free OpenCode models (its own `opencode/` ones, no key needed) that take images, from
+/// `opencode models --verbose`: each `provider/model` line is followed by its JSON, whose
+/// `capabilities.input.image` says whether it can see a picture. Free = no input cost.
+pub fn parse_opencode_vision(out: &str) -> Vec<String> {
+    let mut found = vec![];
+    let mut id: Option<&str> = None;
+    let mut body = String::new();
+    let mut flush = |id: Option<&str>, body: &str| {
+        let Some(id) = id else { return };
+        let Ok(v) = serde_json::from_str::<Value>(body) else { return };
+        let sees = v.pointer("/capabilities/input/image").and_then(Value::as_bool) == Some(true);
+        let free = v.pointer("/cost/input").and_then(Value::as_f64).unwrap_or(1.0) == 0.0;
+        let active = v.get("status").and_then(Value::as_str).is_none_or(|s| s == "active");
+        if sees && free && active && id.starts_with("opencode/") && safe_arg(id) {
+            found.push(id.to_string());
+        }
+    };
+    for line in out.lines() {
+        let t = line.trim_end();
+        if !t.is_empty() && !t.starts_with([' ', '{', '}', '"', '[', ']']) && t.contains('/') && !t.contains(' ') {
+            flush(id, &body);
+            id = Some(t);
+            body.clear();
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    flush(id, &body);
+    found
+}
+
+pub async fn opencode_vision_models(workspace: &Path) -> Vec<String> {
+    run_capture("opencode", &["models", "opencode", "--verbose"], workspace, Duration::from_secs(60)).await.map(|o| parse_opencode_vision(&o)).unwrap_or_default()
 }
 
 /// `grok models` prints `  * grok-4.7 (default)` / `  grok-x` lines under "Available models:".
@@ -889,6 +928,15 @@ pub fn lean_claude_payload(req: &AiStepRequest, emit: &Emit) -> String {
     format!("{}\n", serde_json::json!({ "type": "user", "message": { "role": "user", "content": content } }))
 }
 
+/// Environment of a lean Claude Code step: no prompt caching. Claude Code marks the cache only at the
+/// end of the request, and every lean step (a page read, a story part) ends differently, so nothing it
+/// writes is ever read back: each step was billed as a one-hour cache write (twice the input price)
+/// for its whole prompt. Measured on a page read: 7,856 tokens cache-written, 0 read; with this, the
+/// same tokens are plain input.
+pub fn lean_env() -> Vec<(String, String)> {
+    vec![("DISABLE_PROMPT_CACHING".into(), "1".into())]
+}
+
 pub async fn cli_step(ctx: &StepContext) -> Result<AiStepResult> {
     let id = ctx.req.provider_id;
     let bin = cli_binary(id).ok_or_else(|| AiError::msg(format!("{} is not a CLI provider", id.as_str())))?;
@@ -896,7 +944,7 @@ pub async fn cli_step(ctx: &StepContext) -> Result<AiStepResult> {
         let sys = ctx.workspace.join(LEAN_SYSTEM_FILE);
         std::fs::create_dir_all(&ctx.workspace).and_then(|_| std::fs::write(&sys, lean_system(&ctx.req))).map_err(|e| AiError::msg(format!("Could not write the system prompt: {e}")))?;
         let payload = lean_claude_payload(&ctx.req, &ctx.emit);
-        let res = run_cli(ctx, id, bin, &cli_args(&ctx.req), payload, &[]).await;
+        let res = run_cli(ctx, id, bin, &cli_args(&ctx.req), payload, &lean_env()).await;
         let _ = std::fs::remove_file(sys);
         return res;
     }
@@ -1198,6 +1246,41 @@ mod tests {
         assert_eq!(acc.text, "Hi");
         let (acc, _) = feed_all(AiProviderId::Antigravity, "{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"stream input message is missing the event field\"}}\n");
         assert!(acc.finish("agy", Some(0), false, "", &emit).unwrap_err().to_string().contains("missing the event"));
+    }
+
+    // Trimmed from `opencode models opencode --verbose` (opencode 1.19.5).
+    const OC_VERBOSE: &str = r#"opencode/beam-free
+{
+  "id": "beam-free",
+  "cost": { "input": 0, "output": 0 },
+  "capabilities": { "attachment": false, "input": { "text": true, "image": false } },
+  "status": "active"
+}
+opencode/crouton-alpha-free
+{
+  "id": "crouton-alpha-free",
+  "cost": { "input": 0, "output": 0 },
+  "capabilities": { "input": { "text": true, "image": true } },
+  "status": "active"
+}
+opencode/paid-vision
+{
+  "cost": { "input": 1.5, "output": 3 },
+  "capabilities": { "input": { "image": true } },
+  "status": "active"
+}
+opencode/old-vision-free
+{
+  "cost": { "input": 0 },
+  "capabilities": { "input": { "image": true } },
+  "status": "deprecated"
+}
+"#;
+
+    #[test]
+    fn opencode_vision_models_are_the_free_ones_that_take_images() {
+        assert_eq!(parse_opencode_vision(OC_VERBOSE), vec!["opencode/crouton-alpha-free".to_string()]);
+        assert!(parse_opencode_vision("").is_empty());
     }
 
     #[test]

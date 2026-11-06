@@ -35,6 +35,46 @@ pub fn extract_whole_json(text: &str) -> Option<Value> {
     extract_json(text)
 }
 
+/// A reply whose JSON is complete except for its last closing brackets (some free models stop
+/// after the innermost `}`): the brackets still open are added. Nothing the model said is dropped,
+/// so unlike [`salvage_json`] this is safe for a page reading. `None` when the reply stops anywhere
+/// but right after a closing bracket (inside a string, after a key or a comma: really cut off).
+pub fn close_brackets(text: &str) -> Option<Value> {
+    let start = text.find('{')?;
+    let t = text[start..].trim_end();
+    if !t.ends_with(['}', ']']) {
+        return None;
+    }
+    let (mut stack, mut in_str, mut esc) = (Vec::<u8>::new(), false, false);
+    for &c in t.as_bytes() {
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (_, b'\\') => esc = true,
+                (_, b'"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' => stack.push(b'}'),
+            b'[' => stack.push(b']'),
+            b'}' | b']' => {
+                if stack.pop() != Some(c) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_str || stack.is_empty() {
+        return None;
+    }
+    let closed = format!("{t}{}", stack.iter().rev().map(|&c| c as char).collect::<String>());
+    serde_json::from_str::<Value>(&closed).ok().filter(Value::is_object)
+}
+
 /// Rescue a reply that was cut off in the middle of its JSON (the model ran out of room, or the
 /// connection dropped): close the open string, then the open arrays and objects, and drop a dangling
 /// comma. When the tail is too ragged to close (a key without its value), it is cut back to the last
@@ -210,5 +250,21 @@ mod tests {
         assert!(salvage_json("no json").is_none());
         assert!(salvage_json("{").is_none());
         assert!(salvage_json("{\"a\":1}").is_none());
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn missing_closing_brackets_are_added_but_a_cut_off_reply_is_not_rescued() {
+        // A free model stopped after the page object: the pages array and the root never closed.
+        let v = close_brackets(r#"{"pages":[{"summary":"a","panels":[{"lines":[{"text":"Hi"}]}]}"#).unwrap();
+        assert_eq!(v["pages"][0]["panels"][0]["lines"][0]["text"], "Hi");
+        assert!(close_brackets(r#"{"pages":[{"summary":"a"#).is_none(), "inside a string");
+        assert!(close_brackets(r#"{"pages":[{"summary":"a","#).is_none(), "after a comma");
+        assert!(close_brackets(r#"{"a":1}"#).is_none(), "already whole");
+        assert!(close_brackets(r#"{"a":[1}"#).is_none(), "mismatched");
     }
 }

@@ -392,6 +392,7 @@ impl StudioPage {
             .pr(px(space::XXL))
             .child(header)
             .child(self.series_card(None, cx))
+            .child(self.ai_card(cx))
             .children(select_bar)
             .map(|d| {
                 if shown.is_empty() {
@@ -735,6 +736,7 @@ impl StudioPage {
             .pr(px(space::XXL))
             .child(head)
             .child(self.series_card(Some(&g.id), cx))
+            .child(self.ai_card(cx))
             .child(video)
             .child(youtube)
             .child(chapters)
