@@ -58,7 +58,10 @@ const MAX_TESTS: usize = 6;
 /// Most times one step switches model.
 const MAX_SWITCHES: usize = 3;
 /// How long a test may take (a CLI agent starts slowly; a free model can be busy).
-const TEST_TIMEOUT: Duration = Duration::from_secs(240);
+const TEST_TIMEOUT: Duration = Duration::from_secs(150);
+/// Most models of one CLI tested in a row: a CLI that is down or throttled fails them all alike,
+/// so the next CLI gets its turn soon.
+const PER_CLI: usize = 2;
 
 pub fn label(m: &ModelChoice) -> String {
     if m.model.is_empty() || m.model == "default" {
@@ -161,7 +164,25 @@ async fn candidates(reg: &Registry, role: Role, from: &ModelChoice, tried: &[Mod
         .into_iter()
         .flat_map(|p| models_of(p, vision, cheap, &opencode_vision, &opencode_all, &agy).into_iter().map(move |model| ModelChoice { provider: p, model }))
         .filter(|m| m != from && !tried.contains(m))
-        .collect()
+        .fold(Vec::<ModelChoice>::new(), |mut out, m| {
+            if out.iter().filter(|o| o.provider == m.provider).count() < PER_CLI {
+                out.push(m);
+            }
+            out
+        })
+}
+
+/// `fut` with [`TEST_TIMEOUT`]; on time out `token` is cancelled (stopping the CLI) and awaited.
+async fn timed<T>(fut: impl Future<Output = T>, token: &CancellationToken) -> std::result::Result<T, ()> {
+    tokio::pin!(fut);
+    tokio::select! {
+        r = &mut fut => Ok(r),
+        _ = tokio::time::sleep(TEST_TIMEOUT) => {
+            token.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(20), fut).await;
+            Err(())
+        }
+    }
 }
 
 // ── the test ─────────────────────────────────────────────────────────────────────────────────────
@@ -193,8 +214,10 @@ async fn test_read(reg: &Arc<Registry>, m: &ModelChoice, ch: &ChapterRef, light:
     let opts = ReadOptions { light, ..Default::default() };
     // No waiting out a usage limit here: a model that is limited fails the test.
     let llm: Arc<Registry> = reg.clone();
-    let run = read_chapter_with(&llm, m, &test, &brain, &opts, &silent, cancel);
-    let out = match tokio::time::timeout(TEST_TIMEOUT, run).await {
+    // Its own token: when the test runs out of time the CLI's whole process tree is stopped.
+    let token = cancel.child_token();
+    let run = read_chapter_with(&llm, m, &test, &brain, &opts, &silent, &token);
+    let out = match timed(run, &token).await {
         Err(_) => Err("it took too long".to_string()),
         Ok(Err(e)) => Err(format!("{e:#}")),
         Ok(Ok(read)) => match read.pages.first() {
@@ -225,7 +248,8 @@ Retell this in one short passage per page. Reply with exactly: {"title": "...", 
     let mut req = request(m, vec![AiMessage::system(system), AiMessage::user(prompt)], vec![], Some(work.clone()));
     req.effort = Some(AiEffort::Medium);
     let llm: Arc<Registry> = reg.clone();
-    let out = match tokio::time::timeout(TEST_TIMEOUT, ask_story_json(&llm, req, cancel)).await {
+    let token = cancel.child_token();
+    let out = match timed(ask_story_json(&llm, req, &token), &token).await {
         Err(_) => Err("it took too long".to_string()),
         Ok(Err(e)) => Err(format!("{e:#}")),
         Ok(Ok(Err(_))) => Err("its answer was not JSON".into()),
