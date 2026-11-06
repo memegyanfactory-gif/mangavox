@@ -322,6 +322,21 @@ async fn light_reader(reg: &Arc<Registry>, picked: &ModelChoice, ch: &ChapterRef
     Some(m)
 }
 
+/// Whether `m` can see pictures, as far as the CLI says: OpenCode lists which models take images
+/// (unknown when it lists nothing), Antigravity's GPT-OSS is text only; the others all can.
+async fn can_see(m: &ModelChoice, ch: &ChapterRef) -> bool {
+    match m.provider {
+        AiProviderId::Opencode => {
+            let ws = chapter_dir(ch).join("work");
+            let _ = std::fs::create_dir_all(&ws);
+            let seeing = mv_ai::providers::cli::opencode_vision_models(&ws).await;
+            seeing.is_empty() || seeing.contains(&m.model) || !m.model.starts_with("opencode/")
+        }
+        AiProviderId::Antigravity => !m.model.starts_with("gpt-oss"),
+        _ => true,
+    }
+}
+
 /// [`crate::read_chapter`] with the Studio switches: Light read reads with a cheaper vision model
 /// and the light prompt; Auto replaces a model that fails.
 pub async fn read_chapter_smart(reg: Arc<Registry>, model: ModelChoice, ch: ChapterRef, brain: Arc<Mutex<Brain>>, opts: ReadOptions, progress: ProgressFn, cancel: CancellationToken) -> Result<ChapterRead> {
@@ -347,6 +362,26 @@ pub(crate) async fn read_smart(reg: Arc<Registry>, model: ModelChoice, ch: Chapt
     } else {
         (Role::Read, model)
     };
+    // A model that cannot see pictures never gets the pages: Auto picks one that can at once,
+    // otherwise the step stops with what to do (instead of a long wait for a useless answer).
+    let mut start = start;
+    if role == Role::Read && !can_see(&start, &ch).await {
+        let why = format!("{} can't see pictures, so it can't read pages", label(&start));
+        if !auto {
+            let msg = format!("{why}. Pick a model that can (Claude, Antigravity's Gemini, or an OpenCode vision model), or turn on Auto switch.");
+            progress(Progress::Failed(msg.clone()));
+            return Err(anyhow!(msg));
+        }
+        progress(Progress::Log(format!("Auto: {why}; looking for one that can…")));
+        match find_working(&reg, Role::Read, &start, std::slice::from_ref(&start), &ch, &progress, &cancel).await {
+            Some(m) => {
+                progress(Progress::Log(format!("Auto: switching to {} and carrying on.", label(&m))));
+                remember(Role::Read, &start, &m);
+                start = m;
+            }
+            None => return Err(anyhow!("{why}, and Auto found no other signed-in model that passed the test")),
+        }
+    }
     with_auto(&reg, auto, role, start, &ch, &progress, &cancel, |m| crate::read::read_chapter(reg.clone(), m, ch.clone(), brain.clone(), opts.clone(), progress.clone(), cancel.clone())).await
 }
 

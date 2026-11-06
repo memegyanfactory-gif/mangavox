@@ -157,6 +157,8 @@ async fn call_with_retries(llm: &dyn Llm, req: &AiStepRequest, cancel: &Cancella
                 None => return Ok(text),
             },
             Err(e) if is_cancelled(&e) => return Err(e),
+            // A call that hung for the whole limit would hang again: fail now (Auto can switch).
+            Err(e) if e.to_string() == TIMED_OUT => return Err(e),
             Err(e) => e,
         };
         if retry >= 2 || cancel.is_cancelled() {
