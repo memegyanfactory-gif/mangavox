@@ -462,6 +462,11 @@ impl Facts {
 /// user asked to make this step again. `Err` holds why it is skipped.
 pub fn plan(step: Step, f: &Facts, format: &str, forced: bool) -> Result<(), &'static str> {
     let st = &f.status;
+    // Another upload of the chapter before it: told there, left out here, never a failure. A Story
+    // step that was asked for again decides afresh.
+    if st.same_as.is_some() && step >= Step::Story && !(step == Step::Story && forced) {
+        return Err("Same chapter as the one before");
+    }
     let done = match step {
         Step::Read => st.total_pages > 0 && st.read_pages >= st.total_pages,
         // The read writes the transcript; it only runs on its own when it is missing.
@@ -908,7 +913,25 @@ async fn run_steps(id: u64, steps: std::ops::Range<usize>, mut dirty: bool) -> O
                 it.job = None;
             }
         });
+        // A Story step that ended with the chapter marked as another upload of the one before it.
+        let same_as: Option<String> = match (&out, step) {
+            (Outcome::Done, Step::Story) => {
+                let r = item.chapter.chref();
+                blocking(move || mv_recap::load_same_as(&r).map(|s| s.label)).await.flatten()
+            }
+            _ => None,
+        };
         match out {
+            Outcome::Done if same_as.is_some() => {
+                // Another upload of the chapter before it: left out of the recap, nothing failed.
+                let other = same_as.clone().unwrap_or_default();
+                edit(|q| {
+                    q.set_step(id, step, StepState::Skipped);
+                    if let Some(it) = q.get_mut(id) {
+                        it.note = Some(format!("{SAME_CHAPTER_ITEM_NOTE} {other}, left out of the recap"));
+                    }
+                });
+            }
             Outcome::Done => {
                 // Only a step that really ran long enough counts towards the time estimates.
                 if let Some(secs) = took {
@@ -956,6 +979,9 @@ fn finish(id: u64) {
         }
     });
 }
+
+/// Starts the note of a queue item whose chapter was left out as another upload of the one before it.
+pub const SAME_CHAPTER_ITEM_NOTE: &str = "Same chapter as";
 
 /// Error texts that `issues` recognises (keep them in step).
 pub const NO_MODEL: &str = "No AI model is picked";

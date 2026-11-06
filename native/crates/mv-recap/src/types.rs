@@ -244,6 +244,10 @@ pub struct Story {
     /// speak their own lines in their own voices.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub series: bool,
+    /// The user chose "Write it anyway" for a chapter that is another upload of the one before
+    /// it: later runs keep telling it in full instead of leaving it out again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub told_anyway: bool,
 }
 
 /// One downloaded chapter (mirrors the fields of `ui-studio`'s ChapterItem).
@@ -304,6 +308,19 @@ pub struct PhaseStatus {
     /// The earliest step whose saved output holds an AI provider's own message ("You've hit your
     /// limit") instead of a reading or a story: that step has to be made again.
     pub ai_error: Option<Step>,
+    /// Label of the chapter this one repeats (another upload of the same chapter, see
+    /// [`SameAs`]): it is left out of the recap and never counts as unfinished.
+    pub same_as: Option<String>,
+}
+
+/// The mark on a chapter that is the same chapter as the one before it (`same_as.json` in its
+/// Studio folder). It names the chapter it repeats.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SameAs {
+    pub chapter_id: String,
+    pub label: String,
+    pub output_dir: PathBuf,
 }
 
 /// Video export formats: one 16:9 video, or 9:16 cut into ~1 minute reels.

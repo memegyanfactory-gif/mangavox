@@ -50,6 +50,8 @@ impl StudioPage {
         };
         let no_pages = f.pages.is_empty();
         let nothing_read = f.status.read_pages == 0;
+        // Another upload of the chapter before it (the label of that chapter).
+        let same_as = f.status.same_as.clone();
         self.sync_list(count);
         // The header's Compose button and cue count read the focused chapter's music, so load
         // it before the header (the card below loads it too, but renders after).
@@ -58,6 +60,19 @@ impl StudioPage {
         }
         let header = self.phase_header(window, cx);
         let empty: Option<AnyElement> = match self.phase {
+            // Shown even over an older story of the chapter: it is left out of the recap now.
+            Phase::Story if same_as.is_some() => {
+                let other = same_as.clone().unwrap_or_default();
+                Some(
+                    empty_view(
+                        glyphs::STORY,
+                        format!("Same chapter as {other}"),
+                        format!("This is the same chapter as {other} (another upload of it). Its story is told in {other}, so this one is left out of the recap."),
+                    )
+                    .action(btn("story-anyway", "Write it anyway", ButtonKind::Secondary).icon(glyphs::STORY).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_story_anyway(cx))))
+                    .into_any_element(),
+                )
+            }
             Phase::Story if count == 0 => Some(
                 empty_view(glyphs::STORY, "No story yet", "Pick a feel above (or none to follow each scene) and press Write story. The AI turns what it read into a recap script.")
                     .when(nothing_read, |e| {

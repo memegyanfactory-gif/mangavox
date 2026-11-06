@@ -109,6 +109,12 @@ pub(crate) fn explain(step: Step, raw: &str, chapter: &str, item: Option<u64>) -
     if has(&["connection", "connect", "timed out", "timeout", "network", "unreachable", "dns"]) {
         return ("Studio couldn't reach the AI model or a service it needs".into(), vec![retry()]);
     }
+    if has(&["can't see pictures"]) {
+        return ("the picked AI model can't see pictures, so it can't read pages (pick one that can, like Claude, Gemini or Grok)".into(), vec![act("Pick a model", Fix::PickModel { chapter: Some(chapter.to_string()) }), retry()]);
+    }
+    if has(&["set an auth method", "not logged in", "not signed in", "please log in"]) {
+        return ("the AI tool isn't signed in on this PC (open it once in a terminal and sign in, or pick another model)".into(), vec![act("Pick a model", Fix::PickModel { chapter: Some(chapter.to_string()) }), retry()]);
+    }
     if has(&["401", "403", "unauthorized", "api key", "invalid key"]) {
         return ("the AI provider refused the key (check it in Settings)".into(), vec![act("Pick a model", Fix::PickModel { chapter: Some(chapter.to_string()) }), retry()]);
     }
@@ -147,6 +153,8 @@ pub(crate) struct Inputs<'a> {
 pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
     let mut out: Vec<Issue> = vec![];
     let label = |id: &str| i.names.get(id).map(|n| n.label.clone()).unwrap_or_else(|| "A chapter".into());
+    // Another upload of the chapter before it: left out of the recap on purpose, never an issue.
+    let same = |id: &str| i.statuses.get(id).is_some_and(|s| s.same_as.is_some());
 
     // Setup problems block every chapter, so they come first.
     if let Some((runnable, ffmpeg, voice)) = &i.setup {
@@ -193,7 +201,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
 
     // Generate: chapters that failed, and a queue held since MangaVox closed.
     let mut covered: Vec<&str> = vec![];
-    for it in i.queue.items.iter().filter(|it| it.state == ItemState::Failed) {
+    for it in i.queue.items.iter().filter(|it| it.state == ItemState::Failed && !(same(&it.chapter.id) && it.current_step().is_some_and(|s| s >= Step::Story))) {
         let step = it.current_step().unwrap_or(Step::Read);
         let raw = it.error.clone().unwrap_or_default();
         let name = i.names.get(&it.chapter.id).map(|n| n.label.clone()).unwrap_or_else(|| it.chapter.label());
@@ -266,7 +274,8 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
         let RunState::Failed(raw) = &r.state else { unreachable!() };
         let step = if r.kind == RunKind::Read { Step::Read } else { Step::Story };
         let chapter = r.chapter_id.clone();
-        if !chapter.as_deref().is_some_and(|c| covered.contains(&c)) {
+        // A failed read still shows for a chapter left out as a copy; only its story runs are moot.
+        if !chapter.as_deref().is_some_and(|c| covered.contains(&c) || (r.kind == RunKind::Story && same(c))) {
             let name = chapter.as_deref().map(label).or(r.chapter.clone()).unwrap_or_else(|| "A chapter".into());
             let (why, mut actions) = match &chapter {
                 Some(c) => explain(step, raw, c, None),
@@ -317,7 +326,7 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
     // Missing prerequisites of the open step, for the chapters it works on.
     if let Some(step) = i.step {
         let gap = |id: &String| -> Option<(Step, &'static str)> {
-            let st = i.statuses.get(id)?;
+            let st = i.statuses.get(id).filter(|s| s.same_as.is_none())?;
             match step {
                 Step::Story if st.read_pages == 0 => Some((Step::Read, "hasn't been read yet, so its story can't be written")),
                 Step::Audio if !st.story => Some((Step::Story, "has no story yet, so it can't be narrated")),
@@ -481,6 +490,11 @@ mod tests {
         let (why, acts) = explain(Step::Story, "something odd\nTraceback ...", "c4", None);
         assert_eq!(why, "something odd");
         assert_eq!(acts[0].label, "Retry story");
+        let (why, acts) = explain(Step::Read, "The picked AI model (gpt-oss-120b-medium) can't see pictures, so it can't read pages.", "c4", None);
+        assert!(why.starts_with("the picked AI model can't see pictures"));
+        assert_eq!(acts[0].label, "Pick a model");
+        let (why, _) = explain(Step::Read, r"Page 1: Please set an Auth method in your C:\Users\a\.gemini\settings.json or specify one of the following environment variables before running: GEMINI_API_KEY", "c4", None);
+        assert!(why.starts_with("the AI tool isn't signed in"));
     }
 
     #[test]

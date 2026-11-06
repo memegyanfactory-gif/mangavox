@@ -5,7 +5,7 @@
 use super::{emit_reasoning, emit_text, load_images, StepContext};
 use crate::stream::{js_str, AiError, LineBuffer, Result};
 use crate::transcript::build_transcript;
-use crate::types::{AiAccessMode, AiProviderId, AiRole, AiStepRequest, AiStepResult, AiUsage, Emit, StreamEvent};
+use crate::types::{AiAccessMode, AiEffort, AiProviderId, AiRole, AiStepRequest, AiStepResult, AiUsage, Emit, StreamEvent};
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -180,6 +180,45 @@ fn has_model(req: &AiStepRequest) -> bool {
     !req.model.is_empty() && req.model != "default"
 }
 
+/// The `--model` and `--effort` Antigravity accepts for what was asked. It refuses a Gemini id that
+/// names its own level (`-low`, `-medium`, `-high`) together with a different `--effort`, and it
+/// refuses `--effort` for every model that is not Gemini. So: no model keeps the effort; a Gemini id
+/// with a level becomes the variant of the level asked for and drops the effort; a Gemini id without
+/// a level keeps both; any other id (Claude, GPT-OSS, unknown) never gets an effort.
+pub(crate) fn agy_selection(model: &str, effort: Option<AiEffort>) -> (Option<String>, Option<AiEffort>) {
+    if model.is_empty() || model == "default" {
+        return (None, effort);
+    }
+    if !model.starts_with("gemini-") {
+        return (Some(model.to_string()), None);
+    }
+    for level in ["-low", "-medium", "-high"] {
+        if let Some(base) = model.strip_suffix(level) {
+            return match effort {
+                Some(e) => (Some(format!("{base}-{}", e.as_str())), None),
+                None => (Some(model.to_string()), None),
+            };
+        }
+    }
+    (Some(model.to_string()), effort)
+}
+
+/// The command line for the plain id and no effort, when that differs from what `cli_args_with`
+/// sends to Antigravity. Used to run once more after Antigravity refuses the model selection.
+fn agy_plain_args(req: &AiStepRequest, rels: &[String]) -> Option<Vec<String>> {
+    if req.provider_id != AiProviderId::Antigravity {
+        return None;
+    }
+    let plain = AiStepRequest { effort: None, ..req.clone() };
+    let (sent, plain_args) = (cli_args_with(req, rels), cli_args_with(&plain, rels));
+    (sent != plain_args).then_some(plain_args)
+}
+
+/// True for Antigravity's refusal of a model or effort pair.
+fn is_agy_selection_error(msg: &str) -> bool {
+    msg.contains("invalid model selection")
+}
+
 fn full(req: &AiStepRequest) -> bool {
     req.access == Some(AiAccessMode::Full)
 }
@@ -352,10 +391,11 @@ pub fn cli_args_with(req: &AiStepRequest, rels: &[String]) -> Vec<String> {
         }
         AiProviderId::Antigravity => {
             add(&["--input-format", "stream-json", "--output-format", "stream-json"]);
-            if has_model(req) {
-                add(&["--model", &req.model]);
+            let (model, effort) = agy_selection(&req.model, req.effort);
+            if let Some(m) = &model {
+                add(&["--model", m]);
             }
-            if let Some(e) = req.effort {
+            if let Some(e) = effort {
                 add(&["--effort", e.as_str()]);
             }
             if full(req) {
@@ -877,7 +917,13 @@ pub async fn cli_step(ctx: &StepContext) -> Result<AiStepResult> {
         prompt.push_str(&attachment_prompt(id, &rels));
         stdin_payload(id, &prompt)
     };
-    let res = run_cli(ctx, id, bin, &args, payload, &setup.env).await;
+    let mut res = run_cli(ctx, id, bin, &args, payload.clone(), &setup.env).await;
+    // Antigravity refused the model/effort pair: once more with the plain model and no effort.
+    if let (Err(e), Some(plain)) = (&res, agy_plain_args(&ctx.req, &rels)) {
+        if is_agy_selection_error(&e.to_string()) && !ctx.cancel.is_cancelled() {
+            res = run_cli(ctx, id, bin, &plain, payload, &setup.env).await;
+        }
+    }
     if !inline && !ctx.req.images.is_empty() {
         let _ = std::fs::remove_dir_all(ctx.workspace.join(ATTACH_DIR));
     }
@@ -1177,8 +1223,35 @@ mod tests {
         req.model = "gemini-3.8-flash-high".into();
         let a = cli_args(&req);
         assert!(a.windows(2).any(|w| w == ["--input-format", "stream-json"]) && a.windows(2).any(|w| w == ["--mode", "accept-edits"]));
-        assert!(a.windows(2).any(|w| w == ["--model", "gemini-3.8-flash-high"]) && a.windows(2).any(|w| w == ["--effort", "low"]));
+        assert!(a.windows(2).any(|w| w == ["--model", "gemini-3.8-flash-low"]) && !a.contains(&"--effort".to_string()));
         assert!(a.iter().all(|x| safe_arg(x)));
+        let pick = |model: &str, effort: Option<AiEffort>| agy_selection(model, effort);
+        let some = |m: &str, e: Option<AiEffort>| (Some(m.to_string()), e);
+        assert_eq!(pick("gemini-3.8-flash-high", Some(AiEffort::Low)), some("gemini-3.8-flash-low", None));
+        assert_eq!(pick("gemini-3.8-flash-low", Some(AiEffort::Medium)), some("gemini-3.8-flash-medium", None));
+        assert_eq!(pick("gemini-3.8-flash-high", None), some("gemini-3.8-flash-high", None));
+        assert_eq!(pick("claude-sonnet-4-6", Some(AiEffort::Medium)), some("claude-sonnet-4-6", None));
+        assert_eq!(pick("gpt-oss-120b-medium", Some(AiEffort::Low)), some("gpt-oss-120b-medium", None));
+        assert_eq!(pick("default", Some(AiEffort::Low)), (None, Some(AiEffort::Low)));
+        assert_eq!(pick("gemini-3.8-flash", Some(AiEffort::Medium)), some("gemini-3.8-flash", Some(AiEffort::Medium)));
+        req.model = "default".into();
+        let a = cli_args(&req);
+        assert!(!a.contains(&"--model".to_string()) && a.windows(2).any(|w| w == ["--effort", "low"]));
+        req.model = "claude-sonnet-4-6".into();
+        req.effort = Some(AiEffort::Medium);
+        let a = cli_args(&req);
+        assert!(a.windows(2).any(|w| w == ["--model", "claude-sonnet-4-6"]) && !a.contains(&"--effort".to_string()));
+        req.model = "gemini-3.8-flash".into();
+        assert!(cli_args(&req).windows(2).any(|w| w == ["--effort", "medium"]));
+        // The safety net: only a run that sent something other than the plain id is worth repeating.
+        req.model = "gemini-3.8-flash-high".into();
+        let plain = agy_plain_args(&req, &[]).unwrap();
+        assert!(plain.windows(2).any(|w| w == ["--model", "gemini-3.8-flash-high"]) && !plain.contains(&"--effort".to_string()));
+        assert!(agy_plain_args(&AiStepRequest { effort: None, ..req.clone() }, &[]).is_none());
+        assert!(agy_plain_args(&AiStepRequest { model: "claude-sonnet-4-6".into(), ..req.clone() }, &[]).is_none());
+        assert!(agy_plain_args(&AiStepRequest { provider_id: AiProviderId::Codex, ..req.clone() }, &[]).is_none());
+        assert!(is_agy_selection_error("ERROR: invalid model selection (--model \"x\" --effort \"medium\"): conflicts"));
+        assert!(!is_agy_selection_error("rate limited"));
         assert_eq!((cli_binary(AiProviderId::GrokCli), cli_binary(AiProviderId::Antigravity)), (Some("grok"), Some("agy")));
         assert_eq!(stdin_payload(AiProviderId::Codex, "a\nb"), "a\nb");
         let p = stdin_payload(AiProviderId::Antigravity, "a \"b\"\nc");

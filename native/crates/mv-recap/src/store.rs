@@ -62,6 +62,28 @@ pub fn save_story(ch: &ChapterRef, v: &Story) -> Result<()> {
     write_json_atomic(&chapter_dir(ch).join("story.json"), v)
 }
 
+fn same_as_path(ch: &ChapterRef) -> PathBuf {
+    chapter_dir(ch).join("same_as.json")
+}
+
+/// The chapter `ch` is another upload of, while that chapter still has its story. A mark whose
+/// chapter has lost its story is stale and hides nothing.
+pub fn load_same_as(ch: &ChapterRef) -> Option<SameAs> {
+    let mark: SameAs = read_json(&same_as_path(ch))?;
+    mark.output_dir.join("studio").join("story.json").is_file().then_some(mark)
+}
+
+/// Marks `ch` as the same chapter as `other`.
+pub fn save_same_as(ch: &ChapterRef, other: &ChapterRef) -> Result<()> {
+    let mark = SameAs { chapter_id: other.chapter_id.clone(), label: other.label.clone(), output_dir: other.output_dir.clone() };
+    write_json_atomic(&same_as_path(ch), &mark)
+}
+
+/// Removes the mark (the chapter is told on its own, or the next run decides again).
+pub fn clear_same_as(ch: &ChapterRef) {
+    let _ = std::fs::remove_file(same_as_path(ch));
+}
+
 impl Prefs {
     fn path() -> PathBuf {
         studio_root().join("prefs.json")
@@ -156,6 +178,7 @@ pub fn chapter_status(ch: &ChapterRef) -> PhaseStatus {
         video: video.is_file().then_some(video),
         reels,
         music: ch.output_dir.join("score.wav").is_file(),
+        same_as: load_same_as(ch).map(|s| s.label),
     }
 }
 

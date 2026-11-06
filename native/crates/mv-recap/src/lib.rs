@@ -34,12 +34,14 @@ pub use manual::{load_manual, reset_manual_page, set_manual_page, ManualPage, Ma
 pub use read::read_chapter;
 pub use reset::{chapter_plan, reset_chapter, reset_phase, reset_plan, Footprint, ResetPlan, ResetReport, Step};
 pub use store::{
-    chapter_dir, chapter_status, clear_audio, list_pages, load_read, load_story, load_transcript, panel_path, save_read, save_story, save_transcript,
+    chapter_dir, chapter_status, clear_audio, clear_same_as, list_pages, load_read, load_same_as, load_story, load_transcript, panel_path, save_read, save_same_as, save_story, save_transcript,
     studio_root,
 };
-pub use story::{style_hint, write_story, write_story_for_manga};
+pub use story::{style_hint, write_story, write_story_anyway, write_story_for_manga, SAME_CHAPTER_NOTE};
 pub use transcript::{merge_transcript, rewrite_page, transcript_from_read, update_transcript};
 pub use types::*;
 
+#[cfg(test)]
+mod live_providers;
 #[cfg(test)]
 mod tests;

@@ -38,6 +38,8 @@ pub(crate) fn redo_blocked(step: Step, st: &PhaseStatus) -> Option<&'static str>
 pub(crate) fn missing_blocked(st: &PhaseStatus, queued: bool) -> Option<&'static str> {
     if queued {
         Some("Already in the queue")
+    } else if st.same_as.is_some() {
+        Some("Same chapter as the one before, so it is left out of the recap")
     } else if st.video.is_some() {
         Some("Every step is made; redo one instead")
     } else {

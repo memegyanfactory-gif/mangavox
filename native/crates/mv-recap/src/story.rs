@@ -580,6 +580,10 @@ fn untold(read: &ChapterRead, transcript: Option<&Transcript>, chunk: &[usize], 
     (!rest.is_empty() && left * 100 > all * 15).then_some(rest)
 }
 
+/// Starts the log line of a story run that only met chapters repeating the one before them, so
+/// Studio can say so instead of "finished".
+pub const SAME_CHAPTER_NOTE: &str = "Nothing to write: ";
+
 pub async fn write_story(
     reg: Arc<Registry>,
     model: ModelChoice,
@@ -610,6 +614,28 @@ pub async fn write_story_for_manga(
     write_story_with(&llm, &model, &chapters, &manga, &styles, &brain, &progress, &cancel).await
 }
 
+/// Tells `ch` in full even though it is another upload of the chapter before it: the mark is
+/// cleared, no chapter before it is looked at, and the story remembers the choice so later runs
+/// keep telling it.
+pub async fn write_story_anyway(
+    reg: Arc<Registry>,
+    model: ModelChoice,
+    ch: ChapterRef,
+    styles: Vec<String>,
+    brain: Arc<Mutex<Brain>>,
+    progress: ProgressFn,
+    cancel: CancellationToken,
+) -> Result<Vec<(String, Story)>> {
+    clear_same_as(&ch);
+    let llm = Patient::new(reg, progress.clone());
+    let mut out = write_story_with(&llm, &model, std::slice::from_ref(&ch), &[], &styles, &brain, &progress, &cancel).await?;
+    for (_, story) in out.iter_mut().filter(|(id, _)| *id == ch.chapter_id) {
+        story.told_anyway = true;
+        save_story(&ch, story)?;
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_story_with(
     llm: &dyn Llm,
@@ -629,10 +655,15 @@ pub(crate) async fn write_story_with(
     let mut results: Vec<(String, Story)> = vec![];
     // Chapters the AI answered for but that ended with no narration at all.
     let mut empty: Vec<String> = vec![];
+    // Chapters that are another upload of the chapter before them: left out, not failed.
+    let mut same: Vec<String> = vec![];
     let mut so_far = String::new();
     let mut timeline = Timeline::load(manga, chapters);
 
     for ch in chapters {
+        // Every run decides again whether the chapter repeats the one before it (its mark goes once
+        // it is to be told), unless the user chose to tell it anyway (that choice stays with its story).
+        let told_anyway = load_story(ch).is_some_and(|s| s.told_anyway);
         let Some(mut read) = load_read(ch).filter(|r| !r.pages.is_empty()) else {
             progress(Progress::Log(format!("{}: nothing read yet, skipped.", ch.label)));
             continue;
@@ -657,15 +688,34 @@ pub(crate) async fn write_story_with(
         // chapter before again (another group's upload of it) is left out whole.
         let repeated: Vec<usize> = match chapter_before(manga, chapters, ch) {
             Some(prev) => {
+                // The chapter whose story tells these pages: the one before, or the chapter that
+                // one is itself a copy of (a chapter uploaded three times).
+                let told_in: Option<ChapterRef> = match load_same_as(prev) {
+                    Some(m) => Some(ChapterRef { chapter_id: m.chapter_id, label: m.label, output_dir: m.output_dir, ..Default::default() }),
+                    None => chapter_dir(prev).join("story.json").is_file().then(|| prev.clone()),
+                };
                 let (this_dir, prev_dir) = (panels_dir(ch), panels_dir(prev));
                 match tokio::task::spawn_blocking(move || crate::repeats::repeats_between(&this_dir, &prev_dir)).await.unwrap_or(Repeats::None) {
-                    Repeats::Chapter => {
-                        progress(Progress::Log(format!(
-                            "{}: its pages are the pages of {} again (the same chapter from another source), so it is left out of the story. Untick one of the two for the recap.",
-                            ch.label, prev.label
-                        )));
-                        continue;
+                    Repeats::Chapter if told_anyway => {
+                        progress(Progress::Log(format!("{} is the same chapter as {}, and you chose to tell it anyway, so it is told in full.", ch.label, prev.label)));
+                        vec![]
                     }
+                    // Left out only while a story tells it, so the chapter is always told once.
+                    Repeats::Chapter => match &told_in {
+                        Some(t) => {
+                            progress(Progress::Log(format!(
+                                "{} is the same chapter as {} (another upload of it), so its story is told there and it is left out of the recap.",
+                                ch.label, t.label
+                            )));
+                            save_same_as(ch, t)?;
+                            same.push(ch.label.clone());
+                            continue;
+                        }
+                        None => {
+                            progress(Progress::Log(format!("{} looks like the same chapter as {}, which has no story yet, so it is told in full.", ch.label, prev.label)));
+                            vec![]
+                        }
+                    },
                     Repeats::Pages(pages) => {
                         progress(Progress::Log(format!("{}: pages {} repeat {}, so they are left out.", ch.label, page_ranges(&runs_of(&pages)), prev.label)));
                         pages
@@ -675,6 +725,8 @@ pub(crate) async fn write_story_with(
             }
             None => vec![],
         };
+        // It is told now, so an older mark that left it out goes.
+        clear_same_as(ch);
         // Who is who first, so one person is never told as several strangers.
         let before = brain.lock().unwrap().clone();
         match cast::check_cast(llm, model, ch, &mut read, &before, &so_far, cancel).await {
@@ -698,7 +750,7 @@ pub(crate) async fn write_story_with(
         let transcript = load_transcript(ch);
         let snapshot = brain.lock().unwrap().clone();
         let content: Vec<usize> = read.pages.iter().filter(|p| has_content(p, transcript.as_ref()) && !repeated.contains(&p.index)).map(|p| p.index).collect();
-        let mut story = Story { styles: styles.to_vec(), model: label.clone(), series, ..Default::default() };
+        let mut story = Story { styles: styles.to_vec(), model: label.clone(), series, told_anyway, ..Default::default() };
         let sizes: Vec<(usize, usize)> = content.iter().map(|&i| (i, digest(&read, transcript.as_ref(), &snapshot, &[i]).len())).collect();
         let mut parts: std::collections::VecDeque<(Vec<usize>, bool)> = plan_parts(&sizes, part_budget(model)).into_iter().map(|p| (p, false)).collect();
         // Grows when a part that failed is split in two.
@@ -880,6 +932,13 @@ pub(crate) async fn write_story_with(
         results.push((ch.chapter_id.clone(), story));
     }
 
+    // Only chapters that repeat the one before them were left: nothing failed.
+    if results.is_empty() && empty.is_empty() && !same.is_empty() {
+        let (who, is) = if same.len() == 1 { (same[0].clone(), "is") } else { (same.join(", "), "are") };
+        progress(Progress::Log(format!("{SAME_CHAPTER_NOTE}{who} {is} the same chapter as the one before, so {} left out of the recap.", if same.len() == 1 { "it is" } else { "they are" })));
+        progress(Progress::Done);
+        return Ok(vec![]);
+    }
     if results.is_empty() {
         let msg = if empty.is_empty() {
             "No story could be written. Read the chapters first, then try again.".to_string()

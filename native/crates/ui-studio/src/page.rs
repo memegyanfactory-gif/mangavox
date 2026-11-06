@@ -977,6 +977,25 @@ impl StudioPage {
         cx.notify();
     }
 
+    /// The Story page's "Write it anyway": tells the open chapter in full although it is another
+    /// upload of the chapter before it.
+    pub(crate) fn start_story_anyway(&mut self, cx: &mut Context<Self>) {
+        let Some((model, label)) = self.model(cx) else {
+            self.fail("Pick an AI model first (model button at the top).");
+            return cx.notify();
+        };
+        let Some(ch) = self.focus.as_ref().map(|f| f.chref.clone()) else { return };
+        let styles: Vec<String> = self.prefs.styles.clone();
+        if run::start_story_anyway(ui_assistant::registry(cx), model, label, ch, styles) {
+            self.side_open = true;
+            self.side = Side::Activity;
+            self.notice = None;
+        } else {
+            self.fail_with("Another AI run is still going.", NoticeAction::StopRun);
+        }
+        cx.notify();
+    }
+
     /// Asks the AI to rewrite one transcript page following the instruction box.
     pub(crate) fn rewrite_page(&mut self, page: usize, cx: &mut Context<Self>) {
         let instruction = self.ask_input.read(cx).value().to_string();
@@ -2044,7 +2063,11 @@ impl StudioPage {
                         (None, Some(_)) => String::new(),
                     }),
             )
-            .child(step_cards_small(format!("row-steps-{}", c.id), cards))
+            .map(|d| match &st.same_as {
+                // Another upload of the chapter before it: left out of the recap, nothing to make.
+                Some(other) => d.child(div().flex_none().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("Same as {other}"))),
+                None => d.child(step_cards_small(format!("row-steps-{}", c.id), cards)),
+            })
             .child(
                 icon_button(SharedString::from(format!("ch-reset-{}", c.id)), glyphs::DELETE, "Reset chapter")
                     .small()
@@ -2203,7 +2226,10 @@ fn run_finished_toast(r: &RunInfo, cx: &mut App) {
         RunKind::Story => "The story",
     };
     let where_ = r.chapter.clone().unwrap_or_default();
+    // A story run that only met chapters repeating the one before them wrote nothing: say why.
+    let left_out = r.logs.iter().rev().take(4).find_map(|l| l.strip_prefix(mv_recap::SAME_CHAPTER_NOTE)).filter(|_| r.kind == RunKind::Story);
     match &r.state {
+        RunState::Done if left_out.is_some() => toast::show(cx, Toast::info(left_out.unwrap_or_default().to_string()).icon(glyphs::STORY)),
         RunState::Done => toast::show(cx, Toast::success(format!("{what} finished · {where_}")).icon(if r.kind == RunKind::Read { glyphs::READ } else { glyphs::STORY })),
         RunState::Failed(e) => toast::show(cx, Toast::error(format!("{what} failed: {e}"))),
         RunState::Cancelled | RunState::Running => {}

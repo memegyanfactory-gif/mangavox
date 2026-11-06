@@ -411,6 +411,8 @@ pub async fn story_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch
     let res = match mv_recap::write_story_for_manga(reg, model, vec![ch.clone()], manga, styles, brain, progress_fn(), cancel.clone()).await {
         Ok(stories) => match stories.into_iter().find(|(id, _)| *id == ch.chapter_id) {
             Some((_, story)) => mv_recap::export_for_pipeline(&ch, &story),
+            // Another upload of the chapter before it: left out on purpose, nothing failed.
+            None if mv_recap::load_same_as(&ch).is_some() => Ok(()),
             None => Err(anyhow::anyhow!("The AI wrote no story for {}", ch.label)),
         },
         Err(e) => Err(e),
@@ -418,6 +420,30 @@ pub async fn story_one(reg: Arc<Registry>, model: ModelChoice, label: String, ch
     let out = outcome(&res, &cancel);
     finish(res, &cancel);
     out
+}
+
+/// The Story page's "Write it anyway": tells a chapter that is another upload of the one before
+/// it in full, and exports its narration. Returns false when a story run is already going.
+pub fn start_story_anyway(reg: Arc<Registry>, model: ModelChoice, label: String, ch: ChapterRef, styles: Vec<String>) -> bool {
+    let Some(cancel) = begin(RunKind::Story, label.clone(), 1) else { return false };
+    update(|r| r.log(format!("Writing the story of {} anyway, with {label}", ch.label)));
+    mv_ui::bg::runtime().spawn(async move {
+        update(|r| {
+            r.chapter = Some(format!("{} · {}", ch.manga_title, ch.label));
+            r.chapter_id = Some(ch.chapter_id.clone());
+            r.chapter_pos = (1, 1);
+        });
+        let brain = brain(&ch.manga_id, &ch.manga_title);
+        let res = match mv_recap::write_story_anyway(reg, model, ch.clone(), styles, brain, progress_fn(), cancel.clone()).await {
+            Ok(stories) => match stories.into_iter().find(|(id, _)| *id == ch.chapter_id) {
+                Some((_, story)) => mv_recap::export_for_pipeline(&ch, &story),
+                None => Err(anyhow::anyhow!("The AI wrote no story for {}", ch.label)),
+            },
+            Err(e) => Err(e),
+        };
+        finish(res, &cancel);
+    });
+    true
 }
 
 /// Re-reads single pages of one chapter (e.g. after the user asks to fix a page).

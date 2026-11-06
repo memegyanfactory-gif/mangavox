@@ -154,7 +154,8 @@ fn outputs(ch: &ChapterRef, step: Step) -> Vec<PathBuf> {
             // narration.studio.json plus older narration.<provider>.json / .partial.json / .md
             // beat files (scene_narrator.py), which the pipeline would otherwise fall back to
             // (narration_style.json is a setting: kept).
-            let mut v = vec![st.join("story.json"), out.join("script_edited.json")];
+            // same_as.json: the mark of a chapter left out as another upload of the one before it.
+            let mut v = vec![st.join("story.json"), st.join("same_as.json"), out.join("script_edited.json")];
             v.extend(matching(out, |n| n.starts_with("narration.") && (n.ends_with(".json") || n.ends_with(".md"))));
             v
         }
@@ -674,6 +675,7 @@ mod tests {
             (out.join("ocr_results.json"), Of(Step::Read)),
             (st.join("transcript.json"), Of(Step::Transcript)),
             (st.join("story.json"), Of(Step::Story)),
+            (st.join("same_as.json"), Of(Step::Story)),
             (out.join("script_edited.json"), Of(Step::Story)),
             (out.join("narration.studio.json"), Of(Step::Story)),
             (out.join("narration.gemini.json"), Of(Step::Story)),
@@ -724,6 +726,7 @@ mod tests {
             reels: vec![],
             music: from > Step::Music,
             ai_error: None,
+            same_as: None,
         }
     }
 

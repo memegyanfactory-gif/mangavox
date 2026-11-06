@@ -784,6 +784,8 @@ impl StudioPage {
 /// Six small step marks: made, skipped, running, failed or still to make.
 fn step_trail(it: &QueueItem) -> Div {
     let until = it.until.min(5);
+    // Left out as another upload of the chapter before it: its later steps were skipped for that.
+    let left_out = it.note.as_deref().is_some_and(|n| n.starts_with(crate::pipeline::SAME_CHAPTER_ITEM_NOTE));
     div().flex().items_center().gap(px(4.)).children(Step::ALL.iter().enumerate().map(|(i, s)| {
         let st = it.steps[i];
         let (color, weight) = match st {
@@ -797,6 +799,7 @@ fn step_trail(it: &QueueItem) -> Div {
         let word = match st {
             _ if i > until => "not asked for",
             StepState::Done => "made",
+            StepState::Skipped if left_out && i >= Step::Story.index() => "left out, same chapter as the one before",
             StepState::Skipped => "already made, skipped",
             StepState::Running => "working",
             StepState::Failed => "failed",

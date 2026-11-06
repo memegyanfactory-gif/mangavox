@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use futures::future::BoxFuture;
-use mv_ai::{emit_noop, AiEffort, AiMessage, AiProviderId, AiStepRequest, CancellationToken, Registry};
+use mv_ai::{emit_noop, AiEffort, AiMessage, AiStepRequest, CancellationToken, Registry};
 use serde_json::Value;
 
 use crate::json::{extract_whole_json, salvage_json};
@@ -97,7 +97,8 @@ pub(crate) fn request(m: &ModelChoice, messages: Vec<AiMessage>, images: Vec<Pat
     AiStepRequest {
         request_id: format!("recap-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)),
         provider_id: m.provider,
-        model: low_effort_model(m),
+        // The id stays as chosen; mv-ai matches Antigravity's model id to the effort (and drops the effort where it is refused).
+        model: m.model.clone(),
         messages,
         tools: None,
         // Low effort: each call thinks briefly before it answers. A page read went from 22 s to 14 s on Opus.
@@ -108,19 +109,6 @@ pub(crate) fn request(m: &ModelChoice, messages: Vec<AiMessage>, images: Vec<Pat
         lean: true,
         mcp: None,
     }
-}
-
-/// Antigravity names its Gemini thinking level in the model id (`gemini-3.8-flash-high`) and lets
-/// that win over `--effort`, so the low-effort variant is picked here.
-fn low_effort_model(m: &ModelChoice) -> String {
-    if m.provider == AiProviderId::Antigravity && m.model.starts_with("gemini-") {
-        for level in ["-high", "-medium"] {
-            if let Some(base) = m.model.strip_suffix(level) {
-                return format!("{base}-low");
-            }
-        }
-    }
-    m.model.clone()
 }
 
 /// How long to wait before a failed model call is sent again (the 1st and 2nd retry).

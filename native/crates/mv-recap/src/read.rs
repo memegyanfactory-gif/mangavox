@@ -101,6 +101,53 @@ fn norm_kind(k: &str) -> &'static str {
     }
 }
 
+/// The reply of a model that cannot see the page (a text-only model such as GPT-OSS): it says it
+/// cannot view images, or asks to be told what is on the page, instead of reading it.
+pub(crate) fn blind_reply(text: &str) -> bool {
+    const SAID: [&str; 26] = [
+        // It says it cannot see the picture...
+        "does not support image",
+        "doesn't support image",
+        "unable to view image",
+        "unable to view the image",
+        "unable to see image",
+        "unable to see the image",
+        "cannot view image",
+        "can't view image",
+        "cannot view the image",
+        "can't view the image",
+        "cannot see the image",
+        "can't see the image",
+        "cannot see any image",
+        "can't see any image",
+        "not able to see image",
+        "not able to view image",
+        "cannot process images",
+        "no image was provided",
+        "image was not provided",
+        // ...or asks to be told what is on the page (never words a page summary would use).
+        "share the image",
+        "upload the image",
+        "describe the page",
+        "describe the image",
+        "provide a description of the page",
+        "provide a brief description of the page",
+        "what is on the page?",
+    ];
+    let t = text.to_lowercase().replace('\u{2019}', "'");
+    SAID.iter().any(|s| t.contains(s))
+}
+
+/// What the model said itself in a page answer: its summary and other top-level text (or the
+/// whole reply when it was not JSON), never the characters' lines it read.
+pub(crate) fn own_words(answer: &std::result::Result<Value, String>) -> String {
+    match answer {
+        Ok(Value::Object(m)) => m.values().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+        Ok(v) => v.as_str().unwrap_or_default().to_string(),
+        Err(raw) => raw.clone(),
+    }
+}
+
 /// Lenient conversion of the model's JSON into a [`PageRead`]; missing or odd fields never fail.
 pub(crate) fn parse_page(v: &Value, index: usize, file: &str) -> Parsed {
     let scene_v = v.get("scene").cloned().unwrap_or(Value::Null);
@@ -651,6 +698,12 @@ pub(crate) async fn read_chapter_with(
                     return Err(fail(format!("Page {}: {e}", i + 1)));
                 }
             };
+            // A model that cannot see pictures says so, or asks to be told what is on the page:
+            // that is no reading, and every other page would go the same way.
+            if blind_reply(&own_words(&answer)) {
+                save_read(ch, &read)?;
+                return Err(fail(format!("The picked AI model ({}) can't see pictures, so it can't read pages. Pick one that can, like Claude, Gemini or Grok, for Read.", model.model)));
+            }
             let mut parsed = match answer {
                 Ok(v) => parse_page(&v, i, &file_of(i)),
                 Err(raw) => {

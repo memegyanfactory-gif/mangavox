@@ -88,9 +88,28 @@ fn every_call_asks_for_low_effort() {
     let ask = |provider, model: &str| crate::llm::request(&ModelChoice { provider, model: model.into() }, vec![], vec![], None);
     let r = ask(AiProviderId::ClaudeCode, "claude-opus-5-5");
     assert_eq!((r.effort, r.model.as_str()), (Some(mv_ai::AiEffort::Low), "claude-opus-5-5"));
-    assert_eq!(ask(AiProviderId::Antigravity, "gemini-3.8-flash-high").model, "gemini-3.8-flash-low");
-    assert_eq!(ask(AiProviderId::Antigravity, "gemini-3.8-flash-medium").model, "gemini-3.8-flash-low");
+    let g = ask(AiProviderId::Antigravity, "gemini-3.8-flash-high");
+    assert_eq!((g.effort, g.model.as_str()), (Some(mv_ai::AiEffort::Low), "gemini-3.8-flash-high"));
+    assert_eq!(ask(AiProviderId::Antigravity, "gemini-3.8-flash-medium").model, "gemini-3.8-flash-medium");
     assert_eq!(ask(AiProviderId::Antigravity, "gpt-oss-120b-medium").model, "gpt-oss-120b-medium");
+}
+
+#[test]
+fn a_model_that_cannot_see_the_page_is_caught() {
+    use crate::read::blind_reply;
+    // What GPT-OSS on Antigravity and a text-only OpenCode model answered for a real page.
+    assert!(blind_reply("Could you please provide a brief description of the page layout, panels, characters, and any visible speech balloons or text?"));
+    assert!(blind_reply("Could you please describe the page? Provide the layout of the panels (order and approximate positions), any speech balloons, narration boxes, sound effects."));
+    assert!(blind_reply(r#"{"summary":"Unable to view image - model does not support image input. This is Chapter 1 page 1."}"#));
+    assert!(blind_reply("I can\u{2019}t see the image you attached."));
+    assert!(!blind_reply(r#"{"summary":"Choi Junho introduces himself as a 25-year-old unemployed man.","panels":[{"lines":[{"text":"I can't see a thing!"}]}]}"#));
+    // Only the model's own words count, never a character's line.
+    use crate::read::own_words;
+    let read: serde_json::Value = serde_json::from_str(r#"{"summary":"A blind swordsman faces the demon.","panels":[{"lines":[{"text":"I can't see the image of my enemy!"}]}]}"#).unwrap();
+    assert!(!blind_reply(&own_words(&Ok(read))));
+    let junk: serde_json::Value = serde_json::from_str(r#"{"summary":"Unable to view image - model does not support image input."}"#).unwrap();
+    assert!(blind_reply(&own_words(&Ok(junk))));
+    assert!(blind_reply(&own_words(&Err("Could you please provide a brief description of the page layout?".into()))));
 }
 
 #[test]
@@ -806,11 +825,124 @@ async fn a_chapter_that_is_the_one_before_again_is_left_out() {
     }
     let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"Ruko wins.","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"He presses on."},{"page":6,"panel":1,"text":"Ruko wins."}]}"#]);
     let logged = Arc::new(Mutex::new(vec![]));
-    let out = write_story_with(&llm, &model(), &[a, b], &[], &[], &brain, &logs_into(&logged), &CancellationToken::new()).await.unwrap();
+    let out = write_story_with(&llm, &model(), &[a, b.clone()], &[], &[], &brain, &logs_into(&logged), &CancellationToken::new()).await.unwrap();
     assert_eq!(out.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["c1"]);
     assert_eq!(llm.seen.lock().unwrap().len(), 1, "nothing is asked about the copy");
     let logs = logged.lock().unwrap().clone();
-    assert!(logs.iter().any(|l| l.contains("Chapter 2: its pages are the pages of Chapter 1 again")), "{logs:?}");
+    assert!(logs.iter().any(|l| l.contains("Chapter 2 is the same chapter as Chapter 1")), "{logs:?}");
+    let mark = load_same_as(&b).expect("the copy is marked");
+    assert_eq!((mark.label.as_str(), mark.chapter_id.as_str()), ("Chapter 1", "c1"));
+}
+
+#[test]
+fn a_same_chapter_mark_only_counts_while_the_other_chapter_has_its_story() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (nth_chapter(dir.path(), 1, 2), nth_chapter(dir.path(), 2, 2));
+    assert!(load_same_as(&b).is_none());
+    save_same_as(&b, &a).unwrap();
+    assert!(load_same_as(&b).is_none(), "a stale mark hides nothing");
+    save_story(&a, &Story::default()).unwrap();
+    assert_eq!(load_same_as(&b).map(|m| m.label), Some("Chapter 1".to_string()));
+    assert_eq!(chapter_status(&b).same_as.as_deref(), Some("Chapter 1"));
+    clear_same_as(&b);
+    assert!(load_same_as(&b).is_none());
+    assert!(chapter_status(&b).same_as.is_none());
+}
+
+#[tokio::test]
+async fn a_copy_run_on_its_own_ends_fine_and_is_marked() {
+    let dir = tempfile::tempdir().unwrap();
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let (a, b) = (nth_chapter(dir.path(), 1, 6), nth_chapter(dir.path(), 2, 6));
+    for p in 0..6 {
+        art(&a, p, p as u32);
+        art(&b, p, p as u32);
+    }
+    save_story(&a, &Story::default()).unwrap();
+    let llm = Fake::new(&[]);
+    let manga = [a.clone(), b.clone()];
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&b), &manga, &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    assert!(out.is_empty(), "a chapter left out as a copy is not a failure");
+    assert!(llm.seen.lock().unwrap().is_empty());
+    assert_eq!(load_same_as(&b).map(|m| m.label), Some("Chapter 1".to_string()));
+}
+
+#[tokio::test]
+async fn a_chapter_uploaded_three_times_is_told_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let (a, b, c) = (nth_chapter(dir.path(), 1, 6), nth_chapter(dir.path(), 2, 6), nth_chapter(dir.path(), 3, 6));
+    for p in 0..6 {
+        for ch in [&a, &b, &c] {
+            art(ch, p, p as u32);
+        }
+    }
+    save_story(&a, &Story::default()).unwrap();
+    save_same_as(&b, &a).unwrap();
+    let llm = Fake::new(&[]);
+    let manga = [a.clone(), b.clone(), c.clone()];
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&c), &manga, &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    assert!(out.is_empty() && llm.seen.lock().unwrap().is_empty(), "the third copy is left out too");
+    assert_eq!(load_same_as(&c).map(|m| m.label), Some("Chapter 1".to_string()), "it points at the chapter that has the story");
+}
+
+#[tokio::test]
+async fn a_copy_the_user_told_anyway_stays_told_on_later_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let (a, b) = (nth_chapter(dir.path(), 1, 6), nth_chapter(dir.path(), 2, 6));
+    for p in 0..6 {
+        art(&a, p, p as u32);
+        art(&b, p, p as u32);
+    }
+    save_story(&a, &Story::default()).unwrap();
+    // "Write it anyway" saved a story that remembers the choice.
+    save_story(&b, &Story { told_anyway: true, ..Default::default() }).unwrap();
+    let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"Ruko wins.","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"He presses on."},{"page":6,"panel":1,"text":"Ruko wins."}]}"#]);
+    let manga = [a.clone(), b.clone()];
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&b), &manga, &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    assert_eq!(out.len(), 1, "a later run tells it again instead of leaving it out");
+    assert!(load_same_as(&b).is_none());
+    assert!(load_story(&b).is_some_and(|s| s.told_anyway && !s.segments.is_empty()), "the choice stays with the new story");
+}
+
+#[tokio::test]
+async fn a_copy_of_a_chapter_with_no_story_is_told_in_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let (a, b) = (nth_chapter(dir.path(), 1, 6), nth_chapter(dir.path(), 2, 6));
+    for p in 0..6 {
+        art(&a, p, p as u32);
+        art(&b, p, p as u32);
+    }
+    // The chapter it repeats was read but never told: leaving the copy out would lose the chapter.
+    let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"Ruko wins.","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"He presses on."},{"page":6,"panel":1,"text":"Ruko wins."}]}"#]);
+    let logged = Arc::new(Mutex::new(vec![]));
+    let manga = [a.clone(), b.clone()];
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&b), &manga, &[], &brain, &logs_into(&logged), &CancellationToken::new()).await.unwrap();
+    assert_eq!(out.len(), 1, "the copy gets its own story");
+    assert!(load_same_as(&b).is_none());
+    let logs = logged.lock().unwrap().clone();
+    assert!(logs.iter().any(|l| l.contains("Chapter 2 looks like the same chapter as Chapter 1")), "{logs:?}");
+}
+
+#[tokio::test]
+async fn a_story_saved_for_a_chapter_clears_its_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let brain = Mutex::new(Brain::load_in(dir.path().join("brain"), "m1", "Test Manga"));
+    let (a, b) = (nth_chapter(dir.path(), 1, 6), nth_chapter(dir.path(), 2, 6));
+    for p in 0..6 {
+        art(&a, p, p as u32);
+        art(&b, p, p as u32);
+    }
+    save_story(&a, &Story::default()).unwrap();
+    save_same_as(&b, &a).unwrap();
+    let llm = Fake::new(&[r#"{"title":"T","summary_so_far":"Ruko wins.","segments":[{"page":1,"panel":1,"text":"Ruko draws."},{"page":3,"panel":1,"text":"He presses on."},{"page":6,"panel":1,"text":"Ruko wins."}]}"#]);
+    // Told on its own, with no chapter before it to repeat: the mark goes and the story is saved.
+    let out = write_story_with(&llm, &model(), std::slice::from_ref(&b), &[], &[], &brain, &silent(), &CancellationToken::new()).await.unwrap();
+    assert_eq!(out.len(), 1);
+    assert!(load_same_as(&b).is_none());
+    assert!(load_story(&b).is_some());
 }
 
 #[tokio::test]

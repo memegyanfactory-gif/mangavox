@@ -79,6 +79,10 @@ impl Filter {
 
 /// How many of the six steps a chapter has made.
 pub(crate) fn steps_done(st: &PhaseStatus) -> usize {
+    // Left out as another upload of the chapter before it: nothing more to make.
+    if st.same_as.is_some() {
+        return Phase::ALL.len();
+    }
     Phase::ALL.iter().filter(|p| p.done(st)).count()
 }
 
@@ -89,6 +93,9 @@ pub(crate) fn tile_state(id: &str, st: Option<&PhaseStatus>, queue: &Queue, busy
             ItemState::Queued => return Tile::Queued,
             ItemState::Running => return Tile::Running(it.current_step().unwrap_or(Step::Read)),
             ItemState::Paused => return Tile::Paused,
+            // A chapter left out as another upload of the one before it does not show an old Story
+            // (or later) failure; a failed Read still shows.
+            ItemState::Failed if st.is_some_and(|s| s.same_as.is_some()) && it.current_step().is_some_and(|s| s >= Step::Story) => {}
             ItemState::Failed => return Tile::Failed(it.current_step().unwrap_or(Step::Read)),
             ItemState::Done => {}
         }
@@ -97,7 +104,8 @@ pub(crate) fn tile_state(id: &str, st: Option<&PhaseStatus>, queue: &Queue, busy
         return Tile::Running(s);
     }
     let Some(st) = st else { return Tile::NotStarted };
-    if st.video.is_some() {
+    // Another upload of the chapter before it counts as finished: it is left out of the recap.
+    if st.video.is_some() || st.same_as.is_some() {
         return Tile::Done;
     }
     match steps_done(st) {
@@ -325,6 +333,7 @@ impl StudioPage {
 
     fn manga_grid(&mut self, groups: &[MangaGroup], cx: &mut Context<Self>) -> AnyElement {
         let chapters: usize = groups.iter().map(|g| g.chapters.len()).sum();
+        // Real videos only: a chapter left out as a copy counts as finished, not as a video.
         let made: usize = groups.iter().flat_map(|g| g.chapters.iter()).filter(|c| self.statuses.get(&c.id).is_some_and(|s| s.video.is_some())).count();
         let filter = self.dash_search.read(cx).value().to_lowercase();
         let shown: Vec<&MangaGroup> = groups.iter().filter(|g| filter.is_empty() || g.title.to_lowercase().contains(&filter)).collect();
@@ -398,7 +407,7 @@ impl StudioPage {
         let n = g.chapters.len();
         let tiles: Vec<Tile> = g.chapters.iter().map(|c| self.tile_of(c)).collect();
         // "Made" means a video exists, whatever Generate is doing to the chapter now.
-        let done = g.chapters.iter().filter(|c| self.statuses.get(&c.id).is_some_and(|s| s.video.is_some())).count();
+        let done = g.chapters.iter().filter(|c| self.statuses.get(&c.id).is_some_and(|s| s.video.is_some() || s.same_as.is_some())).count();
         let failed = tiles.iter().filter(|t| matches!(t, Tile::Failed(_))).count();
         let working = tiles.iter().filter(|t| matches!(t, Tile::Running(_) | Tile::Queued)).count();
         let steps: usize = g.chapters.iter().map(|c| self.statuses.get(&c.id).map(steps_done).unwrap_or(0)).sum();
@@ -555,7 +564,7 @@ impl StudioPage {
         let order: Vec<String> = shown.iter().map(|(_, c, _)| c.id.clone()).collect();
         let picked_here: Vec<ChapterItem> = g.chapters.iter().filter(|c| self.dash_pick.contains(&c.id)).cloned().collect();
         let n = g.chapters.len();
-        let done = g.chapters.iter().filter(|c| self.statuses.get(&c.id).is_some_and(|s| s.video.is_some())).count();
+        let done = g.chapters.iter().filter(|c| self.statuses.get(&c.id).is_some_and(|s| s.video.is_some() || s.same_as.is_some())).count();
         let failed = counts.get(&Filter::Failed).copied().unwrap_or(0);
         let steps: usize = g.chapters.iter().map(|c| self.statuses.get(&c.id).map(steps_done).unwrap_or(0)).sum();
         let p = if n > 0 { steps as f32 / (n * Phase::ALL.len()) as f32 } else { 0. };
