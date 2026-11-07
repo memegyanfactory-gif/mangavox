@@ -393,6 +393,26 @@ const SETUP_LEAD = 'On iPhone this icon keeps its own storage. In Safari, open M
 
 /* ---------------- start */
 
+/** Acts on a link from the address bar: a QR code's, or a home-screen setup link's. */
+function useLink(link) {
+  if (link.bad) {
+    show({ title: 'This code is incomplete', lead: 'Scan the code in MangaVox → Mobile on your PC again.' });
+    return;
+  }
+  if (link.inv) {
+    // A home-screen setup link: already paired with this PC (the icon opened again) resumes;
+    // otherwise this icon pairs itself, without a question on the PC.
+    if (saved && saved.rid === link.rid) { connect({ mode: 'resume', pc: saved }); return; }
+    connect({ mode: 'pair', rid: link.rid, code: link.code, fp: link.fp, inv: link.inv });
+    return;
+  }
+  const lan = $('opt-lan');
+  lan.hidden = !link.lan;
+  lan.href = link.lan || '#';
+  $('opt-cloud').onclick = () => connect({ mode: 'pair', rid: link.rid, code: link.code, fp: link.fp });
+  show({ title: 'Connect to your PC', lead: 'How should this phone reach MangaVox?', choose: true });
+}
+
 async function main() {
   $('forget').onclick = () => forget();
   if (!('serviceWorker' in navigator) || !window.indexedDB || !(window.crypto && crypto.subtle) || !window.isSecureContext) {
@@ -412,30 +432,23 @@ async function main() {
 
   const link = readLink();
   saved = await loadPc();
-  if (link && link.bad) {
-    show({ title: 'This code is incomplete', lead: 'Scan the code in MangaVox → Mobile on your PC again.' });
-    return;
-  }
   $('paste-btn').onclick = async () => {
     try { await pasteLink(await navigator.clipboard.readText()); }
     catch { $('paste-in').hidden = false; $('paste-go').hidden = false; $('paste-in').focus(); }
   };
   $('paste-go').onclick = () => pasteLink($('paste-in').value);
-  if (link && link.inv) {
-    // A home-screen setup link: already paired with this PC (the icon opened again) resumes;
-    // otherwise this icon pairs itself, without a question on the PC.
-    if (saved && saved.rid === link.rid) { connect({ mode: 'resume', pc: saved }); return; }
-    connect({ mode: 'pair', rid: link.rid, code: link.code, fp: link.fp, inv: link.inv });
-    return;
-  }
-  if (link) {
-    const lan = $('opt-lan');
-    lan.hidden = !link.lan;
-    lan.href = link.lan || '#';
-    $('opt-cloud').onclick = () => connect({ mode: 'pair', rid: link.rid, code: link.code, fp: link.fp });
-    show({ title: 'Connect to your PC', lead: 'How should this phone reach MangaVox?', choose: true });
-    return;
-  }
+  // A code scanned while this page is already open (a tab left open, or the home-screen app,
+  // which Android opens at the same address with only a new fragment) reloads nothing: the
+  // fragment changes in place, so take the new link from here too.
+  addEventListener('hashchange', () => {
+    const next = readLink();
+    if (!next) return;
+    if (conn) { conn.retire(); conn = null; }
+    clearTimeout(retryTimer);
+    closeApp();
+    useLink(next);
+  });
+  if (link) { useLink(link); return; }
   if (saved) { connect({ mode: 'resume', pc: saved }); return; }
   if (standalone()) { show({ title: 'Set up this icon', lead: SETUP_LEAD, paste: true }); return; }
   show({ title: 'Connect your phone', lead: 'On your PC, open MangaVox → Mobile, turn on From anywhere, and scan the code with this phone.' });

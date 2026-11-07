@@ -5,6 +5,7 @@
   "start_url": "/mangavox/",
   "scope": "/mangavox/",
   "display": "standalone",
+  "launch_handler": { "client_mode": "navigate-existing" },
   "background_color": "#09090f",
   "theme_color": "#09090f",
   "icons": [

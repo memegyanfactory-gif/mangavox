@@ -28,7 +28,10 @@ With cloud access on, the Mobile page's QR code is
 `fp` = first 16 bytes of SHA-256(`S` public, 65-byte uncompressed), base64url. Everything is in
 the fragment, which browsers never send to a server; the page reads it and removes it from the
 address bar at once. The page offers **Same Wi-Fi** (opens the `l` URL, the existing LAN pairing)
-and **From anywhere** (cloud pairing below).
+and **From anywhere** (cloud pairing below). A code scanned while the page is already open (a tab
+left open, or the Android home-screen app, which the manifest's `launch_handler` keeps in one
+window) only changes the fragment without a reload: the page reads it on `hashchange` too, ending
+whatever session it had.
 
 ## Relay (cloud/src/worker.js)
 
