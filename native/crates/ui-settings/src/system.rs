@@ -5,9 +5,11 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mv_core::limits;
-use mv_ui::{ph, segmented, settings_block, settings_group, size, skeleton, skeleton_line, usage_bar, SettingsRow, Tokens};
+use mv_core::{gpu_guard, limits};
+use mv_ui::toast::{self, Toast};
+use mv_ui::{btn, icon_tag, ph, segmented, settings_block, settings_group, size, skeleton, skeleton_line, usage_bar, ButtonKind, SettingsRow, Tokens, Tone};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::ui::{format_bytes, icon_row};
@@ -199,6 +201,80 @@ impl SettingsView {
                 this.background(cx, move || limits::set_gpu_watts(w), move |v, r, cx| v.report(&text, r, cx));
             })),
         ))
+        .children(self.gpu_guard_row(cx))
+    }
+
+    /// "Protect the power supply" (`mv_core::gpu_guard`): only with an NVIDIA card.
+    fn gpu_guard_row(&self, cx: &mut Context<Self>) -> Option<SettingsRow> {
+        let st = self.gpu_guard.as_ref()?;
+        let card = st.card.as_ref()?;
+        let caps = st.caps?;
+        let busy = self.gpu_guard_busy;
+        let detail = if st.on {
+            format!(
+                "On: the {} runs at most {} MHz and {} W, also after every restart, so its split-second power spikes stay small enough for the power supply. Renders and voicing are a little slower. Turning it off asks Windows for permission again.",
+                card.name, caps.clock_mhz, caps.watts
+            )
+        } else {
+            format!(
+                "If the PC switches itself off during renders or voicing, the graphics card's split-second power spikes are tripping the power supply; the limit above cannot stop those. This caps the {} at {} MHz and {} W at every start, which keeps them small. Windows asks for permission once. Renders and voicing get about 15–25% slower.",
+                card.name, caps.clock_mhz, caps.watts
+            )
+        };
+        let control = div().flex().items_center().gap(px(10.)).when(st.on, |d| d.child(icon_tag(ph::SHIELD_CHECK, "On", Tone::Success))).child(
+            btn("gpu-guard", if st.on { "Turn off" } else { "Turn on" }, if st.on { ButtonKind::Ghost } else { ButtonKind::Primary })
+                .small()
+                .icon(if st.on { ph::SHIELD_SLASH } else { ph::SHIELD_CHECK })
+                .loading(busy)
+                .tooltip("Windows asks for administrator permission")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_gpu_guard(cx))),
+        );
+        Some(icon_row(ph::SHIELD_CHECK, "Protect the power supply", detail, control))
+    }
+
+    /// Reads the protection state off the UI thread.
+    pub(crate) fn load_gpu_guard(&mut self, cx: &mut Context<Self>) {
+        if self.gpu_guard_busy {
+            return;
+        }
+        self.background(cx, || Ok(gpu_guard::status()), |v, r, cx| {
+            if let Ok(s) = r {
+                v.gpu_guard = Some(s);
+            }
+            cx.notify();
+        });
+    }
+
+    fn toggle_gpu_guard(&mut self, cx: &mut Context<Self>) {
+        let Some(on) = self.gpu_guard.as_ref().map(|s| s.on) else { return };
+        if self.gpu_guard_busy {
+            return;
+        }
+        self.gpu_guard_busy = true;
+        cx.notify();
+        let work = move || -> anyhow::Result<gpu_guard::Status> {
+            if on {
+                gpu_guard::turn_off()?;
+            } else {
+                gpu_guard::turn_on()?;
+            }
+            Ok(gpu_guard::status())
+        };
+        self.background(cx, work, move |v, r, cx| {
+            v.gpu_guard_busy = false;
+            match r {
+                Ok(s) => {
+                    let text = match (&s.caps, s.on) {
+                        (Some(c), true) => format!("Power supply protection is on: {} MHz, {} W", c.clock_mhz, c.watts),
+                        _ => "Power supply protection is off".to_string(),
+                    };
+                    v.gpu_guard = Some(s);
+                    toast::show(cx, Toast::success(text));
+                }
+                Err(e) => toast::show(cx, Toast::error(format!("{e:#}"))),
+            }
+            cx.notify();
+        });
     }
 
     /// Takes a meter reading off the UI thread (one at a time).

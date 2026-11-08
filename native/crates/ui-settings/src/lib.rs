@@ -295,6 +295,10 @@ pub struct SettingsView {
     limit: u8,
     /// The GPU power limit in watts (`mv_core::limits::gpu_watts`).
     gpu_watts: u16,
+    /// Power supply protection (`mv_core::gpu_guard`); `None` until read.
+    gpu_guard: Option<mv_core::gpu_guard::Status>,
+    /// Turning it on or off (waiting for the Windows permission prompt).
+    gpu_guard_busy: bool,
     limit_slider: Entity<SliderState>,
     meter: Option<system::Meter>,
     sampling: bool,
@@ -434,6 +438,8 @@ impl SettingsView {
             lab_voice,
             limit: mv_core::limits::percent(),
             gpu_watts: mv_core::limits::gpu_watts(),
+            gpu_guard: None,
+            gpu_guard_busy: false,
             limit_slider,
             meter: None,
             sampling: false,
@@ -611,7 +617,10 @@ impl SettingsView {
         match self.tab {
             // Studio's speed preview needs the same engine check.
             Tab::Audio | Tab::Studio => self.audio_open(cx),
-            Tab::System => self.sample_meter(cx),
+            Tab::System => {
+                self.sample_meter(cx);
+                self.load_gpu_guard(cx);
+            }
             Tab::Storage => self.storage_mgr.update(cx, |m, cx| m.refresh(cx)),
             _ => {}
         }

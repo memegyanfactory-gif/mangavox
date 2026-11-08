@@ -5,6 +5,7 @@ pub mod config;
 pub mod covers;
 pub mod db;
 pub mod events;
+pub mod gpu_guard;
 pub mod library;
 pub mod limits;
 pub mod logging;
