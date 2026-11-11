@@ -392,7 +392,7 @@ mod tests {
             assert!(in_scope(&r), "{r:?}");
         }
         assert!(in_scope(&Route::Reader { manga_id: "m".into(), chapter_id: "c".into() }));
-        for r in [Route::Studio, Route::Thumbnails, Route::YouTubeVideos, Route::YouTube, Route::Suggestions, Route::Settings { tab: None }, Route::Mobile, Route::Welcome] {
+        for r in [Route::Studio, Route::Hook, Route::Thumbnails, Route::YouTubeVideos, Route::YouTube, Route::Suggestions, Route::Settings { tab: None }, Route::Mobile, Route::Welcome] {
             assert!(!in_scope(&r), "{r:?}");
         }
         let play = |mal: Option<&str>| Route::Player { request: mv_ui::nav::PlayRequest { title: "x".into(), source: "x".into(), file_idx: None, imdb_id: None, mal_id: mal.map(Into::into), season: None, episode: None } };

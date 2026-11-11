@@ -1754,6 +1754,63 @@ pub(crate) struct Beat {
     pub focus: Value,
     /// Seconds into the chapter video.
     pub start: f64,
+    /// What the story marked the beat as ("reveal, intensity 7"; empty when unknown).
+    pub tag: String,
+    /// How gripping the story marked it, 0 to 1.
+    pub intensity: f64,
+}
+
+impl Beat {
+    /// The beat as the hook writer weighs it (a beat without a picture is never offered).
+    pub fn info(&self) -> mv_recap::hook::BeatInfo {
+        mv_recap::hook::BeatInfo { text: if self.image.is_some() { self.text.clone() } else { String::new() }, tag: self.tag.clone(), intensity: self.intensity }
+    }
+}
+
+/// The beats a hook can use from the chapter whose output folder is `dir`: the written narration
+/// (`narration.studio.json`, there before the video is made, with how gripping each beat is),
+/// each with its start and focus from the video's sync map when one was made; else the sync
+/// map's beats alone.
+pub(crate) fn hook_beats(dir: &Path) -> Vec<Beat> {
+    let Some(n) = std::fs::read_to_string(dir.join("narration.studio.json")).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) else { return chapter_beats(dir) };
+    let made = chapter_beats(dir);
+    let key = |t: &str| t.split_whitespace().take(8).collect::<Vec<_>>().join(" ").to_lowercase();
+    let mut from = 0;
+    let mut out = vec![];
+    for b in n["beats"].as_array().into_iter().flatten() {
+        let text = b["text"].as_str().unwrap_or("").trim().to_string();
+        if b["skip"].as_bool() == Some(true) || text.is_empty() {
+            continue;
+        }
+        let image = b["panel_image"].as_str().map(|p| p.trim_start_matches(r"\\?\").to_string()).filter(|p| Path::new(p).is_file());
+        // The same beat in the made video (in order: a line said twice keeps its own time).
+        let k = key(&text);
+        let found = made[from.min(made.len())..].iter().position(|m| key(&m.text) == k).map(|i| from + i);
+        if let Some(i) = found {
+            from = i + 1;
+        }
+        let kind = b["kind"].as_str().unwrap_or("").trim();
+        let level = b["intensity"].as_f64().unwrap_or(0.).max(0.);
+        let tag = match (kind, level > 0.) {
+            ("" | "other", false) => String::new(),
+            ("" | "other", true) => format!("intensity {level}"),
+            (k, false) => k.to_string(),
+            (k, true) => format!("{k}, intensity {level}"),
+        };
+        out.push(Beat {
+            text,
+            image,
+            focus: found.map(|i| made[i].focus.clone()).unwrap_or(Value::Null),
+            start: found.map(|i| made[i].start).unwrap_or(0.),
+            tag,
+            intensity: (level / 10.).min(1.),
+        });
+    }
+    if out.is_empty() {
+        made
+    } else {
+        out
+    }
 }
 
 /// The beats of the chapter whose output folder is `dir` (`sync_map.json`'s `beat_segments`).
@@ -1769,6 +1826,8 @@ pub(crate) fn chapter_beats(dir: &Path) -> Vec<Beat> {
             image: b["panel_image"].as_str().map(str::to_string),
             focus: b.get("focus_point").cloned().unwrap_or(Value::Null),
             start,
+            tag: String::new(),
+            intensity: 0.,
         });
     }
     out
@@ -1877,7 +1936,7 @@ pub(crate) fn hook_spec(job: &HookJob, chapters: &[(crate::data::ChapterItem, Ve
 /// Writes, voices and renders the hook of `job` for the joined video `j`. Returns the hook video,
 /// and why the model's script was not used when it failed (the narration's own lines were).
 pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &BackgroundExecutor) -> Result<(PathBuf, Option<String>)> {
-    use mv_recap::hook::{fallback_hook, pick_candidates, story_context, write_hook, MAX_CANDIDATES};
+    use mv_recap::hook::{fallback_hook, pick_scenes, story_context, write_hook, MAX_CANDIDATES};
     r.set(0.01, "Writing the hook");
     let work = job.work_dir();
     let (chapters, height) = {
@@ -1886,15 +1945,15 @@ pub(crate) async fn make_hook(job: HookJob, j: &Joined, r: &Reporter, ex: &Backg
             let _ = std::fs::remove_dir_all(&work);
             std::fs::create_dir_all(&work).with_context(|| format!("create {}", work.display()))?;
             let chapters: Vec<_> = items.into_iter().map(|c| {
-                let beats = chapter_beats(&c.output_dir);
+                let beats = hook_beats(&c.output_dir);
                 (c, beats)
             }).collect();
             Ok((chapters, probe(&joined)?.size.1))
         })
         .await??
     };
-    let texts: Vec<(String, Vec<String>)> = chapters.iter().map(|(c, beats)| (c.label(), beats.iter().map(|b| if b.image.is_some() { b.text.clone() } else { String::new() }).collect())).collect();
-    let candidates = pick_candidates(&texts, MAX_CANDIDATES);
+    let infos: Vec<(String, Vec<mv_recap::hook::BeatInfo>)> = chapters.iter().map(|(c, beats)| (c.label(), beats.iter().map(Beat::info).collect())).collect();
+    let candidates = pick_scenes(&infos, MAX_CANDIDATES);
     if candidates.len() < 2 {
         bail!("the chapters have too little narration for a hook");
     }

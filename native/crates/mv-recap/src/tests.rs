@@ -455,17 +455,49 @@ async fn hook_is_written_from_candidates_with_a_json_retry() {
         ("Chapter 2".to_string(), vec!["Kaito betrays the guild.".to_string()]),
     ];
     let cands = pick_candidates(&chapters, MAX_CANDIDATES);
-    let fake = Fake::new(&["not json", r#"{"idea":"premise","lines":[{"ids":[1],"text":"A blade is drawn."},{"id":2,"text":"A friend turns traitor."}],"outro":"Let's see how it begins.","outro_id":0}"#]);
+    let draft = |first: &str| format!(r#"{{"idea":"x","lines":[{{"ids":[1],"text":"{first}"}},{{"id":2,"text":"A friend turns traitor."}}],"outro":"So why does his own guild want him dead? It starts with one letter.","outro_id":0}}"#);
+    // The plan (after a non-JSON answer and its retry), three drafts written at once (the fake
+    // answers them in turn), then the judge.
+    let answers = [
+        "not json".to_string(),
+        r#"{"genre":"fantasy","hero":"Ruko","question":"Why does his own guild want him dead?","seconds":60,"angles":[{"kind":"cold open","pitch":"the blade"},{"kind":"contrast","pitch":"friend and traitor"},{"kind":"question","pitch":"the guild"}]}"#.to_string(),
+        draft("A blade is drawn."),
+        draft("Ruko's best friend draws a blade on him."),
+        draft("You won't believe this."),
+        r#"{"drafts":[{"draft":"A","first_line":10,"question":10,"escalation":10,"concrete":10,"voice":5,"pictures":5,"no_spoilers":10},{"draft":"B","first_line":24,"question":14,"escalation":17,"concrete":13,"voice":9,"pictures":5,"no_spoilers":10,"verdict":"grabs"},{"draft":"C","first_line":5}],"winner":"B","fixes":[{"line":1,"text":"His best friend sells him to the guild."}]}"#.to_string(),
+    ];
+    let fake = Fake::new(&answers.iter().map(String::as_str).collect::<Vec<_>>());
     let h = crate::hook::write_hook_with(&fake, &model(), "Test Manga", "STORY SO FAR: Ruko trains.\n", &cands, 20, &CancellationToken::new()).await.unwrap();
-    assert_eq!(h.lines, vec![HookLine::new(vec![1], "A blade is drawn."), HookLine::new(vec![2], "A friend turns traitor.")]);
+    assert_eq!(h.lines, vec![HookLine::new(vec![1], "Ruko's best friend draws a blade on him."), HookLine::new(vec![2], "His best friend sells him to the guild.")]);
     assert_eq!(h.outro_id, Some(0));
     let seen = fake.seen.lock().unwrap();
-    let user = &seen[0].messages[1].content;
-    assert!(user.contains("SCENE 1 (Chapter 1, where the story begins):\n[0] Ruko meets a stranger.\n[1] The stranger draws a blade!"), "{user}");
-    assert!(user.contains("SCENE 2 (Chapter 2):\n[2] Kaito betrays the guild."), "{user}");
-    assert!(user.contains("about 52 words"));
-    assert!(user.contains("STORY SO FAR: Ruko trains."), "the story is given as context");
-    assert_eq!(seen.len(), 2, "one retry after the non-JSON answer");
+    assert_eq!(seen.len(), 6, "one retry after the non-JSON plan, three drafts, the judge");
+    let plan = &seen[0].messages[1].content;
+    assert!(plan.contains("SCENE 1 (Chapter 1, where the story begins):\n[0] Ruko meets a stranger.\n[1] The stranger draws a blade!"), "{plan}");
+    assert!(plan.contains("SCENE 2 (Chapter 2):\n[2] Kaito betrays the guild."), "{plan}");
+    assert!(plan.contains("STORY SO FAR: Ruko trains."), "the story is given as context");
+    let draft_user = &seen[2].messages[1].content;
+    assert!(draft_user.contains("about 52 words") && draft_user.contains("THE QUESTION the hook plants: Why does his own guild want him dead?") && draft_user.contains("YOUR ANGLE: cold open - the blade"), "{draft_user}");
+    let judge = &seen[5].messages[1].content;
+    assert!(judge.contains("DRAFT A (cold open: the blade):\n0. A blade is drawn.") && judge.contains("DRAFT C"), "{judge}");
+}
+
+#[tokio::test]
+async fn hook_survives_a_failed_plan_and_judge() {
+    use crate::hook::*;
+    let chapters = vec![("Chapter 1".to_string(), vec!["Ruko meets a stranger.".to_string(), "The stranger draws a blade!".to_string(), "Kaito betrays the guild.".to_string()])];
+    let cands = pick_candidates(&chapters, MAX_CANDIDATES);
+    let ok = r#"{"lines":[{"ids":[1],"text":"A blade."},{"ids":[2],"text":"A traitor."}],"outro":"So who sold him out? It starts at the gate."}"#;
+    // Plan: two bad answers; drafts: one good, two bad (each retried once); judge: two bad.
+    let fake = Fake::new(&["x", "x", ok, "x", "x", "x", "x", "x", "x"]);
+    let stages = Arc::new(Mutex::new(vec![]));
+    let s = stages.clone();
+    let r = crate::hook_ai::best_hook_with(&fake, &model(), "T", "", &cands, None, &CancellationToken::new(), &move |m: &str| s.lock().unwrap().push(m.to_string())).await.unwrap();
+    assert_eq!(r.plan.seconds, 90, "the usual length when the plan failed");
+    assert_eq!(r.drafts.len(), 1);
+    assert_eq!(r.drafts[0].score, 60, "unjudged, and it breaks no rule");
+    assert_eq!(r.notes.len(), 4, "{:?}", r.notes);
+    assert_eq!(stages.lock().unwrap().len(), 3);
 }
 
 #[test]

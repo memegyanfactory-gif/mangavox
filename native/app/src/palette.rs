@@ -146,6 +146,7 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
                 row("Studio", glyphs::STUDIO, Cmd::Go(Route::Studio)).keys(["recap", "video", "narrate", "project"]).current(*c.route == Route::Studio),
                 row("YouTube", glyphs::YOUTUBE, Cmd::Go(Route::YouTube)).keys(["upload", "schedule", "channel", "analytics", "seo"]).current(*c.route == Route::YouTube),
                 row("Suggestions", ph::LIGHTBULB, Cmd::Go(Route::Suggestions)).keys(["trending", "ideas", "crawler", "growth", "channel score"]).current(*c.route == Route::Suggestions),
+                row("Hook", ph::LIGHTNING, Cmd::Go(Route::Hook)).keys(["hook", "cold open", "intro hook", "teaser", "trailer"]).current(*c.route == Route::Hook),
                 row("Thumbnails", ph::IMAGES, Cmd::Go(Route::Thumbnails)).keys(["thumbnail", "magnific", "image", "cover art"]).current(*c.route == Route::Thumbnails),
                 row("YouTube videos", ph::MONITOR_PLAY, Cmd::Go(Route::YouTubeVideos)).keys(["preview", "watch page", "rendered", "my videos", "related"]).current(*c.route == Route::YouTubeVideos),
                 row("Creative", ph::PAINT_BRUSH, Cmd::Go(Route::Creative)).keys(["create manga", "original manga", "character sheet", "comic", "pdf", "make a manga"]).current(*c.route == Route::Creative),

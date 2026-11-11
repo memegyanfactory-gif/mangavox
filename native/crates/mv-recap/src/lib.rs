@@ -11,6 +11,7 @@ mod cast;
 pub mod cast_profile;
 mod export;
 pub mod hook;
+pub mod hook_ai;
 mod json;
 mod llm;
 mod manual;

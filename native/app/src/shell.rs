@@ -679,6 +679,7 @@ impl Shell {
             Route::Mobile => vec![here("Mobile")],
             Route::YouTube => vec![here("YouTube")],
             Route::Suggestions => vec![here("Suggestions")],
+            Route::Hook => vec![here("Hook")],
             Route::Thumbnails => vec![here("Thumbnails")],
             Route::YouTubeVideos => vec![here("YouTube videos")],
             Route::Automation => vec![here("Automation")],
@@ -696,6 +697,7 @@ impl Shell {
                         Some(Route::Studio) => vec![link("Studio".into(), CrumbTo::Up(Route::Studio))],
                         Some(Route::YouTube) => vec![link("YouTube".into(), CrumbTo::Up(Route::YouTube))],
                         Some(Route::Suggestions) => vec![link("Suggestions".into(), CrumbTo::Up(Route::Suggestions))],
+                        Some(Route::Hook) => vec![link("Hook".into(), CrumbTo::Up(Route::Hook))],
                         Some(Route::Thumbnails) => vec![link("Thumbnails".into(), CrumbTo::Up(Route::Thumbnails))],
                         Some(Route::YouTubeVideos) => vec![link("YouTube videos".into(), CrumbTo::Up(Route::YouTubeVideos))],
                         Some(o) => vec![section_crumb, link(nav_label(sec, o).unwrap_or("Back").into(), CrumbTo::Up(o.clone()))],
@@ -1411,6 +1413,7 @@ impl Shell {
             let active = owner.as_ref() == Some(&Route::Studio);
             let yt_active = owner.as_ref() == Some(&Route::YouTube);
             let sg_active = owner.as_ref() == Some(&Route::Suggestions);
+            let hk_active = owner.as_ref() == Some(&Route::Hook);
             let th_active = owner.as_ref() == Some(&Route::Thumbnails);
             let yv_active = owner.as_ref() == Some(&Route::YouTubeVideos);
             let au_active = owner.as_ref() == Some(&Route::Automation);
@@ -1422,6 +1425,7 @@ impl Shell {
                 .child(nav_item("nav-studio", glyphs::STUDIO, "Studio", active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Studio, w, cx))))
                 .child(nav_item("nav-youtube", glyphs::YOUTUBE, "YouTube", yt_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::YouTube, w, cx))))
                 .child(nav_item("nav-suggestions", ph::LIGHTBULB, "Suggestions", sg_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Suggestions, w, cx))))
+                .child(nav_item("nav-hook", ph::LIGHTNING, "Hook", hk_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Hook, w, cx))))
                 .child(nav_item("nav-thumbnails", ph::IMAGES, "Thumbnails", th_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Thumbnails, w, cx))))
                 .child(nav_item("nav-youtube-videos", ph::MONITOR_PLAY, "YouTube videos", yv_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::YouTubeVideos, w, cx))))
                 .child(nav_item("nav-automation", ph::ROBOT, "Automation", au_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Automation, w, cx))))
@@ -1672,6 +1676,7 @@ fn route_title(route: &Route) -> &'static str {
         Route::Mobile => "Mobile",
         Route::YouTube => "YouTube",
         Route::Suggestions => "Suggestions",
+        Route::Hook => "Hook",
         Route::Thumbnails => "Thumbnails",
         Route::YouTubeVideos => "YouTube videos",
         Route::Automation => "Automation",

@@ -32,6 +32,8 @@ pub enum Route {
     YouTube,
     /// Studio suggestions: trending manga recaps on YouTube, what to recap next, the channel meter.
     Suggestions,
+    /// Studio hook: a 1-2 minute AI-written, judged and rendered hook for a manga.
+    Hook,
     /// Studio thumbnails: Magnific image generation for a manga's YouTube thumbnails.
     Thumbnails,
     /// Studio's rendered videos as they will look on YouTube: a home grid and a watch page with

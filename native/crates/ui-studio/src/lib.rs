@@ -20,6 +20,7 @@ mod encode;
 pub mod eta;
 mod export;
 mod generate;
+mod hook_page;
 mod issues;
 pub mod look;
 mod music;
@@ -81,6 +82,7 @@ pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView>
             cx.set_global(Kept(page.clone()));
             Some(page.into())
         }
+        Route::Hook => Some(cx.new(hook_page::HookPage::new).into()),
         Route::Thumbnails => Some(cx.new(ytpack::ThumbnailsPage::new).into()),
         Route::YouTubeVideos => Some(cx.new(ytpack::VideosPage::new).into()),
         _ => None,

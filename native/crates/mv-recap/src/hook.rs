@@ -8,19 +8,20 @@
 //! that drops us into its first scene. Each line plays over one to three pictures of the scene it
 //! tells, cut fast.
 //!
-//! The narration beats of every made chapter are narrowed to whole scenes ([`pick_candidates`]):
-//! the story's opening and the strongest showcases, later ones weighing more. The model picks the
-//! opening and writes it over their pictures ([`write_hook`]). Without a model the strongest late
-//! scene's own words are used ([`fallback_hook`]).
+//! The narration beats of every written chapter are narrowed to whole scenes ([`pick_scenes`]):
+//! the story's opening and the strongest showcases (by their words and how gripping the story
+//! marked them), later ones weighing more. The model plans the hook, writes it three ways and
+//! judges them ([`best_hook`], [`crate::hook_ai`]). Without a model the strongest late scene's
+//! own words are used ([`fallback_hook`]).
 
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use mv_ai::{AiMessage, CancellationToken, Registry};
+use mv_ai::{CancellationToken, Registry};
 use serde_json::Value;
 
 use crate::json::{num_of, str_of};
-use crate::llm::{ask_json, request, truncate, Llm};
+use crate::llm::{truncate, Llm};
 use crate::types::ModelChoice;
 
 /// Most candidates offered to the model: about fifteen scenes of [`SCENE_BEATS`].
@@ -29,14 +30,15 @@ pub const MAX_CANDIDATES: usize = 240;
 const SCENE_BEATS: usize = 16;
 /// Spoken words per second of hook (the narration voice's pace).
 const WORDS_PER_SECOND: f64 = 2.6;
-/// Lines a hook has, at most and at least (the outro is one more).
-const MAX_LINES: usize = 16;
+/// Lines a hook has, at most and at least (the outro is one more): a two-minute hook has about
+/// thirty.
+const MAX_LINES: usize = 32;
 const MIN_LINES: usize = 2;
 /// Pictures one line plays over, at most.
 const MAX_SHOTS: usize = 3;
 /// Most words in one line of the fallback.
 const LINE_WORDS: usize = 16;
-const FALLBACK_OUTRO: &str = "So how did it all come to this? Let's start from the beginning.";
+pub(crate) const FALLBACK_OUTRO: &str = "So how did it all come to this? Let's start from the beginning.";
 
 /// A narration beat the hook may show and retell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,10 +49,23 @@ pub struct HookCandidate {
     pub chapter: String,
     /// What the narrator says over that beat.
     pub text: String,
+    /// What the beat is, when the story says ("fight, intensity 8"; empty when unknown).
+    pub tag: String,
+}
+
+/// A narration beat as [`pick_scenes`] weighs it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BeatInfo {
+    /// What the narrator says over it (empty: a beat without a picture, never offered).
+    pub text: String,
+    /// What it is ("fight, intensity 8"), shown to the model next to the text.
+    pub tag: String,
+    /// How gripping the story itself marked it, 0 (calm) to 1 (the peak).
+    pub intensity: f64,
 }
 
 /// One line of the hook: what is said, over the pictures of these beats in turn.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HookLine {
     pub ids: Vec<usize>,
     pub text: String,
@@ -63,7 +78,8 @@ impl HookLine {
 }
 
 /// The hook's script.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct HookScript {
     /// How it opens and on what ("flash-forward: ..." / "premise: ...", empty for the fallback).
     pub idea: String,
@@ -155,11 +171,24 @@ pub fn showcase_score(text: &str) -> f64 {
 /// [`showcase_score`], later chapters weighing up to twice as much (a flash-forward comes from
 /// late in the story). Ids are the beats' indices among all beats of all chapters. In story order.
 pub fn pick_candidates(chapters: &[(String, Vec<String>)], max: usize) -> Vec<HookCandidate> {
-    let mut flat: Vec<(usize, &str)> = vec![];
-    for (c, (_, texts)) in chapters.iter().enumerate() {
-        flat.extend(texts.iter().map(|t| (c, t.trim())));
+    let infos: Vec<(String, Vec<BeatInfo>)> = chapters.iter().map(|(l, t)| (l.clone(), t.iter().map(|t| BeatInfo { text: t.clone(), ..Default::default() }).collect())).collect();
+    pick_scenes(&infos, max)
+}
+
+/// How strongly a beat would open a hook: its words ([`showcase_score`]) and how gripping the
+/// story marked it (a peak beat counts like four more action words).
+pub fn info_score(b: &BeatInfo) -> f64 {
+    showcase_score(&b.text) + 2.5 * b.intensity.clamp(0., 1.)
+}
+
+/// [`pick_candidates`] over beats with what the story says about them: scenes are weighed by
+/// [`info_score`] and each candidate carries its tag.
+pub fn pick_scenes(chapters: &[(String, Vec<BeatInfo>)], max: usize) -> Vec<HookCandidate> {
+    let mut flat: Vec<(usize, &str, &BeatInfo)> = vec![];
+    for (c, (_, beats)) in chapters.iter().enumerate() {
+        flat.extend(beats.iter().map(|b| (c, b.text.trim(), b)));
     }
-    let candidate = |id: usize| HookCandidate { id, chapter: chapters[flat[id].0].0.clone(), text: flat[id].1.to_string() };
+    let candidate = |id: usize| HookCandidate { id, chapter: chapters[flat[id].0].0.clone(), text: flat[id].1.to_string(), tag: flat[id].2.tag.clone() };
     let usable: Vec<usize> = (0..flat.len()).filter(|&id| !flat[id].1.is_empty()).collect();
     if usable.len() <= max {
         return usable.into_iter().map(candidate).collect();
@@ -181,7 +210,7 @@ pub fn pick_candidates(chapters: &[(String, Vec<String>)], max: usize) -> Vec<Ho
         let weight = if n > 1 { 1. + c as f64 / (n - 1) as f64 } else { 1. };
         for s in starts {
             let ids = beats[s..s + w].to_vec();
-            let score = ids.iter().map(|&id| showcase_score(flat[id].1)).sum::<f64>() * weight;
+            let score = ids.iter().map(|&id| info_score(flat[id].2)).sum::<f64>() * weight;
             scenes.push((ids, score));
         }
     }
@@ -280,50 +309,6 @@ fn line_range(seconds: u32) -> (usize, usize) {
     (MIN_LINES, (seconds as usize / 4).clamp(3, MAX_LINES))
 }
 
-fn hook_system(seconds: u32) -> String {
-    let words = max_words(seconds);
-    let (lo, hi) = line_range(seconds);
-    let lo = lo.max(hi / 2);
-    format!(
-        r##"You write the COLD OPEN of a YouTube manga recap: the first {seconds} seconds before the story starts, the part that decides whether a stranger stays for the whole video. The top recap channels open in one of two ways; pick the one that grabs harder for THIS story.
-
-A. FLASH-FORWARD: retell the most jaw-dropping showcase of the hero from LATE in the story (a power reveal in front of a crowd, an exam he destroys, a duel everyone expected him to lose) as a fast mini-scene:
-  1. "This guy is <Name>, and..." who he is and where we are, in one line: "This guy is Choi Junho, and the moment he shows up for the superhuman exam, he's already bored."
-  2. Who is watching and why it matters: "The top hunters in the country have gathered to see what this newbie can do."
-  3. The feat, plainly and fast: "He barely touches the measuring device, and the whole thing explodes."
-  4. The witnesses' shock: "The strongest superhumans can't believe their eyes."
-  5. The escalation: "But that's only the first stage." A bigger test, a bigger feat, a beat of suspense: "Surely that guy is dead by now..."
-  6. The twist or punchline: "...but when the dust settles, it turns out Junho only punched the ground next to him."
-B. PREMISE: tell the story's own opening as a rising montage, when it is the stronger hook (a legend betrayed, a villain given a second life, a hero who dies and wakes up in the past):
-  1. "This guy is <Name>, <the legend he is>." Then a sharp turn: "But what did he get in return? Betrayal."
-  2. The world in one or two lines, only what the viewer needs.
-  3. The premise's climax, beat by beat, rising: "Rows of soldiers and mages close in on just one man. He cuts through wave after wave of them."
-  4. The twist: "He is about to kill them all when suddenly, time itself stops."
-
-THE TURN (the "outro"): the last line hands over to the story, which starts right after it from the very beginning. After a flash-forward it is the question the story answers: "So why is a jobless twenty-five-year-old this ridiculously strong? Let's start from the beginning." After a premise it is the line that drops us into the first scene: "The next thing he knows, he wakes up ten years in the past."
-
-HOW IT SOUNDS
-- A narrator telling a friend about the coolest thing they have seen: present tense, short spoken sentences, quick and confident, "our guy" or "our boy" now and then, one dry joke at most.
-- Concrete events in the order they happen. No vague hype ("an epic journey", "you won't believe"), no list of unrelated moments, no summary of the whole story.
-- The hero's name in the first line; everyone else by role ("the examiner", "the director") unless their name truly matters. No terms the viewer has not met without a few words on what they are.
-- Plain spoken text: no markdown, emojis, brackets, stage directions or chapter numbers. Never say "in this video", never ask to like or subscribe, never describe the artwork (no colours, light, clothes, "the panel", "the screen").
-- Never give away how the story ends or the answer to its big mystery.
-
-PICTURES
-The candidates come as SCENES: runs of the recap's narration beats in story order, each beat with an id and the line said over its picture. Each line of the cold open plays over the pictures of the ids it lists (1-3 ids, shown in turn while the line is spoken, about a second and a half each), so pick beats whose pictures show what the line says, in the order it happens. A flash-forward takes its pictures from ONE late scene (two neighbouring ones at most); a premise from the opening scene. Use only candidate ids, each at most once. The outro has one picture, "outro_id": the hero at his most striking in the chosen scene, or the moment the story begins.
-
-LENGTH
-{lo}-{hi} lines plus the outro, at most {words} words in all (about {seconds} seconds). Each line is one or two short sentences.
-
-OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
-{{"idea": "flash-forward: Junho destroys the superhuman exam",
-  "lines": [{{"ids": [812, 813], "text": "This guy is Choi Junho, and the moment he shows up for the superhuman exam, he's already bored."}},
-            {{"ids": [815], "text": "The top hunters in the country have gathered to see what this newbie can do."}}],
-  "outro": "So why is a jobless twenty-five-year-old this ridiculously strong? Let's start from the beginning.",
-  "outro_id": 840}}"##
-    )
-}
-
 /// What the hook writer is told about the story: the story so far at the end of chapter
 /// `last_label` (else the latest one known), the main character (the most seen one: who they
 /// are, their traits) and the most seen characters' names.
@@ -417,40 +402,36 @@ pub fn candidates_text(candidates: &[HookCandidate]) -> String {
         let note = if Some(scene[0].id) == opening { ", where the story begins" } else { "" };
         s += &format!("SCENE {} ({}{note}):\n", k + 1, scene[0].chapter);
         for c in scene.iter() {
-            s += &format!("[{}] {}\n", c.id, truncate(&c.text, 220));
+            if c.tag.is_empty() {
+                s += &format!("[{}] {}\n", c.id, truncate(&c.text, 220));
+            } else {
+                s += &format!("[{}] ({}) {}\n", c.id, c.tag, truncate(&c.text, 220));
+            }
         }
         s.push('\n');
     }
     s
 }
 
-/// Asks `model` for a cold open of at most `seconds` over `candidates` (see [`pick_candidates`]).
-/// Errors when the call fails or no usable script came back; [`fallback_hook`] is the way out.
-/// `story` is [`story_context`] (may be empty).
+/// The best of several hooks for `candidates` (see [`pick_candidates`], [`crate::hook_ai`]): a
+/// plan, [`crate::hook_ai::DRAFTS`] drafts in different styles, a judge. `seconds`: `None` lets
+/// the AI pick one of [`crate::hook_ai::AUTO_LENGTHS`]. `stage` hears each step. Errors when no
+/// draft could be written; [`fallback_hook`] is the way out. `story` is [`story_context`].
+#[allow(clippy::too_many_arguments)]
+pub async fn best_hook(reg: Arc<Registry>, model: ModelChoice, manga_title: &str, story: &str, candidates: &[HookCandidate], seconds: Option<u32>, cancel: CancellationToken, stage: Arc<dyn Fn(&str) + Send + Sync>) -> Result<crate::hook_ai::HookResult> {
+    crate::hook_ai::best_hook_with(&reg, &model, manga_title, story, candidates, seconds, &cancel, &*stage).await
+}
+
+/// [`best_hook`] of `seconds`, its winner only (the export's hook).
 pub async fn write_hook(reg: Arc<Registry>, model: ModelChoice, manga_title: &str, story: &str, candidates: &[HookCandidate], seconds: u32, cancel: CancellationToken) -> Result<HookScript> {
     write_hook_with(&reg, &model, manga_title, story, candidates, seconds, &cancel).await
 }
 
 pub(crate) async fn write_hook_with(llm: &dyn Llm, model: &ModelChoice, manga_title: &str, story: &str, candidates: &[HookCandidate], seconds: u32, cancel: &CancellationToken) -> Result<HookScript> {
-    if candidates.len() < MIN_LINES {
-        bail!("not enough narration to make a hook from");
-    }
-    let mut prompt = format!("MANGA: {manga_title}\nHOOK LENGTH: at most {seconds} seconds (about {} words at most)\n{story}\nCANDIDATES:\n\n", max_words(seconds));
-    prompt += &candidates_text(candidates);
-    prompt += "Pick the opening (a flash-forward or the premise) and the scene it is told over, then write the cold open. Reply with the JSON object only.";
-    let ws = crate::store::studio_root().join("work").join("hook");
-    let _ = std::fs::create_dir_all(&ws);
-    let mut req = request(model, vec![AiMessage::system(hook_system(seconds)), AiMessage::user(prompt)], vec![], Some(ws));
-    // It reads the whole story's scenes and picks one: a little more thought than a page read.
-    req.effort = Some(mv_ai::AiEffort::Medium);
-    match ask_json(llm, req, cancel).await? {
-        Ok(v) => parse_hook(&v, candidates).map(|mut h| {
-            h.fit(seconds);
-            h
-        }),
-        Err(_) => bail!("the hook was not valid JSON"),
-    }
+    let r = crate::hook_ai::best_hook_with(llm, model, manga_title, story, candidates, Some(seconds), cancel, &|_| {}).await?;
+    r.drafts.into_iter().next().map(|d| d.script).ok_or_else(|| anyhow::anyhow!("no hook was written"))
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -465,7 +446,7 @@ mod tests {
     }
 
     fn cand(id: usize, chapter: &str) -> HookCandidate {
-        HookCandidate { id, chapter: chapter.into(), text: format!("beat {id}") }
+        HookCandidate { id, chapter: chapter.into(), text: format!("beat {id}"), tag: String::new() }
     }
 
     #[test]
@@ -561,11 +542,11 @@ mod tests {
     }
 
     #[test]
-    fn a_line_shows_at_most_three_pictures_and_a_hook_at_most_sixteen_lines() {
-        let cands: Vec<HookCandidate> = (0..40).map(|id| cand(id, "C1")).collect();
+    fn a_line_shows_at_most_three_pictures_and_a_hook_has_a_line_cap() {
+        let cands: Vec<HookCandidate> = (0..80).map(|id| cand(id, "C1")).collect();
         let v = json!({"lines": [{"ids": [0, 1, 2, 3, 4], "text": "Many."}]});
         assert!(parse_hook(&v, &cands).is_err(), "one line is too few");
-        let v = json!({"lines": (0..20).map(|i| json!({"ids": [i * 2, i * 2 + 1], "text": "Line."})).collect::<Vec<_>>()});
+        let v = json!({"lines": (0..40).map(|i| json!({"ids": [i * 2, i * 2 + 1], "text": "Line."})).collect::<Vec<_>>()});
         let h = parse_hook(&v, &cands).unwrap();
         assert_eq!(h.lines.len(), MAX_LINES);
         let v = json!({"lines": [{"ids": [0, 1, 2, 3, 4], "text": "Many."}, {"ids": [1, 5], "text": "Again."}]});
@@ -589,7 +570,7 @@ mod tests {
     #[test]
     fn the_length_follows_the_setting() {
         assert_eq!((target_words(20), target_words(15), max_words(60)), (52, 39, 156));
-        assert_eq!((line_range(15), line_range(30), line_range(60), line_range(120)), ((2, 3), (2, 7), (2, 15), (2, MAX_LINES)));
+        assert_eq!((line_range(15), line_range(30), line_range(60), line_range(120)), ((2, 3), (2, 7), (2, 15), (2, 30)));
     }
 
     #[test]
@@ -607,12 +588,5 @@ mod tests {
         assert!(s.contains("MAIN CHARACTERS: Ruko, Kaito"), "{s}");
         assert!(story_context(&b, "Chapter 1").contains("Ruko joins the academy."));
         assert_eq!(story_context(&crate::Brain::default(), "Chapter 1"), "");
-    }
-
-    #[test]
-    fn the_prompt_teaches_both_openings_and_the_turn() {
-        let sys = hook_system(60);
-        assert!(sys.contains("FLASH-FORWARD") && sys.contains("PREMISE") && sys.contains("THE TURN") && sys.contains("This guy is"), "{sys}");
-        assert!(sys.contains("7-15 lines plus the outro, at most 156 words"), "{sys}");
     }
 }
