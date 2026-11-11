@@ -24,7 +24,7 @@ import os
 import re
 
 # Bumped whenever the prep (masks, plates, depth, analysis) changes, so cached layers are redone.
-PREP_VERSION = 2
+PREP_VERSION = 3
 # Bumped whenever the animation of prepared layers changes (part of the clip cache key).
 ANIM_VERSION = 2
 MODES = ("off", "key", "all")
@@ -222,6 +222,38 @@ def mask_stats(mask, face=None, score=1.0):
         sub = m[y0:y1, x0:x1]
         st["face_cover"] = float(sub.mean()) if sub.size else 0.0
     return st
+
+
+# The second SAM2 pass (layered_motion._sam_masks) may grow a character's matte to the limbs its
+# first, face-sized box cut off: it must keep this share of the first matte and stay under this
+# many times its area (more is the chair, the floor or the next character).
+GROW_KEEP = 0.9
+GROW_MAX = 1.4
+
+
+def grown_ok(first, grown):
+    """A grown matte is the same character, whole: nearly all of the first matte, not much more."""
+    import numpy as np
+    a, g = np.asarray(first, bool), np.asarray(grown, bool)
+    area = int(a.sum())
+    return area > 0 and int((a & g).sum()) >= GROW_KEEP * area and int(g.sum()) <= GROW_MAX * area
+
+
+def drop_specks(mask, share=0.005):
+    """`mask` without its pieces smaller than `share` of it (stray dots a matte leaves on the
+    art around it, which would move apart from everything)."""
+    import numpy as np
+    m = np.asarray(mask, bool)
+    area = int(m.sum())
+    if area == 0:
+        return m
+    lab, n = label(m)
+    if n <= 1:
+        return m
+    sizes = np.bincount(lab.ravel(), minlength=n + 1)
+    keep = sizes >= max(4, share * area)
+    keep[0] = False
+    return keep[lab]
 
 
 def mask_gate(st):
@@ -616,6 +648,28 @@ def panel_key(src, panel, size=None):
 def layers_root(output_dir):
     """`<chapter>/studio/layers`: one folder of prepared layers per panel (panel_key)."""
     return os.path.join(output_dir, "studio", "layers")
+
+
+def prune_stale(output_dir):
+    """Removes the layer folders an older version of the pack cut (they are never read again);
+    returns how many went. A folder being written (no manifest yet) is left alone."""
+    import shutil
+    root, gone = layers_root(output_dir), 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(root, name, "manifest.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("version") != PREP_VERSION:
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+            gone += 1
+    return gone
 
 
 def load_read(output_dir):

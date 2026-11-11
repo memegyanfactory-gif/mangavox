@@ -276,3 +276,45 @@ class RenderWithoutPackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WholeFigureTests(unittest.TestCase):
+    """The second SAM2 pass: a matte grown to the limbs its face-sized box cut off."""
+
+    def test_a_grown_matte_is_taken_only_when_it_is_the_same_character(self):
+        first = np.zeros((100, 100), bool)
+        first[20:60, 30:60] = True
+        hand = first.copy()
+        hand[40:50, 10:30] = True                       # the reaching arm, outside the first box
+        self.assertTrue(lp.grown_ok(first, hand))
+        chair = first.copy()
+        chair[10:90, 5:95] = True                       # the figure plus the chair and the floor
+        self.assertFalse(lp.grown_ok(first, chair), "far more than the character")
+        other = np.zeros((100, 100), bool)
+        other[20:60, 55:95] = True                      # mostly somebody else
+        self.assertFalse(lp.grown_ok(first, other), "loses the first matte")
+        self.assertFalse(lp.grown_ok(np.zeros((10, 10), bool), hand[:10, :10]), "nothing to grow from")
+
+    def test_stray_dots_are_dropped_and_real_pieces_kept(self):
+        m = np.zeros((100, 100), bool)
+        m[10:60, 10:60] = True                          # the figure
+        m[70:80, 70:80] = True                          # a hand behind an armrest: 4 % of it
+        m[90, 90] = m[5, 80] = True                     # dots
+        out = lp.drop_specks(m)
+        self.assertTrue(out[20, 20] and out[75, 75])
+        self.assertFalse(out[90, 90] or out[5, 80])
+        self.assertFalse(lp.drop_specks(np.zeros((4, 4), bool)).any())
+
+    def test_layers_of_an_older_pack_version_are_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = lp.layers_root(d)
+            new, old, half = (os.path.join(root, n) for n in ("new", "old", "half"))
+            for f in (new, old, half):
+                os.makedirs(f)
+            lp.write_manifest(new, {"layers": []})
+            with open(os.path.join(old, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump({"version": lp.PREP_VERSION - 1, "layers": []}, f)
+            self.assertEqual(lp.prune_stale(d), 1)
+            self.assertTrue(os.path.isdir(new) and os.path.isdir(half), "the current and the half-made stay")
+            self.assertFalse(os.path.exists(old))
+            self.assertEqual(lp.prune_stale(os.path.join(d, "nowhere")), 0)

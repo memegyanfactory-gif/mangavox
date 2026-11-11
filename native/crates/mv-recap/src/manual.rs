@@ -145,10 +145,7 @@ fn crop_exact(img: &DynamicImage, b: Bbox, out: &Path) -> Result<()> {
     let (l, t) = ((x0 * w).floor().max(0.0), (y0 * h).floor().max(0.0));
     let (r, bt) = ((x1 * w).ceil().min(w), (y1 * h).ceil().min(h));
     let c = img.crop_imm(l as u32, t as u32, ((r - l) as u32).max(1), ((bt - t) as u32).max(1));
-    if let Some(d) = out.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    c.to_rgb8().save_with_format(out, image::ImageFormat::Jpeg).with_context(|| format!("write {}", out.display()))
+    crate::read::save_jpeg(&c, out, crate::read::KEEP_QUALITY)
 }
 
 /// Removes every crop of a page (blocking).

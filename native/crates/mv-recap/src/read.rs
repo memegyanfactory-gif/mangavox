@@ -238,11 +238,25 @@ pub(crate) fn apply_to_brain(brain: &mut Brain, parsed: &mut Parsed, chapter_id:
 
 // ── image helpers (blocking) ─────────────────────────────────────────────────────────────────────
 
-fn save_jpeg(img: &DynamicImage, out: &Path) -> Result<()> {
+/// JPEG quality of what the video is drawn from (panel crops, stitched strip parts). The image
+/// crate's default of 75 leaves blocks around line art, which the render then enlarges.
+pub(crate) const KEEP_QUALITY: u8 = 93;
+/// JPEG quality of the small reference faces (sent to the model, shown in the cast).
+const FACE_QUALITY: u8 = 88;
+/// JPEG quality of the downscaled page copy only the model sees.
+const SEND_QUALITY: u8 = 80;
+
+pub(crate) fn save_jpeg(img: &DynamicImage, out: &Path, quality: u8) -> Result<()> {
     if let Some(d) = out.parent() {
         std::fs::create_dir_all(d)?;
     }
-    img.to_rgb8().save_with_format(out, image::ImageFormat::Jpeg).with_context(|| format!("write {}", out.display()))
+    let write = || -> Result<()> {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+        img.to_rgb8().write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, quality))?;
+        std::io::Write::flush(&mut w)?;
+        Ok(())
+    };
+    write().with_context(|| format!("write {}", out.display()))
 }
 
 /// Square-ish face thumbnail: bbox + 15% padding, squared up, at most 192px.
@@ -257,7 +271,7 @@ pub(crate) fn crop_face(img: &DynamicImage, b: Bbox, out: &Path) -> Result<()> {
     if c.width() > FACE_PX {
         c = c.resize(FACE_PX, FACE_PX, FilterType::Triangle);
     }
-    save_jpeg(&c, out)
+    save_jpeg(&c, out, FACE_QUALITY)
 }
 
 /// Full-resolution panel crop with a hair of padding.
@@ -268,7 +282,7 @@ pub(crate) fn crop_panel(img: &DynamicImage, b: Bbox, out: &Path) -> Result<()> 
     let (l, t) = ((x0 - px).max(0.0) * w, (y0 - py).max(0.0) * h);
     let (r, bt) = ((x1 + px).min(1.0) * w, (y1 + py).min(1.0) * h);
     let c = img.crop_imm(l as u32, t as u32, ((r - l) as u32).max(1), ((bt - t) as u32).max(1));
-    save_jpeg(&c, out)
+    save_jpeg(&c, out, KEEP_QUALITY)
 }
 
 /// Page image to send to the model: downscaled copy in `work` when huge, else the original.
@@ -291,7 +305,7 @@ pub(crate) fn prep_page(path: &Path, work: &Path, index: usize) -> Result<(PathB
     let factor = factor.min(1.0);
     let small = img.resize(((w as f32 * factor) as u32).max(1), ((h as f32 * factor) as u32).max(1), FilterType::Triangle);
     let out = work.join(format!("page_{index:04}.jpg"));
-    save_jpeg(&small, &out)?;
+    save_jpeg(&small, &out, SEND_QUALITY)?;
     Ok((out, w, h))
 }
 

@@ -213,7 +213,8 @@ pub(crate) fn compose(unit: &Unit, pages: &[PathBuf], out: &Path) -> Result<()> 
     if let Some(d) = out.parent() {
         std::fs::create_dir_all(d)?;
     }
-    canvas.save_with_format(out, image::ImageFormat::Jpeg).with_context(|| format!("write {}", out.display()))
+    // Panels are cropped from this picture, so it is kept at the crops' quality.
+    crate::read::save_jpeg(&image::DynamicImage::ImageRgb8(canvas), out, crate::read::KEEP_QUALITY)
 }
 
 #[cfg(test)]

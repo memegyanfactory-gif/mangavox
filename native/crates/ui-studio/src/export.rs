@@ -1227,7 +1227,12 @@ pub(crate) fn prepare_segment(chapter: &crate::pipeline::QChapter) {
     let r = Reporter { state: Default::default(), cancel: Default::default(), turn: Default::default() };
     let started = Instant::now();
     match chapter_segment(&dir, &video, &spec, &r) {
-        Ok(_) => eprintln!("[studio] export segment of {} ready in {:.1}s", chapter.label(), started.elapsed().as_secs_f32()),
+        Ok(_) => {
+            let secs = started.elapsed().as_secs_f32();
+            eprintln!("[studio] export segment of {} ready in {secs:.1}s", chapter.label());
+            // In the app log beside the render's timings: this is a second encode of the chapter.
+            mv_core::logging::global().info("studio", &format!("{} / {}: export segment (watermark and size) made in {secs:.1} s", chapter.manga_title, chapter.label()));
+        }
         // The export makes it then.
         Err(e) => eprintln!("[studio] could not make the export segment of {}: {e:#}", chapter.label()),
     }

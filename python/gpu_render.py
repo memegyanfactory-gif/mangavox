@@ -699,6 +699,8 @@ def render(plan):
     # Seconds spent queueing the drawing, waiting for it and the copy back (to_420), and waiting
     # for the encoder to take a frame: which of the three holds the engine back.
     spent = [0.0, 0.0, 0.0]
+    # Seconds slept for the frame-rate ceiling since the governor last paced.
+    idle = 0.0
     try:
         with torch.inference_mode():
             for g in range(total):
@@ -725,11 +727,15 @@ def render(plan):
                 if g % 15 == 0:
                     emit({"type": "progress", "done": g, "total": total})
                 if gov is not None:
-                    gov.pace()
+                    # The sleep for the frame-rate ceiling is rest already: counted as work, the
+                    # governor rested for it a second time.
+                    gov.pace(busy_s=max(0.0, time.monotonic() - gov.end - idle))
+                    idle = 0.0
                 if cap > 0:
                     ahead = (g + 1) / cap - (time.monotonic() - t0)
                     if ahead > 0:
                         time.sleep(ahead)
+                        idle = ahead
         while flight and not failed:
             ev, buf = flight.pop(0)
             ev.synchronize()

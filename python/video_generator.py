@@ -2504,10 +2504,13 @@ def clip_codecs(threads):
 def final_codecs(threads):
     """Encoder args to try in order for the finished picture."""
     cpu = ["-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p", "-threads", str(threads)]
-    # Constant quality 27 with adaptive quantisation: measured against a near-lossless render of
-    # the same chapter it scores a little above libx264 -crf 21 (SSIM 0.9961 vs 0.9958) at about
-    # 1.3x the size.
-    gpu = ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "27", "-b:v", "0",
+    # Constant quality with adaptive quantisation. 27 was measured against a near-lossless render
+    # of the same chapter a little above libx264 -crf 21 (SSIM 0.9961 vs 0.9958) at about 1.3x the
+    # size. It is 23 now (MANGAVOX_FINAL_CQ overrides): this file is not the last encode, the
+    # export draws the watermark over it and YouTube encodes it again, so it keeps more than a
+    # file that is only watched needs.
+    cq = str(int(_num(os.environ.get("MANGAVOX_FINAL_CQ"), 23, 15, 35)))
+    gpu = ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
            "-spatial-aq", "1", "-temporal-aq", "1", "-bf", "3", "-rc-lookahead", "20", "-pix_fmt", "yuv420p"]
     return [gpu, cpu] if nvenc_available() else [cpu]
 
@@ -3022,6 +3025,9 @@ def layered_job(c, frames, seg, panels, reads, look, output_dir, video_dir, entr
     plan_in = [list(imgs["fg_size"]), frames, ease, list(drift), c.get("grade"), look.get("glow"), scene, intensity]
     if entrance:
         plan_in.append(entrance)
+    hi = c.get("hi")
+    if hi:
+        plan_in.append(["hi", os.path.basename(hi)])
     akey = layered_plan.anim_key(prep, plan_in)
     return {
         "id": f"clip_{c['idx']:04d}", "src": src, "panel": panel, "scene": scene, "intensity": intensity,
@@ -3030,7 +3036,75 @@ def layered_job(c, frames, seg, panels, reads, look, output_dir, video_dir, entr
         "faces": [list(f) for _, f in layered_plan.panel_faces(panel)],
         "out": os.path.join(video_dir, f"fga_{c['idx']:04d}_{akey}.mp4"), "anim_key": akey,
         **({"entrance": dict(entrance)} if entrance else {}),
+        # The panel's upscaled copy (upscale_panels): the pack draws from it, on the layers it cut
+        # from the scan.
+        **({"hi": hi} if hi else {}),
     }
+
+
+def upscale_panels(sources, w, h, output_dir, config, work_dir):
+    """{panel image: its upscaled copy} for the `sources` the video shows larger than their
+    scan, made by the layered motion pack's Python (upscale.py: Real-ESRGAN's anime model) and
+    kept in `<chapter>/studio/upscaled`. Empty without the pack or when it fails: the render
+    then resizes as it always did."""
+    try:
+        import upscale
+    except ImportError:
+        from . import upscale
+    if not upscale.wanted(config):
+        return {}
+    py, _ = layered_plan.pack_python(config)
+    if not py:
+        return {}
+    t0 = time.monotonic()
+    folder = os.path.join(output_dir, "studio", "upscaled")
+    jobs, where = upscale.plan(sources, w, h, folder)
+    todo = [j for j in jobs if not os.path.isfile(j["dst"])]
+    if todo:
+        path = os.path.join(work_dir, "upscale_jobs.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(todo, f)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upscale.py")
+        env = os.environ.copy()
+        env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
+        env.pop("VIRTUAL_ENV", None)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+        done = error = None
+        try:
+            proc = subprocess.run([py, "-I", script, "run", path], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  env=env, creationflags=flags, timeout=300 + 20 * len(todo))
+            for line in proc.stdout.splitlines():
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("type") == "done":
+                    done = msg
+                elif msg.get("type") == "error":
+                    error = msg.get("message")
+            if not done:
+                error = error or proc.stderr.strip()[-300:] or f"exit {proc.returncode}"
+        except (OSError, subprocess.TimeoutExpired) as e:
+            error = str(e)
+        if error:
+            print(f"[video] Upscaler: {error}; those panels are resized as usual", file=sys.stderr)
+        elif done.get("failed"):
+            print(f"[video] Upscaler: {len(done['failed'])} panel(s) failed and are resized as usual", file=sys.stderr)
+    made = sum(1 for j in todo if os.path.isfile(j["dst"]))
+    where = {src: dst for src, dst in where.items() if os.path.isfile(dst)}
+    # Copies of panels this chapter no longer shows (re-read, another size) go.
+    try:
+        keep = {os.path.normcase(os.path.abspath(d)) for d in where.values()}
+        for name in os.listdir(folder):
+            f = os.path.join(folder, name)
+            if os.path.normcase(os.path.abspath(f)) not in keep:
+                os.remove(f)
+    except OSError:
+        pass
+    if jobs:
+        print(f"[video] Timing: upscaler {time.monotonic() - t0:.1f} s ({made} panel(s) made, {len(where) - made} kept, "
+              f"{len(set(sources)) - len(jobs)} shown at their own size)", file=sys.stderr)
+    return where
 
 
 def run_layered(jobs, config, work_dir, threads=None):
@@ -3398,17 +3472,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
     last_impact = -IMPACT_GAP
     last_impact_t = -1e9
 
-    def prepare(idx, seg):
-        """The clip's source, focus crop and stills (independent of every other clip, so they
-        are made side by side), or None when it cannot be shown."""
+    def image_of(seg):
+        """The picture a clip shows: a beat carries its exact panel crop; otherwise its page."""
         page_num = seg["page"]
-        audio_file = seg.get("audio_file", f"page_{page_num:04d}.wav")
-        audio_path = os.path.join(audio_dir, audio_file)
-
-        if not os.path.exists(audio_path):
-            return None
-
-        # Image: a beat carries its exact panel crop; otherwise resolve the page.
         page_image = seg.get("panel_image") if use_beats else None
         if page_image and not os.path.exists(page_image):
             page_image = None
@@ -3421,6 +3487,27 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
                     break
         if not page_image and isinstance(page_num, int) and page_num < len(page_files):
             page_image = page_files[page_num]
+        return page_image
+
+    # Panels the video shows larger than their scan are redrawn once by the upscaler (kept per
+    # chapter); the stills and the layered panels are then made from that copy.
+    try:
+        sharp = upscale_panels([s for s in (image_of(seg) for seg in render_items) if s], w, h, output_dir, config, video_dir)
+    except Exception as e:
+        print(f"[video] Upscaler skipped: {e}", file=sys.stderr)
+        sharp = {}
+
+    def prepare(idx, seg):
+        """The clip's source, focus crop and stills (independent of every other clip, so they
+        are made side by side), or None when it cannot be shown."""
+        page_num = seg["page"]
+        audio_file = seg.get("audio_file", f"page_{page_num:04d}.wav")
+        audio_path = os.path.join(audio_dir, audio_file)
+
+        if not os.path.exists(audio_path):
+            return None
+
+        page_image = image_of(seg)
         if not page_image:
             return None
         source_image = page_image
@@ -3431,6 +3518,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         # focus goes side by side; only ever widened, never cut into).
         crop = PANEL_FILE.search(str(page_image)) is not None
         region = crop_region(beat_panel(seg, panels)) if crop else (PANEL_TRIM, PANEL_TRIM, 1 - PANEL_TRIM, 1 - PANEL_TRIM)
+        # The same picture, upscaled (every box below is in fractions of it).
+        hi = sharp.get(page_image)
+        page_image = hi or page_image
         focus_point = seg.get("focus_point")
         if focus_point and len(focus_point) == 4 and not crop:
             try:
@@ -3466,7 +3556,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         except Exception as e:
             print(f"[video] Skipping unreadable image for page {page_num}: {e}", file=sys.stderr)
             return None
-        return {"audio_path": audio_path, "source": source_image, "focus": focus_point, "duo": duo, "images": images, "region": region}
+        return {"audio_path": audio_path, "source": source_image, "focus": focus_point, "duo": duo, "images": images, "region": region, "hi": hi}
 
     prepared = [None] * total
     with ThreadPoolExecutor(max_workers=max(2, min(16, cpus()))) as pool:
@@ -3555,7 +3645,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             "duo": duo, "impact": impact, "push": look["push"], "ramp": look.get("ramp", False),
             "punch": seg["amount"] if override == "shake" and seg.get("amount") is not None else 0.12,
             "chroma": look.get("chroma", False), "chroma_k": look["chroma_k"], "motion_k": look["motion_k"],
-            "source": source_image, "focus": focus_point,
+            "source": source_image, "focus": focus_point, "hi": p.get("hi"),
             "audio_path": audio_path, "offset": audio_offset, "speed": speed, "src_duration": src_duration,
             "start": timeline, "duration": duration, "cut": bool(seg.get("cut")), "trans": seg.get("transition"),
             "mood": mood, "grade": mood["grade"] if mood else None, "region": p["region"],
@@ -3721,7 +3811,7 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             if c.get("images"):
                 c["images"].pop("fg_anim", None)
             if c["duo"]:
-                c["images"] = _prepare_clip_images(c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift, c["grade"], margin)
+                c["images"] = _prepare_clip_images(c.get("hi") or c["source"], c["idx"], w, h, fill, video_dir, look["glow"], inset, drift, c["grade"], margin)
                 c["duo"] = None
             c["motion"] = "still"
             c["move"] = None
@@ -3800,6 +3890,8 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
         # usual, under its plain key.
         if layer_jobs:
             t_layered = time.monotonic()
+            # Layers an older version of the pack cut are never read again.
+            layered_plan.prune_stale(output_dir)
             try:
                 # The GPU engine animates the layered panels itself, straight into the video: the
                 # pack only cuts them into layers (cached).

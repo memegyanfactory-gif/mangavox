@@ -469,6 +469,23 @@ def _close(m, r):
     return np.asarray(im) > 127
 
 
+def _inner_points(m, n=6):
+    """`n` points well inside a mask, spread over it (prompts for SAM2's second pass)."""
+    from PIL import Image, ImageFilter
+    import numpy as np
+    core = np.asarray(Image.fromarray(m.astype(np.uint8) * 255).filter(ImageFilter.MinFilter(9))) > 127
+    ys, xs = np.nonzero(core if core.sum() > 50 else m)
+    if len(xs) == 0:
+        return []
+    idx = np.linspace(0, len(xs) - 1, min(len(xs), n * 40)).astype(int)
+    cand = np.stack([xs[idx], ys[idx]], 1).astype(np.float64)
+    picked = [cand[len(cand) // 2]]
+    while len(picked) < min(n, len(cand)):
+        d = np.min([((cand - c) ** 2).sum(1) for c in picked], axis=0)
+        picked.append(cand[int(np.argmax(d))])
+    return [(float(c[0]), float(c[1])) for c in picked]
+
+
 def _resize_mask(m, size):
     from PIL import Image
     import numpy as np
@@ -537,7 +554,29 @@ def _sam_masks(models, prepped):
                 dropped.append({"name": q["name"], "reason": why})
                 continue
             m, st = best
-            m &= ~union
+            # The box is sized from the face, so a reaching hand or a leg lies outside it and was
+            # left on the background (it then stayed behind when the character moved). Asked
+            # again from points inside the matte, without the box and with the other faces as
+            # "not this", SAM2 gives the whole figure; taken when it is the same character.
+            try:
+                others = [o["point"] for o in prompts if o is not q]
+                inner = _inner_points(m)
+                masks2, scores2 = run(img, None, inner + others, [1] * len(inner) + [0] * len(others)) if inner else ([], [])
+                for k in np.argsort(-np.asarray(scores2)):
+                    g = lp.fill_holes(_close(masks2[k], max(1, round(min(w, h) / 300)))) & ~text
+                    if not lp.grown_ok(m, g):
+                        continue
+                    whole = g | m
+                    st2 = lp.mask_stats(whole, q["face"], float(scores2[k]))
+                    if lp.mask_gate(st2)[0]:
+                        m, st = whole, dict(st2, grown=round(float(whole.sum()) / max(1, int(m.sum())), 3))
+                        break
+            except Exception:
+                pass
+            m = lp.drop_specks(m & ~union)
+            if not m.any():
+                dropped.append({"name": q["name"], "reason": "hidden by another character"})
+                continue
             layers.append({"name": q["name"], "mask": m, "face": list(q["face"]), "stats": st})
             union |= m
         # Lettering runs that lie on a character are art, not text (a bubble stays: it covers).
@@ -760,6 +799,18 @@ class Animator:
         self.orig = self._orig(man["src"], W, H, up)
         self.plate = rgb(man["plate"])
         clean = rgb(man["clean"])
+        hi = man.get("hi")
+        if hi and os.path.isfile(hi):
+            # The panel's upscaled copy (upscale.py) is the picture; the layers were cut from the
+            # scan, so only what the inpainting painted is taken from them (a smooth fill, shown
+            # behind what moves).
+            try:
+                sharp = self._hi(hi, W, H)
+                sharp_clean = self._over(sharp, clean, self.orig, up)
+                self.plate = self._over(sharp_clean, self.plate, clean, up)
+                clean, self.orig = sharp_clean, sharp
+            except Exception:
+                pass
         # The original goes back over everything the clean plate inpainted around the lettering
         # (_lama grows the text mask by r + 1 prep pixels) and over the gaps between letters, else
         # letters next to the detected ones vanish or show doubled against the zoomed plate.
@@ -835,6 +886,21 @@ class Animator:
         if up > 1.3:
             im = im.filter(ImageFilter.UnsharpMask(radius=1.6, percent=70, threshold=2))
         return self.torch.from_numpy(np.asarray(im).astype(np.float32) / 255).permute(2, 0, 1).cuda()
+
+    def _hi(self, path, W, H):
+        import numpy as np
+        from PIL import Image
+        im = Image.open(path).convert("RGB").resize((W, H), Image.LANCZOS)
+        return self.torch.from_numpy(np.asarray(im).astype(np.float32) / 255).permute(2, 0, 1).cuda()
+
+    def _over(self, sharp, layer, base, up):
+        """`sharp` with `layer` kept where it differs from `base` (what the layer was made from,
+        resized the same way), the edge of that feathered."""
+        F = self.F
+        m = ((layer - base).abs().amax(0, keepdim=True) > 0.03).float()[None]
+        k = 2 * max(1, round(up)) + 1
+        m = F.avg_pool2d(F.max_pool2d(m, k, 1, k // 2), k, 1, k // 2, count_include_pad=False)[0]
+        return layer * m + sharp * (1 - m)
 
     def _sample(self, img, qx, qy, pad="border"):
         grid = self.torch.stack([qx / self.W * 2 - 1, qy / self.H * 2 - 1], -1)[None]
@@ -1008,7 +1074,7 @@ def animator(job, man):
         f = main["face"]
         subject = ((f[0] + f[2]) / 2 / sw, (f[1] + f[3]) / 2 / sh)
     # The panel as it is now (the cached manifest's path is stale after the data folder moved).
-    anim = Animator(job["cache"], dict(man, src=job["src"]), (W, H), plan, faces, subject, job.get("drift"))
+    anim = Animator(job["cache"], dict(man, src=job["src"], hi=job.get("hi")), (W, H), plan, faces, subject, job.get("drift"))
     if isinstance(job.get("entrance"), dict) and man["layers"]:
         anim.entrance = job["entrance"]
     return anim, _grade_fn(job.get("grade"), job.get("glow"), W, H), plan

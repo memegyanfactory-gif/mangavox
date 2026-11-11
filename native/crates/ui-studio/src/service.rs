@@ -331,6 +331,12 @@ fn apply(inner: &Inner, ev: JobEvent, offset: u64) -> Option<(String, String, Pa
     apply_to(job, ev).map(|(c, s)| (c, s, dir))
 }
 
+/// A worker line that reports how long a part of the voice or the render took.
+fn is_timing(line: &str) -> bool {
+    let l = line.trim_start().trim_start_matches("[python] ");
+    l.starts_with("[video] Timing:") || l.starts_with("[video] GPU engine:") || (l.starts_with("[video] Layered:") && l.contains("animated in")) || (l.starts_with("[video]") && l.contains("frame-rate ceiling"))
+}
+
 fn apply_to(job: &mut JobInfo, ev: JobEvent) -> Option<(String, String)> {
     match ev {
         JobEvent::Started { .. } => {
@@ -338,7 +344,14 @@ fn apply_to(job: &mut JobInfo, ev: JobEvent) -> Option<(String, String)> {
             job.status = "Starting…".into();
             job.log("Started");
         }
-        JobEvent::Log { line, .. } => job.log(line),
+        JobEvent::Log { line, .. } => {
+            // How long each part of a render took goes into the app log too: the job's own log
+            // is gone with the queue, and the timings say what to make faster.
+            if is_timing(&line) {
+                mv_core::logging::global().info("studio", &format!("{} / {}: {}", job.manga_title, job.chapter_label, line.trim()));
+            }
+            job.log(line)
+        }
         JobEvent::Message { message: m, .. } => match m.kind.as_str() {
             "progress" => {
                 let stage = m.stage.clone().unwrap_or_default();
@@ -650,6 +663,16 @@ mod tests {
         assert_eq!(job.state, JobView::Failed("No script text".into()));
         assert_eq!(job.status, "No script text");
         assert!(job.logs.contains(&"[ocr] noise".to_string()));
+    }
+
+    #[test]
+    fn only_timing_lines_go_to_the_app_log() {
+        assert!(is_timing("[video] Timing: 148 clips 12.3 s (4 at once)"));
+        assert!(is_timing("[video] GPU engine: 18000 frames in 140 s (128 fps, GPU memory peak 3100 MB; drawing 90 s)"));
+        assert!(is_timing("[video] Layered: 140 of 148 clips animated in 61 s (layers 40 s, GPU memory peak 5200 MB)"));
+        assert!(is_timing("[video] GPU power governor (engine): target 200 W, mean duty 0.91, rested 9.0 s (frame-rate ceiling 154.0)"));
+        assert!(!is_timing("[video] Layered: making the layers of panel 12"));
+        assert!(!is_timing("[ocr] noise"));
     }
 
     #[test]
