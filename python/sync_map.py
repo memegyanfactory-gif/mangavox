@@ -4,8 +4,9 @@ Creates timing map from page texts + audio durations.
 """
 import os
 import json
+import sys
 
-def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beats=None):
+def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beats=None, config=None):
     """
     Generate a sync map linking pages to audio timing.
 
@@ -15,6 +16,11 @@ def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beat
     per entry so the video can swap panels in sync with the narration. The
     page-level ``segments`` are kept unchanged for backward compatibility. A beat's sound-effect
     cue (``sfx`` / ``sfx_strength``, from the story) is carried onto its beat segment.
+
+    When the narration can be aligned (align.py: the layered motion pack's Python and its word
+    timing model), a page's panels change on the word that starts each one's text instead, and
+    every beat segment carries its ``words`` ([[word, start ms, end ms], ...] in the page's
+    audio file) for the captions. ``config`` is the job's video settings (where the pack is).
 
     Returns the sync map dict.
     """
@@ -40,6 +46,7 @@ def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beat
         pages = [0]
 
     segments = []
+    paths = {}
     current_ms = 0
     audio_dir = os.path.join(output_dir, "audio")
 
@@ -56,6 +63,7 @@ def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beat
 
         duration_ms = _get_audio_duration_ms(audio_path)
 
+        paths[page] = audio_path
         segments.append({
             "page": page,
             "text": text,
@@ -90,7 +98,15 @@ def generate_sync_map(text_segments, audio_files, output_dir, page_count=0, beat
     # ── Panel-level beats ───────────────────────────────────────────────────
     # Subdivide each page segment across that page's panels so the video can
     # advance panel-by-panel in step with the narration.
-    beat_segments = _build_beat_segments(segments, beats, offset)
+    # When each word is said, from the audio itself (empty when it cannot be had).
+    words = {}
+    try:
+        import align
+        timed = align.align_pages([{"audio": paths[s["page"]], "text": s["text"]} for s in segments if s["page"] in paths], output_dir, config)
+        words = {s["page"]: timed[paths[s["page"]]] for s in segments if paths.get(s["page"]) in timed}
+    except Exception as e:
+        print(f"[sync] Word timing skipped: {e}", file=sys.stderr)
+    beat_segments = _build_beat_segments(segments, beats, offset, words)
     if beat_segments:
         sync_map["beat_segments"] = beat_segments
         sync_map["has_beats"] = True
@@ -130,10 +146,33 @@ def _skipped_pages(beats, offset):
     return {p for p, all_skip in flags.items() if all_skip}
 
 
-def _build_beat_segments(segments, beats, offset=None):
-    """Split each page segment's time window across its panels by text length."""
+def _beat_words(words, counts):
+    """The page's aligned `words` shared out to its beats by how many words each says, and
+    where the audio is cut between them (align.beat_cuts); (None, None) when they do not fit."""
+    try:
+        import align
+        cuts = align.beat_cuts(words, counts)
+    except Exception:
+        cuts = None
+    if cuts is None:
+        return None, None
+    shares, k = [], 0
+    for c in counts:
+        shares.append(words[k:k + c])
+        k += c
+    return cuts, shares
+
+
+def _build_beat_segments(segments, beats, offset=None, words=None):
+    """Split each page segment's time window across its panels: on the word that starts each
+    panel's text when the page's `words` ({page: aligned words}) are known, else by text length."""
     if not beats or not segments:
         return []
+    words = words or {}
+    try:
+        from align import tokenize
+    except Exception:
+        tokenize = str.split
     if offset is None:
         offset = _beat_offset(segments, beats)
 
@@ -166,6 +205,8 @@ def _build_beat_segments(segments, beats, offset=None):
             }
             if fp:
                 beat_seg["focus_point"] = fp
+            if words.get(page) and len(words[page]) == len(tokenize(seg.get("text", ""))):
+                beat_seg["words"] = words[page]
             out.append(beat_seg)
             continue
 
@@ -175,9 +216,15 @@ def _build_beat_segments(segments, beats, offset=None):
         weights = [max(len((pb.get("text") or "").strip()), 8) for pb in page_beats]
         total_w = sum(weights) or 1
         cursor = start
+        # The real cuts: each panel comes in on the word that starts its text.
+        cuts, shares = _beat_words(words.get(page), [len(tokenize(pb.get("text") or "")) for pb in page_beats]) if words.get(page) else (None, None)
+        if cuts is not None and any(c >= span for c in cuts):
+            cuts, shares = None, None
         for i, pb in enumerate(page_beats):
             if i == len(page_beats) - 1:
                 seg_end = end  # last panel absorbs rounding to hit the page end exactly
+            elif cuts is not None:
+                seg_end = start + cuts[i]
             else:
                 seg_end = cursor + int(span * weights[i] / total_w)
             seg_end = max(cursor, seg_end)
@@ -196,6 +243,8 @@ def _build_beat_segments(segments, beats, offset=None):
             }
             if pb.get("focus_point"):
                 beat_seg["focus_point"] = pb["focus_point"]
+            if shares is not None:
+                beat_seg["words"] = shares[i]
             # The story writer's sound-effect cue for this beat (validated; see sfx.py).
             sfx = _sfx_name(pb.get("sfx"))
             if sfx:

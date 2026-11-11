@@ -3656,6 +3656,9 @@ def generate_video(page_files, sync_map, output_dir, config=None, progress_cb=No
             "end_ms": int(round((timeline + duration) * 1000)),
             "audio_path": audio_path,
             "audio_offset_ms": int(round(audio_offset * 1000)),
+            # When each word is said (sync_map / align.py), in the page's audio: the captions
+            # follow it. `word_offset_ms` and `speed` place those times on the clip.
+            **({"words": seg["words"], "word_offset_ms": int(round(audio_offset * 1000)), "speed": speed} if seg.get("words") else {}),
             # Series mode (beta): a character's first line brings up their name card.
             **({"name_card": seg["name_card"]} if seg.get("name_card") else {}),
         })

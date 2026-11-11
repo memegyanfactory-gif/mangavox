@@ -314,7 +314,7 @@ def run_pipeline(job):
             from sync_map import generate_sync_map
             script = cleaned_text or load_script_segments(output_dir)
             beats = load_beats(output_dir)
-            sync = generate_sync_map(script, audio_files, output_dir, page_count=page_count, beats=beats)
+            sync = generate_sync_map(script, audio_files, output_dir, page_count=page_count, beats=beats, config=job.get("video_config"))
             outputs["sync_map"] = sync
             outputs["audio"] = audio_files
             emit_stage_complete("sync_map", {

@@ -684,6 +684,29 @@ def time_words(text: str, start: float, end: float, audio_path: str | None = Non
     return [{"text": w, "start": round(start + a, 3), "end": round(start + b, 3)} for w, a, b in timed]
 
 
+def aligned_words(seg: dict, text: str, start: float, end: float) -> list[dict] | None:
+    """Word timings (absolute seconds) from the segment's aligned `words` ([[word, start ms,
+    end ms], ...] in its audio file, see align.py), or None when it has none or they are not
+    this text any more (the editor changed the caption)."""
+    raw = seg.get("words")
+    toks = tokenize(text)
+    if not raw or len(raw) != len(toks):
+        return None
+    try:
+        if any(str(r[0]) != t for r, t in zip(raw, toks)):
+            return None
+        off = float(seg.get("word_offset_ms", seg.get("audio_offset_ms", 0)) or 0)
+        speed = max(0.1, float(seg.get("speed") or 1.0))
+        out = []
+        for tok, a, b in raw:
+            ws = min(max(start + (float(a) - off) / 1000.0 / speed, start), end)
+            we = min(max(start + (float(b) - off) / 1000.0 / speed, ws + 0.01), max(end, ws + 0.01))
+            out.append({"text": tok, "start": round(ws, 3), "end": round(we, 3)})
+    except (TypeError, ValueError, IndexError):
+        return None
+    return out
+
+
 # ----------------------------------------------------------------------------- cues
 
 
@@ -708,7 +731,7 @@ def build_cues(segments: list[dict], style: dict) -> list[dict]:
         e = float(seg.get("end_ms", 0)) / 1000.0
         if e <= s:
             continue
-        words = time_words(text, s, e, seg.get("audio_path"), float(seg.get("audio_offset_ms", 0) or 0) / 1000.0)
+        words = aligned_words(seg, text, s, e) or time_words(text, s, e, seg.get("audio_path"), float(seg.get("audio_offset_ms", 0) or 0) / 1000.0)
         if not words:
             continue
         # Sentences, then even chunks of at most per_cue words.
