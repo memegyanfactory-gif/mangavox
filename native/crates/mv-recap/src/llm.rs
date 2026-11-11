@@ -52,6 +52,9 @@ impl Llm for Arc<Registry> {
     }
 }
 
+/// Longest wait for a limit of a CLI whose sign-in cannot be watched (`mv_ai::account::tracked`).
+const UNTRACKED_WAIT: u64 = 1800;
+
 /// The registry for long runs (Read, Story): when the provider hits a usage / rate limit, the run
 /// says so ([`Progress::Waiting`]), sleeps until the limit resets and sends the same request again,
 /// so nothing is skipped or stored half-done. Cancelling stops the wait.
@@ -71,6 +74,8 @@ impl Llm for Patient {
         Box::pin(async move {
             let mut attempt = 0;
             loop {
+                // Who is signed in for this call, to notice another sign-in while waiting out a limit.
+                let account = mv_ai::account::fingerprint(req.provider_id);
                 let Some(r) = run_timed(&self.reg, req.clone(), &cancel).await else { bail!(TIMED_OUT) };
                 if r.stopped {
                     bail!("cancelled");
@@ -89,13 +94,22 @@ impl Llm for Patient {
                     bail!("usage limit: {}", r.error.unwrap_or(limit.message));
                 }
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-                let wait = limit.wait_secs(attempt, now);
+                let mut wait = limit.wait_secs(attempt, now);
+                // A new sign-in cannot be seen for this AI tool: ask again at least every half hour.
+                if !mv_ai::account::tracked(req.provider_id) && mv_ai::provider_def(req.provider_id).kind == mv_ai::AiProviderKind::Cli {
+                    wait = wait.min(UNTRACKED_WAIT);
+                }
                 (self.progress)(Progress::Waiting { message: r.error.unwrap_or(limit.message), until: now + wait as i64 });
                 attempt += 1;
                 tokio::select! {
                     _ = cancel.cancelled() => bail!("cancelled"),
                     _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
                     _ = retry_signal().notified() => {}
+                    // The limit belonged to the account that was signed in: with another one the
+                    // same request goes out now instead of after the old account's reset.
+                    _ = mv_ai::account::changed(req.provider_id, account) => {
+                        (self.progress)(Progress::Log("Another account is signed in to the AI tool: trying again now.".into()));
+                    }
                 }
             }
         })
@@ -192,7 +206,14 @@ async fn ask_json_with(llm: &dyn Llm, req: AiStepRequest, cancel: &CancellationT
     let mut retry = req;
     retry.request_id.push_str("-retry");
     retry.messages.push(AiMessage::assistant(raw.clone()));
-    retry.messages.push(AiMessage::user("Your previous answer was not valid JSON. Reply with JSON only."));
+    if repairable(&raw) {
+        // The answer is there, only its JSON is broken: mending it needs no second look at the
+        // pictures, which are most of what a page read costs.
+        retry.images.clear();
+        retry.messages.push(AiMessage::user("Your previous answer was not valid JSON. Send the same answer again as valid JSON only, changing nothing else."));
+    } else {
+        retry.messages.push(AiMessage::user("Your previous answer was not valid JSON. Reply with JSON only."));
+    }
     // A nudge that cannot be answered leaves the first reply to be judged.
     let raw2 = match call_with_retries(llm, &retry, cancel).await {
         Ok(t) => t,
@@ -211,11 +232,33 @@ async fn ask_json_with(llm: &dyn Llm, req: AiStepRequest, cancel: &CancellationT
     Ok(Err(raw2))
 }
 
+/// A reply that is not JSON but holds an answer to mend (it opens a JSON value and says
+/// something), unlike an empty reply or a refusal, which has to be asked again in full.
+fn repairable(raw: &str) -> bool {
+    let t = raw.trim();
+    t.len() >= 200 && t.contains(['{', '['])
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_answer_with_broken_json_is_mended_without_the_pictures() {
+        let cut = format!("{{\"pages\": [{{\"summary\": \"{}", "He walks in. ".repeat(30));
+        assert!(repairable(&cut), "a long answer cut off mid-way");
+        assert!(!repairable(""), "an empty reply is asked again in full");
+        assert!(!repairable("  \n"), "blank");
+        assert!(!repairable("I can't read these images."), "a refusal has nothing to mend");
+        assert!(!repairable(&"Sorry, I cannot help with that request. ".repeat(10)), "long but no JSON in it");
     }
 }

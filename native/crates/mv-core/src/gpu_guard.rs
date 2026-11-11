@@ -227,6 +227,7 @@ pub fn turn_on() -> Result<Caps> {
     let s = Saved { clock_mhz: caps.clock_mhz, watts: caps.watts, previous_watts: previous };
     crate::config::Config::open_default().set(CONFIG_KEY, json!(s))?;
     crate::logging::global().log_with(crate::logging::Level::Info, "system", "gpu protection on", json!({ "card": card.name, "clockMhz": caps.clock_mhz, "watts": caps.watts, "previousWatts": previous }));
+    refresh_risk();
     Ok(caps)
 }
 
@@ -241,7 +242,71 @@ pub fn turn_off() -> Result<()> {
     run_elevated(&off_script(&smi.to_string_lossy(), restore))?;
     crate::config::Config::open_default().set(CONFIG_KEY, serde_json::Value::Null)?;
     crate::logging::global().log_with(crate::logging::Level::Info, "system", "gpu protection off", json!({ "restoredWatts": restore }));
+    refresh_risk();
     Ok(())
+}
+
+
+// ---- Is this PC at risk? -----------------------------------------------------------------------
+
+/// How far back power losses count as recent.
+pub const LOSS_DAYS: u32 = 14;
+
+/// The PC lost power lately and protection is off: Studio says so and offers to turn it on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Risk {
+    pub card: String,
+    /// Times Windows logged a power loss in the last [`LOSS_DAYS`] days.
+    pub losses: u32,
+    pub caps: Caps,
+}
+
+/// Counts the events in `wevtutil ... /f:xml` output.
+pub fn count_events(xml: &str) -> u32 {
+    xml.matches("<Event ").count() as u32
+}
+
+/// Times the PC went off without shutting down (Windows logs Kernel-Power 41 at the next start)
+/// in the last `days` days. Reading the log needs no rights. Blocking.
+pub fn power_losses(days: u32) -> u32 {
+    let query = format!(
+        "/q:*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=41) and TimeCreated[timediff(@SystemTime) <= {}]]]",
+        days as u64 * 86_400_000
+    );
+    hidden(Command::new("wevtutil").args(["qe", "System", &query, "/c:200", "/f:xml"]))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map_or(0, |o| count_events(&String::from_utf8_lossy(&o.stdout)))
+}
+
+/// The risk for a state and a number of recent power losses: none while protection is on,
+/// without an NVIDIA card or when the PC never lost power.
+pub fn risk_of(st: &Status, losses: u32) -> Option<Risk> {
+    let card = st.card.as_ref()?;
+    (!st.on && losses > 0).then(|| Risk { card: card.name.clone(), losses, caps: st.caps.unwrap_or_else(|| caps_for(card)) })
+}
+
+fn risk_cell() -> &'static std::sync::Mutex<Option<Risk>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Option<Risk>>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Reads the risk again (blocking: nvidia-smi, the task list and the Windows event log).
+pub fn refresh_risk() {
+    let st = status();
+    let risk = if st.card.is_some() && !st.on { risk_of(&st, power_losses(LOSS_DAYS)) } else { None };
+    *risk_cell().lock().unwrap_or_else(|e| e.into_inner()) = risk;
+}
+
+/// The risk as last read; never blocks. The first call starts the read on its own thread, so it
+/// answers `None` until that is done.
+pub fn risk() -> Option<Risk> {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        std::thread::spawn(refresh_risk);
+    });
+    risk_cell().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[cfg(test)]
@@ -270,6 +335,18 @@ mod tests {
         // A slower card gets 80% of its top clock.
         let slow = Card { max_clock: 1500, default_watts: 120, min_watts: 60, limit_watts: 120, name: "x".into() };
         assert_eq!(caps_for(&slow), Caps { clock_mhz: 1200, watts: 75 });
+    }
+
+    #[test]
+    fn a_pc_that_lost_power_is_at_risk_until_protection_is_on() {
+        let card = rtx3080(224);
+        let st = |on: bool| Status { card: Some(card.clone()), on, caps: Some(caps_for(&card)) };
+        assert_eq!(risk_of(&st(false), 13), Some(Risk { card: card.name.clone(), losses: 13, caps: Caps { clock_mhz: 1600, watts: 200 } }));
+        assert_eq!(risk_of(&st(false), 0), None, "never lost power");
+        assert_eq!(risk_of(&st(true), 13), None, "already protected");
+        assert_eq!(risk_of(&Status { card: None, on: false, caps: None }, 13), None, "no NVIDIA card");
+        assert_eq!(count_events("<Event xmlns='x'><System/></Event><Event xmlns='x'><EventData/></Event>"), 2);
+        assert_eq!(count_events(""), 0);
     }
 
     #[test]

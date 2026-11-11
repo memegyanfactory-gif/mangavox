@@ -108,6 +108,27 @@ pub fn retry_at(msg: &str, now: DateTime<Local>) -> Option<i64> {
         };
         return Some(now.timestamp() + secs.ceil() as i64);
     }
+    // A weekly limit names the day: "resets Nov 13, 1:30am" (midnight when it names no time).
+    static ON: OnceLock<Regex> = OnceLock::new();
+    let on = ON.get_or_init(|| {
+        Regex::new(r"(?i)resets?\s+(?:at\s+|on\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:(?:,|\s+at)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?").unwrap()
+    });
+    if let Some(c) = on.captures(msg) {
+        use chrono::Datelike as _;
+        let month = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].iter().position(|m| *m == c[1].to_lowercase())? as u32 + 1;
+        let day: u32 = c[2].parse().ok()?;
+        let mut h: u32 = c.get(3).map_or(Some(0), |x| x.as_str().parse().ok())?;
+        let m: u32 = c.get(4).map_or(Some(0), |x| x.as_str().parse().ok())?;
+        match c.get(5).map(|x| x.as_str().to_lowercase()).as_deref() {
+            Some("pm") if h < 12 => h += 12,
+            Some("am") if h == 12 => h = 0,
+            _ => {}
+        }
+        // The day is the next one with that date: this year, or next year once it has passed.
+        let when = |year: i32| chrono::NaiveDate::from_ymd_opt(year, month, day).and_then(|d| d.and_hms_opt(h, m, 0));
+        let t = when(now.year()).filter(|t| *t > now.naive_local()).or_else(|| when(now.year() + 1))?;
+        return Local.from_local_datetime(&t).earliest().map(|t| t.timestamp());
+    }
     let at = AT.get_or_init(|| Regex::new(r"(?i)resets?\s+(?:at\s+|on\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?").unwrap());
     let c = at.captures(msg)?;
     let mut h: u32 = c[1].parse().ok()?;
@@ -170,6 +191,12 @@ mod tests {
         assert_eq!(retry_at("Rate limited. Try again in 2 minutes", now), Some(now.timestamp() + 120));
         assert_eq!(retry_at("usage limit reached|1793390400", now), Some(1_793_390_400));
         assert_eq!(retry_at("429 Too Many Requests", now), None);
+        // A weekly limit names the day (now is Oct 31, 23:10).
+        let day = |mo: u32, d: u32, h: u32, m: u32| Local.from_local_datetime(&chrono::NaiveDate::from_ymd_opt(2026, mo, d).unwrap().and_hms_opt(h, m, 0).unwrap()).unwrap().timestamp();
+        assert_eq!(retry_at("You've hit your weekly limit · resets Nov 13, 1:30am (Asia/Kolkata)", now), Some(day(11, 13, 1, 30)));
+        assert_eq!(retry_at("weekly limit reached · resets Nov 2 at 9pm", now), Some(day(11, 2, 21, 0)));
+        assert_eq!(retry_at("limit · resets December 1", now), Some(day(12, 1, 0, 0)));
+        assert!(retry_at("limit · resets Jan 3, 8am", now).is_some_and(|t| t > day(12, 31, 0, 0)), "next year");
     }
 
     #[test]

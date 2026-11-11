@@ -25,6 +25,8 @@ pub(crate) enum Fix {
     /// The AI steps need a model: open the chapter's Read step, where the model button is.
     PickModel { chapter: Option<String> },
     ResumeQueue,
+    /// Turn on power supply protection (`mv_core::gpu_guard`); Windows asks for permission.
+    ProtectPower,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,6 +149,33 @@ pub(crate) struct Inputs<'a> {
     /// Chapters the user pressed a fix for: while Generate works on them they show as being
     /// fixed, even when the fixed issue itself is gone (a retried chapter is no longer failed).
     pub fixing: &'a [String],
+    /// The PC lost power lately and power supply protection is off (`gpu_guard::risk`).
+    pub power: Option<&'a mv_core::gpu_guard::Risk>,
+}
+
+/// The PC keeps switching itself off and protection is off: said before anything else, since the
+/// next render or voicing can switch it off again.
+fn power_issue(r: &mv_core::gpu_guard::Risk) -> Issue {
+    Issue {
+        // Another power loss brings a dismissed warning back.
+        key: format!("power-risk-{}", r.losses),
+        kind: AlertKind::Warning,
+        chapter: None,
+        step: None,
+        title: format!(
+            "This PC switched itself off {} time{} in the last {} days, and power supply protection is off. Renders and voicing can switch it off again.",
+            r.losses,
+            crate::page::plural(r.losses as usize),
+            mv_core::gpu_guard::LOSS_DAYS
+        ),
+        detail: Some(format!(
+            "Turning it on caps the {} at {} MHz and {} W, now and after every restart, so its split-second power spikes stay small enough for the power supply. Windows asks for permission once. Renders and voicing get about 15-25% slower. It can be turned off in Settings, System.",
+            r.card, r.caps.clock_mhz, r.caps.watts
+        )),
+        actions: vec![act("Turn on protection", Fix::ProtectPower)],
+        queue_item: None,
+        fixing: None,
+    }
 }
 
 /// Every issue, worst first.
@@ -155,6 +184,10 @@ pub(crate) fn collect(i: &Inputs) -> Vec<Issue> {
     let label = |id: &str| i.names.get(id).map(|n| n.label.clone()).unwrap_or_else(|| "A chapter".into());
     // Another upload of the chapter before it: left out of the recap on purpose, never an issue.
     let same = |id: &str| i.statuses.get(id).is_some_and(|s| s.same_as.is_some());
+
+    if let Some(r) = i.power {
+        out.push(power_issue(r));
+    }
 
     // Setup problems block every chapter, so they come first.
     if let Some((runnable, ffmpeg, voice)) = &i.setup {
@@ -503,7 +536,7 @@ mod tests {
         let statuses = HashMap::new();
         let names = names();
         let q = Queue::default();
-        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[] });
+        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[], power: None });
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "Chapter 4 video failed: it has no narration audio.");
         assert_eq!(issues[0].actions.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(), vec!["Generate audio", "Retry video", "Open Video"]);
@@ -520,7 +553,7 @@ mod tests {
         let id = q.items[0].id;
         // Fix it was pressed: the failure turns into a progress row (it used to just vanish).
         let fixing = vec!["c4".to_string()];
-        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &fixing });
+        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &fixing, power: None });
         assert_eq!(issues.len(), 1);
         assert_eq!((issues[0].title.as_str(), issues[0].fixing, issues[0].actions.len()), ("Chapter 4: being fixed", Some(id), 0));
 
@@ -528,12 +561,12 @@ mod tests {
         let mut statuses = HashMap::new();
         statuses.insert("c4".to_string(), PhaseStatus { read_pages: 5, total_pages: 5, story: false, ..Default::default() });
         let targets = vec!["c4".to_string()];
-        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Audio), fixing: &[] });
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Audio), fixing: &[], power: None });
         assert_eq!(issues.iter().map(|i| i.fixing).collect::<Vec<_>>(), vec![Some(id)]);
 
         // Once it is done, nothing is left.
         q.items[0].state = ItemState::Done;
-        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &fixing });
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &fixing, power: None });
         assert!(issues.is_empty());
     }
 
@@ -542,7 +575,7 @@ mod tests {
         let mut statuses = HashMap::new();
         statuses.insert("c4".to_string(), PhaseStatus { read_pages: 5, total_pages: 5, story: true, audio_files: 5, ai_error: Some(Step::Read), ..Default::default() });
         let (names, q) = (names(), Queue::default());
-        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[] });
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[], power: None });
         assert_eq!(issues.len(), 1);
         assert!(issues[0].title.starts_with("Chapter 4: its reading holds an AI provider message"), "{}", issues[0].title);
         assert_eq!(issues[0].actions[0].fix, Fix::Make { chapters: vec!["c4".into()], until: Step::Audio, force: Some(Step::Read) });
@@ -555,7 +588,7 @@ mod tests {
         // Newest first: the render succeeded after it failed.
         let jobs = vec![job(3, "c4", true, JobView::Done), job(2, "c4", true, JobView::Failed("boom".into()))];
         let (statuses, names, q) = (HashMap::new(), names(), Queue::default());
-        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[] });
+        let issues = collect(&Inputs { queue: &q, jobs: &jobs, run: None, statuses: &statuses, names: &names, setup: None, targets: &[], step: None, fixing: &[], power: None });
         assert!(issues.is_empty());
     }
 
@@ -566,11 +599,11 @@ mod tests {
         statuses.insert("c4".to_string(), PhaseStatus { read_pages: 5, total_pages: 5, story: false, ..Default::default() });
         let (names, q) = (names(), Queue::default());
         let targets = vec!["c3".to_string(), "c4".to_string()];
-        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Audio), fixing: &[] });
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Audio), fixing: &[], power: None });
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "Chapter 4 has no story yet, so it can't be narrated.");
         assert_eq!(issues[0].actions[0].label, "Write story");
-        let video = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Video), fixing: &[] });
+        let video = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: None, targets: &targets, step: Some(Step::Video), fixing: &[], power: None });
         assert_eq!(video.len(), 2);
         assert!(video.iter().all(|i| i.title.ends_with("has no narration audio.")));
     }
@@ -584,7 +617,7 @@ mod tests {
         q.items[0].current = Some(Step::Audio.index());
         q.items[0].error = Some("The narrator voice is not ready: Kokoro Heart".into());
         let (statuses, names) = (HashMap::new(), names());
-        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: Some((true, false, None)), targets: &[], step: None, fixing: &[] });
+        let issues = collect(&Inputs { queue: &q, jobs: &[], run: None, statuses: &statuses, names: &names, setup: Some((true, false, None)), targets: &[], step: None, fixing: &[], power: None });
         assert_eq!(issues[0].key, "setup-ffmpeg");
         assert_eq!(issues[1].title, "Chapter 3 audio failed: the narrator voice (Kokoro Heart) isn't downloaded or set up.");
         assert_eq!(issues[1].queue_item, Some(q.items[0].id));

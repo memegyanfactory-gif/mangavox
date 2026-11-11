@@ -33,7 +33,8 @@ pub struct ProviderUsage {
 
 const TTL: Duration = Duration::from_secs(60);
 
-type Cache = Mutex<HashMap<AiProviderId, (Instant, Option<ProviderUsage>)>>;
+/// Per provider: when it was read, the sign-in it was read for (`account::sign_in_stamp`) and the limits.
+type Cache = Mutex<HashMap<AiProviderId, (Instant, String, Option<ProviderUsage>)>>;
 fn cache() -> &'static Cache {
     static C: OnceLock<Cache> = OnceLock::new();
     C.get_or_init(Default::default)
@@ -61,13 +62,16 @@ pub fn session_totals(provider: AiProviderId) -> (u64, u64, u32) {
     totals().lock().unwrap().get(&provider).copied().unwrap_or_default()
 }
 
-/// Current limits for `provider` (cached 60 s). `None` when the provider has no limit data.
+/// Current limits for `provider` (cached 60 s, and read again at once after another sign-in, so
+/// the limits of the account that was signed in before are never shown). `None` when the provider
+/// has no limit data.
 pub async fn fetch(provider: AiProviderId) -> Option<ProviderUsage> {
     if !matches!(provider, AiProviderId::ClaudeCode | AiProviderId::Codex) {
         return None;
     }
-    if let Some((at, v)) = cache().lock().unwrap().get(&provider) {
-        if at.elapsed() < TTL {
+    let signed_in = crate::account::sign_in_stamp(provider);
+    if let Some((at, who, v)) = cache().lock().unwrap().get(&provider) {
+        if at.elapsed() < TTL && *who == signed_in {
             return v.clone();
         }
     }
@@ -75,7 +79,7 @@ pub async fn fetch(provider: AiProviderId) -> Option<ProviderUsage> {
         AiProviderId::ClaudeCode => fetch_claude().await,
         _ => fetch_codex().await,
     };
-    cache().lock().unwrap().insert(provider, (Instant::now(), v.clone()));
+    cache().lock().unwrap().insert(provider, (Instant::now(), signed_in, v.clone()));
     v
 }
 
@@ -255,7 +259,7 @@ fn window_label(mins: u64) -> String {
 pub fn stash_codex_rate_limits(rl: &Value) {
     let u = parse_codex_rate_limits(rl, now_secs());
     if !u.windows.is_empty() {
-        cache().lock().unwrap().insert(AiProviderId::Codex, (Instant::now(), Some(u)));
+        cache().lock().unwrap().insert(AiProviderId::Codex, (Instant::now(), crate::account::sign_in_stamp(AiProviderId::Codex), Some(u)));
     }
 }
 

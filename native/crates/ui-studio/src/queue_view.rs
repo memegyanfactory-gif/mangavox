@@ -165,6 +165,24 @@ impl StudioPage {
         groups.iter().flat_map(|g| g.chapters.iter()).filter(|c| ids.contains(&c.id)).cloned().collect()
     }
 
+    /// Turns on power supply protection off the UI thread (Windows asks for permission), then
+    /// says how it went. The warning leaves once it is on.
+    fn protect_power(&mut self, cx: &mut Context<Self>) {
+        toast::show(cx, Toast::info("Windows asks for permission to protect the power supply").icon(ph::SHIELD_CHECK));
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::blocking(mv_core::gpu_guard::turn_on).await.and_then(|r| r);
+            this.update(cx, |_, cx| {
+                match res {
+                    Ok(c) => toast::show(cx, Toast::success(format!("Power supply protection is on: {} MHz, {} W", c.clock_mhz, c.watts)).icon(ph::SHIELD_CHECK)),
+                    Err(e) => toast::show(cx, Toast::error(format!("{e:#}"))),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Runs an issue's fix.
     pub(crate) fn apply_fix(&mut self, fix: Fix, window: &mut Window, cx: &mut Context<Self>) {
         match fix {
@@ -225,6 +243,7 @@ impl StudioPage {
                 self.sync_pipeline(cx);
                 pipeline::resume_all();
             }
+            Fix::ProtectPower => self.protect_power(cx),
         }
         // Show the fix at once (tiles and issues read this copy of the queue; the poll would
         // only catch up a moment later).
@@ -279,6 +298,7 @@ impl StudioPage {
         });
         let editor = self.view == crate::page::View::Editor && self.focus.is_some();
         let targets: Vec<String> = if editor { self.targets().into_iter().map(|c| c.id).collect() } else { vec![] };
+        let power = mv_core::gpu_guard::risk();
         let inputs = crate::issues::Inputs {
             queue: &self.queue,
             jobs: &self.jobs,
@@ -289,6 +309,7 @@ impl StudioPage {
             targets: &targets,
             step: editor.then(|| self.phase.step()),
             fixing: &self.fixing,
+            power: power.as_ref(),
         };
         let mut out = crate::issues::collect(&inputs);
         out.retain(|i| !self.dismissed.contains(&i.key));

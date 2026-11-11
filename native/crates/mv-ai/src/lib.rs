@@ -4,6 +4,7 @@
 //! * [`ModelHub`] — Hugging Face search/detail, resumable GGUF downloads, local models, Ollama import.
 //! * Streaming deltas arrive through an [`Emit`] callback ([`StreamEvent`]).
 
+pub mod account;
 pub mod config;
 pub mod gguf;
 pub mod hub;
