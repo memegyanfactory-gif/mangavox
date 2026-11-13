@@ -6,6 +6,7 @@
 //!
 //! This crate is the engine (data, prompts, layout, lettering, PDF, video); `ui-creative` is the
 //! page, and it runs the image models through Studio's catalog.
+mod disk;
 mod letter;
 pub mod layout;
 pub mod pdf;
@@ -13,6 +14,7 @@ pub mod project;
 pub mod prompts;
 pub mod video;
 
+pub use disk::*;
 pub use project::*;
 
 use std::path::{Path, PathBuf};

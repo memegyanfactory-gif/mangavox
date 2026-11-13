@@ -74,6 +74,16 @@ fn outcome(v: &Value) -> Result<&str> {
     }
 }
 
+/// Why the page gave no answer, in words the user can act on: a check for a person whose window
+/// was closed before it was done is theirs to finish, anything else is said as it came.
+fn no_answer(e: &str) -> String {
+    if e.contains("closed by the user") {
+        "Magnific's website asked to confirm you are a person, and its window was closed before that was done. Press Continue and finish the check in the window that opens.".into()
+    } else {
+        format!("Magnific's website did not answer: {e}")
+    }
+}
+
 /// Makes one picture on Magnific's website and saves it as PNG at `out`.
 pub(crate) async fn generate(prompt: &str, refs: &[Reference], aspect: &str, out: &Path, on_status: impl Fn(&str)) -> Result<()> {
     let wall = browser()?;
@@ -92,7 +102,7 @@ pub(crate) async fn generate(prompt: &str, refs: &[Reference], aspect: &str, out
     on_status("On Magnific's website: typing the prompt and pressing Generate");
     let prompt = named(prompt, &refs.iter().take(small.len()).map(|r| r.caption.clone()).collect::<Vec<_>>());
     let js = script(&prompt, aspect, &small);
-    let answer = wall.eval_json_for(GENERATOR, &js, WAIT + Duration::from_secs(150)).await.map_err(|e| anyhow!("Magnific's website did not answer: {e}"))?;
+    let answer = wall.eval_json_for(GENERATOR, &js, WAIT + Duration::from_secs(150)).await.map_err(|e| anyhow!(no_answer(&e.to_string())))?;
     let data = match outcome(&answer) {
         Ok(d) => d.to_string(),
         Err(e) => {
@@ -143,5 +153,11 @@ mod tests {
         assert!(why(json!({ "ok": false, "need": "paid", "why": "Magnific does not show this picture as Unlimited (size 2K)" })).contains("not show this picture as Unlimited"));
         assert!(why(json!({ "ok": false, "need": "site", "why": "Magnific said: error" })).contains("could not make the picture"));
         assert!(why(json!({ "ok": true })).contains("no picture"));
+        // No answer at all: a closed check says what to do; anything else is passed on. Both
+        // name Magnific's website, which is what stops the run.
+        let closed = no_answer("wall solver: verification window closed by the user");
+        assert!(closed.contains("confirm you are a person") && closed.contains("Press Continue") && !closed.contains("wall solver"));
+        assert_eq!(no_answer("timed out"), "Magnific's website did not answer: timed out");
+        assert!(closed.starts_with("Magnific's website"));
     }
 }

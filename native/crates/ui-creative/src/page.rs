@@ -109,6 +109,19 @@ pub(crate) struct CreativePage {
     /// A page or sheet shown large.
     pub(crate) viewing: Option<PathBuf>,
     pub(crate) confirm_delete: bool,
+    /// A delete on the Video page waiting for its "Delete": the project it was asked for, what,
+    /// and the bytes and files it frees.
+    pub(crate) confirm_clear: Option<(String, crate::motion::ClearAsk, u64, usize)>,
+    /// What the open chapter and the whole project take on disk, as last measured, and the
+    /// (project, chapter, last change) a measure was last asked for.
+    pub(crate) disk: Option<crate::motion::DiskUse>,
+    pub(crate) disk_for: Option<(String, u32, u64)>,
+    /// The Video page's chapter cards scroll on their own; the (project, chapter, number of
+    /// cards, window width) the open chapter's card was last brought into view for.
+    pub(crate) chapters_scroll: ScrollHandle,
+    pub(crate) chapters_at: Option<(String, u32, usize, u32)>,
+    /// The window's width in whole pixels, as of the last repaint.
+    pub(crate) view_w: u32,
     pub(crate) ffmpeg: Option<bool>,
     pub(crate) chat_scroll: ScrollHandle,
     pub(crate) scroll: ScrollHandle,
@@ -175,6 +188,12 @@ impl CreativePage {
             chapter,
             viewing: None,
             confirm_delete: false,
+            confirm_clear: None,
+            disk: None,
+            disk_for: None,
+            chapters_scroll: ScrollHandle::new(),
+            chapters_at: None,
+            view_w: 0,
             ffmpeg: None,
             chat_scroll: ScrollHandle::new(),
             scroll: ScrollHandle::new(),
@@ -274,6 +293,7 @@ impl CreativePage {
                 self.p = Some(p);
                 self.error = None;
                 self.confirm_delete = false;
+                self.confirm_clear = None;
             }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
@@ -760,6 +780,7 @@ fn summary(p: &Project) -> String {
 impl Render for CreativePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inputs(window, cx);
+        self.view_w = f32::from(window.viewport_size().width) as u32;
         if !self.mode.tabs().iter().any(|(t, _)| *t == self.tab) {
             self.mode = Mode::ALL.into_iter().find(|m| m.tabs().iter().any(|(t, _)| *t == self.tab)).unwrap_or(Mode::Manga);
         }
