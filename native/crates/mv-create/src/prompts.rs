@@ -130,7 +130,7 @@ const SERIES_SHAPE: &str = r#"{
   "bible": {"logline": "", "genre": "", "tone": "", "themes": "", "twist": "the user's spin, stated plainly",
             "art_style": "a precise art direction for every image: line weight, inking, screentone use, how faces/eyes/hair are drawn, anatomy, backgrounds, lettering feel; name the influences (e.g. 'in the spirit of Boichi's Dr. Stone: crisp detailed linework, heavy dramatic shading')",
             "world": "setting, era, rules, the places scenes happen"},
-  "cast": [{"name": "", "role": "protagonist|deuteragonist|antagonist|supporting|minor", "age": "", "intro_chapter": 1,
+  "cast": [{"name": "", "role": "protagonist|deuteragonist|antagonist|main|supporting|minor", "age": "", "intro_chapter": 1,
             "personality": "", "appearance": "face shape, eyes, eyebrows, hair (style, length, colour/tone), skin tone, height, build, marks — what must never change",
             "outfits": [{"name": "default", "look": "every garment, colour/tone, shoes, accessories"}],
             "signature": "props, poses, tells"}],
@@ -145,8 +145,14 @@ pub fn series(p: &Project, brief: &str, inspiration_notes: &str) -> (String, Str
         "You create original manga series. {CRAFT}\n\nAnswer with ONE JSON object, no other text, in this shape:\n{SERIES_SHAPE}\n\nRules: the series is ORIGINAL (no copied names, characters or plot), but it should feel like its inspirations: same genre energy, art direction and storytelling rhythm. The user's own characters are the leads, exactly as they describe them. Plan a cast that can grow past 30 named characters over the run, each with a distinct silhouette and face, and spread their intro_chapter across chapters (2-3 new faces per chapter after the first). Outline at least 8 chapters. Appearance and outfit text must be concrete enough that an artist could draw the same person a hundred times."
     );
     let mut user = format!("The user's idea:\n{brief}\n");
+    let system = match &p.adapts {
+        Some(title) => format!(
+            "You adapt the user's own downloaded manga \"{title}\" into a live-action series for their private use. {CRAFT}\n\nAnswer with ONE JSON object, no other text, in this shape:\n{SERIES_SHAPE}\n\nRules: this is a FAITHFUL adaptation: keep the manga's own characters (their names, personalities and every trait of their look: hair, eyes, build, marks, outfits) and its story, chapter by chapter, from the notes below. Describe each appearance as a real human being would look with those traits (real hair, real skin, real clothes), concrete enough that a casting sheet could be shot of them. Sort the cast by how much of the story is theirs, using \"role\": the one or two characters the story is truly about are \"protagonist\" / \"deuteragonist\" (never more than two); up to about 19 main characters are \"antagonist\" or \"main\"; those who come back now and then are \"supporting\"; one-off faces are \"minor\" (list only the ones a scene needs). Order the cast leads first. bible.art_style describes the live-action look (lighting, lens, colour grade, production design), not a drawing style. Outline the chapters the notes cover."
+        ),
+        None => system,
+    };
     if !inspiration_notes.trim().is_empty() {
-        let _ = write!(user, "\nWhat we know of the inspiring manga (for feel only, do not copy):\n{inspiration_notes}\n");
+        let _ = write!(user, "\n{}:\n{inspiration_notes}\n", if p.adapts.is_some() { "What Studio read of the manga (its characters and story): adapt this" } else { "What we know of the inspiring manga (for feel only, do not copy)" });
     }
     if !p.cast.is_empty() {
         let _ = write!(user, "\nCharacters the user already added (keep them as leads):\n");
@@ -154,7 +160,7 @@ pub fn series(p: &Project, brief: &str, inspiration_notes: &str) -> (String, Str
             let _ = writeln!(user, "- {}: {} {}", c.name, c.appearance, c.personality);
         }
     }
-    let _ = write!(user, "\nChapters are about {} pages. {}", p.settings.pages_per_chapter, if p.settings.color { "Full colour." } else { "Black and white with screentone, like a printed weekly manga." });
+    let _ = write!(user, "\nChapters are about {} pages. {}", p.settings.pages_per_chapter, if p.settings.live_action { "Each page is a storyboard of film scenes: every panel is one live-action shot with its spoken lines and how it moves." } else if p.settings.color { "Full colour." } else { "Black and white with screentone, like a printed weekly manga." });
     (system, user)
 }
 
@@ -310,7 +316,9 @@ pub fn page_digest(pages: &[Page]) -> String {
 // ------------------------------------------------------------------ image prompts
 
 fn medium(p: &Project) -> &'static str {
-    if p.settings.color {
+    if p.settings.live_action {
+        "photorealistic live-action film still shot on a cinema camera: real human actors, natural skin texture and pores, real fabric, cinematic lighting, shallow depth of field, 35mm lens; NOT a drawing, NOT anime, NOT 3D render"
+    } else if p.settings.color {
         "full-colour manga art, cel shading"
     } else {
         "black-and-white Japanese manga art, clean ink lines, screentone shading, pure white paper, no colour"
@@ -331,6 +339,24 @@ fn look(c: &CastMember, outfit: &str) -> String {
 
 /// A character model sheet: the turnaround every page is drawn from.
 pub fn sheet(p: &Project, c: &CastMember, has_refs: bool) -> String {
+    if p.settings.live_action {
+        // A casting sheet: the same real person, whole body in every view. Leads get more views.
+        let extra = match c.tier() {
+            0 => " Bottom row: three large face close-ups of the same person (neutral, their signature expression, three-quarter angle) and a half-body shot.",
+            1 => " One large face close-up of the same person in the corner.",
+            _ => " One small face close-up in the corner.",
+        };
+        return format!(
+            "Photorealistic casting reference sheet of ONE real person playing \"{}\" in a live-action film, {}. Top row: the same person standing four times side by side on a plain light-grey studio background, FULL BODY from head to shoes in every view: front view, three-quarter view, side profile and back view, relaxed neutral standing pose, same height and proportions in each.{extra}\nThis person keeps the character's own traits exactly, turned into a believable real human: {}. Age {}; {}. Realistic hair in the character's style and colour, their real eye colour, build and marks, and the same outfit in every view. Even soft studio light, sharp focus, no scenery, no props except their signature items, no text except the name \"{}\" small at the top.{}",
+            c.name,
+            medium(p),
+            look(c, ""),
+            if c.age.is_empty() { "unknown" } else { &c.age },
+            c.personality,
+            c.name,
+            if has_refs { "\nThe attached images show the character as drawn: keep their face shape, hair, outfit and marks, but as a real person, not a drawing." } else { "" }
+        );
+    }
     format!(
         "Professional manga character model sheet for \"{}\". {}. Art direction: {}.\nShow the same character four times side by side on a plain white background: front view, three-quarter view, side profile and back view, full body head to toe, neutral standing pose, consistent proportions, plus a large head close-up in the corner. Character: {}. Age {}; {}.\nClean line art, consistent design in every view, no scenery, no text except the name \"{}\" small at the top.{}",
         c.name,
@@ -346,6 +372,14 @@ pub fn sheet(p: &Project, c: &CastMember, has_refs: bool) -> String {
 
 /// A 3×3 expression sheet, drawn after the model sheet (which is attached).
 pub fn expressions(p: &Project, c: &CastMember) -> String {
+    if p.settings.live_action {
+        return format!(
+            "Photorealistic expression sheet of the real person in the attached casting sheet, playing \"{}\": the identical face, eyes, hair and outfit collar. {}.\nA 3x3 grid of head-and-shoulders portraits on a plain light-grey background: neutral, happy laugh, angry shout, sad tears, shocked, determined, smug grin, embarrassed, scared. Each expression natural and readable, acted the way this person would ({}). Thin gaps between cells, no text.",
+            c.name,
+            medium(p),
+            c.personality
+        );
+    }
     format!(
         "Manga expression sheet for \"{}\", the same character as in the attached model sheet: identical face, eyes, hair and outfit collar. {}. Art direction: {}.\nA 3x3 grid of head-and-shoulders portraits on white: neutral, happy laugh, angry shout, sad tears, shocked, determined, smug grin, embarrassed blush, scared. Each expression strong and readable in that character's personality ({}). Thin grid lines between cells, no other text.",
         c.name,
@@ -419,6 +453,14 @@ pub fn page(p: &Project, chapter: u32, pg: &Page, refs: &[String]) -> String {
 
 /// One panel as its own image (laid out and lettered by the app).
 pub fn panel(p: &Project, panel: &Panel, aspect: &str, refs: &[String]) -> String {
+    if p.settings.live_action {
+        // The first frame of the scene's clip: a film still, nothing drawn or written on it.
+        let mut s = format!("One frame of a live-action film, {aspect} frame, {}.\n{}\nNo text, no captions, no speech balloons, no panel border, no watermark. Mouths closed or just about to speak.", medium(p), panel_text(p, panel, false));
+        if !refs.is_empty() {
+            let _ = write!(s, "\nReference images: {}. Every person must be the same real person as in their casting sheet (face, hair, build, outfit).", refs.join("; "));
+        }
+        return s;
+    }
     let mut s = format!("One manga panel, {aspect} frame, {}. Art direction: {}.\n{}\nNo panel border, no speech balloons, no text (lettering is added later); leave some calm space near the top for balloons.", medium(p), p.bible.art_style, panel_text(p, panel, false));
     if !panel.sfx.is_empty() {
         let _ = write!(s, " Hand-drawn sound effect lettering is fine: {}.", panel.sfx);
@@ -431,8 +473,41 @@ pub fn panel(p: &Project, panel: &Panel, aspect: &str, refs: &[String]) -> Strin
 
 /// What the video model is asked for one panel.
 pub fn motion(p: &Project, panel: &Panel) -> String {
+    if p.settings.live_action {
+        return scene(panel);
+    }
     let m = if panel.motion.trim().is_empty() { "subtle camera push-in, characters breathe and blink, hair and clothes move slightly" } else { panel.motion.trim() };
-    format!("Animate this manga panel as anime: {m}. Keep the exact art style, character designs and composition of the image. {} No new characters, no text overlays.", if p.settings.color { "" } else { "Keep it black and white with screentone." })
+    let notes = if panel.notes.trim().is_empty() { String::new() } else { format!(" Director's notes, follow them: {}", panel.notes.trim()) };
+    format!("Animate this manga panel as anime: {m}. Keep the exact art style, character designs and composition of the image. {} No new characters, no text overlays.{notes}", if p.settings.color { "" } else { "Keep it black and white with screentone." })
+}
+
+/// A live-action scene for the video model: what happens over time, what is seen, and what is
+/// heard (the spoken lines, so the mouths move with the voice), then the user's notes.
+fn scene(panel: &Panel) -> String {
+    let m = if panel.motion.trim().is_empty() { "natural small movements, the camera slowly pushes in" } else { panel.motion.trim() };
+    let mut s = format!("A live-action film scene, photorealistic, real actors. {} shot, {}. {} Action: {m}.", panel.shot, panel.camera, panel.description);
+    let spoken = spoken_lines(panel);
+    if spoken.is_empty() {
+        s.push_str(" Nobody speaks; only the natural sounds of the place.");
+    } else {
+        for (who, text) in &spoken {
+            if who.is_empty() || who.eq_ignore_ascii_case("narrator") || who.eq_ignore_ascii_case("narration") {
+                let _ = write!(s, " A narrator says off screen: \"{text}\" (nobody on screen moves their lips for it).");
+            } else {
+                let _ = write!(s, " {who} says, lips in sync with the voice: \"{text}\"");
+            }
+        }
+    }
+    s.push_str(" Keep every person exactly as in the first frame: same face, hair and outfit. No text, no subtitles, no new characters.");
+    if !panel.notes.trim().is_empty() {
+        let _ = write!(s, " Director's notes, follow them: {}", panel.notes.trim());
+    }
+    s
+}
+
+/// The lines of a scene that are heard, in order: who says them and the words.
+pub fn spoken_lines(panel: &Panel) -> Vec<(String, String)> {
+    panel.lines.iter().filter(|l| !l.text.trim().is_empty()).map(|l| (l.speaker.trim().to_string(), l.text.trim().to_string())).collect()
 }
 
 #[cfg(test)]

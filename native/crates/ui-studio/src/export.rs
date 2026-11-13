@@ -344,13 +344,33 @@ pub(crate) struct Reporter {
 }
 
 impl Reporter {
-    fn set(&self, p: f32, label: &str) {
+    /// A reporter of its own (no export job behind it: the Hook page), stopped by `cancel`.
+    pub(crate) fn standalone(cancel: Arc<AtomicBool>) -> Reporter {
+        Reporter { state: Default::default(), cancel, turn: Default::default() }
+    }
+
+    /// Shows it in Activity (with Cancel) until it is dropped.
+    pub(crate) fn track(&self, manga_id: &str, title: &str) {
+        crate::pipeline::track_export(manga_id, title, &self.state, &self.cancel);
+    }
+
+    /// What it says now, and how far along it is.
+    pub(crate) fn now(&self) -> (f32, String) {
+        self.state.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Asks the work it reports on to stop.
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set(&self, p: f32, label: &str) {
         if let Ok(mut s) = self.state.lock() {
             *s = (p.clamp(0., 1.), label.to_string());
         }
     }
 
-    fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 
@@ -1414,6 +1434,16 @@ fn join_opening(hook: &Path, hook_sound: Sound, intro: &Path, w: u32, h: u32, ou
     finish(&tmp, out)
 }
 
+/// The Hook page's video: `hook` (as `hook_maker.py` rendered it) and then the character `intro`
+/// (its cast cards and the ribbon transition), at the intro's size, saved at `out`. The hook's
+/// music is at the level set for exports. Returns its length. Blocking.
+pub(crate) fn hook_then_intro(hook: &Path, intro: &Path, out: &Path, r: &Reporter) -> Result<f64> {
+    let (hp, ip) = (probe(hook)?, probe(intro)?);
+    let sound = Sound::of(music_level(true), hp.solo(), true);
+    join_opening(hook, sound, intro, ip.size.0, ip.size.1, out, r)?;
+    Ok(hp.duration + ip.duration)
+}
+
 /// How much shorter than the picture an export's sound may be (encoder padding and rounding).
 const SOUND_SLACK: f64 = 1.0;
 
@@ -2052,6 +2082,27 @@ pub(crate) async fn export_joined(j: Joined, hook: Option<HookJob>, intro: Optio
         h.chapters.retain(|c| j.files.contains(&c.output_dir.join(crate::data::VIDEO_FILE)));
         h
     });
+    // The hook made on the Hook page for these chapters, when there is one: the export plays it
+    // as it is (the one written, judged and picked there) instead of writing another.
+    let made_there = match &hook {
+        Some(h) => {
+            let (id, ids) = (h.manga_id.clone(), h.chapters.iter().map(|c| c.id.clone()).collect::<Vec<_>>());
+            mv_ui::bg::blocking(move || crate::hook_page::ready_hook(&id, &ids)).await.ok().flatten()
+        }
+        None => None,
+    };
+    let hook = match made_there {
+        Some(path) => {
+            hook_note.push_str(" · with the hook made on the Hook page");
+            if let Some((to, secs)) = keep_at.clone() {
+                let (hook, joined) = (path.clone(), j.path.clone());
+                let _ = mv_ui::bg::blocking(move || keep_hook(&to, &hook, &joined, secs)).await;
+            }
+            hook_path = Some(path);
+            None
+        }
+        None => hook,
+    };
     let res = match hook {
         Some(job) => match make_hook(job, &j, &r, &ex).await {
             Ok((path, why)) => {
@@ -2795,18 +2846,27 @@ impl StudioPage {
                 }))
         };
         let small = |t: String| div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(t);
-        // The hook's switch lives in the Video style panel: collapsed, the row still says it is on.
-        let hook_chip = (!self.style.prefs.open && mode == Mode::Whole && prefs.hook).then(|| {
-            btn("vid-hook", format!("Hook {} s", prefs.hook_secs), ButtonKind::Ghost)
-                .small()
-                .icon(ph::LIGHTNING)
-                .tooltip("A cold open of the most jaw-dropping scene plays before chapter 1. Open the Video style panel to change or turn it off")
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.style.prefs.open = true;
-                    this.style.prefs.seen = true;
-                    this.style.prefs.save();
+        // The hook and the intro, right on the card (also in the Video style panel): one video
+        // opens with the hook, then the cast cards and the ribbon transition into chapter 1.
+        let hook_switches = (mode == Mode::Whole).then(|| {
+            let label = |id: &'static str, text: &'static str, why: &'static str| div().id(id).tooltip(tip(why)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(text);
+            div()
+                .flex()
+                .items_center()
+                .gap(px(space::XS))
+                .child(switch("vid-hook", prefs.hook).on_click(cx.listener(|this, on: &bool, _, cx| {
+                    this.export_prefs.hook = *on;
+                    this.save_export_prefs();
                     cx.notify();
-                }))
+                })))
+                .child(label("vid-hook-label", "Hook", "A cold open before chapter 1, like the top recap channels. The hook made on the Hook page plays when there is one for these chapters; else the export writes one of the length set in the Video style panel."))
+                .child(div().w(px(space::XS)))
+                .child(switch("vid-intro", prefs.intro).on_click(cx.listener(|this, on: &bool, _, cx| {
+                    this.export_prefs.intro = *on;
+                    this.save_export_prefs();
+                    cx.notify();
+                })))
+                .child(label("vid-intro-label", "Intro", "After the hook: the main characters on cinematic cards, then the Netflix-style ribbon transition into chapter 1."))
         });
 
         let note = match mode {
@@ -2844,7 +2904,7 @@ impl StudioPage {
                             text
                         }
                     })))
-                    .children(hook_chip)
+                    .children(hook_switches)
                     .child(preview)
                     .child(play)
                     .child(

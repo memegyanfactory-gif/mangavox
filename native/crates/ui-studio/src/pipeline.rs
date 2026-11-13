@@ -1382,6 +1382,13 @@ pub(crate) fn track_export(manga_id: &str, manga_title: &str, state: &Arc<Mutex<
     g.push(Tracked { id, manga_id: manga_id.to_string(), manga_title: manga_title.to_string(), state: Arc::downgrade(state), cancel: Arc::downgrade(cancel) });
 }
 
+/// Shows long work of another page (Creative's painting and video queue) in Activity, like an
+/// export: `state` is how far along it is and what it is doing, `cancel` is set when the user
+/// presses Cancel on its card. The card goes when `state` is dropped.
+pub fn track_activity(id: &str, title: &str, state: &Arc<Mutex<(f32, String)>>, cancel: &Arc<AtomicBool>) {
+    track_export(id, title, state, cancel);
+}
+
 /// Exports and joins running now, then the ones waiting their turn.
 pub fn exports() -> Vec<ExportActivity> {
     let mut g = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());

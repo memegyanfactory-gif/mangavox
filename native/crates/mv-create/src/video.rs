@@ -18,6 +18,9 @@ pub enum VideoVia {
     /// FFmpeg pan and zoom.
     Local,
     ComfyUi,
+    /// The LTX 2.3 image + audio workflow built in here, on a local ComfyUI: the clip is made
+    /// from the panel and the voice of its lines, and comes back with that sound.
+    ComfyLtx,
     Magnific,
     /// A service id from `mv_ai::SERVICES`.
     Service(&'static str),
@@ -36,11 +39,15 @@ pub struct VideoModel {
     pub note: &'static str,
 }
 
+/// The id of the LTX 2.3 image + audio model.
+pub const LTX_VOICE: &str = "ltx23-ia2v";
+
 const MG_API: &str = "https://api.magnific.com/v1/ai/";
 
 pub static VIDEO_MODELS: &[VideoModel] = &[
     VideoModel { id: "local-motion", name: "Pan & zoom (FFmpeg, on this PC)", via: VideoVia::Local, path: "", poll: "", seconds: &[3, 4, 5, 6, 8], note: "Free and offline: moves the camera over each panel." },
     VideoModel { id: "comfyui", name: "ComfyUI workflow (local model)", via: VideoVia::ComfyUi, path: "", poll: "", seconds: &[3, 4, 5, 6, 8, 10], note: "Your own image-to-video workflow (Wan, LTX, Hunyuan…) on a local ComfyUI." },
+    VideoModel { id: LTX_VOICE, name: "LTX 2.3 with voice (ComfyUI, on this PC)", via: VideoVia::ComfyLtx, path: "", poll: "", seconds: &[3, 4, 5, 6, 8, 9, 10], note: "Each scene is voiced, then LTX 2.3 in your ComfyUI films it from the picture and that voice. Needs ComfyUI open with the LTX 2.3 models." },
     VideoModel { id: "mg-kling-3-turbo-1080p", name: "Kling 3.0 Turbo 1080p · Magnific", via: VideoVia::Magnific, path: "image-to-video/kling-v3-turbo-1080p", poll: "image-to-video/kling-v3-turbo", seconds: &[3, 5, 8, 10, 15], note: "Fast, keeps the panel's shape." },
     VideoModel { id: "mg-kling-3-turbo-720p", name: "Kling 3.0 Turbo 720p · Magnific", via: VideoVia::Magnific, path: "image-to-video/kling-v3-turbo-720p", poll: "image-to-video/kling-v3-turbo", seconds: &[3, 5, 8, 10, 15], note: "Cheaper Kling Turbo." },
     VideoModel { id: "mg-kling-2-6-pro", name: "Kling 2.6 Pro · Magnific", via: VideoVia::Magnific, path: "image-to-video/kling-v2-6-pro", poll: "image-to-video/kling-v2-6", seconds: &[5, 10], note: "16:9, 9:16 or 1:1." },
@@ -59,7 +66,7 @@ impl VideoModel {
     }
 
     pub fn is_local(&self) -> bool {
-        matches!(self.via, VideoVia::Local | VideoVia::ComfyUi)
+        matches!(self.via, VideoVia::Local | VideoVia::ComfyUi | VideoVia::ComfyLtx)
     }
 }
 
@@ -131,10 +138,24 @@ pub fn stitch(clips: &[PathBuf], aspect: &str, music: Option<&Path>, work: &Path
     let (w, h) = frame(aspect);
     std::fs::create_dir_all(work)?;
     let mut list = String::new();
+    // Clips with their own sound (voiced scenes) keep it; the silent ones among them get silence,
+    // so every part joins without re-encoding.
+    let sound: Vec<bool> = clips.iter().map(|c| has_audio(c)).collect();
+    let any_sound = sound.iter().any(|s| *s);
     for (i, c) in clips.iter().enumerate() {
         let norm = work.join(format!("n{i:04}.mp4"));
         let mut cmd = ffmpeg();
-        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(c).args(["-filter_complex", &format!("{},fps=30,format=yuv420p", fill_filter(w, h)), "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-an"]).arg(&norm);
+        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(c);
+        if any_sound && !sound[i] {
+            cmd.args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]);
+        }
+        cmd.args(["-filter_complex", &format!("{},fps=30,format=yuv420p[v]", fill_filter(w, h)), "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]);
+        if any_sound {
+            cmd.args(["-map", if sound[i] { "0:a:0" } else { "1:a:0" }, "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest"]);
+        } else {
+            cmd.arg("-an");
+        }
+        cmd.arg(&norm);
         run(cmd, &format!("clip {}", i + 1))?;
         list.push_str(&format!("file '{}'\n", norm.to_string_lossy().replace('\\', "/").replace('\'', "'\\''")));
     }
@@ -145,7 +166,8 @@ pub fn stitch(clips: &[PathBuf], aspect: &str, music: Option<&Path>, work: &Path
     }
     let mut cmd = ffmpeg();
     cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i"]).arg(&list_file);
-    match music {
+    // Voiced clips keep their own sound: music under them is not mixed here.
+    match music.filter(|_| !any_sound) {
         Some(m) => {
             cmd.args(["-stream_loop", "-1", "-i"]).arg(m).args(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-af", "afade=t=in:d=1"]);
         }
@@ -155,6 +177,54 @@ pub fn stitch(clips: &[PathBuf], aspect: &str, music: Option<&Path>, work: &Path
     }
     cmd.args(["-movflags", "+faststart"]).arg(out);
     run(cmd, "the chapter video")
+}
+
+/// `file` has a sound track.
+pub fn has_audio(file: &Path) -> bool {
+    // FFmpeg lists the streams (on stderr) and then stops for want of an output: that is enough.
+    ffmpeg().args(["-hide_banner", "-i"]).arg(file).stdin(std::process::Stdio::null()).output().is_ok_and(|o| String::from_utf8_lossy(&o.stderr).lines().any(|l| l.contains("Stream #") && l.contains("Audio:")))
+}
+
+/// Seconds of sound or picture in `file`, when FFmpeg can tell.
+pub fn media_seconds(file: &Path) -> Option<f64> {
+    let out = ffmpeg().args(["-hide_banner", "-i"]).arg(file).stdin(std::process::Stdio::null()).output().ok()?;
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let t = err.split("Duration: ").nth(1)?.split(',').next()?.trim().to_string();
+    let mut parts = t.split(':');
+    let (h, m, s) = (parts.next()?.parse::<f64>().ok()?, parts.next()?.parse::<f64>().ok()?, parts.next()?.parse::<f64>().ok()?);
+    Some(h * 3600. + m * 60. + s)
+}
+
+/// `seconds` of silence as a WAV at `out` (a scene nobody speaks in still needs a sound track).
+pub fn silence(seconds: f64, out: &Path) -> Result<()> {
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut cmd = ffmpeg();
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", &format!("{seconds:.2}")]).arg(out);
+    run(cmd, "the silent track")
+}
+
+/// `parts` (voice lines in order) joined into one WAV at `out`, with a short breath after each.
+pub fn join_voice(parts: &[PathBuf], out: &Path) -> Result<()> {
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut cmd = ffmpeg();
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+    for p in parts {
+        cmd.arg("-i").arg(p);
+    }
+    let mut graph = String::new();
+    for i in 0..parts.len() {
+        graph.push_str(&format!("[{i}:a]aresample=48000,aformat=channel_layouts=stereo,apad=pad_dur=0.25[a{i}];"));
+    }
+    for i in 0..parts.len() {
+        graph.push_str(&format!("[a{i}]"));
+    }
+    graph.push_str(&format!("concat=n={}:v=0:a=1[out]", parts.len()));
+    cmd.args(["-filter_complex", &graph, "-map", "[out]"]).arg(out);
+    run(cmd, "the scene's voice")
 }
 
 // ------------------------------------------------------------------ API models
@@ -330,10 +400,7 @@ fn comfy_output(history: &Value) -> Option<(String, String, String)> {
 
 /// Runs the user's ComfyUI workflow on `image` and saves the video at `out`.
 pub async fn comfy_clip(base: &str, workflow_file: &Path, image: &Path, prompt: &str, seconds: u32, out: &Path, on_status: impl Fn(&str)) -> Result<()> {
-    let base = base.trim().trim_end_matches('/');
-    if !(base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost") || base.starts_with("http://[::1]") || base.starts_with("http://192.168.") || base.starts_with("http://10.")) {
-        bail!("ComfyUI should be on this PC or your local network (e.g. http://127.0.0.1:8188)");
-    }
+    let base = local_comfy(base)?;
     let workflow = tokio::fs::read_to_string(workflow_file).await.with_context(|| format!("could not read the workflow {}", workflow_file.display()))?;
     let http = client()?;
     on_status("Uploading");
@@ -343,14 +410,73 @@ pub async fn comfy_clip(base: &str, workflow_file: &Path, image: &Path, prompt: 
     let up: Value = http.post(format!("{base}/upload/image")).multipart(form).send().await.context("could not reach ComfyUI; is it running?")?.error_for_status()?.json().await?;
     let uploaded = up.get("name").and_then(Value::as_str).unwrap_or(&name).to_string();
     let graph = fill_workflow(&workflow, &uploaded, prompt, seconds)?;
+    comfy_run(&http, base, graph, out, false, 1200, on_status).await
+}
+
+/// The built-in LTX 2.3 image + audio workflow (as ComfyUI's own template runs it), filled in:
+/// the uploaded picture and voice, what happens, the length, the frame and a seed.
+pub fn ltx_graph(image_name: &str, audio_name: &str, prompt: &str, seconds: f64, aspect: &str, seed: u64) -> Result<Value> {
+    let mut g: Value = serde_json::from_str(include_str!("ltx23_ia2v.json")).context("the built-in LTX workflow is damaged")?;
+    let (w, h) = if aspect == "9:16" { (720, 1280) } else { (1280, 720) };
+    let mut put = |node: &str, key: &str, v: Value| -> Result<()> {
+        *g.get_mut(node).and_then(|n| n.get_mut("inputs")).and_then(|i| i.get_mut(key)).ok_or_else(|| anyhow!("the built-in LTX workflow has no {node}.{key}"))? = v;
+        Ok(())
+    };
+    put("269", "image", json!(image_name))?;
+    put("276", "audio", json!(audio_name))?;
+    put("340:319", "value", json!(prompt))?;
+    put("340:331", "value", json!((seconds.clamp(1., 20.) * 10.).round() / 10.))?;
+    put("340:330", "value", json!(w))?;
+    put("340:324", "value", json!(h))?;
+    put("340:286", "noise_seed", json!(seed))?;
+    Ok(g)
+}
+
+async fn comfy_upload(http: &reqwest::Client, base: &str, file: &Path, mime: &str) -> Result<String> {
+    let bytes = tokio::fs::read(file).await.with_context(|| format!("could not read {}", file.display()))?;
+    // A name of its own, so two scenes never overwrite each other's upload.
+    let name = format!("mangavox-{}-{}", crate::now(), file.file_name().and_then(|n| n.to_str()).unwrap_or("file"));
+    let form = reqwest::multipart::Form::new().part("image", reqwest::multipart::Part::bytes(bytes).file_name(name.clone()).mime_str(mime)?).text("overwrite", "true");
+    let up: Value = http.post(format!("{base}/upload/image")).multipart(form).send().await.context("could not reach ComfyUI; open ComfyUI first")?.error_for_status()?.json().await?;
+    Ok(up.get("name").and_then(Value::as_str).unwrap_or(&name).to_string())
+}
+
+fn local_comfy(base: &str) -> Result<&str> {
+    let base = base.trim().trim_end_matches('/');
+    if !(base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost") || base.starts_with("http://[::1]") || base.starts_with("http://192.168.") || base.starts_with("http://10.")) {
+        bail!("ComfyUI should be on this PC or your local network (e.g. http://127.0.0.1:8188)");
+    }
+    Ok(base)
+}
+
+/// Films one scene with LTX 2.3 on the local ComfyUI: `image` is its first frame, `audio` its
+/// voice (kept as the clip's sound; the mouths follow it), `prompt` what happens. Saved with its
+/// sound as MP4 at `out`. It waits its turn behind whatever ComfyUI is already making.
+pub async fn ltx_clip(base: &str, image: &Path, audio: &Path, prompt: &str, seconds: f64, aspect: &str, out: &Path, on_status: impl Fn(&str)) -> Result<()> {
+    let base = local_comfy(base)?;
+    let http = client()?;
+    on_status("Uploading the picture and the voice");
+    let img = comfy_upload(&http, base, image, "image/png").await?;
+    let snd = comfy_upload(&http, base, audio, "audio/wav").await?;
+    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| (d.as_nanos() % 1_000_000_000_000) as u64).unwrap_or(7);
+    let graph = ltx_graph(&img, &snd, prompt, seconds, aspect, seed)?;
+    // A long clip on a 10 GB card takes a good while, more so behind another job.
+    comfy_run(&http, base, graph, out, true, 2400, on_status).await
+}
+
+/// Queues `graph` on ComfyUI, waits for its video and saves it at `out` (with its sound when
+/// `keep_sound`).
+async fn comfy_run(http: &reqwest::Client, base: &str, graph: Value, out: &Path, keep_sound: bool, polls: u32, on_status: impl Fn(&str)) -> Result<()> {
     on_status("Queued");
-    let q: Value = http.post(format!("{base}/prompt")).json(&json!({ "prompt": graph, "client_id": "mangavox-creative" })).send().await?.json().await?;
+    let q: Value = http.post(format!("{base}/prompt")).json(&json!({ "prompt": graph, "client_id": "mangavox-creative" })).send().await.context("could not reach ComfyUI; open ComfyUI first")?.json().await?;
     if let Some(e) = q.get("error") {
-        bail!("ComfyUI refused the workflow: {}", e.get("message").and_then(Value::as_str).unwrap_or("invalid prompt"));
+        // The first node it could not take says what is missing (a model file, most often).
+        let why = q.get("node_errors").and_then(Value::as_object).and_then(|n| n.values().next()).and_then(|n| n.pointer("/errors/0/details")).and_then(Value::as_str).unwrap_or("");
+        bail!("ComfyUI refused the workflow: {}{}", e.get("message").and_then(Value::as_str).unwrap_or("invalid prompt"), if why.is_empty() { String::new() } else { format!(" ({why})") });
     }
     let id = q.get("prompt_id").and_then(Value::as_str).ok_or_else(|| anyhow!("ComfyUI did not queue the workflow"))?.to_string();
     on_status("Animating");
-    for _ in 0..1200 {
+    for _ in 0..polls {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let Ok(r) = http.get(format!("{base}/history/{id}")).send().await else { continue };
         let h: Value = r.json().await.unwrap_or(Value::Null);
@@ -370,7 +496,13 @@ pub async fn comfy_clip(base: &str, workflow_file: &Path, image: &Path, prompt: 
             tokio::fs::write(&target, &data).await?;
             if target != out {
                 let mut cmd = ffmpeg();
-                cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(&target).args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-an"]).arg(out);
+                cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(&target).args(["-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+                if keep_sound {
+                    cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+                } else {
+                    cmd.arg("-an");
+                }
+                cmd.arg(out);
                 run(cmd, "the ComfyUI clip")?;
             }
             return Ok(());
@@ -418,6 +550,26 @@ mod tests {
         let h = json!({ "outputs": { "9": { "gifs": [{ "filename": "clip.mp4", "subfolder": "", "type": "output" }] } } });
         assert_eq!(comfy_output(&h).map(|o| o.0), Some("clip.mp4".to_string()));
         assert_eq!(comfy_output(&json!({ "outputs": { "3": { "images": [{ "filename": "still.png" }] } } })), None);
+    }
+
+    #[test]
+    fn the_ltx_workflow_takes_the_scene() {
+        let g = ltx_graph("p.png", "v.wav", "She says \"run\"", 6.44, "9:16", 5).unwrap();
+        assert_eq!(g["269"]["inputs"]["image"], "p.png");
+        assert_eq!(g["276"]["inputs"]["audio"], "v.wav");
+        assert_eq!(g["340:319"]["inputs"]["value"], "She says \"run\"");
+        assert_eq!(g["340:331"]["inputs"]["value"], 6.4);
+        assert_eq!((g["340:330"]["inputs"]["value"].as_u64(), g["340:324"]["inputs"]["value"].as_u64()), (Some(720), Some(1280)));
+        assert_eq!(g["340:286"]["inputs"]["noise_seed"], 5);
+        // Every link points at a node that is there.
+        for (id, n) in g.as_object().unwrap() {
+            for v in n["inputs"].as_object().unwrap().values() {
+                if let Some(to) = v.as_array().and_then(|a| a.first()).and_then(Value::as_str) {
+                    assert!(g.get(to).is_some(), "{id} links to the missing {to}");
+                }
+            }
+        }
+        assert!(video_model(LTX_VOICE).is_local());
     }
 
     #[test]

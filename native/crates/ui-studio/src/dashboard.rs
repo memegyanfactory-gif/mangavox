@@ -622,6 +622,7 @@ impl StudioPage {
                     .flex_wrap()
                     .items_center()
                     .gap(px(space::XS))
+                    .child(btn("dash-hook", "Hook", ButtonKind::Secondary).small().icon(ph::LIGHTNING).tooltip("Make this manga's hook: the cold open, then the character intro and the Netflix-style ribbon into chapter 1").on_click(|_, w, cx| mv_ui::navigate(Route::Hook, w, cx)))
                     .child(
                         btn("dash-restyle-all", "Music & subtitles", ButtonKind::Secondary)
                             .small()

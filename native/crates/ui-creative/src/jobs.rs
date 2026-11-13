@@ -65,6 +65,10 @@ pub(crate) fn resolution(p: &Project, m: &ImageModel) -> &'static str {
 
 /// Whole pages, or panel by panel, for this model.
 pub(crate) fn whole_pages(p: &Project, m: &ImageModel) -> bool {
+    // Live action is filmed scene by scene: each panel is its own film still.
+    if p.settings.live_action {
+        return false;
+    }
     match p.settings.mode {
         mv_create::RenderMode::Page => paints_pages(m),
         mv_create::RenderMode::Panels => false,
@@ -261,7 +265,8 @@ fn page_job(p: &Project, m: &'static ImageModel, res: &'static str, chapter: u32
         let refs = refs_for(p, &names, &panel.location, prev.clone(), m.refs);
         let prompt = prompts::panel(p, panel, aspect, &captions(&refs));
         let file = p.new_image("panels", &format!("ch{chapter:02}-p{page:03}-{}", i + 1));
-        work.push((prompt, refs, aspect, file, panel.lines.clone()));
+        // Film stills carry no balloons: their lines are spoken in the clip.
+        work.push((prompt, refs, aspect, file, if p.settings.live_action { vec![] } else { panel.lines.clone() }));
     }
     let layout_id = pg.layout.clone();
     let count = work.len();
@@ -304,6 +309,10 @@ fn clip_job(p: &Project, chapter: u32, page: u32, i: usize, status: Arc<Mutex<St
         _ => None,
     };
     let comfy = (p.settings.comfy_url.clone(), PathBuf::from(p.settings.comfy_workflow.clone()));
+    // LTX with voice: the scene's lines are spoken first, and the clip is as long as they are.
+    let spoken: String = prompts::spoken_lines(&panel).into_iter().map(|(_, t)| t).collect::<Vec<_>>().join(" ");
+    let voice_pick = p.settings.voice.clone();
+    let voice_dir = p.dir().join("voice").join(format!("ch{chapter:02}-p{page:03}-{}-{}", i + 1, mv_create::now()));
     if vm.via == VideoVia::ComfyUi && !comfy.1.is_file() {
         bail!("Pick your ComfyUI workflow (API format JSON) on the Video tab first");
     }
@@ -324,12 +333,74 @@ fn clip_job(p: &Project, chapter: u32, page: u32, i: usize, status: Arc<Mutex<St
                 tokio::task::spawn_blocking(move || video::local_motion(&s, seconds, &aspect, i + page as usize, &o)).await??;
             }
             VideoVia::ComfyUi => video::comfy_clip(&comfy.0, &comfy.1, &src, &prompt, seconds, &out, |s| set(&st, s)).await?,
+            VideoVia::ComfyLtx => {
+                let (audio, secs) = scene_voice(spoken, voice_pick, voice_dir, seconds, &st).await?;
+                video::ltx_clip(&comfy.0, &src, &audio, &prompt, secs, &aspect, &out, |s| set(&st, format!("LTX 2.3 · {s}"))).await?;
+            }
             _ => video::api_clip(vm, key.as_deref().unwrap_or(""), &src, &prompt, seconds, &aspect, &out, |s| set(&st, s)).await?,
         }
         Ok(Outcome::Clip { chapter, page, panel: i, rel: rel(&out) })
     };
     Ok(Job { label: format!("Chapter {chapter} · page {page} · panel {}", i + 1), credits: 0., model: None, fut: fut.boxed() })
 }
+
+/// The sound of a scene for LTX: its lines spoken with the project's voice (Studio's voice when
+/// none is picked), or silence of `seconds` when nobody speaks. Returns the file and how long the
+/// clip should be (the voice and a moment after it, at most [`LONGEST_SCENE`]).
+async fn scene_voice(spoken: String, voice: String, dir: PathBuf, seconds: u32, st: &Arc<Mutex<String>>) -> Result<(PathBuf, f64)> {
+    if spoken.trim().is_empty() {
+        set(st, "Nobody speaks: a silent track");
+        let out = dir.join("silence.wav");
+        let o = out.clone();
+        tokio::task::spawn_blocking(move || video::silence(seconds as f64, &o)).await??;
+        return Ok((out, seconds as f64));
+    }
+    set(st, "Voicing the scene");
+    // Studio's Python as Studio last checked it, else found the way Studio finds it.
+    let (python, layout, voice) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let env = ui_studio::setup::latest().map(|c| c.env).and_then(|e| Some((e.python.ok()?, e.scripts.ok()?)));
+        let (python, layout) = match env {
+            Some(x) => x,
+            None => (
+                mv_studio::python::voice_python().map_err(|e| anyhow!("The scene is voiced by Studio's Python, which is not set up yet (open Studio and finish Setup): {e}"))?,
+                mv_studio::PythonLayout::resolve(None).map_err(|e| anyhow!("Studio's scripts were not found: {e}"))?,
+            ),
+        };
+        let voice = if voice.trim().is_empty() { mv_studio::voices::default_voice() } else { voice };
+        Ok((python, layout, voice))
+    })
+    .await??;
+    // The picked voice, then the voices that stand in for it when its engine is not installed
+    // (as Studio's narration does): a scene is never left silent for want of one engine.
+    let mut tries = vec![voice.clone()];
+    tries.extend(mv_studio::tts::fallback_candidates(&voice).into_iter().map(str::to_string));
+    let mut sample = None;
+    let mut why = String::new();
+    for v in &tries {
+        let mut req = mv_studio::tts::LabRequest::new(v, "dialogue");
+        req.text = Some(spoken.clone());
+        req.intensities = vec![5];
+        match mv_studio::tts::voice_lab(&python, &layout, &dir, &std::env::temp_dir(), &req).await {
+            Ok(res) => {
+                if let Some(s) = res.samples.into_iter().find(|s| s.path.is_file()) {
+                    sample = Some(s);
+                    break;
+                }
+            }
+            // The first reason is the one about the voice the user picked.
+            Err(e) if why.is_empty() => why = e.to_string(),
+            Err(_) => {}
+        }
+    }
+    let sample = sample.ok_or_else(|| anyhow!("The scene could not be voiced: {}", if why.is_empty() { "the voice made no sound" } else { &why }))?;
+    let file = sample.path.clone();
+    let heard = if sample.duration > 0. { sample.duration } else { tokio::task::spawn_blocking(move || video::media_seconds(&file)).await?.unwrap_or(seconds as f64) };
+    Ok((sample.path, (heard + 0.6).clamp(2., LONGEST_SCENE)))
+}
+
+/// The longest clip LTX is asked for (a 10 GB card manages about this at 720p); a longer voice is
+/// cut there, so long lines belong in two scenes.
+const LONGEST_SCENE: f64 = 10.;
 
 /// Stores a finished job's result in the project.
 pub(crate) fn apply(p: &mut Project, o: Outcome) {
@@ -460,6 +531,30 @@ mod tests {
         assert_eq!(t.last(), Some(&Task::Page { chapter: 1, page: 2 }));
         let v = plan(&p, &Proposal::Video { chapter: 1 });
         assert_eq!(v, vec![Task::Clip { chapter: 1, page: 2, panel: 0 }, Task::Stitch { chapter: 1 }]);
+    }
+
+    /// The real thing, end to end: voices a line with Studio's voice, then has LTX 2.3 on the
+    /// local ComfyUI film `MV_LTX_IMAGE` with it. Needs ComfyUI open and takes minutes on the GPU,
+    /// so it only runs when asked: `cargo test -p ui-creative ltx_films -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn ltx_films_a_voiced_scene() {
+        // The voice scripts find the engines through this, as the app sets it at start.
+        std::env::set_var("MANGAVOX_DATA", mv_core::paths::root());
+        let image = PathBuf::from(std::env::var("MV_LTX_IMAGE").expect("set MV_LTX_IMAGE to a picture"));
+        let dir = std::env::temp_dir().join(format!("mangavox-ltx-test-{}", mv_create::now()));
+        let out = dir.join("scene.mp4");
+        let st = Arc::new(Mutex::new(String::new()));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (o, d, s) = (out.clone(), dir.clone(), st.clone());
+        rt.block_on(async move {
+            let (audio, secs) = scene_voice("Hello. This is a test of the voice.".into(), String::new(), d.join("voice"), 3, &s).await.unwrap();
+            println!("voice: {} ({secs:.1} s clip)", audio.display());
+            video::ltx_clip("http://127.0.0.1:8188", &image, &audio, "A live-action film scene. The character looks at the camera and says, lips in sync with the voice: \"Hello. This is a test of the voice.\"", secs, "16:9", &o, |x| println!("status: {x}")).await.unwrap();
+        });
+        assert!(std::fs::metadata(&out).unwrap().len() > 10_000);
+        assert!(video::has_audio(&out), "the clip kept its voice");
+        println!("clip: {} ({:?} s)", out.display(), video::media_seconds(&out));
     }
 
     #[test]

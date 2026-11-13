@@ -10182,6 +10182,7 @@ dependencies = [
  "mv-core",
  "mv-create",
  "mv-recap",
+ "mv-studio",
  "mv-ui",
  "serde_json",
  "tokio",

@@ -32,6 +32,23 @@ impl CreativePage {
             t
         }).collect();
         let painted = p.cast.iter().filter(|c| c.has_sheets()).count();
+        // Leads and the main cast first: their sheets matter most (and are the most detailed).
+        let key: Vec<Task> = {
+            let mut cast: Vec<_> = p.cast.iter().filter(|c| c.tier() <= 1).collect();
+            cast.sort_by_key(|c| c.tier());
+            cast.iter().flat_map(|c| {
+                let mut t = vec![];
+                if c.sheet.is_none() {
+                    t.push(Task::Sheet(c.id.clone()));
+                }
+                if c.expressions.is_none() {
+                    t.push(Task::Expressions(c.id.clone()));
+                }
+                t
+            }).collect()
+        };
+        let n_key = key.len();
+        let tiers = [0u8, 1, 2, 3].map(|t| p.cast.iter().filter(|c| c.tier() == t).count());
         let mut chapters: Vec<u32> = p.cast.iter().map(|c| c.intro_chapter).collect();
         chapters.sort_unstable();
         chapters.dedup();
@@ -46,7 +63,10 @@ impl CreativePage {
                     .flex()
                     .items_center()
                     .gap(px(space::SM))
-                    .child(div().flex_1().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} characters · {painted} with sheets. Sheets are painted before a character's first page, so they look the same everywhere.", p.cast.len())))
+                    .child(div().flex_1().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} characters ({} lead, {} main cast, {} recurring, {} minor) · {painted} with sheets. {} are made before a character's first scene, so they look the same everywhere.", p.cast.len(), tiers[0], tiers[1], tiers[2], tiers[3], if p.settings.live_action { "Realistic full-body casting sheets" } else { "Sheets" })))
+                    .when(n_key > 0, |d| {
+                        d.child(btn("cr-paint-key", format!("Make the leads' and main cast's sheets ({n_key})"), ButtonKind::Secondary).small().icon(ph::STAR).tooltip("The one or two leads first, then the main cast").on_click(cx.listener(move |this, _, _, cx| this.enqueue(key.clone(), cx))))
+                    })
                     .when(n_missing > 0, |d| {
                         d.child(btn("cr-paint-missing", format!("Paint {n_missing} missing sheets up to chapter {}", self.chapter.max(1)), ButtonKind::Primary).small().icon(ph::PAINT_BRUSH).on_click(cx.listener(move |this, _, _, cx| this.enqueue(missing.clone(), cx))))
                     }),
@@ -116,6 +136,7 @@ impl CreativePage {
                     .items_center()
                     .gap(px(6.))
                     .child(div().flex_1().min_w_0().text_size(px(size::MD)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).truncate().child(c.name.clone()))
+                    .child(tag(c.tier_label(), if c.tier() == 0 { Tone::Accent } else { Tone::Neutral }))
                     .when(!c.role.is_empty(), |d| d.child(tag(c.role.clone(), if c.role.contains("protagonist") { Tone::Accent } else if c.role.contains("antagonist") { Tone::Danger } else { Tone::Neutral })))
                     .when(!c.age.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(c.age.clone()))),
             )

@@ -10,6 +10,7 @@ mv-core = { path = "../mv-core" }
 mv-ai = { path = "../mv-ai" }
 mv-recap = { path = "../mv-recap" }
 mv-create = { path = "../mv-create" }
+mv-studio = { path = "../mv-studio" }
 ui-studio = { path = "../ui-studio" }
 ui-assistant = { path = "../ui-assistant" }
 ui-3d = { path = "../ui-3d" }

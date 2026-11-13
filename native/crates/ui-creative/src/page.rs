@@ -3,6 +3,7 @@
 //! paint queue (`jobs`) runs underneath all of them.
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -69,6 +70,11 @@ pub(crate) struct CreativePage {
     pub(crate) three_d: Option<AnyView>,
     /// A repaint loop is running (`tick`).
     pub(crate) ticking: bool,
+    /// The run as Activity shows it (how far along, what it is doing) and its Cancel.
+    pub(crate) activity: Option<(Arc<Mutex<(f32, String)>>, Arc<AtomicBool>)>,
+    /// The clip picked on the Video tab (page, panel) and the box its notes are typed in.
+    pub(crate) clip_sel: Option<(u32, usize)>,
+    pub(crate) clip_notes: Option<Entity<TextareaState>>,
     /// Cancels the director AI's request in flight.
     pub(crate) ai_cancel: mv_ai::CancellationToken,
     pub(crate) _subs: Vec<Subscription>,
@@ -117,6 +123,9 @@ impl CreativePage {
             scroll: ScrollHandle::new(),
             three_d: None,
             ticking: false,
+            activity: None,
+            clip_sel: None,
+            clip_notes: None,
             ai_cancel: mv_ai::CancellationToken::new(),
             _subs: subs,
         };
@@ -135,6 +144,7 @@ impl CreativePage {
             }
         }));
         self.composer = Some(composer);
+        self.clip_notes = Some(cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 4).placeholder("Notes for this clip: \"she should turn to the camera and smile\", \"slower, hold on his face\", \"it is raining\"")));
         self.picker = Some(ui_assistant::model_picker_above(window, cx));
     }
 
@@ -239,6 +249,15 @@ impl CreativePage {
         if !self.busy() {
             self.run_done = 0;
         }
+        // The run shows in Activity from every page, with Cancel, until the queue is empty.
+        if self.activity.is_none() {
+            if let Some(p) = self.p.as_ref() {
+                let state = Arc::new(Mutex::new((0., "Starting".to_string())));
+                let cancel = Arc::new(AtomicBool::new(false));
+                ui_studio::pipeline::track_activity(&p.id, &format!("Creative · {}", if p.title.is_empty() { "Untitled manga" } else { &p.title }), &state, &cancel);
+                self.activity = Some((state, cancel));
+            }
+        }
         for t in tasks {
             if !self.queue.contains(&t) {
                 self.queue.push_back(t);
@@ -258,12 +277,30 @@ impl CreativePage {
         cx.notify();
     }
 
+    /// Tells Activity where the run is, and stops it when Cancel was pressed there.
+    fn report(&mut self, cx: &mut Context<Self>) {
+        let Some((state, cancel)) = self.activity.clone() else { return };
+        if cancel.swap(false, Ordering::Relaxed) && !self.queue.is_empty() {
+            self.stop(cx);
+        }
+        let Some(r) = self.running.as_ref() else { return };
+        let total = self.run_done + self.queue.len() + 1;
+        let status = r.status.lock().map(|s| s.clone()).unwrap_or_default();
+        if let Ok(mut s) = state.lock() {
+            *s = (self.run_done as f32 / total as f32, format!("{} · {status} · {} of {total}", r.label, self.run_done + 1));
+        };
+    }
+
     /// Starts the next task when nothing is running.
     fn pump(&mut self, cx: &mut Context<Self>) {
         if self.running.is_some() {
             return;
         }
-        let Some(task) = self.queue.pop_front() else { return };
+        let Some(task) = self.queue.pop_front() else {
+            // Nothing left: the Activity card goes.
+            self.activity = None;
+            return;
+        };
         let Some(p) = self.p.clone() else {
             self.queue.clear();
             return;
@@ -274,7 +311,7 @@ impl CreativePage {
             Err(e) => {
                 // A missing key stops everything; anything else skips just this task.
                 let msg = format!("{e:#}");
-                if msg.contains("key") || msg.contains("workflow") {
+                if msg.contains("key") || msg.contains("workflow") || msg.contains("ComfyUI") {
                     self.queue.clear();
                     self.error = Some(msg);
                 } else {
@@ -287,6 +324,7 @@ impl CreativePage {
         let (label, credits, model) = (job.label.clone(), job.credits, job.model);
         let pid = p.id.clone();
         self.running = Some(Running { label: label.clone(), status, started: Instant::now() });
+        self.report(cx);
         let fut = job.fut;
         cx.spawn(async move |this, cx| {
             let res = mv_ui::bg::run(fut).await.and_then(|r| r);
@@ -314,7 +352,7 @@ impl CreativePage {
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        let fatal = ["API key", "out of credits", "rate limiting", "refused the request", "Connect Magnific", "FFmpeg"].iter().any(|k| msg.contains(k));
+                        let fatal = ["API key", "out of credits", "rate limiting", "refused the request", "Connect Magnific", "FFmpeg", "ComfyUI", "Studio's Python"].iter().any(|k| msg.contains(k));
                         this.note(format!("{label} failed: {msg}"));
                         if fatal {
                             this.queue.clear();
@@ -342,6 +380,7 @@ impl CreativePage {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
             let alive = this.update(cx, |this, cx| {
+                this.report(cx);
                 cx.notify();
                 let alive = this.running.is_some() || this.thinking.is_some() || !this.queue.is_empty();
                 if !alive {
@@ -450,7 +489,9 @@ impl CreativePage {
         let Some(p) = self.p.as_ref() else { return div() };
         let m = jobs::image_model(p, &self.keys);
         let mode_ix = mv_create::RenderMode::ALL.iter().position(|x| *x == p.settings.mode).unwrap_or(0);
-        let note = if jobs::whole_pages(p, m) {
+        let note = if p.settings.live_action {
+            "Live action: characters become real-looking people (full-body casting sheets) and every scene is a film still, then a clip."
+        } else if jobs::whole_pages(p, m) {
             "Paints each page whole: panels, balloons and lettering."
         } else if matches!(p.settings.mode, mv_create::RenderMode::Page) {
             "This model cannot paint a portrait page, so it paints panel by panel."
@@ -466,6 +507,10 @@ impl CreativePage {
             .children(self.resolution_menu("cr-res", cx))
             .child(segmented("cr-mode", mv_create::RenderMode::ALL.map(|m| m.label()), mode_ix).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
                 this.edit(|p| p.settings.mode = mv_create::RenderMode::ALL[*ix]);
+                cx.notify();
+            })))
+            .child(segmented("cr-live", ["Drawn manga", "Live action"], usize::from(p.settings.live_action)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+                this.edit(|p| p.settings.live_action = *ix == 1);
                 cx.notify();
             })))
             .child(segmented("cr-color", ["B&W", "Colour"], usize::from(p.settings.color)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
@@ -671,5 +716,6 @@ impl CreativePage {
             .child(div().text_size(px(size::XL)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Make your own manga"))
             .child(div().max_w(px(560.)).text_center().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Chat with the AI about the story you want. It writes the series, designs every character with a model sheet and expression sheet, paints the pages with your image model, exports them as PDF or images, and animates them into a video."))
             .child(btn("cr-new", "Start a new manga", ButtonKind::Primary).icon(ph::PLUS).on_click(cx.listener(|this, _, _, cx| this.new_project(cx))))
+            .children(self.adapt_menu("cr-adapt-welcome", cx))
     }
 }

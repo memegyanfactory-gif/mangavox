@@ -1,5 +1,6 @@
 //! Video: animate a painted chapter panel by panel with the picked video model (FFmpeg on this
 //! PC, a local ComfyUI workflow, or an API model), then stitch the clips in reading order.
+use gpui_kit::component::input::Textarea;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mv_create::video::{self, VideoVia, VIDEO_MODELS};
@@ -78,6 +79,12 @@ impl CreativePage {
                         })),
                 )
             })
+            .when(vm.via == VideoVia::ComfyLtx, |d| {
+                d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!(
+                    "Uses the LTX 2.3 image + audio workflow you installed in ComfyUI (at {}), built in: no workflow file to pick. Keep ComfyUI open. Each scene's lines are spoken with Studio's voice, then LTX films the scene from its picture so the mouths follow that voice; the clip is as long as the voice (up to 10 s). A scene waits its turn behind anything ComfyUI is already making.",
+                    p.settings.comfy_url
+                )))
+            })
             .when(vm.via == VideoVia::Local && self.ffmpeg == Some(false), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).child("FFmpeg is not installed: clips and stitching need it (winget install Gyan.FFmpeg).")))
     }
 
@@ -92,6 +99,72 @@ impl CreativePage {
             });
         })
         .detach();
+    }
+
+    /// Picks a clip to give notes to: its notes go in the box.
+    fn pick_clip(&mut self, chapter: u32, page: u32, panel: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let notes = self.p.as_ref().and_then(|p| p.chapter(chapter)).and_then(|c| c.pages.iter().find(|x| x.number == page)).and_then(|pg| pg.panels.get(panel)).map(|x| x.notes.clone()).unwrap_or_default();
+        if let Some(t) = &self.clip_notes {
+            t.update(cx, |s, cx| {
+                s.set_value(notes, window, cx);
+                s.focus(window, cx);
+            });
+        }
+        self.clip_sel = Some((page, panel));
+        cx.notify();
+    }
+
+    /// Keeps the notes typed for a clip and makes it again with them (then the chapter video).
+    fn redo_clip(&mut self, chapter: u32, page: u32, panel: usize, cx: &mut Context<Self>) {
+        let notes = self.clip_notes.as_ref().map(|t| t.read(cx).value().trim().to_string()).unwrap_or_default();
+        self.edit(|p| {
+            if let Some(x) = p.chapter_mut(chapter).pages.iter_mut().find(|x| x.number == page).and_then(|pg| pg.panels.get_mut(panel)) {
+                x.notes = notes;
+            }
+        });
+        self.enqueue(vec![Task::Clip { chapter, page, panel }, Task::Stitch { chapter }], cx);
+    }
+
+    /// The picked clip: what the scene is, its lines, the notes box and Make again.
+    fn clip_editor(&self, p: &mv_create::Project, chapter: u32, page: u32, i: usize, cx: &mut Context<Self>) -> Option<Div> {
+        let x = p.chapter(chapter)?.pages.iter().find(|pg| pg.number == page)?.panels.get(i)?.clone();
+        let clip = existing(p, x.clip.as_ref());
+        let title = format!("{} · chapter {chapter} · page {page} · scene {}", p.title, i + 1);
+        let lines: Vec<String> = x.lines.iter().filter(|l| !l.text.trim().is_empty()).map(|l| format!("{}: {}", if l.speaker.is_empty() { "Narrator" } else { &l.speaker }, l.text.trim())).collect();
+        let queued = self.queue.contains(&Task::Clip { chapter, page, panel: i }) || self.running.as_ref().is_some_and(|r| r.label == format!("Chapter {chapter} · page {page} · panel {}", i + 1));
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::SM))
+                .p(px(space::MD))
+                .rounded(px(radius::LG))
+                .bg(Tokens::surface_2())
+                .border_1()
+                .border_color(Tokens::accent())
+                .child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(format!("Page {page} · scene {}", i + 1)))
+                .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).line_clamp(3).child(if x.motion.is_empty() { x.description.clone() } else { format!("{} Moves: {}", x.description, x.motion) }))
+                .when(!lines.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).line_clamp(4).child(format!("Spoken: {}", lines.join(" / ")))))
+                .children(self.clip_notes.as_ref().map(|t| Textarea::new(t)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(space::SM))
+                        .child(btn("cr-clip-redo", if clip.is_some() { "Make this clip again with my notes" } else { "Make this clip with my notes" }, ButtonKind::Primary).small().icon(ph::ARROWS_CLOCKWISE).loading(queued).tooltip("The notes are sent to the video model with the scene; the chapter video is stitched again after").on_click(cx.listener(move |this, _, _, cx| this.redo_clip(chapter, page, i, cx))))
+                        .when_some(clip, |d, f| {
+                            d.child(btn("cr-clip-play", "Play this clip", ButtonKind::Secondary).small().icon(ph::PLAY).on_click(move |_, window, cx| {
+                                let request = mv_ui::nav::PlayRequest { title: title.clone(), source: f.to_string_lossy().to_string(), file_idx: None, imdb_id: None, mal_id: None, season: None, episode: None };
+                                mv_ui::navigate(mv_ui::Route::Player { request }, window, cx);
+                            }))
+                        })
+                        .child(btn("cr-clip-close", "Close", ButtonKind::Ghost).small().on_click(cx.listener(|this, _, _, cx| {
+                            this.clip_sel = None;
+                            cx.notify();
+                        }))),
+                ),
+        )
     }
 
     pub(crate) fn video_tab(&mut self, cx: &mut Context<Self>) -> Div {
@@ -145,6 +218,7 @@ impl CreativePage {
                         .child(btn("cr-reveal", "Show in folder", ButtonKind::Ghost).small().icon(ph::FOLDER_OPEN).on_click(move |_, _, _| reveal(&f2))),
                 )
             })
+            .children(self.clip_sel.and_then(|(page, i)| self.clip_editor(&p, n, page, i, cx)))
             .child(div().flex().flex_col().gap(px(space::MD)).children(ch.pages.iter().filter(|pg| pg.image.is_some()).map(|pg| {
                 let page = pg.number;
                 div()
@@ -171,6 +245,7 @@ impl CreativePage {
                                     .child(div().flex_1().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(if busy { "Animating…".to_string() } else if x.motion.is_empty() { format!("Panel {}", i + 1) } else { x.motion.clone() }))
                                     .child(btn(SharedString::from(format!("cr-reclip-{page}-{i}")), if has { "Redo" } else { "Make" }, ButtonKind::Ghost).small().on_click(cx.listener(move |this, _, _, cx| this.enqueue(vec![Task::Clip { chapter: n, page, panel: i }, Task::Stitch { chapter: n }], cx)))),
                             )
+                            .child(btn(SharedString::from(format!("cr-clipnotes-{page}-{i}")), if x.notes.trim().is_empty() { "Notes…" } else { "Notes ✓" }, if self.clip_sel == Some((page, i)) { ButtonKind::Secondary } else { ButtonKind::Ghost }).small().icon(ph::PENCIL_SIMPLE).tooltip("Write what this clip should do differently, then make it again").on_click(cx.listener(move |this, _, window, cx| this.pick_clip(n, page, i, window, cx))))
                     })))
             })))
     }

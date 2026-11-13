@@ -4,10 +4,17 @@
 //! voiced and rendered over the chapters' own panels (`hook_maker.py`). Another draft can be
 //! rendered instead with one click.
 //!
-//! What was made is kept in `<studio>/<manga>/hook/` (`hook.json`, `hook.mp4`), so the page shows
-//! it again later. The run is app-wide ([`RUN`]): leaving the page does not stop it.
+//! The video then goes on like a one-video export with its hook on: the manga's character intro
+//! (the cast on cinematic cards, see `export::intro`) and the Netflix-style ribbon transition into
+//! chapter 1. A full-recap export with the Hook on plays this hook (without the intro, which the
+//! export adds itself) instead of writing another ([`ready_hook`]).
+//!
+//! What was made is kept in `<studio>/<manga>/hook/` (`hook.json`, `hook.mp4`, the hook alone, and
+//! `hook_intro.mp4`, the hook and the intro), so the page shows it again later. The run is
+//! app-wide ([`RUN`]): leaving the page does not stop it.
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +29,7 @@ use mv_ui::{badge, btn, muted, page_title, ph, segmented, size, ButtonKind, Toke
 use serde::{Deserialize, Serialize};
 
 use crate::data::{ChapterItem, MangaGroup};
-use crate::export::{hook_beats, hook_spec, Beat, HookJob};
+use crate::export::{hook_beats, hook_spec, intro, Beat, HookJob, Reporter};
 use crate::page::Load;
 
 /// The length choices: the AI's own pick, then 1, 1.5 and 2 minutes.
@@ -41,6 +48,13 @@ pub(crate) struct Saved {
     pub seconds: f64,
     /// Chapters it was made from.
     pub chapters: usize,
+    /// Their ids (empty in hooks made before they were kept).
+    pub chapter_ids: Vec<String>,
+    /// The hook alone (`video` is the hook and then the intro when `with_intro`).
+    pub hook_only: Option<PathBuf>,
+    pub with_intro: bool,
+    /// Why the video has no intro, when it could not be made.
+    pub intro_note: String,
 }
 
 fn hook_dir(manga_id: &str) -> PathBuf {
@@ -49,7 +63,22 @@ fn hook_dir(manga_id: &str) -> PathBuf {
 
 fn load_saved(manga_id: &str) -> Option<Saved> {
     let s: Saved = serde_json::from_str(&std::fs::read_to_string(hook_dir(manga_id).join("hook.json")).ok()?).ok()?;
-    Some(Saved { video: s.video.clone().filter(|v| v.is_file()), ..s })
+    Some(Saved { video: s.video.clone().filter(|v| v.is_file()), hook_only: s.hook_only.clone().filter(|v| v.is_file()), ..s })
+}
+
+/// The hook made on this page for manga `manga_id`, alone (without the intro), when it was made
+/// only from chapters among `chapter_ids` (those of the video it would open): a full-recap export
+/// plays it. Blocking.
+pub(crate) fn ready_hook(manga_id: &str, chapter_ids: &[String]) -> Option<PathBuf> {
+    let s = load_saved(manga_id)?;
+    hook_for(&s, chapter_ids)
+}
+
+fn hook_for(s: &Saved, chapter_ids: &[String]) -> Option<PathBuf> {
+    // A hook made before the intro was added: its video is the hook alone.
+    let file = s.hook_only.clone().or_else(|| (!s.with_intro).then(|| s.video.clone()).flatten())?;
+    let fits = if s.chapter_ids.is_empty() { s.chapters > 0 && s.chapters <= chapter_ids.len() } else { s.chapter_ids.iter().all(|id| chapter_ids.contains(id)) };
+    fits.then_some(file)
 }
 
 fn save(manga_id: &str, s: &Saved) -> Result<()> {
@@ -62,31 +91,33 @@ fn save(manga_id: &str, s: &Saved) -> Result<()> {
 /// The hook being made, app-wide (one at a time).
 struct Running {
     manga_id: String,
-    stage: String,
+    /// Says the stage (the intro's own steps come through it too) and stops the intro.
+    reporter: Reporter,
     cancel: mv_ai::CancellationToken,
 }
 
 static RUN: Mutex<Option<Running>> = Mutex::new(None);
 
 fn running() -> Option<(String, String)> {
-    RUN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| (r.manga_id.clone(), r.stage.clone()))
+    RUN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| (r.manga_id.clone(), r.reporter.now().1))
 }
 
 fn set_stage(stage: &str) {
-    if let Some(r) = RUN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        r.stage = stage.to_string();
+    if let Some(r) = RUN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        r.reporter.set(0., stage);
     }
 }
 
 fn cancel_run() {
     if let Some(r) = RUN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         r.cancel.cancel();
+        r.reporter.cancel();
         // A stage that is not a model call (voicing, rendering) sees the cancel at its next check.
     }
 }
 
 fn cancelled() -> bool {
-    RUN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|r| r.cancel.is_cancelled())
+    RUN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|r| r.cancel.is_cancelled() || r.reporter.cancelled())
 }
 
 /// The written chapters of `g` with the beats a hook can use, in story order.
@@ -197,7 +228,24 @@ impl HookPage {
         let seconds = LENGTHS[self.length].0;
         let earlier = self.saved.get(&g.id).cloned().flatten();
         let cancel = mv_ai::CancellationToken::new();
-        *RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running { manga_id: g.id.clone(), stage: "Reading the written chapters".into(), cancel: cancel.clone() });
+        // The intro after the hook, as a one-video export makes it (its cast profiles written with
+        // the same model).
+        let intro_job = intro::IntroJob {
+            manga_id: g.id.clone(),
+            manga_title: g.title.clone(),
+            chapters: g.chapters.clone(),
+            numbers: intro::chapter_numbers(&g.chapters),
+            model_name: model.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
+            model: model.clone().filter(|m| !m.model.trim().is_empty()),
+            reg: reg.clone(),
+            python: python.clone(),
+            layout: layout.clone(),
+        };
+        let reporter = Reporter::standalone(Arc::new(AtomicBool::new(false)));
+        reporter.set(0., "Reading the written chapters");
+        // In Activity too (its Cancel stops the run), so it is seen from every page.
+        reporter.track(&g.id, &format!("Hook · {}", g.title));
+        *RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running { manga_id: g.id.clone(), reporter: reporter.clone(), cancel: cancel.clone() });
         self.error = None;
         self.tick(cx);
         cx.notify();
@@ -205,12 +253,18 @@ impl HookPage {
         cx.spawn(async move |this, cx| {
             let id = g.id.clone();
             let res = run(g, draft, earlier, seconds, model, reg, python, layout, cancel, &ex).await;
+            let res = match res {
+                Ok(s) => with_intro(s, intro_job, &reporter, &ex).await,
+                Err(e) => Err(e),
+            };
+            drop(reporter);
             *RUN.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let _ = this.update(cx, |this, cx| {
                 match res {
                     Ok(s) => {
                         let score = s.result.drafts.get(s.shown).map(|d| d.score).unwrap_or(0);
-                        toast::show(cx, Toast::success(format!("Hook ready · {score}/100 · {}", fmt_secs(s.seconds))));
+                        let how = if s.with_intro { "with the intro and the ribbon" } else { "hook only, see the note on the page" };
+                        toast::show(cx, Toast::success(format!("Hook ready · {score}/100 · {} · {how}", fmt_secs(s.seconds))));
                         this.saved.insert(id, Some(s));
                     }
                     Err(e) if e.to_string() == "cancelled" => {
@@ -343,6 +397,11 @@ impl HookPage {
             actions = actions.child(btn("hk-render", "Render this hook", ButtonKind::Primary).icon(ph::FILM_STRIP).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.make(g2.clone(), Some(shown_ix), cx))));
         }
         top = top.child(actions);
+        if s.with_intro {
+            top = top.child(muted("Plays the hook, then the character intro and the Netflix-style ribbon transition into chapter 1. A full-recap export with the Hook on uses this hook."));
+        } else if !s.intro_note.is_empty() {
+            top = top.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).child(s.intro_note.clone()));
+        }
         for n in &s.result.notes {
             top = top.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("Note: {n}")));
         }
@@ -433,6 +492,8 @@ async fn run(
         (Some(i), Some(mut s)) if i < s.result.drafts.len() => {
             s.shown = i;
             s.video = None;
+            s.hook_only = None;
+            s.with_intro = false;
             s
         }
         _ => {
@@ -460,7 +521,7 @@ async fn run(
                     }
                 }
             };
-            Saved { result, video: None, shown: 0, seconds: 0., chapters: chapters.len() }
+            Saved { result, chapters: chapters.len(), chapter_ids: chapters.iter().map(|(c, _)| c.id.clone()).collect(), ..Default::default() }
         }
     };
     let id = g.id.clone();
@@ -520,6 +581,8 @@ async fn run(
         bail!("The hook was written but could not be rendered: {why}");
     }
     saved.video = Some(out).filter(|p| p.is_file());
+    saved.hook_only = saved.video.clone();
+    saved.with_intro = false;
     saved.seconds = v["seconds"].as_f64().unwrap_or(0.);
     let (id, s2) = (g.id.clone(), saved.clone());
     mv_ui::bg::blocking(move || {
@@ -527,6 +590,57 @@ async fn run(
         save(&id, &s2)
     })
     .await??;
+    Ok(saved)
+}
+
+/// Goes on from the rendered hook of `saved` like a one-video export with its hook on: the manga's
+/// chapter videos joined (as Play and Export join them, kept), its character intro made or the
+/// kept one reused (`job`, each step through `r`), then the hook and the intro joined into
+/// `hook_intro.mp4`, which becomes the page's video. Without a chapter video, or when the intro
+/// cannot be made, the hook stays alone and the page says why.
+async fn with_intro(mut saved: Saved, job: intro::IntroJob, r: &Reporter, ex: &BackgroundExecutor) -> Result<Saved> {
+    let Some(hook) = saved.hook_only.clone() else { return Ok(saved) };
+    let id = job.manga_id.clone();
+    let files: Vec<PathBuf> = job.chapters.iter().map(|c| c.output_dir.join(crate::data::VIDEO_FILE)).filter(|p| p.is_file()).collect();
+    let made = if files.is_empty() {
+        Err(anyhow!("no chapter of this manga has a video yet (the intro opens onto chapter 1's first frame)"))
+    } else {
+        r.set(0., "Joining the chapter videos for the intro");
+        let (rr, out) = (r.clone(), crate::export::joined_path(&id));
+        let joined = mv_ui::bg::blocking(move || -> Result<_> {
+            rr.take_turn()?;
+            crate::export::join(&files, &out, &rr)
+        })
+        .await
+        .and_then(|x| x);
+        match joined {
+            Ok(j) => intro::make_intro(job, &j, r, ex).await.map(|m| m.path),
+            Err(e) => Err(e),
+        }
+    };
+    if r.cancelled() || cancelled() {
+        bail!("cancelled");
+    }
+    match made {
+        Ok(intro_file) => {
+            r.set(0.99, "Joining the hook, the intro and the transition");
+            let (rr, out, h) = (r.clone(), hook_dir(&id).join("hook_intro.mp4"), hook.clone());
+            let res = mv_ui::bg::blocking(move || crate::export::hook_then_intro(&h, &intro_file, &out, &rr).map(|secs| (out, secs))).await.and_then(|x| x);
+            match res {
+                Ok((out, secs)) => {
+                    saved.video = Some(out);
+                    saved.with_intro = true;
+                    saved.seconds = secs;
+                    saved.intro_note.clear();
+                }
+                Err(_) if r.cancelled() => bail!("cancelled"),
+                Err(e) => saved.intro_note = format!("The hook and the intro could not be joined ({e:#}), so the video is the hook alone."),
+            }
+        }
+        Err(e) => saved.intro_note = format!("The video is the hook alone: the character intro could not be made ({e:#})."),
+    }
+    let s2 = saved.clone();
+    mv_ui::bg::blocking(move || save(&id, &s2)).await??;
     Ok(saved)
 }
 
@@ -555,7 +669,7 @@ impl Render for HookPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = page_title("Hook")
             .icon(ph::LIGHTNING)
-            .subtitle("A 1-2 minute hook for any manga Studio has written. The AI finds the peak moments and the one question to plant, writes three hooks in different styles, judges them like a top recap channel's editor, and renders the winner over the chapters' own panels.");
+            .subtitle("A 1-2 minute hook for any manga Studio has written. The AI finds the peak moments and the one question to plant, writes three hooks in different styles, judges them like a top recap channel's editor, and renders the winner over the chapters' own panels, followed by the character intro and the Netflix-style ribbon transition into chapter 1.");
         let body: AnyElement = match &self.library {
             Load::Loading => muted("Loading your manga...").into_any_element(),
             Load::Failed(e) => div().text_size(px(size::SM)).text_color(Tokens::danger()).child(format!("Could not load your manga. {e}")).into_any_element(),
@@ -588,6 +702,8 @@ impl Render for HookPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The UI kit's glob brings its own `test` attribute (for UI tests); these are plain tests.
+    use core::prelude::v1::test;
 
     #[test]
     fn scores_read_at_a_glance() {
@@ -606,5 +722,19 @@ mod tests {
         // Older files without some fields still load.
         let old: Saved = serde_json::from_str(r#"{"result": {"drafts": []}}"#).unwrap();
         assert!(old.video.is_none() && old.result.drafts.is_empty());
+    }
+    #[test]
+    fn an_export_uses_the_hook_alone_and_only_for_its_chapters() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (alone, both) = (PathBuf::from("hook.mp4"), PathBuf::from("hook_intro.mp4"));
+        let s = Saved { video: Some(both.clone()), hook_only: Some(alone.clone()), with_intro: true, chapters: 2, chapter_ids: ids(&["a", "b"]), ..Default::default() };
+        assert_eq!(hook_for(&s, &ids(&["a", "b", "c"])), Some(alone.clone()), "the export adds the intro itself");
+        assert_eq!(hook_for(&s, &ids(&["a", "c"])), None, "made from a chapter the video leaves out");
+        // Made before the intro: the video is the hook alone.
+        let old = Saved { video: Some(alone.clone()), chapters: 2, ..Default::default() };
+        assert_eq!(hook_for(&old, &ids(&["a", "b"])), Some(alone));
+        assert_eq!(hook_for(&old, &ids(&["a"])), None);
+        let no_hook_alone = Saved { video: Some(both), with_intro: true, chapters: 1, ..Default::default() };
+        assert_eq!(hook_for(&no_hook_alone, &ids(&["a"])), None);
     }
 }

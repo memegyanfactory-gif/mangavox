@@ -11,7 +11,7 @@ use mv_ai::AiMessage;
 use mv_create::prompts::{self, Op};
 use mv_create::{CardState, ChatLine, Project, Proposal};
 use mv_ui::theme::{radius, space};
-use mv_ui::{btn, icon_ph, ph, size, ButtonKind, Tokens};
+use mv_ui::{btn, icon_ph, menu_button, ph, size, ButtonKind, MenuItem, Tokens};
 
 use crate::ai::{self, Brainbox};
 use crate::jobs;
@@ -35,6 +35,66 @@ impl CreativePage {
         }
         input.update(cx, |s, cx| s.set_value("", window, cx));
         self.send(text, cx);
+    }
+
+    /// Starts a live-action adaptation of a downloaded manga: a new project that keeps the
+    /// manga's own characters and story (from what Studio read of it), with realistic casting
+    /// sheets and scenes filmed by LTX 2.3 with their voice.
+    pub(crate) fn adapt(&mut self, m: crate::page::LibManga, cx: &mut Context<Self>) {
+        if self.busy() {
+            self.error = Some("Wait for the AI or the painting to finish, or stop it, before starting another manga.".into());
+            cx.notify();
+            return;
+        }
+        if let Err(e) = Brainbox::current(self.ai_cancel.clone(), cx) {
+            self.error = Some(e);
+            cx.notify();
+            return;
+        }
+        let mut p = Project::new(&format!("{} (live action)", m.title));
+        p.settings.image_model = jobs::image_model(&p, &self.keys).id.to_string();
+        p.settings.live_action = true;
+        p.settings.color = true;
+        p.settings.rtl = false;
+        p.settings.video_model = mv_create::video::LTX_VOICE.to_string();
+        p.adapts = Some(m.title.clone());
+        if let Err(e) = p.save() {
+            self.error = Some(format!("Could not create the project: {e:#}"));
+            cx.notify();
+            return;
+        }
+        self.projects.insert(0, p.clone());
+        self.p = Some(p);
+        self.chapter = 1;
+        self.tab = crate::page::Tab::Chat;
+        self.error = None;
+        let brief = format!("A faithful live-action adaptation of my downloaded manga \"{}\": the same characters with their own traits as real people, the same story.", m.title);
+        self.note(format!("Adapting “{}” as live action: reading what Studio knows of its characters and story.", m.title));
+        self.thinking = Some(Arc::new(Mutex::new(String::new())));
+        self.tick(cx);
+        self.run_ops(VecDeque::from([Op::CreateSeries { brief, inspirations: vec![m.title] }]), cx);
+        cx.notify();
+    }
+
+    /// The downloaded manga to adapt, as a menu.
+    pub(crate) fn adapt_menu(&self, id: &'static str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.library.is_empty() {
+            return None;
+        }
+        let weak = cx.entity().downgrade();
+        let items = self
+            .library
+            .iter()
+            .take(200)
+            .map(|m| {
+                let (w, m2) = (weak.clone(), m.clone());
+                MenuItem::new(m.title.clone(), move |_, cx| {
+                    let _ = w.update(cx, |this, cx| this.adapt(m2.clone(), cx));
+                })
+                .icon(ph::FILM_STRIP)
+            })
+            .collect();
+        Some(menu_button(id, ph::FILM_STRIP, "Turn a downloaded manga into a live-action series: realistic character sheets of its cast, then every scene filmed with its voice", items).label("Adapt a downloaded manga as live action").small().min_width(360.).into_any_element())
     }
 
     fn library_titles(&self) -> Vec<String> {
@@ -153,7 +213,9 @@ impl CreativePage {
                 let fut = async move {
                     let proj = p.clone();
                     let (notes, refs) = tokio::task::spawn_blocking(move || {
-                        let notes: String = found.iter().map(|m| inspiration_notes(&m.id, &m.title)).collect::<Vec<_>>().join("\n\n");
+                        // An adaptation needs the whole known cast and story, not a taste of them.
+                        let (cast, lines) = if proj.adapts.is_some() { (80, 60) } else { (12, 12) };
+                        let notes: String = found.iter().map(|m| inspiration_notes(&m.id, &m.title, cast, lines)).collect::<Vec<_>>().join("\n\n");
                         let style: Vec<std::path::PathBuf> = found.iter().flat_map(|m| mv_create::style_pages(&m.pages_dirs, 2)).take(3).collect();
                         (notes, mv_create::import_refs(&proj, &style, "style").unwrap_or_default())
                     })
@@ -375,6 +437,7 @@ impl CreativePage {
             .pt(px(24.))
             .child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("What manga do you want to make?"))
             .child(div().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Name a manga it should feel like, describe your own characters (or add their pictures on the Characters tab), and your twist. The AI writes the series and a cast that grows chapter by chapter; every character gets a model sheet and an expression sheet before they appear, so they stay on model on every page."))
+            .children(self.adapt_menu("cr-adapt", cx))
             .children(EXAMPLES.iter().enumerate().map(|(i, e)| {
                 let text = e.to_string();
                 div()
@@ -463,13 +526,13 @@ impl CreativePage {
 }
 
 /// What Studio learned of a downloaded manga (its characters and story), for the inspiration.
-fn inspiration_notes(id: &str, title: &str) -> String {
+fn inspiration_notes(id: &str, title: &str, cast: usize, lines: usize) -> String {
     let b = mv_recap::Brain::load(id, title);
     let mut s = format!("{title}:");
-    for c in b.characters.iter().take(12) {
-        s.push_str(&format!("\n- {}: {}", c.name, c.description.chars().take(160).collect::<String>()));
+    for c in b.characters.iter().take(cast) {
+        s.push_str(&format!("\n- {}: {}", c.name, c.description.chars().take(if cast > 12 { 320 } else { 160 }).collect::<String>()));
     }
-    let notes: String = b.notes.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+    let notes: String = b.notes.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
     if !notes.is_empty() {
         s.push_str(&format!("\nStory notes:\n{notes}"));
     }

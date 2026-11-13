@@ -96,6 +96,11 @@ pub struct Settings {
     /// ComfyUI address and the API-format workflow for the local video model.
     pub comfy_url: String,
     pub comfy_workflow: String,
+    /// Live action: real-looking people and places instead of drawn manga (character sheets,
+    /// scene pictures and clips), each character keeping their own traits.
+    pub live_action: bool,
+    /// The voice that speaks the scenes' lines (empty: Studio's voice).
+    pub voice: String,
 }
 
 impl Default for Settings {
@@ -112,6 +117,8 @@ impl Default for Settings {
             video_aspect: "16:9".into(),
             comfy_url: "http://127.0.0.1:8188".into(),
             comfy_workflow: String::new(),
+            live_action: false,
+            voice: String::new(),
         }
     }
 }
@@ -182,6 +189,25 @@ impl CastMember {
     pub fn has_sheets(&self) -> bool {
         self.sheet.is_some() && self.expressions.is_some()
     }
+
+    /// How much of the story is theirs: 0 the one or two leads it is about, 1 the main cast,
+    /// 2 those who come back now and then, 3 the rest.
+    pub fn tier(&self) -> u8 {
+        let r = self.role.to_lowercase();
+        if r.contains("protagonist") || r.contains("deuteragonist") || r.contains("lead") {
+            0
+        } else if r.contains("antagonist") || r.contains("main") {
+            1
+        } else if r.contains("minor") || r.contains("extra") || r.contains("background") {
+            3
+        } else {
+            2
+        }
+    }
+
+    pub fn tier_label(&self) -> &'static str {
+        ["Lead", "Main cast", "Recurring", "Minor"][self.tier() as usize]
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -242,6 +268,9 @@ pub struct Panel {
     pub motion: String,
     pub image: Option<String>,
     pub clip: Option<String>,
+    /// The user's notes for this scene's clip: what to do differently when it is made again.
+    #[serde(deserialize_with = "lenient_text")]
+    pub notes: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -336,6 +365,9 @@ pub struct Project {
     pub brief: String,
     /// Manga it should feel like ("Dr. Stone").
     pub inspirations: Vec<String>,
+    /// The downloaded manga this is a live-action adaptation of (its own characters and story
+    /// are kept), when it is one.
+    pub adapts: Option<String>,
     /// Pages from the user's downloaded manga that set the look (relative, in `refs/`).
     pub style_refs: Vec<String>,
     pub bible: Bible,
@@ -536,6 +568,8 @@ mod tests {
         assert_eq!(p.cast[0].id, "kai-tanaka");
         assert_eq!(p.cast[1].id, "kai-tanaka-2");
         assert_eq!(p.cast[0].intro_chapter, 1);
+        let tier = |role: &str| CastMember { role: role.into(), ..Default::default() }.tier();
+        assert_eq!((tier("Protagonist"), tier("antagonist"), tier("main"), tier("supporting"), tier(""), tier("minor")), (0, 1, 1, 2, 2, 3));
         assert_eq!(p.character("kai").map(|c| c.id.as_str()), Some("kai-tanaka"));
         p.chapter_mut(3).title = "Three".into();
         p.chapter_mut(1).title = "One".into();
