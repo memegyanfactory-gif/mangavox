@@ -311,7 +311,7 @@ impl CreativePage {
             Err(e) => {
                 // A missing key stops everything; anything else skips just this task.
                 let msg = format!("{e:#}");
-                if msg.contains("key") || msg.contains("workflow") || msg.contains("ComfyUI") {
+                if msg.contains("key") || msg.contains("workflow") || msg.contains("ComfyUI") || msg.contains("Magnific's website") {
                     self.queue.clear();
                     self.error = Some(msg);
                 } else {
@@ -352,7 +352,7 @@ impl CreativePage {
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        let fatal = ["API key", "out of credits", "rate limiting", "refused the request", "Connect Magnific", "FFmpeg", "ComfyUI", "Studio's Python"].iter().any(|k| msg.contains(k));
+                        let fatal = ["API key", "out of credits", "rate limiting", "refused the request", "Connect Magnific", "FFmpeg", "ComfyUI", "Studio's Python", "Magnific's website"].iter().any(|k| msg.contains(k));
                         this.note(format!("{label} failed: {msg}"));
                         if fatal {
                             this.queue.clear();
@@ -489,7 +489,10 @@ impl CreativePage {
         let Some(p) = self.p.as_ref() else { return div() };
         let m = jobs::image_model(p, &self.keys);
         let mode_ix = mv_create::RenderMode::ALL.iter().position(|x| *x == p.settings.mode).unwrap_or(0);
-        let note = if p.settings.live_action {
+        let web = p.settings.web_images;
+        let note = if web {
+            "Pictures are made on Magnific's website in the app's browser window, signed in as you: Google Nano Banana 2.1 at 1K with unlimited mode on, one at a time. Nothing is generated unless the page shows it as Unlimited."
+        } else if p.settings.live_action {
             "Live action: characters become real-looking people (full-body casting sheets) and every scene is a film still, then a clip."
         } else if jobs::whole_pages(p, m) {
             "Paints each page whole: panels, balloons and lettering."
@@ -503,8 +506,25 @@ impl CreativePage {
             .flex_wrap()
             .items_center()
             .gap(px(space::SM))
-            .child(self.model_menu("cr-model", cx))
-            .children(self.resolution_menu("cr-res", cx))
+            .child(segmented("cr-via", ["API key", "Magnific website"], usize::from(web)).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
+                this.edit(|p| p.settings.web_images = *ix == 1);
+                cx.notify();
+            })))
+            .when(web, |d| {
+                d.child(btn("cr-web-open", "Open Magnific window", ButtonKind::Secondary).small().icon(ph::GLOBE).tooltip("Sign in to Magnific here once; the app keeps the sign-in. If Magnific asks you to confirm you are a person, do it in this window.").on_click(cx.listener(|this, _, _, cx| {
+                    cx.spawn(async move |this, cx| {
+                        if let Err(e) = mv_ui::bg::run(crate::web::open_window()).await.and_then(|r| r) {
+                            let _ = this.update(cx, |this, cx| {
+                                this.error = Some(format!("{e:#}"));
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .detach();
+                    let _ = this;
+                })))
+            })
+            .when(!web, |d| d.child(self.model_menu("cr-model", cx)).children(self.resolution_menu("cr-res", cx)))
             .child(segmented("cr-mode", mv_create::RenderMode::ALL.map(|m| m.label()), mode_ix).small().on_change(cx.listener(|this, ix: &usize, _, cx| {
                 this.edit(|p| p.settings.mode = mv_create::RenderMode::ALL[*ix]);
                 cx.notify();
@@ -522,8 +542,8 @@ impl CreativePage {
                 cx.notify();
             })))
             .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(note))
-            .when(m.refs == 0, |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).child(format!("{} takes no reference images, so characters can drift. Nano Banana 2.1 keeps them on model.", m.name))))
-            .when(!self.keys.has(m), |d| {
+            .when(!web && m.refs == 0, |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).child(format!("{} takes no reference images, so characters can drift. Nano Banana 2.1 keeps them on model.", m.name))))
+            .when(!web && !self.keys.has(m), |d| {
                 d.child(btn("cr-keys", if m.via == ui_studio::images::Via::Magnific { "Add Magnific key" } else { "Add key" }, ButtonKind::Secondary).small().icon(ph::KEY).on_click(move |_, window, cx| {
                     let tab = if m.via == ui_studio::images::Via::Magnific { "magnific" } else { "services" };
                     mv_ui::navigate(mv_ui::Route::Settings { tab: Some(tab.into()) }, window, cx);

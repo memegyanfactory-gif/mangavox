@@ -365,7 +365,7 @@ impl YouTubePage {
                     }))
                     .child(div().flex().flex_1().min_w_0().items_center().gap(px(10.)).child(yt::thumb(&thumb_src(store, v), 96., Some(yt::duration(v.duration_secs)).filter(|_| v.duration_secs > 0))).child(yt::para(13., yt::TEXT, 2, v.title.clone()).flex_1()))
                     .child(yt::col(140., false).child(div().flex().flex_col().min_w_0().child(yt::line(13., FontWeight::NORMAL, yt::TEXT, if v.published_at > 0 { when::when(v.published_at) } else { "—".into() })).child(yt::caption(if v.published_exact { "exact" } else { "estimated" }))))
-                    .child(yt::col(70., true).child(yt::text(13., 18., FontWeight::NORMAL, yt::TEXT).child(fmt_num(v.views))))
+                    .child(yt::col(70., true).child(yt::text(13., 18., FontWeight::NORMAL, yt::TEXT).child(if v.views == 0 && !v.published_exact { "—".to_string() } else { fmt_num(v.views) })))
                     .child(yt::col(70., true).child(yt::text(13., 18., FontWeight::NORMAL, yt::TEXT_2).child(format!("{:.0}", competitors::velocity(v, now)))))
                     .child(yt::col(80., true).child(if changes > 0 { yt::badge(format!("{changes}×"), 0x0f0f0f, yt::c(yt::AMBER).into()).into_any_element() } else { yt::caption("—").into_any_element() }))
             }));

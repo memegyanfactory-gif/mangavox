@@ -60,6 +60,30 @@ pub fn import_refs(p: &Project, files: &[PathBuf], prefix: &str) -> anyhow::Resu
     Ok(out)
 }
 
+/// `file` as a JPEG of at most `max_side` pixels a side, in base64 (a reference picture light
+/// enough to hand to a web page).
+pub fn small_jpeg_b64(file: &Path, max_side: u32) -> anyhow::Result<String> {
+    use base64::Engine as _;
+    let img = image::open(file).map_err(|e| anyhow::anyhow!("could not read {}: {e}", file.display()))?;
+    let img = if img.width().max(img.height()) > max_side { img.resize(max_side, max_side, image::imageops::FilterType::Lanczos3) } else { img };
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img.to_rgb8()).write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(out.into_inner()))
+}
+
+/// Saves a picture that came as a `data:image/...;base64,` URL as PNG at `out`. Returns its size.
+pub fn save_data_url(data: &str, out: &Path) -> anyhow::Result<(u32, u32)> {
+    use base64::Engine as _;
+    let b64 = data.split_once("base64,").map(|(_, b)| b).ok_or_else(|| anyhow::anyhow!("the picture did not arrive as image data"))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).map_err(|e| anyhow::anyhow!("the picture's data is damaged: {e}"))?;
+    let img = image::load_from_memory(&bytes).map_err(|e| anyhow::anyhow!("the picture could not be read: {e}"))?;
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    img.save_with_format(out, image::ImageFormat::Png)?;
+    Ok((img.width(), img.height()))
+}
+
 /// The image path, if it is there.
 pub fn existing(p: &Project, rel: Option<&String>) -> Option<PathBuf> {
     rel.map(|r| p.file(r)).filter(|f| Path::new(f).is_file())
@@ -68,6 +92,18 @@ pub fn existing(p: &Project, rel: Option<&String>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pictures_go_to_a_page_and_come_back() {
+        let t = tempfile::tempdir().unwrap();
+        let big = t.path().join("big.png");
+        image::RgbImage::from_fn(2000, 1000, |x, y| image::Rgb([(x % 255) as u8, (y % 255) as u8, 40])).save(&big).unwrap();
+        let b64 = small_jpeg_b64(&big, 1280).unwrap();
+        let out = t.path().join("sub").join("back.png");
+        assert_eq!(save_data_url(&format!("data:image/jpeg;base64,{b64}"), &out).unwrap(), (1280, 640));
+        assert!(out.is_file());
+        assert!(save_data_url("https://x/y.png", &out).is_err() && save_data_url("data:image/png;base64,AAAA", &out).is_err());
+    }
 
     #[test]
     fn style_pages_skip_covers_and_spread() {

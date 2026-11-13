@@ -10184,6 +10184,7 @@ dependencies = [
  "mv-recap",
  "mv-studio",
  "mv-ui",
+ "mv-webwall",
  "serde_json",
  "tokio",
  "ui-3d",

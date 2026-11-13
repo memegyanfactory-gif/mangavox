@@ -531,8 +531,10 @@ impl CreativePage {
             let clips = tasks.iter().filter(|t| matches!(t, jobs::Task::Clip { .. })).count();
             format!("{clips} clips with {}, {} s each, stitched in reading order.", vm.name, vm.fit_seconds(p.settings.clip_seconds))
         } else {
-            let mut s = format!("{images} image{} with {}", if images == 1 { "" } else { "s" }, m.name);
-            if credits > 0. {
+            let mut s = format!("{images} image{} with {}", if images == 1 { "" } else { "s" }, if p.settings.web_images { "Magnific's website (Nano Banana 2.1, 1K, unlimited)" } else { m.name });
+            if p.settings.web_images {
+                s.push_str(" · one at a time, about a minute each");
+            } else if credits > 0. {
                 s.push_str(&format!(" · about {} Magnific credits", credits.round()));
             } else if m.via != ui_studio::images::Via::Magnific {
                 s.push_str(&format!(" · billed by {}", m.service_label()));

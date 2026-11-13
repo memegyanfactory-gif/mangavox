@@ -21,7 +21,11 @@ pub(crate) type Reply = oneshot::Sender<Result<Value, String>>;
 
 pub(crate) enum Kind {
     Html { url: String, wait_for: Option<String> },
-    Eval { url: String, script: String },
+    /// `timeout`: how long the script may take (default: the configured action timeout).
+    Eval { url: String, script: String, timeout: Option<Duration> },
+    /// Opens `url` in a window the user sees and uses (to sign in to a site), kept open until
+    /// they close it. Later requests for that site run in it.
+    Show { url: String, title: String },
     Fetch { url: String, headers: Vec<(String, String)> },
     Cookies { url: String },
 }
@@ -30,7 +34,7 @@ impl Kind {
     /// The page that has to be loaded (and cleared) before the job can act.
     fn nav_url(&self) -> String {
         match self {
-            Kind::Html { url, .. } | Kind::Eval { url, .. } | Kind::Cookies { url } => url.clone(),
+            Kind::Html { url, .. } | Kind::Eval { url, .. } | Kind::Show { url, .. } | Kind::Cookies { url } => url.clone(),
             Kind::Fetch { url, .. } => origin_of(url).map(|o| format!("{o}/")).unwrap_or_else(|| url.clone()),
         }
     }
@@ -86,6 +90,9 @@ struct Page {
     loaded_url: Option<String>,
     cleared: bool,
     visible: bool,
+    /// Shown to the user on purpose ([`Kind::Show`]): never hidden, closed or reused for another
+    /// site by the runner; it goes when the user closes it.
+    pinned: bool,
     job: Option<Job>,
     idle_since: Instant,
 }
@@ -225,6 +232,7 @@ impl Runner {
                 loaded_url: None,
                 cleared: false,
                 visible: self.cfg.show_windows,
+                pinned: false,
                 job: None,
                 idle_since: Instant::now(),
             },
@@ -266,7 +274,7 @@ impl Runner {
         if self.cfg.show_windows {
             return;
         }
-        if let Some(p) = self.pages.get_mut(&pid) {
+        if let Some(p) = self.pages.get_mut(&pid).filter(|p| !p.pinned) {
             p.visible = false;
             p.window.set_visible(false);
         }
@@ -293,7 +301,7 @@ impl Runner {
                         continue;
                     }
                 }
-            } else if let Some(&other) = idle.first() {
+            } else if let Some(other) = idle.iter().copied().find(|i| !self.pages[i].pinned) {
                 self.remove_page(other);
                 continue;
             } else {
@@ -315,7 +323,7 @@ impl Runner {
         let skip_nav = page.cleared
             && match &req.kind {
                 Kind::Html { .. } => false,
-                Kind::Eval { url, .. } => page.loaded_url.as_deref() == Some(url.as_str()),
+                Kind::Eval { url, .. } | Kind::Show { url, .. } => page.loaded_url.as_deref() == Some(url.as_str()),
                 Kind::Fetch { .. } | Kind::Cookies { .. } => page.origin == origin,
             };
         let mut job = Job {
@@ -332,6 +340,16 @@ impl Runner {
             cleared_at: None,
             poll_since: None,
         };
+        if let Kind::Show { title, .. } = &job.kind {
+            // The user's own window: in front, with a taskbar button, from the first moment (a
+            // wall or a sign-in page is theirs to get through).
+            page.pinned = true;
+            page.visible = true;
+            page.window.set_title(title);
+            show_front(&page.window);
+            job.shown_for_user = true;
+            job.deadline = now + self.cfg.interactive_timeout.max(Duration::from_secs(90));
+        }
         if skip_nav {
             page.job = Some(job);
             self.act(pid);
@@ -358,7 +376,7 @@ impl Runner {
             let (expired, idle_drop) = {
                 let Some(page) = self.pages.get_mut(&pid) else { continue };
                 match page.job.as_mut() {
-                    None => (None, now.duration_since(page.idle_since) > self.cfg.idle_ttl && !self.cfg.show_windows),
+                    None => (None, now.duration_since(page.idle_since) > self.cfg.idle_ttl && !self.cfg.show_windows && !page.pinned),
                     Some(job) if now > job.deadline => (
                         Some(match job.phase {
                             Phase::Navigating => {
@@ -454,11 +472,15 @@ impl Runner {
 
     /// The page is clear: run the job's action.
     fn act(&mut self, pid: u64) {
-        let action_deadline = Instant::now() + self.cfg.action_timeout;
+        let now = Instant::now();
+        let default_timeout = self.cfg.action_timeout;
         let Some(page) = self.pages.get_mut(&pid) else { return };
         let Some(job) = page.job.as_mut() else { return };
         let jid = job.id;
-        job.deadline = action_deadline;
+        job.deadline = now + match &job.kind {
+            Kind::Eval { timeout: Some(t), .. } => *t,
+            _ => default_timeout,
+        };
         job.phase = Phase::Awaiting;
         let p = self.proxy.clone();
         let res: Result<(), String> = match &job.kind {
@@ -473,6 +495,10 @@ impl Runner {
                     Value::Array(cs.iter().map(|c| serde_json::json!([c.name(), c.value()])).collect())
                 });
                 self.finish(pid, r);
+                return;
+            }
+            Kind::Show { .. } => {
+                self.finish(pid, Ok(Value::Null));
                 return;
             }
             Kind::Eval { script, .. } => page.webview.evaluate_script(&wrap_async(jid, script)).map_err(|e| format!("evaluate: {e}")),
@@ -527,6 +553,18 @@ impl Runner {
             self.hide(pid);
         }
     }
+}
+
+/// Shows `window` as an ordinary window: in front, focused, with its taskbar button.
+fn show_front(window: &Window) {
+    #[cfg(windows)]
+    {
+        use tao::platform::windows::WindowExtWindows;
+        let _ = window.set_skip_taskbar(false);
+    }
+    window.set_visible(true);
+    window.set_minimized(false);
+    window.set_focus();
 }
 
 /// Run `expr` (an async JS expression) and report `{job, ok, v|e}` through the ipc channel.

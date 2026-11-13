@@ -287,12 +287,36 @@ fn video_from_lockup(l: &Value) -> Option<TrendVideo> {
     }
     let meta = l.get("metadata")?.get("lockupMetadataViewModel")?;
     let title = meta.get("title").map(text).unwrap_or_default();
-    let mut parts = Vec::new();
-    find_all(meta, "content", &mut parts);
-    let parts: Vec<String> = parts.into_iter().filter_map(|p| p.as_str().map(str::to_string)).collect();
-    let views = parts.iter().find(|p| p.to_ascii_lowercase().contains("view")).and_then(|p| parse_count(p)).unwrap_or(0);
-    let age = parts.iter().find(|p| p.to_ascii_lowercase().ends_with("ago")).and_then(|p| parse_age_hours(p))?;
-    Some(TrendVideo { id, title, views, age_hours: age, ..Default::default() })
+    // Each part under the title: what it shows ("93M", "1.2K views", "12d ago") and what a screen
+    // reader says for it ("93 million views"). Since late 2026 the views are a bare number next
+    // to a play icon, so the word "views" is only in that label.
+    let mut found = Vec::new();
+    find_all(meta.get("metadata").unwrap_or(meta), "metadataParts", &mut found);
+    let parts: Vec<(String, String, bool)> = found
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .map(|p| {
+            let shown = p.get("text").map(text).unwrap_or_default();
+            let said = p.get("accessibilityLabel").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+            let play = p.pointer("/leadingIcon/name").and_then(Value::as_str).is_some_and(|n| n.starts_with("PLAY"));
+            (shown, said, play)
+        })
+        .collect();
+    let is_age = |shown: &str| shown.to_ascii_lowercase().ends_with("ago");
+    let views = parts
+        .iter()
+        .find(|(shown, said, play)| !is_age(shown) && (shown.to_ascii_lowercase().contains("view") || said.contains("view") || *play))
+        .and_then(|(shown, _, _)| parse_count(shown))
+        .unwrap_or(0);
+    let age = parts.iter().find(|(shown, _, _)| is_age(shown)).and_then(|(shown, _, _)| parse_age_hours(shown))?;
+    // The length is the badge on the thumbnail ("1:34:07"); a live or upcoming one has none.
+    let mut badges = Vec::new();
+    if let Some(image) = l.get("contentImage") {
+        find_all(image, "thumbnailBadgeViewModel", &mut badges);
+    }
+    let length_secs = badges.iter().filter_map(|b| b.get("text").map(text)).find(|t| t.contains(':') && t.chars().all(|c| c.is_ascii_digit() || c == ':')).map(|t| parse_length(&t)).unwrap_or(0);
+    Some(TrendVideo { id, title, views, age_hours: age, length_secs, ..Default::default() })
 }
 
 /// The videos of a search results or channel page (`ytInitialData`), in page order, no repeats.
@@ -948,6 +972,25 @@ mod tests {
         assert_eq!((v[0].id.as_str(), v[0].views, v[0].age_hours, v[0].length_secs, v[0].channel.as_str()), ("a1", 9797, 9.0, 3600, "Chan"));
         assert_eq!(v[0].description, "Manhwa: Solo Leveling");
         assert_eq!((v[1].id.as_str(), v[1].views, v[1].age_hours), ("b2", 1200, 72.0));
+    }
+
+    #[test]
+    fn channel_cards_with_bare_view_numbers_and_a_length_badge() {
+        // As channel pages are since late 2026: "93M" beside a play icon, the length on the thumbnail.
+        let card = |id: &str, parts: Value, badge: Value| {
+            json!({"lockupViewModel": {"contentId": id, "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                "contentImage": {"thumbnailViewModel": {"overlays": [{"thumbnailBottomOverlayViewModel": {"badges": [{"thumbnailBadgeViewModel": badge}]}}]}},
+                "metadata": {"lockupMetadataViewModel": {"title": {"content": "A 12 views ago title"}, "metadata": {"contentMetadataViewModel": {"metadataRows": [{"metadataParts": parts}]}}}}}})
+        };
+        let data = json!({"contents": [
+            card("c1", json!([{"text": {"content": "93M"}, "accessibilityLabel": "93 million views", "leadingIcon": {"name": "PLAY_ARROW_OUTLINED"}}, {"text": {"content": "12d ago"}, "accessibilityLabel": "12 days ago"}]), json!({"text": "1:34:07"})),
+            card("c2", json!([{"text": {"content": "325.7K"}, "leadingIcon": {"name": "PLAY_ARROW_OUTLINED"}}, {"text": {"content": "3w ago"}}]), json!({"text": "22:28"})),
+            card("c3", json!([{"text": {"content": "1mo ago"}}]), json!({"text": "LIVE"})),
+        ]});
+        let v = parse_videos(&data);
+        let got: Vec<(&str, u64, f64, u64)> = v.iter().map(|x| (x.id.as_str(), x.views, x.age_hours, x.length_secs)).collect();
+        assert_eq!(got, vec![("c1", 93_000_000, 288.0, 5647), ("c2", 325_700, 504.0, 1348), ("c3", 0, 720.0, 0)]);
+        assert_eq!(v[0].title, "A 12 views ago title");
     }
 
     fn video(id: &str, channel: &str, views: u64, hours: f64, keywords: &[&str], desc: &str) -> TrendVideo {

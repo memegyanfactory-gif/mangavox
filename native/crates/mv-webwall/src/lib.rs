@@ -64,6 +64,18 @@ impl Default for WallConfig {
     }
 }
 
+static GLOBAL: std::sync::OnceLock<Arc<WebWall>> = std::sync::OnceLock::new();
+
+/// Keeps the app's one browser where other pages can reach it (set once at startup).
+pub fn set_global(wall: Arc<WebWall>) {
+    let _ = GLOBAL.set(wall);
+}
+
+/// The app's browser, when WebView2 is available.
+pub fn global() -> Option<Arc<WebWall>> {
+    GLOBAL.get().cloned()
+}
+
 /// Handle to the WebView thread. Dropping the last `Arc` closes every window.
 pub struct WebWall {
     cfg: WallConfig,
@@ -117,14 +129,33 @@ impl WebWall {
         &self.cfg
     }
 
+    /// Opens `url` in a browser window the user sees (titled `title`), to sign in to a site
+    /// with this app's own browser profile. It stays open until they close it, and later
+    /// requests for that site run in it, as that signed-in user.
+    pub async fn show(&self, url: &str, title: &str) -> Result<(), SourceError> {
+        self.call(Kind::Show { url: url.into(), title: title.into() }).await.map(|_| ())
+    }
+
+    /// [`WallSolver::eval_json`] for a script that takes long (waiting for a site to make
+    /// something): it may run for `timeout`. Runs in the window opened by [`show`](Self::show)
+    /// when there is one for that site, as it stands (no reload), else in a hidden one.
+    pub async fn eval_json_for(&self, page_url: &str, script: &str, timeout: Duration) -> Result<Value, SourceError> {
+        self.call_within(Kind::Eval { url: page_url.into(), script: script.into(), timeout: Some(timeout) }, timeout).await
+    }
+
     async fn call(&self, kind: Kind) -> Result<Value, SourceError> {
+        self.call_within(kind, Duration::ZERO).await
+    }
+
+    /// `call` with `extra` time for the action itself.
+    async fn call_within(&self, kind: Kind, extra: Duration) -> Result<Value, SourceError> {
         let (tx, rx) = oneshot::channel();
         self.proxy
             .lock()
             .unwrap()
             .send_event(Ev::Submit(Request { kind, reply: tx }))
             .map_err(|_| SourceError::Solver("webview thread is not running".into()))?;
-        let mut total = self.cfg.hidden_timeout + self.cfg.action_timeout + Duration::from_secs(20);
+        let mut total = self.cfg.hidden_timeout + self.cfg.action_timeout + Duration::from_secs(20) + extra;
         if self.cfg.interactive {
             total += self.cfg.interactive_timeout;
         }
@@ -175,6 +206,6 @@ impl WallSolver for WebWall {
     }
 
     async fn eval_json(&self, page_url: &str, script: &str) -> mv_sources::Result<Value> {
-        self.call(Kind::Eval { url: page_url.into(), script: script.into() }).await
+        self.call(Kind::Eval { url: page_url.into(), script: script.into(), timeout: None }).await
     }
 }

@@ -49,6 +49,43 @@ pub(crate) fn aspects(m: &ImageModel) -> &'static [&'static str] {
     }
 }
 
+/// The frames to pick from: the website's when pictures are made there, else the model's.
+pub(crate) fn shapes(p: &Project, m: &ImageModel) -> &'static [&'static str] {
+    if p.settings.web_images {
+        crate::web::ASPECTS
+    } else {
+        aspects(m)
+    }
+}
+
+/// Reference pictures one image may carry.
+fn ref_cap(p: &Project, m: &ImageModel) -> usize {
+    if p.settings.web_images {
+        crate::web::MAX_REFS
+    } else {
+        m.refs
+    }
+}
+
+/// Credits one image costs: none on the website's unlimited offer.
+fn cost(p: &Project, m: &ImageModel, res: &str) -> f64 {
+    if p.settings.web_images {
+        0.
+    } else {
+        m.cost_at(res)
+    }
+}
+
+/// One picture: on Magnific's website (signed in, one at a time) or through the model's API.
+#[allow(clippy::too_many_arguments)]
+async fn paint(web: bool, m: &'static ImageModel, key: &str, prompt: &str, refs: &[Reference], aspect: &str, res: &str, out: &std::path::Path, on_status: impl Fn(&str)) -> Result<()> {
+    if web {
+        crate::web::generate(prompt, refs, aspect, out, on_status).await
+    } else {
+        images::generate(m, key, prompt, refs, aspect, res, out, on_status).await
+    }
+}
+
 /// It can paint a whole portrait page.
 pub(crate) fn paints_pages(m: &ImageModel) -> bool {
     aspects(m).contains(&PAGE_ASPECT)
@@ -68,6 +105,10 @@ pub(crate) fn whole_pages(p: &Project, m: &ImageModel) -> bool {
     // Live action is filmed scene by scene: each panel is its own film still.
     if p.settings.live_action {
         return false;
+    }
+    // The website paints a portrait page whatever model the API side has picked.
+    if p.settings.web_images {
+        return !matches!(p.settings.mode, mv_create::RenderMode::Panels);
     }
     match p.settings.mode {
         mv_create::RenderMode::Page => paints_pages(m),
@@ -144,15 +185,16 @@ fn set(status: &Arc<Mutex<String>>, s: impl Into<String>) {
 pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<String>>) -> Result<Job> {
     let m = image_model(p, keys);
     let res = resolution(p, m);
-    let one = m.cost_at(res);
+    let one = cost(p, m, res);
+    let web = p.settings.web_images;
     let image_job = |label: String, prompt: String, refs: Vec<Reference>, aspect: &'static str, out: PathBuf, done: Box<dyn FnOnce(String) -> Outcome + Send>, rel_of: Box<dyn Fn(&std::path::Path) -> String + Send>| -> Result<Job> {
-        let k = key(m)?;
+        let k = if web { String::new() } else { key(m)? };
         let st = status.clone();
         let fut = async move {
-            images::generate(m, &k, &prompt, &refs, aspect, res, &out, move |s| set(&st, s)).await?;
+            paint(web, m, &k, &prompt, &refs, aspect, res, &out, move |s| set(&st, s)).await?;
             Ok(done(rel_of(&out)))
         };
-        Ok(Job { label, credits: one, model: Some(m), fut: fut.boxed() })
+        Ok(Job { label, credits: one, model: (!web).then_some(m), fut: fut.boxed() })
     };
     let dir = p.dir();
     let rel = move |f: &std::path::Path| f.strip_prefix(&dir).unwrap_or(f).to_string_lossy().replace('\\', "/");
@@ -173,9 +215,9 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
                 refs.push(Reference { file: p.file(r), caption: format!("Image {}: art style reference (style only, not its characters)", refs.len() + 1) });
             }
             refs.retain(|r| r.file.is_file());
-            refs.truncate(m.refs);
+            refs.truncate(ref_cap(p, m));
             let prompt = if expr { prompts::expressions(p, &c) } else { prompts::sheet(p, &c, !refs.is_empty()) };
-            let aspect = layout::nearest(if expr { 1. } else { 16. / 9. }, aspects(m));
+            let aspect = layout::nearest(if expr { 1. } else { 16. / 9. }, shapes(p, m));
             let out = p.new_image("sheets", &format!("{}-{}", c.id, if expr { "expressions" } else { "sheet" }));
             let id = c.id.clone();
             let label = format!("{} · {}", c.name, if expr { "expression sheet" } else { "model sheet" });
@@ -183,10 +225,10 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
         }
         Task::Location(id) => {
             let l = p.locations.iter().find(|l| &l.id == id).ok_or_else(|| anyhow!("that location is gone"))?.clone();
-            let refs: Vec<Reference> = p.style_refs.iter().take(2).map(|r| Reference { file: p.file(r), caption: "art style reference (style only)".into() }).filter(|r| r.file.is_file()).take(m.refs).collect();
+            let refs: Vec<Reference> = p.style_refs.iter().take(2).map(|r| Reference { file: p.file(r), caption: "art style reference (style only)".into() }).filter(|r| r.file.is_file()).take(ref_cap(p, m)).collect();
             let out = p.new_image("sheets", &format!("loc-{}", l.id));
             let id = l.id.clone();
-            image_job(format!("{} · location", l.name), prompts::location(p, &l), refs, layout::nearest(16. / 9., aspects(m)), out, Box::new(move |rel| Outcome::Location { id, rel }), Box::new(rel))
+            image_job(format!("{} · location", l.name), prompts::location(p, &l), refs, layout::nearest(16. / 9., shapes(p, m)), out, Box::new(move |rel| Outcome::Location { id, rel }), Box::new(rel))
         }
         Task::Page { chapter, page } => page_job(p, m, res, *chapter, *page, status),
         Task::Clip { chapter, page, panel } => clip_job(p, *chapter, *page, *panel, status),
@@ -220,7 +262,8 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
 fn page_job(p: &Project, m: &'static ImageModel, res: &'static str, chapter: u32, page: u32, status: Arc<Mutex<String>>) -> Result<Job> {
     let ch = p.chapter(chapter).ok_or_else(|| anyhow!("no chapter {chapter}"))?;
     let pg = ch.pages.iter().find(|x| x.number == page).ok_or_else(|| anyhow!("no page {page} in chapter {chapter}"))?.clone();
-    let k = key(m)?;
+    let web = p.settings.web_images;
+    let k = if web { String::new() } else { key(m)? };
     let prev = ch.pages.iter().filter(|x| x.number < page).max_by_key(|x| x.number).and_then(|x| existing(p, x.image.as_ref()));
     let label = format!("Chapter {chapter} · page {page}");
     let dir = p.dir();
@@ -240,19 +283,19 @@ fn page_job(p: &Project, m: &'static ImageModel, res: &'static str, chapter: u32
         names.sort_by_key(|(_, k)| std::cmp::Reverse(*k));
         let names: Vec<String> = names.into_iter().map(|(n, _)| n).collect();
         let location = pg.panels.first().map(|x| x.location.clone()).unwrap_or_default();
-        let refs = refs_for(p, &names, &location, prev, m.refs);
+        let refs = refs_for(p, &names, &location, prev, ref_cap(p, m));
         let prompt = prompts::page(p, chapter, &pg, &captions(&refs));
         let raw = out.with_extension("raw.png");
         let n = pg.panels.len();
         let model = m.name.to_string();
         let fut = async move {
-            images::generate(m, &k, &prompt, &refs, PAGE_ASPECT, res, &raw, move |s| set(&st, s)).await?;
+            paint(web, m, &k, &prompt, &refs, PAGE_ASPECT, res, &raw, move |s| set(&st, s)).await?;
             let (r, o) = (raw.clone(), out.clone());
             tokio::task::spawn_blocking(move || layout::fit_page(&r, &o)).await??;
             let _ = std::fs::remove_file(&raw);
             Ok(Outcome::Page { chapter, page, rel: rel(&out), panels: vec![None; n], model })
         };
-        return Ok(Job { label, credits: m.cost_at(res), model: Some(m), fut: fut.boxed() });
+        return Ok(Job { label, credits: cost(p, m, res), model: (!web).then_some(m), fut: fut.boxed() });
     }
     // Panel by panel: each at the model's nearest shape to its place on the page, then laid out
     // and lettered here.
@@ -260,9 +303,9 @@ fn page_job(p: &Project, m: &'static ImageModel, res: &'static str, chapter: u32
     let mut work = vec![];
     for (i, panel) in pg.panels.iter().enumerate() {
         let (_, _, w, h) = layout::place(rects[i], layout::PAGE_W, layout::PAGE_H);
-        let aspect = layout::nearest(w as f32 / h as f32, aspects(m));
+        let aspect = layout::nearest(w as f32 / h as f32, shapes(p, m));
         let names: Vec<String> = panel.characters.iter().map(|c| c.name.clone()).collect();
-        let refs = refs_for(p, &names, &panel.location, prev.clone(), m.refs);
+        let refs = refs_for(p, &names, &panel.location, prev.clone(), ref_cap(p, m));
         let prompt = prompts::panel(p, panel, aspect, &captions(&refs));
         let file = p.new_image("panels", &format!("ch{chapter:02}-p{page:03}-{}", i + 1));
         // Film stills carry no balloons: their lines are spoken in the clip.
@@ -276,7 +319,7 @@ fn page_job(p: &Project, m: &'static ImageModel, res: &'static str, chapter: u32
         let mut panels = vec![];
         for (i, (prompt, refs, aspect, file, lines)) in work.into_iter().enumerate() {
             let st2 = st.clone();
-            images::generate(m, &k, &prompt, &refs, aspect, res, &file, move |s| set(&st2, format!("Panel {} of {count} · {s}", i + 1))).await.with_context(|| format!("panel {}", i + 1))?;
+            paint(web, m, &k, &prompt, &refs, aspect, res, &file, move |s| set(&st2, format!("Panel {} of {count} · {s}", i + 1))).await.with_context(|| format!("panel {}", i + 1))?;
             panels.push(Some(rel(&file)));
             arts.push(PanelArt { image: Some(file), lines });
         }
@@ -285,7 +328,7 @@ fn page_job(p: &Project, m: &'static ImageModel, res: &'static str, chapter: u32
         tokio::task::spawn_blocking(move || layout::compose(&layout_id, &arts, rtl, &o)).await??;
         Ok(Outcome::Page { chapter, page, rel: rel(&out), panels, model })
     };
-    Ok(Job { label, credits: m.cost_at(res) * count as f64, model: Some(m), fut: fut.boxed() })
+    Ok(Job { label, credits: cost(p, m, res) * count as f64, model: (!web).then_some(m), fut: fut.boxed() })
 }
 
 fn clip_job(p: &Project, chapter: u32, page: u32, i: usize, status: Arc<Mutex<String>>) -> Result<Job> {
@@ -737,7 +780,7 @@ pub(crate) fn estimate(p: &Project, keys: &Keys, tasks: &[Task]) -> (usize, f64)
             _ => 0,
         };
     }
-    (images, images as f64 * m.cost_at(res))
+    (images, images as f64 * cost(p, m, res))
 }
 
 #[cfg(test)]
@@ -873,6 +916,23 @@ mod tests {
         // Cast once, the same ever after.
         assert_eq!(cast_voices(&t, &cast, &names), v);
         let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn the_website_paints_free_whole_pages_with_its_own_frames() {
+        let mut p = Project::default();
+        let flux = CATALOG.iter().find(|m| m.id == "flux-2-pro").unwrap();
+        let banana = CATALOG.iter().find(|m| m.id == "nano-banana-2-1").unwrap();
+        assert!(!whole_pages(&p, flux) && cost(&p, banana, "2K") > 0.);
+        p.settings.web_images = true;
+        assert!(whole_pages(&p, flux), "the website paints portrait pages whatever the API model");
+        assert_eq!((cost(&p, banana, "2K"), ref_cap(&p, flux)), (0., crate::web::MAX_REFS));
+        assert!(shapes(&p, flux).contains(&PAGE_ASPECT) && shapes(&p, flux).contains(&"16:9"));
+        p.settings.mode = mv_create::RenderMode::Panels;
+        assert!(!whole_pages(&p, flux));
+        p.settings.mode = mv_create::RenderMode::Auto;
+        p.settings.live_action = true;
+        assert!(!whole_pages(&p, flux), "live action is always scene by scene");
     }
 
     #[test]

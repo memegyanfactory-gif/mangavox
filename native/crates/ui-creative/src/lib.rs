@@ -10,6 +10,7 @@ mod jobs;
 mod manga;
 mod motion;
 mod page;
+mod web;
 
 /// The one Creative page of the app. Every visit shows the same page, so a paint queue or an AI
 /// answer still running from an earlier visit is never raced by a second copy of the project.

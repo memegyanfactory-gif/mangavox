@@ -101,6 +101,9 @@ pub struct Settings {
     pub live_action: bool,
     /// The voice that speaks the scenes' lines (empty: Studio's voice).
     pub voice: String,
+    /// Pictures are made on Magnific's website, in the app's browser window where the user is
+    /// signed in (its unlimited offer), instead of through an API key.
+    pub web_images: bool,
 }
 
 impl Default for Settings {
@@ -119,6 +122,7 @@ impl Default for Settings {
             comfy_workflow: String::new(),
             live_action: false,
             voice: String::new(),
+            web_images: false,
         }
     }
 }
