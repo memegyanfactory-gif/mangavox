@@ -145,6 +145,8 @@ impl CreativePage {
                 .child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child(format!("Page {page} · scene {}", i + 1)))
                 .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).line_clamp(3).child(if x.motion.is_empty() { x.description.clone() } else { format!("{} Moves: {}", x.description, x.motion) }))
                 .when(!lines.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).line_clamp(4).child(format!("Spoken: {}", lines.join(" / ")))))
+                .child(prompt_box("What the picture is made from", mv_create::prompts::panel(p, &x, &p.settings.video_aspect, &[])))
+                .child(prompt_box("What the clip is filmed from", mv_create::prompts::motion(p, &x)))
                 .children(self.clip_notes.as_ref().map(|t| Textarea::new(t)))
                 .child(
                     div()
@@ -167,12 +169,109 @@ impl CreativePage {
         )
     }
 
-    pub(crate) fn video_tab(&mut self, cx: &mut Context<Self>) -> Div {
-        let p = self.p.clone().unwrap_or_default();
-        if p.chapters.iter().all(|c| c.painted() == 0) {
-            return div().child(mv_ui::empty_state("Paint a chapter first", "Once a chapter's pages are painted, each panel becomes a short clip here, stitched into one video."));
+    /// The road from a manga to its video as five steps: which are done, which is being made
+    /// now, and one button that makes everything that is left.
+    fn steps(&self, p: &mv_create::Project, n: u32, cx: &mut Context<Self>) -> Div {
+        let stage = jobs::stage(p, n);
+        let at = stage.index();
+        let ch = p.chapter(n).cloned().unwrap_or_default();
+        let opening = p.opening_cast();
+        let with_sheets = opening.iter().filter(|name| p.character(name).is_some_and(|c| c.has_sheets())).count();
+        let places = p.locations.iter().filter(|l| l.sheet.is_some()).count();
+        let scenes: usize = ch.pages.iter().map(|pg| pg.panels.len()).sum();
+        let clips = ch.pages.iter().flat_map(|pg| &pg.panels).filter(|x| x.clip.is_some()).count();
+        let busy = self.busy();
+        let rows: [(&str, String); 5] = [
+            ("Characters and story", if p.cast.is_empty() { "Read from the manga: who is in it and what happens".into() } else { format!("{} characters, {} chapters", p.cast.len(), p.chapters.len()) }),
+            ("Character sheets and places", format!("{with_sheets} of {} main characters have their sheets · {places} of {} places pictured (every scene is made from these, so faces and places stay the same)", opening.len(), p.locations.len())),
+            ("Scenes written", if scenes == 0 { format!("The AI writes chapter {n} scene by scene: what is seen, who speaks, how it moves") } else { format!("{scenes} scenes on {} pages", ch.pages.len()) }),
+            ("Scene pictures", format!("{} of {} pages shot", ch.painted(), ch.pages.len())),
+            ("Voices, clips and the video", if at == 5 { "Ready to play".into() } else { format!("{clips} of {scenes} scenes voiced and filmed, then joined") }),
+        ];
+        let now = self.running.as_ref().map(|r| format!("{} · {}", r.label, r.status.lock().map(|s| s.clone()).unwrap_or_default())).or_else(|| self.thinking.as_ref().map(|s| s.lock().map(|s| if s.is_empty() { "The AI is writing".to_string() } else { s.clone() }).unwrap_or_default()));
+        let auto = self.auto.is_some();
+        let label = match (at, auto && busy) {
+            (_, true) => "Making it automatically…".to_string(),
+            (5, _) => "The video is made".to_string(),
+            (0 | 1, _) if with_sheets == 0 => "Make the whole video automatically".to_string(),
+            _ => "Continue automatically from here".to_string(),
+        };
+        let mut col = div().flex().flex_col().gap(px(space::SM)).p(px(space::MD)).rounded(px(radius::LG)).bg(Tokens::surface_2()).border_1().border_color(Tokens::border());
+        for (i, (title, detail)) in rows.into_iter().enumerate() {
+            // Step i is done once the stage is past it (the stage index is one ahead of the rows).
+            let (done, current) = (at > i, at == i);
+            let lead: AnyElement = if done {
+                icon_ph(ph::CHECK_CIRCLE, Tokens::success(), 18.).into_any_element()
+            } else if current && busy {
+                mv_ui::spinner(("cr-step-spin", i), Tokens::accent(), 16.).into_any_element()
+            } else {
+                div().w(px(18.)).h(px(18.)).rounded_full().border_1().border_color(if current { Tokens::accent() } else { Tokens::border() }).flex().items_center().justify_center().text_size(px(10.)).text_color(Tokens::text_3()).child(format!("{}", i + 1)).into_any_element()
+            };
+            col = col.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(space::SM))
+                    .child(div().pt(px(1.)).child(lead))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(if done || current { Tokens::text_1() } else { Tokens::text_3() }).child(title))
+                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().child(detail))
+                            .when_some(now.clone().filter(|_| current && busy), |d, t| d.child(div().text_size(px(size::XS)).text_color(Tokens::accent()).whitespace_normal().child(format!("Now: {t}")))),
+                    ),
+            );
         }
-        let n = self.chapter;
+        col.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(space::SM))
+                .pt(px(space::XS))
+                .when(at < 5, |d| {
+                    d.child(btn("cr-auto", label.clone(), ButtonKind::Primary).icon(ph::PLAY).loading(auto && busy).tooltip("Does every step that is left, one after another, without asking again. Stop it any time; what is made is kept.").on_click(cx.listener(|this, _, _, cx| {
+                        if !this.busy() {
+                            this.auto_start(cx);
+                        }
+                    })))
+                })
+                .when(busy, |d| {
+                    d.child(btn("cr-auto-stop", "Stop", ButtonKind::Ghost).small().icon(ph::STOP).on_click(cx.listener(|this, _, _, cx| {
+                        this.auto = None;
+                        if this.thinking.is_some() {
+                            this.stop_ai(cx);
+                        }
+                        this.stop(cx);
+                    })))
+                })
+                .child(div().flex_1().min_w(px(200.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(if auto && busy { "Runs by itself to the end. It also shows in Activity." } else { "Or do one step at a time with the buttons below." })),
+        )
+    }
+
+    pub(crate) fn video_tab(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(p) = self.p.clone() else {
+            // Nothing open: the one thing to do is pick the manga.
+            return div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(space::LG))
+                .pt(px(48.))
+                .child(icon_ph(ph::FILM_STRIP, Tokens::accent(), 44.))
+                .child(div().text_size(px(size::XL)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("Make a video from a manga"))
+                .child(div().max_w(px(600.)).text_center().text_size(px(size::SM)).text_color(Tokens::text_2()).child("Pick a manga you downloaded. The app reads its characters and story, makes a realistic sheet of every main character and a picture of every place, writes the scenes, shoots a picture of each, then voices and films them and joins the video. You watch each step and can open any scene to read or change what was asked for."))
+                .children(self.adapt_menu("cr-adapt-video", cx))
+                .when(self.library.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).child("No downloaded manga found yet: download chapters of one first.")));
+        };
+        if self.error.is_some() {
+            self.auto = None;
+        }
+        let n = if p.chapter(self.chapter).is_some() { self.chapter } else { p.first_chapter() };
+        let steps = self.steps(&p, n, cx);
         let ch = p.chapter(n).cloned().unwrap_or_default();
         let todo = jobs::plan(&p, &Proposal::Video { chapter: n });
         let clips_left = todo.iter().filter(|t| matches!(t, Task::Clip { .. })).count();
@@ -185,7 +284,11 @@ impl CreativePage {
             .flex_col()
             .gap(px(space::LG))
             .child(self.chapter_picker(&p, cx))
+            .child(steps)
+            .child(mv_ui::section_label("How it is made"))
+            .child(self.look_bar(cx))
             .child(self.video_bar(cx))
+            .child(mv_ui::section_label("Scenes"))
             .child(
                 div()
                     .flex()
@@ -219,13 +322,13 @@ impl CreativePage {
                 )
             })
             .children(self.clip_sel.and_then(|(page, i)| self.clip_editor(&p, n, page, i, cx)))
-            .child(div().flex().flex_col().gap(px(space::MD)).children(ch.pages.iter().filter(|pg| pg.image.is_some()).map(|pg| {
+            .child(div().flex().flex_col().gap(px(space::MD)).children(ch.pages.iter().map(|pg| {
                 let page = pg.number;
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(format!("Page {page}")))
+                    .child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(format!("Page {page}{}", if pg.beat.is_empty() { String::new() } else { format!(" · {}", pg.beat) })))
                     .child(div().flex().flex_wrap().gap(px(6.)).children(pg.panels.iter().enumerate().map(|(i, x)| {
                         let src = existing(&p, x.image.as_ref()).or_else(|| existing(&p, pg.image.as_ref()));
                         let has = x.clip.is_some();
@@ -245,10 +348,23 @@ impl CreativePage {
                                     .child(div().flex_1().text_size(px(size::XS)).text_color(Tokens::text_3()).truncate().child(if busy { "Animating…".to_string() } else if x.motion.is_empty() { format!("Panel {}", i + 1) } else { x.motion.clone() }))
                                     .child(btn(SharedString::from(format!("cr-reclip-{page}-{i}")), if has { "Redo" } else { "Make" }, ButtonKind::Ghost).small().on_click(cx.listener(move |this, _, _, cx| this.enqueue(vec![Task::Clip { chapter: n, page, panel: i }, Task::Stitch { chapter: n }], cx)))),
                             )
-                            .child(btn(SharedString::from(format!("cr-clipnotes-{page}-{i}")), if x.notes.trim().is_empty() { "Notes…" } else { "Notes ✓" }, if self.clip_sel == Some((page, i)) { ButtonKind::Secondary } else { ButtonKind::Ghost }).small().icon(ph::PENCIL_SIMPLE).tooltip("Write what this clip should do differently, then make it again").on_click(cx.listener(move |this, _, window, cx| this.pick_clip(n, page, i, window, cx))))
+                            .child(btn(SharedString::from(format!("cr-clipnotes-{page}-{i}")), if x.notes.trim().is_empty() { "Prompt & notes" } else { "Prompt & notes ✓" }, if self.clip_sel == Some((page, i)) { ButtonKind::Secondary } else { ButtonKind::Ghost }).small().icon(ph::PENCIL_SIMPLE).tooltip("Read exactly what is asked for this scene's picture and clip, and write what should be different").on_click(cx.listener(move |this, _, window, cx| this.pick_clip(n, page, i, window, cx))))
                     })))
             })))
     }
+}
+
+/// A prompt as sent, in a box that can be read whole.
+fn prompt_box(title: &'static str, text: String) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .p(px(space::SM))
+        .rounded(px(radius::MD))
+        .bg(Tokens::surface_3())
+        .child(div().text_size(px(size::XS)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_2()).child(title))
+        .child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).whitespace_normal().child(text))
 }
 
 fn reveal(f: &std::path::Path) {

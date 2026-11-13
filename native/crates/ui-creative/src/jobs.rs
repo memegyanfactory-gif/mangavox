@@ -768,6 +768,74 @@ pub(crate) fn plan(p: &Project, proposal: &mv_create::Proposal) -> Vec<Task> {
     out
 }
 
+/// Where the video of a chapter stands: the next thing to make, in the order it is made.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Stage {
+    /// No cast yet: the series has to be written (from the manga it adapts, or in Chat).
+    Series,
+    /// The opening cast's sheets and the places' pictures, so everyone and everywhere looks the
+    /// same in every scene.
+    Sheets(Vec<Task>),
+    /// The chapter's scenes are not written yet.
+    Script,
+    /// Scene pictures (with the sheets and places a scene needs that are still missing).
+    Stills(Vec<Task>),
+    /// Voices, clips and the stitched video.
+    Film(Vec<Task>),
+    Done,
+}
+
+impl Stage {
+    /// 0 to 5, in order.
+    pub(crate) fn index(&self) -> usize {
+        match self {
+            Stage::Series => 0,
+            Stage::Sheets(_) => 1,
+            Stage::Script => 2,
+            Stage::Stills(_) => 3,
+            Stage::Film(_) => 4,
+            Stage::Done => 5,
+        }
+    }
+
+    pub(crate) fn tasks(&self) -> &[Task] {
+        match self {
+            Stage::Sheets(t) | Stage::Stills(t) | Stage::Film(t) => t,
+            _ => &[],
+        }
+    }
+}
+
+/// Places that have no picture yet: the ones chapter `n`'s scenes are set in once it is written,
+/// else the first few of the series.
+fn places_to_paint(p: &Project, n: u32) -> Vec<Task> {
+    let used: Vec<String> = p.chapter(n).map(|c| c.pages.iter().flat_map(|pg| &pg.panels).map(|x| x.location.trim().to_lowercase()).filter(|l| !l.is_empty()).collect()).unwrap_or_default();
+    p.locations.iter().filter(|l| l.sheet.is_none()).filter(|l| if used.is_empty() { true } else { used.contains(&l.name.trim().to_lowercase()) }).take(8).map(|l| Task::Location(l.id.clone())).collect()
+}
+
+/// The stage chapter `n`'s video is at.
+pub(crate) fn stage(p: &Project, n: u32) -> Stage {
+    if p.cast.is_empty() {
+        return Stage::Series;
+    }
+    let ch = p.chapter(n).cloned().unwrap_or_default();
+    if ch.pages.is_empty() {
+        let mut t = plan(p, &mv_create::Proposal::Sheets { names: vec![], locations: vec![] });
+        t.extend(places_to_paint(p, n));
+        return if t.is_empty() { Stage::Script } else { Stage::Sheets(t) };
+    }
+    if ch.painted() < ch.pages.len() {
+        let mut t = places_to_paint(p, n);
+        t.extend(plan(p, &mv_create::Proposal::Pages { chapter: n, pages: vec![] }));
+        return Stage::Stills(t);
+    }
+    let film = plan(p, &mv_create::Proposal::Video { chapter: n });
+    if film.iter().any(|t| matches!(t, Task::Clip { .. })) || ch.video.is_none() {
+        return Stage::Film(film);
+    }
+    Stage::Done
+}
+
 /// What a set of tasks costs in images and Magnific credits with the project's model.
 pub(crate) fn estimate(p: &Project, keys: &Keys, tasks: &[Task]) -> (usize, f64) {
     let m = image_model(p, keys);
@@ -933,6 +1001,32 @@ mod tests {
         p.settings.mode = mv_create::RenderMode::Auto;
         p.settings.live_action = true;
         assert!(!whole_pages(&p, flux), "live action is always scene by scene");
+    }
+
+    #[test]
+    fn a_chapters_video_goes_through_its_stages_in_order() {
+        use mv_create::Location;
+        let mut p = Project::default();
+        assert_eq!(stage(&p, 1), Stage::Series);
+        p.cast.push(CastMember { name: "Kai".into(), role: "protagonist".into(), intro_chapter: 1, ..Default::default() });
+        p.locations.push(Location { name: "Harbor".into(), ..Default::default() });
+        p.chapter_mut(1);
+        p.normalize();
+        // Sheets and places first, so every scene is painted from them.
+        assert_eq!(stage(&p, 1), Stage::Sheets(vec![Task::Sheet("kai".into()), Task::Expressions("kai".into()), Task::Location("harbor".into())]));
+        p.cast[0].sheet = Some("s.png".into());
+        p.cast[0].expressions = Some("e.png".into());
+        p.locations[0].sheet = Some("l.png".into());
+        assert_eq!(stage(&p, 1), Stage::Script);
+        let panel = Panel { characters: vec![PanelChar { name: "Kai".into(), ..Default::default() }], location: "Harbor".into(), ..Default::default() };
+        p.chapter_mut(1).pages = vec![Page { number: 1, panels: vec![panel], ..Default::default() }];
+        assert_eq!(stage(&p, 1), Stage::Stills(vec![Task::Page { chapter: 1, page: 1 }]));
+        p.chapter_mut(1).pages[0].image = Some("p.png".into());
+        assert_eq!(stage(&p, 1), Stage::Film(vec![Task::Clip { chapter: 1, page: 1, panel: 0 }, Task::Stitch { chapter: 1 }]));
+        p.chapter_mut(1).pages[0].panels[0].clip = Some("c.mp4".into());
+        assert_eq!(stage(&p, 1).index(), 4, "the clips are made but not stitched yet");
+        p.chapter_mut(1).video = Some("v.mp4".into());
+        assert_eq!(stage(&p, 1), Stage::Done);
     }
 
     #[test]

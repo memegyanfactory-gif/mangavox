@@ -1,6 +1,7 @@
 //! The dedicated WebView2 thread: a tao event loop that owns every hidden window.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::platform::windows::EventLoopBuilderExtWindows;
 use tao::window::{Window, WindowBuilder, WindowId};
 use tokio::sync::oneshot;
-use wry::{WebContext, WebView, WebViewBuilder};
+use wry::{NewWindowResponse, WebContext, WebView, WebViewBuilder};
 
 use crate::detect::{classify, origin_of, state_script, PageState};
 use crate::WallConfig;
@@ -93,6 +94,9 @@ struct Page {
     /// Shown to the user on purpose ([`Kind::Show`]): never hidden, closed or reused for another
     /// site by the runner; it goes when the user closes it.
     pinned: bool,
+    /// Popups may open from this page: only once it is the user's own window (a site's
+    /// "Continue with Google" opens one). Hidden pages never open any.
+    popups: Arc<AtomicBool>,
     job: Option<Job>,
     idle_since: Instant,
 }
@@ -213,8 +217,11 @@ impl Runner {
             .build(elwt)
             .map_err(|e| format!("window: {e}"))?;
         let p = self.proxy.clone();
+        let popups = Arc::new(AtomicBool::new(false));
+        let allow = popups.clone();
         let mut b = WebViewBuilder::new_with_web_context(&mut self.ctx)
             .with_url("about:blank")
+            .with_new_window_req_handler(move |_url, _features| if allow.load(Ordering::Relaxed) { NewWindowResponse::Allow } else { NewWindowResponse::Deny })
             .with_ipc_handler(move |req| {
                 let _ = p.send_event(Ev::Ipc(pid, req.body().clone()));
             });
@@ -233,6 +240,7 @@ impl Runner {
                 cleared: false,
                 visible: self.cfg.show_windows,
                 pinned: false,
+                popups,
                 job: None,
                 idle_since: Instant::now(),
             },
@@ -344,6 +352,7 @@ impl Runner {
             // The user's own window: in front, with a taskbar button, from the first moment (a
             // wall or a sign-in page is theirs to get through).
             page.pinned = true;
+            page.popups.store(true, Ordering::Relaxed);
             page.visible = true;
             page.window.set_title(title);
             show_front(&page.window);

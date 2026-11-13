@@ -66,7 +66,10 @@ impl CreativePage {
         self.projects.insert(0, p.clone());
         self.p = Some(p);
         self.chapter = 1;
-        self.tab = crate::page::Tab::Chat;
+        // Stays where the user started it: the Video page shows the steps as they go.
+        if self.mode != crate::page::Mode::Video {
+            self.tab = crate::page::Tab::Chat;
+        }
         self.error = None;
         let brief = format!("A faithful live-action adaptation of my downloaded manga \"{}\": the same characters with their own traits as real people, the same story.", m.title);
         self.note(format!("Adapting “{}” as live action: reading what Studio knows of its characters and story.", m.title));
@@ -74,6 +77,80 @@ impl CreativePage {
         self.tick(cx);
         self.run_ops(VecDeque::from([Op::CreateSeries { brief, inspirations: vec![m.title] }]), cx);
         cx.notify();
+    }
+
+    /// Makes the open chapter's video from wherever it stands, one stage after another without
+    /// asking: the cast's sheets and the places, the scenes written, their pictures, then the
+    /// voices, clips and the stitched video.
+    pub(crate) fn auto_start(&mut self, cx: &mut Context<Self>) {
+        let Some(p) = self.p.as_ref() else { return };
+        let n = if p.chapter(self.chapter).is_some() { self.chapter } else { p.first_chapter() };
+        self.chapter = n;
+        self.auto = Some(n);
+        self.auto_last = None;
+        self.error = None;
+        self.auto_step(cx);
+        cx.notify();
+    }
+
+    /// Starts the next stage of the automatic video, when nothing is running. It stops by itself
+    /// when the video is made, when something went wrong, or when a stage could make nothing more.
+    pub(crate) fn auto_step(&mut self, cx: &mut Context<Self>) {
+        let Some(n) = self.auto else { return };
+        if self.busy() {
+            return;
+        }
+        if self.error.is_some() {
+            self.auto = None;
+            return;
+        }
+        let Some(p) = self.p.clone() else {
+            self.auto = None;
+            return;
+        };
+        // The chapter it was started for, or the first one once the series has been written.
+        let n = if p.chapter(n).is_some() { n } else { p.first_chapter() };
+        self.auto = Some(n);
+        self.chapter = n;
+        let stage = jobs::stage(&p, n);
+        let mark = (stage.index(), stage.tasks().len());
+        if self.auto_last == Some(mark) {
+            // The same stage with as much left as before: what is left cannot be made.
+            self.auto = None;
+            self.note(format!("The automatic video stopped: {} job{} of this step could not be made. See the notes above, then press Continue.", mark.1.max(1), if mark.1.max(1) == 1 { "" } else { "s" }));
+            return;
+        }
+        self.auto_last = Some(mark);
+        match stage {
+            jobs::Stage::Series => match p.adapts.clone() {
+                Some(title) if Brainbox::current(self.ai_cancel.clone(), cx).is_ok() => {
+                    let brief = format!("A faithful live-action adaptation of my downloaded manga \"{title}\": the same characters with their own traits as real people, the same story.");
+                    self.thinking = Some(Arc::new(Mutex::new(String::new())));
+                    self.tick(cx);
+                    self.run_ops(VecDeque::from([Op::CreateSeries { brief, inspirations: vec![title] }]), cx);
+                }
+                _ => {
+                    self.auto = None;
+                    self.note("Pick a downloaded manga to adapt (and an AI model in the assistant) first.");
+                }
+            },
+            jobs::Stage::Script => {
+                if let Err(e) = Brainbox::current(self.ai_cancel.clone(), cx) {
+                    self.auto = None;
+                    self.error = Some(e);
+                    return;
+                }
+                self.thinking = Some(Arc::new(Mutex::new(format!("Writing the scenes of chapter {n}"))));
+                self.tick(cx);
+                self.run_ops(VecDeque::from([Op::WriteChapter { chapter: n, note: String::new() }]), cx);
+            }
+            jobs::Stage::Sheets(tasks) | jobs::Stage::Stills(tasks) | jobs::Stage::Film(tasks) => self.enqueue(tasks, cx),
+            jobs::Stage::Done => {
+                self.auto = None;
+                self.note(format!("Chapter {n}'s video is ready."));
+                mv_ui::toast::show(cx, mv_ui::toast::Toast::success(format!("Chapter {n}'s video is ready")).icon(ph::FILM_STRIP));
+            }
+        }
     }
 
     /// The downloaded manga to adapt, as a menu.
@@ -166,6 +243,8 @@ impl CreativePage {
     fn run_ops(&mut self, mut ops: VecDeque<Op>, cx: &mut Context<Self>) {
         let Some(op) = ops.pop_front() else {
             self.thinking = None;
+            // An automatic video goes on to its next step once the AI has written.
+            self.auto_step(cx);
             return;
         };
         let status = self.thinking.clone().unwrap_or_else(|| Arc::new(Mutex::new(String::new())));
@@ -319,6 +398,7 @@ impl CreativePage {
                     Err(e) if e.to_string() == "stopped" => {}
                     Err(e) => {
                         this.thinking = None;
+                        this.auto = None;
                         this.note(format!("That did not work: {e:#}. Ask again, or pick another AI model."));
                     }
                 }

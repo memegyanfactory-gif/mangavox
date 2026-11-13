@@ -28,7 +28,46 @@ pub(crate) enum Tab {
     ThreeD,
 }
 
-pub(crate) const TABS: [(Tab, &str); 5] = [(Tab::Chat, "Chat"), (Tab::Characters, "Characters"), (Tab::Manga, "Manga"), (Tab::Video, "Video"), (Tab::ThreeD, "3D")];
+
+/// What the user came to make: each has only the pages it needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Write and paint a manga: chat with the AI, the cast, the pages.
+    Manga,
+    /// Turn a manga into a video: one list of steps, then the scenes.
+    Video,
+    /// Manga to Blender.
+    ThreeD,
+}
+
+impl Mode {
+    pub(crate) const ALL: [Mode; 3] = [Mode::Manga, Mode::Video, Mode::ThreeD];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Mode::Manga => "Make a manga",
+            Mode::Video => "Make a video",
+            Mode::ThreeD => "3D (Blender)",
+        }
+    }
+
+    pub(crate) fn about(self) -> &'static str {
+        match self {
+            Mode::Manga => "Write your own series with the AI and paint its pages",
+            Mode::Video => "Turn a downloaded manga into a live-action video, step by step",
+            Mode::ThreeD => "Manga to Blender: assets, previz and renders",
+        }
+    }
+
+    /// Its pages, the first is where it opens.
+    pub(crate) fn tabs(self) -> &'static [(Tab, &'static str)] {
+        match self {
+            Mode::Manga => &[(Tab::Chat, "Chat"), (Tab::Characters, "Characters"), (Tab::Manga, "Pages")],
+            Mode::Video => &[(Tab::Video, "Video"), (Tab::Characters, "Characters")],
+            Mode::ThreeD => &[(Tab::ThreeD, "3D")],
+        }
+    }
+}
 
 /// A downloaded manga: its title and chapter folders (style references, inspiration notes).
 #[derive(Clone)]
@@ -48,6 +87,11 @@ pub(crate) struct CreativePage {
     pub(crate) projects: Vec<Project>,
     pub(crate) p: Option<Project>,
     pub(crate) tab: Tab,
+    pub(crate) mode: Mode,
+    /// The chapter whose video is being made automatically, step after step, and the stage and
+    /// number of jobs it last started (the same again means nothing more can be made: it stops).
+    pub(crate) auto: Option<u32>,
+    pub(crate) auto_last: Option<(usize, usize)>,
     pub(crate) library: Vec<LibManga>,
     pub(crate) composer: Option<Entity<TextareaState>>,
     pub(crate) picker: Option<AnyView>,
@@ -106,6 +150,9 @@ impl CreativePage {
             projects,
             p,
             tab: Tab::Chat,
+            mode: Mode::Manga,
+            auto: None,
+            auto_last: None,
             library: vec![],
             composer: None,
             picker: None,
@@ -271,6 +318,7 @@ impl CreativePage {
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
         let left = self.queue.len();
         self.queue.clear();
+        self.auto = None;
         if left > 0 {
             self.note(format!("Stopped. {left} job{} left unpainted; the one running now finishes.", if left == 1 { "" } else { "s" }));
         }
@@ -297,8 +345,9 @@ impl CreativePage {
             return;
         }
         let Some(task) = self.queue.pop_front() else {
-            // Nothing left: the Activity card goes.
+            // Nothing left: the Activity card goes, and an automatic video goes on to its next step.
             self.activity = None;
+            self.auto_step(cx);
             return;
         };
         let Some(p) = self.p.clone() else {
@@ -618,7 +667,28 @@ impl CreativePage {
             }).icon(ph::TRASH).danger());
         }
         let title = self.p.as_ref().map(|p| if p.title.is_empty() { "Untitled manga".to_string() } else { p.title.clone() }).unwrap_or_else(|| "Creative".into());
-        let tab_ix = TABS.iter().position(|(t, _)| *t == self.tab).unwrap_or(0);
+        let tabs = self.mode.tabs();
+        let tab_ix = tabs.iter().position(|(t, _)| *t == self.tab).unwrap_or(0);
+        let mode = self.mode;
+        let mode_items: Vec<MenuItem> = Mode::ALL
+            .iter()
+            .map(|m| {
+                let (w, m) = (weak.clone(), *m);
+                MenuItem::new(format!("{} · {}", m.label(), m.about()), move |_, cx| {
+                    let _ = w.update(cx, |this, cx| {
+                        this.mode = m;
+                        this.tab = m.tabs()[0].0;
+                        cx.notify();
+                    });
+                })
+                .icon(match m {
+                    Mode::Manga => ph::BOOK_OPEN,
+                    Mode::Video => ph::FILM_STRIP,
+                    Mode::ThreeD => ph::CUBE,
+                })
+                .checked(m == mode)
+            })
+            .collect();
         div()
             .flex()
             .flex_col()
@@ -638,12 +708,17 @@ impl CreativePage {
                             .child(div().text_size(px(size::XL)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).truncate().child(title))
                             .child(muted(self.p.as_ref().map(summary).unwrap_or_else(|| "Write and paint your own manga with AI.".into()))),
                     )
+                    .child(menu_button("cr-mode", ph::SQUARES_FOUR, "What do you want to make?", mode_items).label(mode.label()).min_width(420.))
                     .child(menu_button("cr-projects", ph::BOOKS, "Your manga", items).label("Manga").small().min_width(260.)),
             )
-            .child(segmented("cr-tabs", TABS.map(|(_, l)| l), tab_ix).on_change(cx.listener(|this, ix: &usize, _, cx| {
-                this.tab = TABS[*ix].0;
-                cx.notify();
-            })))
+            .when(tabs.len() > 1, |d| {
+                d.child(segmented("cr-tabs", tabs.iter().map(|(_, l)| *l).collect::<Vec<_>>(), tab_ix).on_change(cx.listener(|this, ix: &usize, _, cx| {
+                    if let Some((t, _)) = this.mode.tabs().get(*ix) {
+                        this.tab = *t;
+                    }
+                    cx.notify();
+                })))
+            })
             .when(self.confirm_delete, |d| {
                 d.child(
                     mv_ui::inline_alert(mv_ui::AlertKind::Warning, "Delete this manga?", "Its script, sheets, pages and videos are removed from this PC. Exported PDFs and images stay.")
@@ -675,6 +750,9 @@ fn summary(p: &Project) -> String {
 impl Render for CreativePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inputs(window, cx);
+        if !self.mode.tabs().iter().any(|(t, _)| *t == self.tab) {
+            self.mode = Mode::ALL.into_iter().find(|m| m.tabs().iter().any(|(t, _)| *t == self.tab)).unwrap_or(Mode::Manga);
+        }
         let header = self.header(cx);
         if self.tab == Tab::ThreeD && self.three_d.is_none() {
             self.three_d = Some(ui_3d::view(window, cx));
@@ -682,6 +760,7 @@ impl Render for CreativePage {
         let body: AnyElement = match (&self.p, self.tab) {
             // The 3D pipeline works from the downloaded manga, so it needs no Creative project.
             (_, Tab::ThreeD) => self.three_d.clone().map(|v| v.into_any_element()).unwrap_or_else(|| div().into_any_element()),
+            (None, Tab::Video) => self.video_tab(cx).into_any_element(),
             (None, _) => self.welcome(cx).into_any_element(),
             (Some(_), Tab::Chat) => self.chat_tab(cx).into_any_element(),
             (Some(_), Tab::Characters) => self.cast_tab(cx).into_any_element(),
