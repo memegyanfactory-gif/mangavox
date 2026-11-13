@@ -229,7 +229,9 @@ impl CreativePage {
                         this.edit(|p| p.style_refs = refs);
                     }
                     let p = this.p.clone().unwrap_or_default();
-                    let first: Vec<String> = p.cast.iter().filter(|c| c.intro_chapter <= 1).map(|c| c.name.clone()).collect();
+                    // The cast the story opens with, leads first (a manga adapted from chapter 75 opens there).
+                    let first = p.opening_cast();
+                    this.chapter = p.first_chapter();
                     let mut msg = format!("Series written: “{}”, {} characters, {} chapters outlined.", p.title, p.cast.len(), p.chapters.len());
                     if !used.is_empty() {
                         msg.push_str(&format!(" Style references taken from your downloaded {}.", used.join(", ")));
@@ -344,7 +346,11 @@ impl CreativePage {
             return;
         }
         let text = match &proposal {
-            Proposal::Sheets { names, .. } => format!("Paint model sheets and expression sheets for {}", if names.is_empty() { "chapter 1's cast".to_string() } else { names.join(", ") }),
+            Proposal::Sheets { names, .. } => format!("{} for {}", if p.settings.live_action { "Make realistic casting sheets and expression sheets" } else { "Paint model sheets and expression sheets" }, match names.len() {
+                0 => "the opening cast".to_string(),
+                1..=6 => names.join(", "),
+                n => format!("{} and {} more", names[..5].join(", "), n - 5),
+            }),
             Proposal::Pages { chapter, pages } if pages.is_empty() => format!("Paint chapter {chapter}"),
             Proposal::Pages { chapter, pages } => format!("Paint chapter {chapter}, page{} {}", if pages.len() == 1 { "" } else { "s" }, pages.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")),
             Proposal::Video { chapter } => format!("Animate chapter {chapter} into a video"),
@@ -400,6 +406,7 @@ impl CreativePage {
                         )
                     }),
             )
+            .children(self.next_steps(&p, cx))
             .child(
                 div()
                     .w_full()
@@ -424,6 +431,44 @@ impl CreativePage {
                             .child(btn("cr-send", "Send", ButtonKind::Primary).small().icon(ph::PAPER_PLANE_TILT).loading(self.thinking.is_some()).on_click(cx.listener(|this, _, window, cx| this.send_from_composer(window, cx)))),
                     ),
             )
+    }
+
+    /// What comes next for this manga, as buttons: sheets for the cast that has none, then the
+    /// open chapter written, painted and filmed. Nothing while the AI writes or something runs.
+    fn next_steps(&self, p: &Project, cx: &mut Context<Self>) -> Option<Div> {
+        if p.cast.is_empty() || self.busy() {
+            return None;
+        }
+        let n = if p.chapter(self.chapter).is_some() { self.chapter } else { p.first_chapter() };
+        let live = p.settings.live_action;
+        let mut row = div().w_full().max_w(px(860.)).mx_auto().flex().flex_wrap().items_center().gap(px(space::SM)).child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child("Next:"));
+        let mut any = false;
+        let sheets = jobs::plan(p, &Proposal::Sheets { names: vec![], locations: vec![] });
+        if !sheets.is_empty() {
+            any = true;
+            let k = sheets.len();
+            row = row.child(btn("cr-next-sheets", format!("{} ({k} images)", if live { "Make the cast's realistic sheets" } else { "Paint the cast's sheets" }), ButtonKind::Primary).small().icon(ph::PAINT_BRUSH).tooltip("The leads first, then the main cast and everyone the story opens with").on_click(cx.listener(move |this, _, _, cx| this.enqueue(sheets.clone(), cx))));
+        }
+        let ch = p.chapter(n).cloned().unwrap_or_default();
+        if ch.pages.is_empty() {
+            any = true;
+            row = row.child(btn("cr-next-write", format!("Write chapter {n}"), if sheets_done(p) { ButtonKind::Primary } else { ButtonKind::Secondary }).small().icon(ph::PENCIL_SIMPLE).on_click(cx.listener(move |this, _, _, cx| this.send(format!("Write chapter {n}."), cx))));
+        } else if ch.painted() < ch.pages.len() {
+            any = true;
+            let todo = jobs::plan(p, &Proposal::Pages { chapter: n, pages: vec![] });
+            row = row.child(btn("cr-next-paint", format!("{} chapter {n}", if live { "Shoot the scenes of" } else { "Paint" }), ButtonKind::Secondary).small().icon(ph::IMAGES).on_click(cx.listener(move |this, _, _, cx| this.enqueue(todo.clone(), cx))));
+        } else {
+            let todo = jobs::plan(p, &Proposal::Video { chapter: n });
+            if todo.len() > 1 || ch.video.is_none() {
+                any = true;
+                row = row.child(btn("cr-next-film", format!("{} chapter {n}", if live { "Film" } else { "Animate" }), ButtonKind::Secondary).small().icon(ph::FILM_STRIP).on_click(cx.listener(move |this, _, _, cx| this.enqueue(todo.clone(), cx))));
+            }
+        }
+        row = row.child(btn("cr-next-cast", "See the characters", ButtonKind::Ghost).small().icon(ph::USERS).on_click(cx.listener(|this, _, _, cx| {
+            this.tab = crate::page::Tab::Characters;
+            cx.notify();
+        })));
+        any.then_some(row)
     }
 
     fn chat_empty(&self, cx: &mut Context<Self>) -> Div {
@@ -466,7 +511,7 @@ impl CreativePage {
     fn line(&self, p: &Project, i: usize, l: &ChatLine, cx: &mut Context<Self>) -> AnyElement {
         match l.role.as_str() {
             "user" => div().flex().justify_end().child(div().max_w(px(640.)).px(px(space::MD)).py(px(space::SM)).rounded(px(radius::LG)).bg(Tokens::accent_soft()).text_size(px(size::SM)).text_color(Tokens::text_1()).whitespace_normal().child(l.text.clone())).into_any_element(),
-            "note" => div().flex().items_start().gap(px(6.)).text_size(px(size::XS)).text_color(Tokens::text_3()).child(icon_ph(ph::CHECK, Tokens::text_3(), 12.)).child(div().flex_1().whitespace_normal().child(l.text.clone())).into_any_element(),
+            "note" => div().flex().items_start().gap(px(space::SM)).px(px(space::MD)).py(px(space::SM)).rounded(px(radius::MD)).bg(Tokens::surface_2()).text_size(px(size::SM)).text_color(Tokens::text_2()).child(div().pt(px(2.)).child(icon_ph(ph::CHECK, Tokens::success(), 14.))).child(div().flex_1().whitespace_normal().child(l.text.clone())).into_any_element(),
             "card" => self.card(p, i, l, cx).into_any_element(),
             _ => div().flex().items_start().gap(px(space::SM)).child(icon_ph(ph::PAINT_BRUSH, Tokens::accent(), 16.)).child(div().flex_1().text_size(px(size::SM)).text_color(Tokens::text_1()).whitespace_normal().child(l.text.clone())).into_any_element(),
         }
@@ -523,6 +568,11 @@ impl CreativePage {
             )
             .when(!open, |d| d.opacity(0.85))
     }
+}
+
+/// Every lead and main character has their sheets.
+fn sheets_done(p: &Project) -> bool {
+    p.cast.iter().filter(|c| c.tier() <= 1).all(|c| c.has_sheets())
 }
 
 /// What Studio learned of a downloaded manga (its characters and story), for the inspiration.

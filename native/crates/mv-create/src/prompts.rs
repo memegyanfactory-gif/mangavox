@@ -130,7 +130,7 @@ const SERIES_SHAPE: &str = r#"{
   "bible": {"logline": "", "genre": "", "tone": "", "themes": "", "twist": "the user's spin, stated plainly",
             "art_style": "a precise art direction for every image: line weight, inking, screentone use, how faces/eyes/hair are drawn, anatomy, backgrounds, lettering feel; name the influences (e.g. 'in the spirit of Boichi's Dr. Stone: crisp detailed linework, heavy dramatic shading')",
             "world": "setting, era, rules, the places scenes happen"},
-  "cast": [{"name": "", "role": "protagonist|deuteragonist|antagonist|main|supporting|minor", "age": "", "intro_chapter": 1,
+  "cast": [{"name": "", "role": "protagonist|deuteragonist|antagonist|main|supporting|minor", "age": "a number of years", "gender": "male|female", "intro_chapter": 1,
             "personality": "", "appearance": "face shape, eyes, eyebrows, hair (style, length, colour/tone), skin tone, height, build, marks — what must never change",
             "outfits": [{"name": "default", "look": "every garment, colour/tone, shoes, accessories"}],
             "signature": "props, poses, tells"}],
@@ -167,7 +167,7 @@ pub fn series(p: &Project, brief: &str, inspiration_notes: &str) -> (String, Str
 /// The same shape, revised.
 pub fn revise(p: &Project, instruction: &str) -> (String, String) {
     let system = format!("You edit an original manga series. {CRAFT}\n\nAnswer with ONE JSON object, no other text, the WHOLE series after the change, in this shape:\n{SERIES_SHAPE}\n\nKeep everything the instruction does not touch exactly as it is (same names, same appearance text), so painted sheets stay valid.");
-    let current = serde_json::json!({ "title": p.title, "bible": p.bible, "cast": p.cast.iter().map(|c| serde_json::json!({"name": c.name, "role": c.role, "age": c.age, "intro_chapter": c.intro_chapter, "personality": c.personality, "appearance": c.appearance, "outfits": c.outfits, "signature": c.signature})).collect::<Vec<_>>(), "locations": p.locations.iter().map(|l| serde_json::json!({"name": l.name, "look": l.look})).collect::<Vec<_>>(), "chapters": p.chapters.iter().map(|c| serde_json::json!({"number": c.number, "title": c.title, "summary": c.summary})).collect::<Vec<_>>() });
+    let current = serde_json::json!({ "title": p.title, "bible": p.bible, "cast": p.cast.iter().map(|c| serde_json::json!({"name": c.name, "role": c.role, "age": c.age, "gender": c.gender, "intro_chapter": c.intro_chapter, "personality": c.personality, "appearance": c.appearance, "outfits": c.outfits, "signature": c.signature})).collect::<Vec<_>>(), "locations": p.locations.iter().map(|l| serde_json::json!({"name": l.name, "look": l.look})).collect::<Vec<_>>(), "chapters": p.chapters.iter().map(|c| serde_json::json!({"number": c.number, "title": c.title, "summary": c.summary})).collect::<Vec<_>>() });
     (system, format!("The series now:\n{current}\n\nChange: {instruction}"))
 }
 
@@ -486,15 +486,29 @@ pub fn motion(p: &Project, panel: &Panel) -> String {
 fn scene(panel: &Panel) -> String {
     let m = if panel.motion.trim().is_empty() { "natural small movements, the camera slowly pushes in" } else { panel.motion.trim() };
     let mut s = format!("A live-action film scene, photorealistic, real actors. {} shot, {}. {} Action: {m}.", panel.shot, panel.camera, panel.description);
-    let spoken = spoken_lines(panel);
+    let spoken = delivery(panel);
     if spoken.is_empty() {
         s.push_str(" Nobody speaks; only the natural sounds of the place.");
     } else {
-        for (who, text) in &spoken {
-            if who.is_empty() || who.eq_ignore_ascii_case("narrator") || who.eq_ignore_ascii_case("narration") {
-                let _ = write!(s, " A narrator says off screen: \"{text}\" (nobody on screen moves their lips for it).");
+        for d in &spoken {
+            if d.line_kind == "narrator" {
+                let _ = write!(s, " A narrator says off screen: \"{}\" (nobody on screen moves their lips for it).", d.text);
+            } else if d.line_kind == "inner" {
+                let _ = write!(s, " {} thinks, heard as a voice-over, lips closed: \"{}\"", d.speaker, d.text);
             } else {
-                let _ = write!(s, " {who} says, lips in sync with the voice: \"{text}\"");
+                // The face and body act the same feeling the voice has.
+                let how = match d.kind {
+                    "fight" => "furious, face tense",
+                    "horror" => "frightened, breathing fast",
+                    "emotional" => "in grief, eyes wet",
+                    "reveal" => "shocked, eyes wide",
+                    "action" => "with hard resolve",
+                    "comedy" => "happily, smiling",
+                    "romance" => "tenderly",
+                    "calm" => "quietly",
+                    _ => "naturally",
+                };
+                let _ = write!(s, " {} says {how}{}, lips in sync with the voice: \"{}\"", d.speaker, if d.mood.is_empty() { String::new() } else { format!(" ({})", d.mood) }, d.text);
             }
         }
     }
@@ -510,10 +524,97 @@ pub fn spoken_lines(panel: &Panel) -> Vec<(String, String)> {
     panel.lines.iter().filter(|l| !l.text.trim().is_empty()).map(|l| (l.speaker.trim().to_string(), l.text.trim().to_string())).collect()
 }
 
+/// How one line of a scene is said: what the voice engine acts it from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delivery {
+    pub speaker: String,
+    pub text: String,
+    /// The feeling, as one of the voice engine's scene kinds ("fight" is rage, "emotional" grief,
+    /// "horror" fear, "reveal" shock, "comedy" joy, "romance" tenderness, "calm" hushed, "action"
+    /// resolve, "dialogue" plain talk).
+    pub kind: &'static str,
+    /// 0 flat to 10 the peak of that feeling.
+    pub intensity: u8,
+    /// "speech" (said aloud, acted), "inner" (a thought, softer) or "narrator".
+    pub line_kind: &'static str,
+    /// The speaker's expression in the scene, in the script's own words.
+    pub mood: String,
+}
+
+/// The feelings a line can carry and the words in a script that mean them, strongest first.
+const FEELINGS: [(&str, u8, &[&str]); 8] = [
+    ("fight", 9, &["angry", "anger", "rage", "furious", "fury", "yell", "shout", "roar", "scream", "snarl", "enraged", "glare"]),
+    ("horror", 8, &["scared", "terrified", "terror", "fear", "afraid", "panic", "horrified", "dread", "trembl"]),
+    ("emotional", 8, &["sad", "cry", "tears", "tearful", "grief", "sob", "heartbroken", "despair", "sorrow", "weep", "pain", "guilt"]),
+    ("reveal", 8, &["shock", "surpris", "stunned", "gasp", "disbelief", "wide-eyed", "astonish"]),
+    ("action", 7, &["determined", "resolute", "serious", "fierce", "focused", "defiant", "confident", "smug", "cold", "stern"]),
+    ("comedy", 6, &["happy", "laugh", "smile", "grin", "joy", "excited", "cheer", "playful", "amused", "teasing"]),
+    ("romance", 6, &["love", "blush", "tender", "shy", "embarrass", "fond", "longing", "affection"]),
+    ("calm", 3, &["calm", "quiet", "gentle", "soft", "whisper", "tired", "sleepy", "peaceful", "relieved", "neutral"]),
+];
+
+/// How each heard line of a scene is said, from the script: the line's own kind (shout, whisper,
+/// thought, narration), the speaker's expression in that scene, and how the line is written
+/// ("!" lifts it, a trailing "…" lowers it).
+pub fn delivery(panel: &Panel) -> Vec<Delivery> {
+    panel
+        .lines
+        .iter()
+        .filter(|l| !l.text.trim().is_empty())
+        .map(|l| {
+            let text = l.text.trim().to_string();
+            let speaker = l.speaker.trim().to_string();
+            let said = l.kind.trim().to_lowercase();
+            let mood = panel.characters.iter().find(|c| !speaker.is_empty() && (c.name.eq_ignore_ascii_case(&speaker) || c.name.split_whitespace().next().is_some_and(|f| f.eq_ignore_ascii_case(&speaker)))).map(|c| c.expression.trim().to_string()).unwrap_or_default();
+            let narrator = said == "narration" || speaker.is_empty() || speaker.eq_ignore_ascii_case("narrator") || speaker.eq_ignore_ascii_case("narration");
+            let hint = format!("{said} {}", mood.to_lowercase());
+            let (mut kind, mut intensity) = FEELINGS.iter().find(|(_, _, words)| words.iter().any(|w| hint.contains(w))).map(|(k, i, _)| (*k, *i)).unwrap_or(("dialogue", 5));
+            if said == "whisper" {
+                (kind, intensity) = if matches!(kind, "horror" | "emotional" | "romance") { (kind, intensity.min(6)) } else { ("calm", 3) };
+            }
+            let shouted = text.matches('!').count();
+            if shouted > 0 {
+                intensity = (intensity + 1 + shouted.min(2) as u8).min(10);
+            } else if text.ends_with("...") || text.ends_with('…') {
+                intensity = intensity.saturating_sub(1);
+            }
+            // A narrator stays steady; the cast carries the feeling.
+            let line_kind = if narrator { "narrator" } else if said == "thought" { "inner" } else { "speech" };
+            Delivery { speaker, text, kind, intensity, line_kind, mood }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn each_line_is_said_its_own_way() {
+        use crate::project::{Line, PanelChar};
+        let line = |speaker: &str, text: &str, kind: &str| Line { speaker: speaker.into(), text: text.into(), kind: kind.into() };
+        let who = |name: &str, expression: &str| PanelChar { name: name.into(), expression: expression.into(), ..Default::default() };
+        let panel = Panel {
+            characters: vec![who("Kai Tanaka", "furious glare"), who("Rin", "tearful, heartbroken"), who("Mio", "soft smile")],
+            lines: vec![
+                line("Kai", "Get out!!", "shout"),
+                line("Rin", "I thought you'd stay...", "speech"),
+                line("Mio", "It's fine.", "whisper"),
+                line("", "That night changed everything.", "narration"),
+                line("Rin", "Why did he lie?", "thought"),
+                line("Stranger", "Good morning.", "speech"),
+                line("Kai", "   ", "speech"),
+            ],
+            ..Default::default()
+        };
+        let d = delivery(&panel);
+        let got: Vec<(&str, u8, &str)> = d.iter().map(|x| (x.kind, x.intensity, x.line_kind)).collect();
+        assert_eq!(got, vec![("fight", 10, "speech"), ("emotional", 7, "speech"), ("calm", 3, "speech"), ("dialogue", 5, "narrator"), ("emotional", 8, "inner"), ("dialogue", 5, "speech")]);
+        assert_eq!(d[0].mood, "furious glare");
+        let film = scene(&panel);
+        assert!(film.contains("Kai says furious, face tense (furious glare), lips in sync") && film.contains("Rin thinks, heard as a voice-over") && film.contains("A narrator says off screen"), "{film}");
+    }
 
     fn project() -> Project {
         let mut p = Project { title: "Stone Spark".into(), ..Default::default() };

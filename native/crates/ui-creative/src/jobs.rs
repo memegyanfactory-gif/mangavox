@@ -310,7 +310,15 @@ fn clip_job(p: &Project, chapter: u32, page: u32, i: usize, status: Arc<Mutex<St
     };
     let comfy = (p.settings.comfy_url.clone(), PathBuf::from(p.settings.comfy_workflow.clone()));
     // LTX with voice: the scene's lines are spoken first, and the clip is as long as they are.
-    let spoken: String = prompts::spoken_lines(&panel).into_iter().map(|(_, t)| t).collect::<Vec<_>>().join(" ");
+    let mut spoken = prompts::delivery(&panel);
+    // Each speaker under their cast name ("Kai" is "Kai Tanaka"), so they get their own voice.
+    for d in &mut spoken {
+        if let Some(c) = p.character(&d.speaker) {
+            d.speaker = c.name.clone();
+        }
+    }
+    let cast: Vec<Speaker> = p.cast.iter().map(Speaker::of).collect();
+    let cast_dir = p.dir().join("voice");
     let voice_pick = p.settings.voice.clone();
     let voice_dir = p.dir().join("voice").join(format!("ch{chapter:02}-p{page:03}-{}-{}", i + 1, mv_create::now()));
     if vm.via == VideoVia::ComfyUi && !comfy.1.is_file() {
@@ -334,7 +342,7 @@ fn clip_job(p: &Project, chapter: u32, page: u32, i: usize, status: Arc<Mutex<St
             }
             VideoVia::ComfyUi => video::comfy_clip(&comfy.0, &comfy.1, &src, &prompt, seconds, &out, |s| set(&st, s)).await?,
             VideoVia::ComfyLtx => {
-                let (audio, secs) = scene_voice(spoken, voice_pick, voice_dir, seconds, &st).await?;
+                let (audio, secs) = scene_voice(spoken, cast, cast_dir, voice_pick, voice_dir, seconds, &st).await?;
                 video::ltx_clip(&comfy.0, &src, &audio, &prompt, secs, &aspect, &out, |s| set(&st, format!("LTX 2.3 · {s}"))).await?;
             }
             _ => video::api_clip(vm, key.as_deref().unwrap_or(""), &src, &prompt, seconds, &aspect, &out, |s| set(&st, s)).await?,
@@ -347,17 +355,26 @@ fn clip_job(p: &Project, chapter: u32, page: u32, i: usize, status: Arc<Mutex<St
 /// The sound of a scene for LTX: its lines spoken with the project's voice (Studio's voice when
 /// none is picked), or silence of `seconds` when nobody speaks. Returns the file and how long the
 /// clip should be (the voice and a moment after it, at most [`LONGEST_SCENE`]).
-async fn scene_voice(spoken: String, voice: String, dir: PathBuf, seconds: u32, st: &Arc<Mutex<String>>) -> Result<(PathBuf, f64)> {
-    if spoken.trim().is_empty() {
+async fn scene_voice(spoken: Vec<prompts::Delivery>, cast: Vec<Speaker>, cast_dir: PathBuf, voice: String, dir: PathBuf, seconds: u32, st: &Arc<Mutex<String>>) -> Result<(PathBuf, f64)> {
+    if spoken.is_empty() {
         set(st, "Nobody speaks: a silent track");
         let out = dir.join("silence.wav");
         let o = out.clone();
         tokio::task::spawn_blocking(move || video::silence(seconds as f64, &o)).await??;
         return Ok((out, seconds as f64));
     }
+    // Qwen3-TTS when its engine is installed: each line by a voice described in words (who the
+    // character is and how they say it). Without it, or should it fail, Studio's voice speaks.
+    match qwen_voice(&spoken, &cast, &dir, st).await {
+        Ok(Some(made)) => return Ok(made),
+        Ok(None) => {}
+        Err(e) => eprintln!("[creative] Qwen3 voice failed, Studio's voice speaks instead: {e:#}"),
+    }
     set(st, "Voicing the scene");
     // Studio's Python as Studio last checked it, else found the way Studio finds it.
-    let (python, layout, voice) = tokio::task::spawn_blocking(move || -> Result<_> {
+    let names: Vec<String> = spoken.iter().filter(|d| d.line_kind != "narrator").map(|d| d.speaker.clone()).collect();
+    let (python, layout, voice, voices) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let voices = cast_voices(&cast_dir, &cast, &names);
         let env = ui_studio::setup::latest().map(|c| c.env).and_then(|e| Some((e.python.ok()?, e.scripts.ok()?)));
         let (python, layout) = match env {
             Some(x) => x,
@@ -367,7 +384,7 @@ async fn scene_voice(spoken: String, voice: String, dir: PathBuf, seconds: u32, 
             ),
         };
         let voice = if voice.trim().is_empty() { mv_studio::voices::default_voice() } else { voice };
-        Ok((python, layout, voice))
+        Ok((python, layout, voice, voices))
     })
     .await??;
     // The picked voice, then the voices that stand in for it when its engine is not installed
@@ -378,8 +395,22 @@ async fn scene_voice(spoken: String, voice: String, dir: PathBuf, seconds: u32, 
     let mut why = String::new();
     for v in &tries {
         let mut req = mv_studio::tts::LabRequest::new(v, "dialogue");
-        req.text = Some(spoken.clone());
-        req.intensities = vec![5];
+        // Every line with its own feeling (a shout, a sob, a whisper), in one pass of the voice.
+        req.units = spoken
+            .iter()
+            .map(|d| {
+                let mut u = serde_json::json!({ "text": d.text, "kind": d.kind, "intensity": d.intensity, "line_kind": d.line_kind, "mood": d.mood, "speaker": d.speaker });
+                // A character's line is said in that character's own voice; the narrator keeps the main one.
+                if let Some(v) = voices.iter().find(|v| d.line_kind != "narrator" && v.name.eq_ignore_ascii_case(&d.speaker)) {
+                    u["voice_ref"] = serde_json::json!(v.clip);
+                    u["voice_make_with"] = serde_json::json!(v.base);
+                    u["voice_pitch"] = serde_json::json!(v.pitch);
+                }
+                u
+            })
+            .collect();
+        req.text = Some(spoken.iter().map(|d| d.text.as_str()).collect::<Vec<_>>().join(" "));
+        req.intensities = vec![spoken.iter().map(|d| d.intensity).max().unwrap_or(5)];
         match mv_studio::tts::voice_lab(&python, &layout, &dir, &std::env::temp_dir(), &req).await {
             Ok(res) => {
                 if let Some(s) = res.samples.into_iter().find(|s| s.path.is_file()) {
@@ -396,6 +427,209 @@ async fn scene_voice(spoken: String, voice: String, dir: PathBuf, seconds: u32, 
     let file = sample.path.clone();
     let heard = if sample.duration > 0. { sample.duration } else { tokio::task::spawn_blocking(move || video::media_seconds(&file)).await?.unwrap_or(seconds as f64) };
     Ok((sample.path, (heard + 0.6).clamp(2., LONGEST_SCENE)))
+}
+
+// ------------------------------------------------------------------ Qwen3-TTS scene voice
+
+/// The Qwen3-TTS VoiceDesign engine in the data folder (`engines/qwen3tts`: its own Python and
+/// the model), when it is installed.
+fn qwen_engine() -> Option<(PathBuf, PathBuf)> {
+    let dir = mv_core::paths::root().join("engines").join("qwen3tts");
+    let python = if cfg!(windows) { dir.join(".venv").join("Scripts").join("python.exe") } else { dir.join(".venv").join("bin").join("python3") };
+    let model = dir.join("model-voicedesign");
+    (python.is_file() && model.join("config.json").is_file()).then_some((python, model))
+}
+
+/// A number of a character's own, from their name: the same voice is asked for in every scene.
+fn voice_seed(name: &str) -> u32 {
+    name.trim().to_lowercase().bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619)) & 0x7fff_ffff
+}
+
+/// Timbres that set one voice apart from the next of the same age and gender.
+const TIMBRES: [&str; 8] = ["deep and slightly rough", "clear and bright", "soft and breathy", "warm and low", "sharp and crisp", "husky", "smooth and even", "light and quick"];
+
+/// Who is speaking, in words the voice model casts a voice from: their gender and age (a child
+/// sounds like a child, an old man like one), a timbre of their own, and their nature.
+fn voice_of(s: &Speaker) -> String {
+    let female = if s.gender.is_empty() { mv_recap::series::guess_gender(&s.about) == mv_recap::series::Gender::Female } else { s.gender.starts_with('f') };
+    let timbre = TIMBRES[(voice_seed(&s.name) as usize / 7) % TIMBRES.len()];
+    let who = match (s.years, female) {
+        (Some(y), true) if y <= 12 => format!("A {y}-year-old little girl with a small, high, soft child's voice"),
+        (Some(y), false) if y <= 12 => format!("A {y}-year-old little boy with a small, high, bright child's voice"),
+        (Some(y), true) if y <= 17 => format!("A teenage girl of {y} with a young, {timbre} voice"),
+        (Some(y), false) if y <= 17 => format!("A teenage boy of {y} with a young, {timbre} voice that has only just broken"),
+        (Some(y), true) if y >= 60 => format!("An elderly woman of {y} with an aged, thin, {timbre} voice"),
+        (Some(y), false) if y >= 60 => format!("An elderly man of {y} with an aged, gravelly, {timbre} voice"),
+        (Some(y), true) => format!("A woman of {y} with a {timbre} adult female voice"),
+        (Some(y), false) => format!("A man of {y} with a {timbre} adult male voice"),
+        (None, true) => format!("A young woman with a {timbre} female voice"),
+        (None, false) => format!("A young man with a {timbre} male voice"),
+    };
+    let nature: String = s.personality.split(['.', ';']).next().unwrap_or("").trim().chars().take(110).collect();
+    if nature.is_empty() {
+        format!("{who}.")
+    } else {
+        format!("{who}. Character: {nature}.")
+    }
+}
+
+/// How a line is said, in words: the feeling and how strong it is.
+fn feeling(d: &prompts::Delivery) -> &'static str {
+    let strong = d.intensity >= 8;
+    match d.kind {
+        "fight" if strong => "Furious and shouting, loud, sharp and forceful.",
+        "fight" => "Angry and tense, voice hard and clipped.",
+        "horror" if strong => "Terrified, voice trembling and breathless, close to panic.",
+        "horror" => "Afraid and uneasy, voice unsteady.",
+        "emotional" if strong => "Crying, voice shaking and breaking, sniffling between words.",
+        "emotional" => "Sad and quiet, close to tears.",
+        "reveal" if strong => "Shocked, gasping in disbelief.",
+        "reveal" => "Surprised and taken aback.",
+        "action" => "Determined, firm and intense.",
+        "comedy" if strong => "Laughing, bright and full of joy.",
+        "comedy" => "Cheerful and light, smiling while speaking.",
+        "romance" => "Tender and warm, a little shy.",
+        "calm" => "Very soft and quiet, almost a whisper.",
+        _ => "Speaking naturally, as in an ordinary conversation.",
+    }
+}
+
+/// The whole direction for one line: the speaker's voice, then how this line is said.
+fn instruct(d: &prompts::Delivery, cast: &[Speaker]) -> String {
+    if d.line_kind == "narrator" {
+        let how = match d.kind {
+            "emotional" | "horror" => "Quiet, slow and grave.",
+            "fight" | "action" | "reveal" => "Tense and gripping, a little faster.",
+            _ => "Even and unhurried.",
+        };
+        return format!("A calm, warm adult narrator with a low, steady documentary voice. {how}");
+    }
+    let voice = match cast.iter().find(|c| c.name.eq_ignore_ascii_case(&d.speaker)) {
+        Some(c) => voice_of(c),
+        // Someone the cast does not list: cast from their name alone.
+        None => voice_of(&Speaker { name: d.speaker.clone(), gender: String::new(), years: None, about: d.speaker.clone(), personality: String::new() }),
+    };
+    let mut s = format!("{voice} {}", feeling(d));
+    if d.line_kind == "inner" {
+        s.push_str(" Said inwardly, as a quiet thought to oneself.");
+    }
+    if !d.mood.is_empty() {
+        s.push_str(&format!(" Expression: {}.", d.mood.chars().take(80).collect::<String>()));
+    }
+    s
+}
+
+/// The scene spoken by Qwen3-TTS: every line with its own speaker's voice and feeling, joined
+/// into one WAV. `None` when the engine is not installed.
+async fn qwen_voice(spoken: &[prompts::Delivery], cast: &[Speaker], dir: &std::path::Path, st: &Arc<Mutex<String>>) -> Result<Option<(PathBuf, f64)>> {
+    let found = tokio::task::spawn_blocking(|| -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let (python, model) = qwen_engine()?;
+        let layout = ui_studio::setup::latest().and_then(|c| c.env.scripts.ok()).or_else(|| mv_studio::PythonLayout::resolve(None).ok())?;
+        Some((python, model, layout.script("qwen_scene_tts.py").ok()?))
+    })
+    .await?;
+    let Some((python, model, script)) = found else { return Ok(None) };
+    set(st, format!("Voicing the scene with Qwen3 ({} line{})", spoken.len(), if spoken.len() == 1 { "" } else { "s" }));
+    let out = dir.join("scene.wav");
+    let units: Vec<serde_json::Value> = spoken
+        .iter()
+        .map(|d| serde_json::json!({ "text": d.text, "instruct": instruct(d, cast), "seed": voice_seed(if d.line_kind == "narrator" { "narrator" } else { &d.speaker }) }))
+        .collect();
+    let args = serde_json::json!({ "model_dir": model, "out": out, "language": "English", "gap_ms": 300, "units": units });
+    tokio::fs::create_dir_all(dir).await?;
+    let args_file = dir.join("qwen-args.json");
+    tokio::fs::write(&args_file, serde_json::to_vec(&args)?).await?;
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.arg(&script).arg(&args_file).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let run = cmd.output().await.with_context(|| format!("could not start {}", python.display()))?;
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let answer: serde_json::Value = stdout.lines().rev().find(|l| !l.trim().is_empty()).and_then(|l| serde_json::from_str(l).ok()).unwrap_or(serde_json::Value::Null);
+    if answer.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        let why = answer.get("message").and_then(serde_json::Value::as_str).map(str::to_string).unwrap_or_else(|| String::from_utf8_lossy(&run.stderr).lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("it gave no answer").to_string());
+        bail!("{why}");
+    }
+    let heard = answer.get("duration").and_then(serde_json::Value::as_f64).unwrap_or(0.);
+    if !out.is_file() || heard <= 0. {
+        bail!("it made no sound");
+    }
+    Ok(Some((out, (heard + 0.6).clamp(2., LONGEST_SCENE))))
+}
+
+/// What a character's voice is cast from.
+#[derive(Clone, Debug)]
+pub(crate) struct Speaker {
+    name: String,
+    /// "male", "female" or empty (then guessed from `about`).
+    gender: String,
+    years: Option<u32>,
+    about: String,
+    personality: String,
+}
+
+impl Speaker {
+    fn of(c: &mv_create::CastMember) -> Speaker {
+        Speaker { name: c.name.clone(), gender: c.gender.trim().to_lowercase(), years: c.years(), about: format!("{} {} {} {}", c.role, c.age, c.appearance, c.personality), personality: c.personality.clone() }
+    }
+}
+
+/// A character's own voice: the clip Chatterbox clones, and what it is made from when missing.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CharacterVoice {
+    name: String,
+    clip: PathBuf,
+    base: String,
+    pitch: f32,
+}
+
+/// How far a voice is raised or lowered for the character's age, in semitones.
+fn age_pitch(years: Option<u32>) -> f32 {
+    match years {
+        Some(y) if y <= 7 => 4.5,
+        Some(y) if y <= 12 => 3.5,
+        Some(y) if y <= 16 => 1.5,
+        Some(y) if y >= 60 => -2.0,
+        _ => 0.0,
+    }
+}
+
+/// Gives every speaker of a scene their own voice, kept for the whole project in
+/// `<project>/voice/voice_cast.json` (the way Studio's series mode casts a manga): a man gets a
+/// male voice, a woman a female one, no two characters the same voice, a child a high, light one
+/// and an old character a lower one. A voice once given never changes, so a character sounds the
+/// same in every scene.
+fn cast_voices(dir: &std::path::Path, cast: &[Speaker], speakers: &[String]) -> Vec<CharacterVoice> {
+    use mv_recap::series::VoiceCast;
+    // What the casting reads of each character. Their stated gender leads; a young child is
+    // given a woman's voice raised, as children are voiced in dubbing.
+    let known: Vec<serde_json::Value> = cast
+        .iter()
+        .map(|c| {
+            let child = c.years.is_some_and(|y| y <= 10);
+            let lead = if c.gender.starts_with('f') || (child && !c.gender.is_empty()) {
+                "she her woman female. "
+            } else if c.gender.starts_with('m') {
+                "he him man male. "
+            } else {
+                ""
+            };
+            // With a stated gender the description's own words must not outvote it.
+            serde_json::json!({ "name": c.name, "description": if lead.is_empty() { c.about.clone() } else { lead.to_string() } })
+        })
+        .collect();
+    let brain: mv_recap::Brain = serde_json::from_value(serde_json::json!({ "characters": known })).unwrap_or_default();
+    let _ = std::fs::create_dir_all(dir);
+    let mut vc = VoiceCast::load_in(dir.to_path_buf());
+    let before = vc.voices.len();
+    if vc.assign(speakers, &brain) > 0 {
+        for v in vc.voices.iter_mut().skip(before) {
+            let years = cast.iter().find(|c| c.name.eq_ignore_ascii_case(&v.name)).and_then(|c| c.years);
+            v.pitch = (v.pitch + age_pitch(years)).clamp(-6., 6.);
+        }
+        let _ = vc.save();
+    }
+    speakers.iter().filter_map(|s| vc.find(s).map(|v| CharacterVoice { name: s.clone(), clip: vc.clip_path(v), base: v.base.clone(), pitch: v.pitch })).collect()
 }
 
 /// The longest clip LTX is asked for (a 10 GB card manages about this at 720p); a longer voice is
@@ -457,7 +691,7 @@ pub(crate) fn plan(p: &Project, proposal: &mv_create::Proposal) -> Vec<Task> {
     };
     match proposal {
         mv_create::Proposal::Sheets { names, locations } => {
-            let names: Vec<String> = if names.is_empty() { p.cast.iter().filter(|c| c.intro_chapter <= 1).map(|c| c.name.clone()).collect() } else { names.clone() };
+            let names: Vec<String> = if names.is_empty() { p.opening_cast() } else { names.clone() };
             sheets_for(&mut out, &names);
             for l in locations {
                 if let Some(l) = p.location(l).filter(|l| l.sheet.is_none()) {
@@ -548,13 +782,97 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (o, d, s) = (out.clone(), dir.clone(), st.clone());
         rt.block_on(async move {
-            let (audio, secs) = scene_voice("Hello. This is a test of the voice.".into(), String::new(), d.join("voice"), 3, &s).await.unwrap();
+            let (audio, secs) = scene_voice(
+                vec![
+                    prompts::Delivery { speaker: "Cactus".into(), text: "You left me out here!".into(), kind: "fight", intensity: 9, line_kind: "speech", mood: "furious".into() },
+                    prompts::Delivery { speaker: "Cactus".into(), text: "I waited all night for you...".into(), kind: "emotional", intensity: 8, line_kind: "speech", mood: "heartbroken".into() },
+                ],
+                vec![],
+                d.join("cast"),
+                String::new(),
+                d.join("voice"),
+                3,
+                &s,
+            ).await.unwrap();
             println!("voice: {} ({secs:.1} s clip)", audio.display());
-            video::ltx_clip("http://127.0.0.1:8188", &image, &audio, "A live-action film scene. The character looks at the camera and says, lips in sync with the voice: \"Hello. This is a test of the voice.\"", secs, "16:9", &o, |x| println!("status: {x}")).await.unwrap();
+            video::ltx_clip("http://127.0.0.1:8188", &image, &audio, "A live-action film scene. The character turns to the camera and says furious, lips in sync with the voice: \"You left me out here!\" Then says in grief: \"I waited all night for you...\"", secs, "16:9", &o, |x| println!("status: {x}")).await.unwrap();
         });
         assert!(std::fs::metadata(&out).unwrap().len() > 10_000);
         assert!(video::has_audio(&out), "the clip kept its voice");
         println!("clip: {} ({:?} s)", out.display(), video::media_seconds(&out));
+    }
+
+    /// The real voice, no video: a man shouts, a little girl answers in tears, a narrator closes.
+    /// `cargo test -p ui-creative voices_a_scene -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn voices_a_scene_with_feeling_and_a_voice_each() {
+        std::env::set_var("MANGAVOX_DATA", mv_core::paths::root());
+        let dir = std::env::temp_dir().join(format!("mangavox-voice-test-{}", mv_create::now()));
+        let who = |name: &str, gender: &str, age: &str| Speaker::of(&CastMember { name: name.into(), gender: gender.into(), age: age.into(), ..Default::default() });
+        let line = |speaker: &str, text: &str, kind: &'static str, intensity: u8, line_kind: &'static str| prompts::Delivery { speaker: speaker.into(), text: text.into(), kind, intensity, line_kind, mood: String::new() };
+        let st = Arc::new(Mutex::new(String::new()));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let d = dir.clone();
+        let (audio, secs) = rt
+            .block_on(async move {
+                scene_voice(
+                    vec![line("Ren", "Where were you? I told you to stay inside!", "fight", 9, "speech"), line("Mio", "I'm sorry... I just wanted to find my mom.", "emotional", 8, "speech"), line("", "Neither of them spoke again that night.", "dialogue", 5, "narrator")],
+                    vec![who("Ren", "male", "34"), who("Mio", "female", "7")],
+                    d.join("cast"),
+                    String::new(),
+                    d.join("voice"),
+                    3,
+                    &st,
+                )
+                .await
+            })
+            .unwrap();
+        println!("voice: {} ({secs:.1} s clip)", audio.display());
+        for f in std::fs::read_dir(dir.join("cast").join("voices")).into_iter().flatten().flatten() {
+            println!("character clip: {}", f.path().display());
+        }
+        assert!(std::fs::metadata(&audio).unwrap().len() > 10_000);
+    }
+
+    #[test]
+    fn a_line_is_directed_by_who_says_it_and_how() {
+        let who = |name: &str, gender: &str, age: &str, nature: &str| Speaker::of(&CastMember { name: name.into(), gender: gender.into(), age: age.into(), personality: nature.into(), ..Default::default() });
+        let cast = vec![who("Ren", "male", "34", "Stern but caring. Hides his fear."), who("Mio", "female", "7", ""), who("Jiro", "male", "72", ""), who("Aya", "", "", "")];
+        let line = |speaker: &str, kind: &'static str, intensity: u8, line_kind: &'static str| prompts::Delivery { speaker: speaker.into(), text: "x".into(), kind, intensity, line_kind, mood: String::new() };
+        let ren = instruct(&line("Ren", "fight", 9, "speech"), &cast);
+        assert!(ren.starts_with("A man of 34 with a ") && ren.contains("adult male voice. Character: Stern but caring. Furious and shouting"), "{ren}");
+        let mio = instruct(&line("Mio", "emotional", 8, "speech"), &cast);
+        assert!(mio.starts_with("A 7-year-old little girl with a small, high, soft child's voice. Crying"), "{mio}");
+        assert!(instruct(&line("Jiro", "calm", 3, "inner"), &cast).contains("An elderly man of 72") && instruct(&line("Jiro", "calm", 3, "inner"), &cast).ends_with("as a quiet thought to oneself."));
+        assert!(instruct(&line("", "dialogue", 5, "narrator"), &cast).starts_with("A calm, warm adult narrator"));
+        // The same character is always asked for the same voice; two characters for different ones.
+        assert_eq!(voice_of(&cast[0]), voice_of(&cast[0]));
+        assert_eq!(voice_seed("Ren"), voice_seed(" ren "));
+        assert_ne!(voice_seed("Ren"), voice_seed("Mio"));
+    }
+
+    #[test]
+    fn every_character_gets_a_voice_of_their_own() {
+        let t = std::env::temp_dir().join(format!("mangavox-cast-test-{}-{}", std::process::id(), mv_create::now()));
+        let who = |name: &str, gender: &str, age: &str| Speaker::of(&CastMember { name: name.into(), gender: gender.into(), age: age.into(), ..Default::default() });
+        let cast = vec![who("Kai", "male", "17"), who("Rin", "female", "16"), who("Old Jiro", "male", "72"), who("Mio", "female", "6"), who("Ren", "male", "30"), who("Timmy", "male", "5")];
+        let names: Vec<String> = cast.iter().map(|c| c.name.clone()).collect();
+        let v = cast_voices(&t, &cast, &names);
+        assert_eq!(v.len(), 6);
+        let is_f = |b: &str| b.starts_with("af_") || b.starts_with("bf_");
+        assert!(!is_f(&v[0].base) && is_f(&v[1].base) && !is_f(&v[2].base) && is_f(&v[3].base) && !is_f(&v[4].base), "{v:?}");
+        // A small boy is voiced by a raised woman's voice; a child is high, an old man low.
+        assert!(is_f(&v[5].base) && v[5].pitch >= 4.0 && v[3].pitch >= 4.0 && v[2].pitch < v[4].pitch, "{v:?}");
+        // No two characters share a voice.
+        for (i, a) in v.iter().enumerate() {
+            for b in &v[i + 1..] {
+                assert!(a.base != b.base || (a.pitch - b.pitch).abs() >= 0.6, "{a:?} and {b:?}");
+            }
+        }
+        // Cast once, the same ever after.
+        assert_eq!(cast_voices(&t, &cast, &names), v);
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]

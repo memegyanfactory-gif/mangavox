@@ -1196,13 +1196,29 @@ LAB_TEXT = {
 }
 
 
-def voice_lab(voice, kind, out_dir, text=None, intensities=(2, 5, 8), mood="", strength=1.0, reference=None):
+def voice_lab(voice, kind, out_dir, text=None, intensities=(2, 5, 8), mood="", strength=1.0, reference=None, units=None):
     """Renders the same sentence for scene `kind` at each intensity with `voice`'s engine
     (Chatterbox: exaggeration/cfg/temperature; Kokoro/Piper: speed), each sample normalised
     to the chapter loudness. Returns {ok, voice, engine, kind, text, samples: [{intensity,
     path, params, duration, elapsed, rtf}]}."""
     import narration_tts as nt
     kind = nt.normalize_kind(kind)
+    # A scene (Creative): `units` are its lines in order, each with its own feeling
+    # ({text, kind, intensity, line_kind, mood, speaker}), spoken as ONE sample so every line is
+    # acted the way it is meant (a shout, a sob, a whisper) instead of one tone for all of them.
+    scene = [
+        {"text": str(u.get("text") or "").strip(), "kind": nt.normalize_kind(u.get("kind") or kind),
+         "mood": str(u.get("mood") or ""), "intensity": nt.clamp(float(u.get("intensity", 5)), 0.0, 10.0),
+         "line_kind": str(u.get("line_kind") or "speech"),
+         # Who says it and the voice cloned for them (their own, so each character sounds different).
+         **{k: u[k] for k in nt.SPEAKER_KEYS if u.get(k) is not None}}
+        for u in (units or []) if str(u.get("text") or "").strip()
+    ]
+    if scene:
+        strongest = max(scene, key=lambda u: u["intensity"])
+        kind = strongest["kind"]
+        text = " ".join(u["text"] for u in scene)
+        intensities = (strongest["intensity"],)
     text = (text or LAB_TEXT.get(kind) or LAB_TEXT["other"]).strip()
     os.makedirs(out_dir, exist_ok=True)
     ready = _run_kokoro_json(["voice-ready", voice])
@@ -1215,14 +1231,17 @@ def voice_lab(voice, kind, out_dir, text=None, intensities=(2, 5, 8), mood="", s
     if engine == "chatterbox":
         import chatterbox_tts as cb
         ref = reference if reference and os.path.isfile(reference) else None
+        if scene:
+            # Each speaking character's own voice clip, made once (a missing one: the main voice).
+            _make_cast_clips(cb, [{"units": scene}], {})
         with cb.Worker() as w:
             for level in intensities:
-                units = [{"text": text, "kind": kind, "mood": mood, "intensity": float(level), "line_kind": "narration"}]
+                units = scene or [{"text": text, "kind": kind, "mood": mood, "intensity": float(level), "line_kind": "narration"}]
                 chunks = _chatterbox_chunks(nt, cb, 0, units, synth_voice, strength, "")
                 out = os.path.join(out_dir, f"lab_{safe}_{kind}_{int(level)}.wav")
-                res = w.page(out, synth_voice, [{k: c[k] for k in ("text", "params", "seed", "pause_before_ms")} for c in chunks],
+                res = w.page(out, synth_voice, [{k: c[k] for k in ("text", "params", "seed", "pause_before_ms", "reference") if k in c} for c in chunks],
                              reference=ref, lead_ms=nt.PAGE_LEAD_MS, tail_ms=nt.PAGE_TAIL_MS,
-                             tempo=nt.chatterbox_tempo(kind) if strength > 0 else 1.0)
+                             tempo=nt.chatterbox_tempo(kind) if strength > 0 and not scene else 1.0)
                 loud = _normalize_files([out])
                 dur = float(res.get("duration") or 0)
                 samples.append({"intensity": level, "path": out, "params": chunks[0]["params"] if chunks else {},

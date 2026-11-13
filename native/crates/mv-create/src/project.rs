@@ -165,6 +165,9 @@ pub struct CastMember {
     pub role: String,
     #[serde(deserialize_with = "lenient_text")]
     pub age: String,
+    /// "male" or "female" (their voice is cast from it; empty: guessed from the description).
+    #[serde(deserialize_with = "lenient_text")]
+    pub gender: String,
     /// The chapter the character first appears in; their sheets are made before it.
     #[serde(deserialize_with = "lenient_u32")]
     pub intro_chapter: u32,
@@ -203,6 +206,12 @@ impl CastMember {
         } else {
             2
         }
+    }
+
+    /// Their age in years, when the script gives a number ("17", "about 40", "8 years old").
+    pub fn years(&self) -> Option<u32> {
+        let digits: String = self.age.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok().filter(|n| *n > 0 && *n < 130)
     }
 
     pub fn tier_label(&self) -> &'static str {
@@ -469,6 +478,20 @@ impl Project {
         self.locations.iter().find(|l| l.name.eq_ignore_ascii_case(n) || l.id == slug(n))
     }
 
+    /// The number of the first chapter (an adapted manga may start anywhere, say at 75).
+    pub fn first_chapter(&self) -> u32 {
+        self.chapters.iter().map(|c| c.number).min().unwrap_or(1)
+    }
+
+    /// The cast whose sheets come first: everyone a story opens with, the leads before the main
+    /// cast before the rest.
+    pub fn opening_cast(&self) -> Vec<String> {
+        let first = self.first_chapter().max(self.cast.iter().map(|c| c.intro_chapter).min().unwrap_or(1));
+        let mut cast: Vec<&CastMember> = self.cast.iter().filter(|c| c.intro_chapter <= first || c.tier() <= 1).collect();
+        cast.sort_by_key(|c| c.tier());
+        cast.into_iter().map(|c| c.name.clone()).collect()
+    }
+
     pub fn chapter(&self, n: u32) -> Option<&Chapter> {
         self.chapters.iter().find(|c| c.number == n)
     }
@@ -568,6 +591,13 @@ mod tests {
         assert_eq!(p.cast[0].id, "kai-tanaka");
         assert_eq!(p.cast[1].id, "kai-tanaka-2");
         assert_eq!(p.cast[0].intro_chapter, 1);
+        let aged = |age: &str| CastMember { age: age.into(), ..Default::default() }.years();
+        assert_eq!((aged("8 years old"), aged("about 40"), aged("17"), aged("unknown"), aged("")), (Some(8), Some(40), Some(17), None, None));
+        let mut late = Project::default();
+        late.cast = vec![CastMember { name: "Side".into(), role: "supporting".into(), intro_chapter: 75, ..Default::default() }, CastMember { name: "Hero".into(), role: "protagonist".into(), intro_chapter: 75, ..Default::default() }, CastMember { name: "Later".into(), role: "minor".into(), intro_chapter: 80, ..Default::default() }];
+        late.chapter_mut(75);
+        late.chapter_mut(76);
+        assert_eq!((late.first_chapter(), late.opening_cast()), (75, vec!["Hero".to_string(), "Side".to_string()]));
         let tier = |role: &str| CastMember { role: role.into(), ..Default::default() }.tier();
         assert_eq!((tier("Protagonist"), tier("antagonist"), tier("main"), tier("supporting"), tier(""), tier("minor")), (0, 1, 1, 2, 2, 3));
         assert_eq!(p.character("kai").map(|c| c.id.as_str()), Some("kai-tanaka"));

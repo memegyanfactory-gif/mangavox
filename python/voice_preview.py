@@ -30,6 +30,7 @@ def lab(args_path: str) -> int:
             mood=args.get("mood", ""),
             strength=float(args.get("strength", 1.0)),
             reference=args.get("reference"),
+            units=args.get("units"),
         )
         print(json.dumps(result), flush=True)
         return 0

@@ -794,11 +794,15 @@ pub struct LabRequest {
     pub strength: f32,
     /// A WAV for a Chatterbox voice to clone instead of its own reference clip.
     pub reference: Option<PathBuf>,
+    /// A scene's lines in order, each with its own feeling
+    /// (`{text, kind, intensity, line_kind, mood, speaker}`): spoken as one sample, every line
+    /// acted its own way. Empty: the one sentence above at each intensity.
+    pub units: Vec<serde_json::Value>,
 }
 
 impl LabRequest {
     pub fn new(voice: &str, kind: &str) -> Self {
-        Self { voice: voice.into(), kind: kind.into(), text: None, intensities: vec![], strength: 1.0, reference: None }
+        Self { voice: voice.into(), kind: kind.into(), text: None, intensities: vec![], strength: 1.0, reference: None, units: vec![] }
     }
 }
 
@@ -845,6 +849,7 @@ pub async fn voice_lab(interpreter: &PythonInterpreter, layout: &PythonLayout, o
         "intensities": intensities,
         "strength": req.strength.clamp(0.0, 2.0),
         "reference": req.reference,
+        "units": req.units,
         "out_dir": out_dir,
     });
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);

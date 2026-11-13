@@ -21,7 +21,7 @@ impl CreativePage {
                 cx.notify();
             })));
         }
-        let missing: Vec<Task> = p.cast.iter().filter(|c| c.intro_chapter <= self.chapter.max(1)).flat_map(|c| {
+        let missing: Vec<Task> = p.cast.iter().filter(|c| c.intro_chapter <= self.chapter.max(p.first_chapter())).flat_map(|c| {
             let mut t = vec![];
             if c.sheet.is_none() {
                 t.push(Task::Sheet(c.id.clone()));
@@ -61,14 +61,15 @@ impl CreativePage {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(space::SM))
-                    .child(div().flex_1().text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} characters ({} lead, {} main cast, {} recurring, {} minor) · {painted} with sheets. {} are made before a character's first scene, so they look the same everywhere.", p.cast.len(), tiers[0], tiers[1], tiers[2], tiers[3], if p.settings.live_action { "Realistic full-body casting sheets" } else { "Sheets" })))
+                    .child(div().flex_1().min_w(px(320.)).text_size(px(size::SM)).text_color(Tokens::text_2()).child(format!("{} characters ({} lead, {} main cast, {} recurring, {} minor) · {painted} with sheets. {} are made before a character's first scene, so they look the same everywhere.", p.cast.len(), tiers[0], tiers[1], tiers[2], tiers[3], if p.settings.live_action { "Realistic full-body casting sheets" } else { "Sheets" })))
                     .when(n_key > 0, |d| {
                         d.child(btn("cr-paint-key", format!("Make the leads' and main cast's sheets ({n_key})"), ButtonKind::Secondary).small().icon(ph::STAR).tooltip("The one or two leads first, then the main cast").on_click(cx.listener(move |this, _, _, cx| this.enqueue(key.clone(), cx))))
                     })
                     .when(n_missing > 0, |d| {
-                        d.child(btn("cr-paint-missing", format!("Paint {n_missing} missing sheets up to chapter {}", self.chapter.max(1)), ButtonKind::Primary).small().icon(ph::PAINT_BRUSH).on_click(cx.listener(move |this, _, _, cx| this.enqueue(missing.clone(), cx))))
+                        d.child(btn("cr-paint-missing", format!("Paint {n_missing} missing sheets up to chapter {}", self.chapter.max(p.first_chapter())), ButtonKind::Primary).small().icon(ph::PAINT_BRUSH).on_click(cx.listener(move |this, _, _, cx| this.enqueue(missing.clone(), cx))))
                     }),
             )
             .children(chapters.into_iter().map(|ch| {
