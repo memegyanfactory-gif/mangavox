@@ -75,6 +75,8 @@ pub(crate) struct LibManga {
     pub id: String,
     pub title: String,
     pub pages_dirs: Vec<PathBuf>,
+    /// The numbers of its downloaded chapters, in order.
+    pub chapters: Vec<u32>,
 }
 
 pub(crate) struct Running {
@@ -140,7 +142,15 @@ impl CreativePage {
             let lib = mv_ui::bg::blocking(|| ui_studio::data::load().unwrap_or_default()).await.unwrap_or_default();
             let ff = mv_ui::bg::blocking(mv_create::video::has_ffmpeg).await.unwrap_or(false);
             let _ = this.update(cx, |this, cx| {
-                this.library = lib.into_iter().map(|g| LibManga { id: g.id, title: g.title, pages_dirs: g.chapters.into_iter().map(|c| c.pages_dir).collect() }).collect();
+                this.library = lib
+                    .into_iter()
+                    .map(|g| {
+                        let mut chapters: Vec<u32> = g.chapters.iter().filter_map(|c| c.number).filter(|n| *n >= 1.).map(|n| n as u32).collect();
+                        chapters.sort_unstable();
+                        chapters.dedup();
+                        LibManga { id: g.id, title: g.title, pages_dirs: g.chapters.into_iter().map(|c| c.pages_dir).collect(), chapters }
+                    })
+                    .collect();
                 this.ffmpeg = Some(ff);
                 cx.notify();
             });
@@ -779,7 +789,9 @@ impl Render for CreativePage {
                     .id("cr-scroll")
                     .size_full()
                     .when(!chat, |d| d.overflow_y_scroll().track_scroll(&self.scroll))
-                    .child(div().size_full().flex().flex_col().gap(px(space::LG)).px(px(size::PAGE_X)).py(px(size::PAGE_Y)).child(header).children(self.queue_strip(cx)).child(div().flex_1().min_h_0().flex().flex_col().child(body))),
+                    // The chat fills the window (its composer is pinned); every other page is as tall as
+                    // what is on it and scrolls.
+                    .child(div().w_full().when(chat, |d| d.h_full()).flex().flex_col().gap(px(space::LG)).px(px(size::PAGE_X)).py(px(size::PAGE_Y)).child(header).children(self.queue_strip(cx)).child(div().when(chat, |d| d.flex_1().min_h_0()).flex().flex_col().child(body))),
             )
             .when_some(self.viewing.clone(), |d, f| {
                 d.child(

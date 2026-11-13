@@ -38,6 +38,16 @@ pub(crate) async fn open_window() -> Result<()> {
     browser()?.show(GENERATOR, "Magnific · sign in here (MangaVox)").await.map_err(|e| anyhow!("Could not open the Magnific window: {e}"))
 }
 
+/// The prompt with a line saying what each attached picture is, by the name the page gives it
+/// (`@img1`, `@img2`…), so a face is known to be that character's face.
+fn named(prompt: &str, captions: &[String]) -> String {
+    if captions.is_empty() {
+        return prompt.to_string();
+    }
+    let list: Vec<String> = captions.iter().enumerate().map(|(i, c)| format!("@img{} is {}", i + 1, c.split_once(": ").map(|(_, w)| w).unwrap_or(c))).collect();
+    format!("{prompt}\nThe attached pictures: {}.", list.join("; "))
+}
+
 /// The routine with what this picture needs filled in.
 fn script(prompt: &str, aspect: &str, refs: &[(String, String)]) -> String {
     let params = json!({
@@ -80,7 +90,8 @@ pub(crate) async fn generate(prompt: &str, refs: &[Reference], aspect: &str, out
     let files: Vec<_> = refs.iter().take(MAX_REFS).map(|r| r.file.clone()).collect();
     let small = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> { files.iter().enumerate().map(|(i, f)| Ok((format!("mangavox-ref-{}.jpg", i + 1), mv_create::small_jpeg_b64(f, 1280)?))).collect() }).await??;
     on_status("On Magnific's website: typing the prompt and pressing Generate");
-    let js = script(prompt, aspect, &small);
+    let prompt = named(prompt, &refs.iter().take(small.len()).map(|r| r.caption.clone()).collect::<Vec<_>>());
+    let js = script(&prompt, aspect, &small);
     let answer = wall.eval_json_for(GENERATOR, &js, WAIT + Duration::from_secs(150)).await.map_err(|e| anyhow!("Magnific's website did not answer: {e}"))?;
     let data = match outcome(&answer) {
         Ok(d) => d.to_string(),
@@ -115,6 +126,12 @@ mod tests {
         assert!(js.contains(r#"!== "1K""#) && js.contains(r#"!== "ON""#) && js.contains("/unlimited/i.test(label)"));
         // A check for a person is reported, never worked around.
         assert!(js.contains(r#"fail("human""#) && !js.to_lowercase().contains("solve"));
+    }
+
+    #[test]
+    fn attached_pictures_are_named_in_the_prompt() {
+        assert_eq!(named("A sheet.", &[]), "A sheet.");
+        assert_eq!(named("A sheet.", &["Image 1: Mu Jin's face as drawn in the manga".into(), "Image 2: the harbor".into()]), "A sheet.\nThe attached pictures: @img1 is Mu Jin's face as drawn in the manga; @img2 is the harbor.");
     }
 
     #[test]

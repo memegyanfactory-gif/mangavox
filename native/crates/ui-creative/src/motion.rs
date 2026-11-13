@@ -169,6 +169,68 @@ impl CreativePage {
         )
     }
 
+    /// Every chapter there is to make a video of: the manga's downloaded chapters (all of them,
+    /// not only the ones the outline covers) and the project's own. A click opens it; one the
+    /// project has not met yet is added, with what Studio read of it as its summary.
+    fn video_chapters(&self, p: &mv_create::Project, cx: &mut Context<Self>) -> Div {
+        let norm = |s: &str| s.trim().to_lowercase();
+        let downloaded: Vec<u32> = p.adapts.as_ref().and_then(|t| self.library.iter().find(|m| norm(&m.title) == norm(t))).map(|m| m.chapters.clone()).unwrap_or_default();
+        let mut all: Vec<u32> = downloaded.iter().copied().chain(p.chapters.iter().map(|c| c.number)).collect();
+        all.sort_unstable();
+        all.dedup();
+        let total: u64 = all.iter().map(|n| jobs::forecast(p, *n).left_secs).sum();
+        let video: u64 = all.iter().map(|n| jobs::forecast(p, *n).video_secs).sum();
+        let chips = all.iter().map(|n| {
+            let n = *n;
+            let ch = p.chapter(n);
+            let mark = match ch {
+                Some(c) if c.video.is_some() => " ✓",
+                Some(c) if !c.pages.is_empty() => " •",
+                _ => "",
+            };
+            let title = p.adapts.clone();
+            mv_ui::filter_chip(("cr-vch", n as usize), format!("Ch. {n}{mark}"), self.chapter == n).on_click(cx.listener(move |this, _, _, cx| {
+                if this.busy() && this.auto.is_some() {
+                    return;
+                }
+                this.chapter = n;
+                this.clip_sel = None;
+                let known = this.p.as_ref().is_some_and(|p| p.chapter(n).is_some_and(|c| !c.summary.trim().is_empty() || !c.pages.is_empty()));
+                if !known {
+                    this.edit(|p| {
+                        p.chapter_mut(n);
+                    });
+                    // What Studio read of this chapter becomes its summary, so the scenes are written from the real story.
+                    if let Some(title) = title.clone() {
+                        let pid = this.project_id();
+                        cx.spawn(async move |this, cx| {
+                            let found = mv_ui::bg::blocking(move || chapter_recap(&title, n)).await.ok().flatten();
+                            let _ = this.update(cx, |this, cx| {
+                                if let (Some(summary), true) = (found, this.project_id() == pid) {
+                                    this.edit(|p| {
+                                        let ch = p.chapter_mut(n);
+                                        if ch.summary.trim().is_empty() {
+                                            ch.summary = summary;
+                                        }
+                                    });
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                }
+                cx.notify();
+            }))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().flex().items_center().gap(px(space::SM)).child(mv_ui::section_label(if downloaded.is_empty() { "Chapters".to_string() } else { format!("Chapters · {} downloaded", downloaded.len()) })).child(div().flex_1().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("✓ video made · • scenes written. All {} together: a video of {}, {} left to make.", all.len(), jobs::about(video), if total == 0 { "nothing".to_string() } else { jobs::about(total) }))))
+            .child(div().id("cr-vch-scroll").flex().flex_wrap().gap(px(6.)).max_h(px(112.)).overflow_y_scroll().children(chips))
+    }
+
     /// The road from a manga to its video as five steps: which are done, which is being made
     /// now, and one button that makes everything that is left.
     fn steps(&self, p: &mv_create::Project, n: u32, cx: &mut Context<Self>) -> Div {
@@ -189,6 +251,14 @@ impl CreativePage {
             ("Voices, clips and the video", if at == 5 { "Ready to play".into() } else { format!("{clips} of {scenes} scenes voiced and filmed, then joined") }),
         ];
         let now = self.running.as_ref().map(|r| format!("{} · {}", r.label, r.status.lock().map(|s| s.clone()).unwrap_or_default())).or_else(|| self.thinking.as_ref().map(|s| s.lock().map(|s| if s.is_empty() { "The AI is writing".to_string() } else { s.clone() }).unwrap_or_default()));
+        let fc = jobs::forecast(p, n);
+        let forecast = format!(
+            "Chapter {n}: {}{} scenes, a video of {}. {}",
+            if fc.guessed { "about " } else { "" },
+            fc.scenes,
+            jobs::about(fc.video_secs),
+            if fc.left_secs == 0 { "Everything is made.".to_string() } else { format!("Making what is left takes {} on this PC (a picture about a minute, a clip about {}).", jobs::about(fc.left_secs), jobs::about(if matches!(video::video_model(&p.settings.video_model).via, VideoVia::ComfyLtx) { 300 } else { 150 })) }
+        );
         let auto = self.auto.is_some();
         let label = match (at, auto && busy) {
             (_, true) => "Making it automatically…".to_string(),
@@ -225,7 +295,7 @@ impl CreativePage {
                     ),
             );
         }
-        col.child(
+        col.child(div().flex().items_center().gap(px(6.)).child(icon_ph(ph::CLOCK, Tokens::text_3(), 14.)).child(div().flex_1().text_size(px(size::XS)).text_color(Tokens::text_2()).whitespace_normal().child(forecast))).child(
             div()
                 .flex()
                 .flex_wrap()
@@ -283,7 +353,7 @@ impl CreativePage {
             .flex()
             .flex_col()
             .gap(px(space::LG))
-            .child(self.chapter_picker(&p, cx))
+            .child(self.video_chapters(&p, cx))
             .child(steps)
             .child(mv_ui::section_label("How it is made"))
             .child(self.look_bar(cx))
@@ -352,6 +422,24 @@ impl CreativePage {
                     })))
             })))
     }
+}
+
+/// What Studio read of chapter `n` of the manga `title` (its story up to the end of that
+/// chapter), when it has read it.
+fn chapter_recap(title: &str, n: u32) -> Option<String> {
+    let norm = |s: &str| s.trim().to_lowercase();
+    let groups = ui_studio::data::load().ok()?;
+    let g = groups.iter().find(|g| norm(&g.title) == norm(title))?;
+    let brain = mv_recap::Brain::load(&g.id, &g.title);
+    brain.recaps.iter().find(|r| label_number(&r.label) == Some(n)).map(|r| r.summary.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// The chapter number in a label ("Vol. 2 Ch. 12" is 12, "Chapter 75 · The Duel" is 75).
+fn label_number(label: &str) -> Option<u32> {
+    let l = label.to_lowercase();
+    let from = l.find("ch").unwrap_or(0);
+    let digits: String = l[from..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// A prompt as sent, in a box that can be read whole.

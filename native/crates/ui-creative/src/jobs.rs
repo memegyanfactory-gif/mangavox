@@ -86,6 +86,68 @@ async fn paint(web: bool, m: &'static ImageModel, key: &str, prompt: &str, refs:
     }
 }
 
+/// The faces Studio cut out of the manga's pages for each character (`<brain>/faces`), by the
+/// names and aliases it knows them under. Read once per manga.
+fn manga_faces(title: &str, name: &str) -> Vec<PathBuf> {
+    type Known = Vec<(Vec<String>, Vec<PathBuf>)>;
+    static CACHE: Mutex<Option<(String, Known)>> = Mutex::new(None);
+    let norm = |s: &str| s.trim().to_lowercase();
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.as_ref().is_none_or(|(t, _)| t != title) {
+        let groups = ui_studio::data::load().unwrap_or_default();
+        let t = norm(title);
+        let known: Known = groups
+            .iter()
+            .find(|g| norm(&g.title) == t)
+            .or_else(|| groups.iter().find(|g| norm(&g.title).contains(&t) || t.contains(&norm(&g.title))))
+            .map(|g| {
+                mv_recap::Brain::load(&g.id, &g.title)
+                    .characters
+                    .iter()
+                    .map(|c| (std::iter::once(&c.name).chain(&c.aliases).map(|n| norm(n)).collect(), c.faces.iter().filter(|f| f.is_file()).cloned().collect()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        *cache = Some((title.to_string(), known));
+    }
+    let known = cache.as_ref().map(|(_, k)| k.as_slice()).unwrap_or(&[]);
+    pick_faces(known, name)
+}
+
+/// The faces of `name` among `known` (each: the names a character goes by, their face files):
+/// by the whole name, else by a first name ("Mu Jin" is "Mu Jin the Trainer"). At most three.
+fn pick_faces(known: &[(Vec<String>, Vec<PathBuf>)], name: &str) -> Vec<PathBuf> {
+    let n = name.trim().to_lowercase();
+    if n.is_empty() {
+        return vec![];
+    }
+    let exact = known.iter().find(|(names, faces)| !faces.is_empty() && names.contains(&n));
+    // A looser match only when it points at exactly one character: a shared family name ("Mu"
+    // of Mu Jin and Mu Gung) must not give one brother the other's face.
+    let loose = || {
+        let mut hits = known.iter().filter(|(names, faces)| !faces.is_empty() && names.iter().any(|k| k.starts_with(&format!("{n} ")) || n.starts_with(&format!("{k} "))));
+        match (hits.next(), hits.next()) {
+            (Some(one), None) => Some(one),
+            _ => None,
+        }
+    };
+    exact.or_else(loose).map(|(_, faces)| faces.iter().take(3).cloned().collect()).unwrap_or_default()
+}
+
+/// Puts a character's manga faces among the references (after the first `keep`), numbers every
+/// caption again and keeps at most `cap`.
+fn with_faces(refs: &mut Vec<Reference>, faces: &[PathBuf], name: &str, keep: usize, cap: usize) {
+    let at = keep.min(refs.len());
+    for (i, f) in faces.iter().enumerate() {
+        refs.insert(at + i, Reference { file: f.clone(), caption: format!("Image 0: {name}'s face as drawn in the manga (the real person has this face, hair and marks)") });
+    }
+    refs.truncate(cap.max(1));
+    for (i, r) in refs.iter_mut().enumerate() {
+        let what = r.caption.split_once(": ").map(|(_, w)| w.to_string()).unwrap_or_else(|| r.caption.clone());
+        r.caption = format!("Image {}: {what}", i + 1);
+    }
+}
+
 /// It can paint a whole portrait page.
 pub(crate) fn paints_pages(m: &ImageModel) -> bool {
     aspects(m).contains(&PAGE_ASPECT)
@@ -149,7 +211,7 @@ pub(crate) fn refs_for(p: &Project, names: &[String], location: &str, prev: Opti
             push(&mut out, f, format!("{} expression sheet", c.name));
         }
     }
-    for r in p.style_refs.iter().take(2) {
+    for r in p.style_refs.iter().take(if p.settings.live_action { 0 } else { 2 }) {
         let f = p.file(r);
         if f.is_file() {
             push(&mut out, f, "art style reference: match its linework, inking and screentone, NOT its characters".into());
@@ -187,10 +249,22 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
     let res = resolution(p, m);
     let one = cost(p, m, res);
     let web = p.settings.web_images;
-    let image_job = |label: String, prompt: String, refs: Vec<Reference>, aspect: &'static str, out: PathBuf, done: Box<dyn FnOnce(String) -> Outcome + Send>, rel_of: Box<dyn Fn(&std::path::Path) -> String + Send>| -> Result<Job> {
+    let cap = ref_cap(p, m);
+    // `face_of`: (the manga adapted, the character, how many leading references stay first). The
+    // character's own face as the manga draws it is looked up when the job runs and attached.
+    let image_job = |label: String, prompt: String, refs: Vec<Reference>, face_of: Option<(String, String, usize)>, aspect: &'static str, out: PathBuf, done: Box<dyn FnOnce(String) -> Outcome + Send>, rel_of: Box<dyn Fn(&std::path::Path) -> String + Send>| -> Result<Job> {
         let k = if web { String::new() } else { key(m)? };
         let st = status.clone();
         let fut = async move {
+            let (mut refs, mut prompt) = (refs, prompt);
+            if let Some((title, name, keep)) = face_of {
+                let who = name.clone();
+                let faces = tokio::task::spawn_blocking(move || manga_faces(&title, &who)).await.unwrap_or_default();
+                if !faces.is_empty() {
+                    with_faces(&mut refs, &faces, &name, keep, cap);
+                    prompt.push_str(&format!("\nThe attached face pictures show {name} as the manga draws them. The real person must have this same face shape, hairstyle, hair colour, eye colour and marks, so they are recognisably {name}. Do not copy the drawing style: a real photographed human."));
+                }
+            }
             paint(web, m, &k, &prompt, &refs, aspect, res, &out, move |s| set(&st, s)).await?;
             Ok(done(rel_of(&out)))
         };
@@ -211,24 +285,30 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
             for r in c.user_refs.iter().take(3) {
                 refs.push(Reference { file: p.file(r), caption: format!("Image {}: {} as designed by the author — keep this design", refs.len() + 1, c.name) });
             }
-            for r in p.style_refs.iter().take(2) {
-                refs.push(Reference { file: p.file(r), caption: format!("Image {}: art style reference (style only, not its characters)", refs.len() + 1) });
+            // Drawn manga takes its line and tone from the style pages; live action must not (a
+            // manga page as a reference pulls a photograph towards a drawing).
+            if !p.settings.live_action {
+                for r in p.style_refs.iter().take(2) {
+                    refs.push(Reference { file: p.file(r), caption: format!("Image {}: art style reference (style only, not its characters)", refs.len() + 1) });
+                }
             }
             refs.retain(|r| r.file.is_file());
             refs.truncate(ref_cap(p, m));
+            // An adapted character with no pictures of the user's own: their face from the manga.
+            let face_of = p.adapts.clone().filter(|_| c.user_refs.is_empty()).map(|title| (title, c.name.clone(), usize::from(expr && !refs.is_empty())));
             let prompt = if expr { prompts::expressions(p, &c) } else { prompts::sheet(p, &c, !refs.is_empty()) };
             let aspect = layout::nearest(if expr { 1. } else { 16. / 9. }, shapes(p, m));
             let out = p.new_image("sheets", &format!("{}-{}", c.id, if expr { "expressions" } else { "sheet" }));
             let id = c.id.clone();
             let label = format!("{} · {}", c.name, if expr { "expression sheet" } else { "model sheet" });
-            image_job(label, prompt, refs, aspect, out, Box::new(move |rel| if expr { Outcome::Expressions { id, rel } } else { Outcome::Sheet { id, rel } }), Box::new(rel))
+            image_job(label, prompt, refs, face_of, aspect, out, Box::new(move |rel| if expr { Outcome::Expressions { id, rel } } else { Outcome::Sheet { id, rel } }), Box::new(rel))
         }
         Task::Location(id) => {
             let l = p.locations.iter().find(|l| &l.id == id).ok_or_else(|| anyhow!("that location is gone"))?.clone();
             let refs: Vec<Reference> = p.style_refs.iter().take(2).map(|r| Reference { file: p.file(r), caption: "art style reference (style only)".into() }).filter(|r| r.file.is_file()).take(ref_cap(p, m)).collect();
             let out = p.new_image("sheets", &format!("loc-{}", l.id));
             let id = l.id.clone();
-            image_job(format!("{} · location", l.name), prompts::location(p, &l), refs, layout::nearest(16. / 9., shapes(p, m)), out, Box::new(move |rel| Outcome::Location { id, rel }), Box::new(rel))
+            image_job(format!("{} · location", l.name), prompts::location(p, &l), refs, None, layout::nearest(16. / 9., shapes(p, m)), out, Box::new(move |rel| Outcome::Location { id, rel }), Box::new(rel))
         }
         Task::Page { chapter, page } => page_job(p, m, res, *chapter, *page, status),
         Task::Clip { chapter, page, panel } => clip_job(p, *chapter, *page, *panel, status),
@@ -836,6 +916,65 @@ pub(crate) fn stage(p: &Project, n: u32) -> Stage {
     Stage::Done
 }
 
+/// Roughly how long one job takes on this PC, in seconds: a picture on Magnific's website or
+/// through an API, the AI writing a chapter, and a clip with the project's video model (LTX
+/// with voice was measured at about four minutes a clip here, voice included).
+const PICTURE_SECS: u64 = 60;
+const SCRIPT_SECS: u64 = 180;
+fn clip_secs(p: &Project) -> u64 {
+    match video::video_model(&p.settings.video_model).via {
+        VideoVia::Local => 6,
+        VideoVia::ComfyLtx => 300,
+        VideoVia::ComfyUi => 240,
+        _ => 150,
+    }
+}
+
+/// What chapter `n`'s video comes to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Forecast {
+    /// Scenes it has, or is expected to have while it is not written yet (`guessed`).
+    pub scenes: usize,
+    pub guessed: bool,
+    /// How long the video runs.
+    pub video_secs: u64,
+    /// How long making what is left takes.
+    pub left_secs: u64,
+}
+
+/// The forecast for chapter `n`: from its script once written, else from the usual chapter
+/// (about four scenes a page).
+pub(crate) fn forecast(p: &Project, n: u32) -> Forecast {
+    let ch = p.chapter(n).cloned().unwrap_or_default();
+    let written = !ch.pages.is_empty();
+    let scenes = if written { ch.pages.iter().map(|pg| pg.panels.len()).sum() } else { p.settings.pages_per_chapter.max(1) as usize * 4 };
+    let clip_len = if matches!(video::video_model(&p.settings.video_model).via, VideoVia::ComfyLtx) { 6 } else { video::video_model(&p.settings.video_model).fit_seconds(p.settings.clip_seconds) as u64 };
+    let st = stage(p, n);
+    // What is left: missing sheets and places, the script, each scene's picture, each clip.
+    let sheets = match &st {
+        Stage::Sheets(t) => t.len(),
+        Stage::Stills(t) => t.iter().filter(|t| !matches!(t, Task::Page { .. })).count(),
+        _ => 0,
+    } as u64;
+    let pictures = if !written {
+        scenes
+    } else {
+        ch.pages.iter().filter(|pg| pg.image.is_none()).map(|pg| images_per_page(p, image_model(p, &Keys::default()), pg.panels.len())).sum()
+    } as u64;
+    let clips = if written { ch.pages.iter().flat_map(|pg| &pg.panels).filter(|x| x.clip.is_none()).count() } else { scenes } as u64;
+    let left_secs = if st == Stage::Done { 0 } else { sheets * PICTURE_SECS + if written { 0 } else { SCRIPT_SECS } + pictures * PICTURE_SECS + clips * clip_secs(p) };
+    Forecast { scenes, guessed: !written, video_secs: scenes as u64 * clip_len, left_secs }
+}
+
+/// "about 3 h 20 min", "about 12 min", "under a minute".
+pub(crate) fn about(secs: u64) -> String {
+    match secs {
+        0..=59 => "under a minute".into(),
+        60..=3599 => format!("about {} min", (secs + 30) / 60),
+        _ => format!("about {} h {} min", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
 /// What a set of tasks costs in images and Magnific credits with the project's model.
 pub(crate) fn estimate(p: &Project, keys: &Keys, tasks: &[Task]) -> (usize, f64) {
     let m = image_model(p, keys);
@@ -964,6 +1103,26 @@ mod tests {
     }
 
     #[test]
+    fn a_character_is_made_from_their_own_face() {
+        let f = |s: &str| PathBuf::from(s);
+        let known = vec![
+            (vec!["mu jin".to_string(), "jin".to_string()], vec![f("a1.jpg"), f("a2.jpg"), f("a3.jpg"), f("a4.jpg")]),
+            (vec!["mu gung the tiger".to_string()], vec![f("b1.jpg")]),
+            (vec!["nobody".to_string()], vec![]),
+        ];
+        assert_eq!(pick_faces(&known, " Mu Jin "), vec![f("a1.jpg"), f("a2.jpg"), f("a3.jpg")], "their own, three at most");
+        assert_eq!(pick_faces(&known, "Mu Gung"), vec![f("b1.jpg")], "a first name finds the longer one");
+        assert!(pick_faces(&known, "Nobody").is_empty() && pick_faces(&known, "Mu").is_empty() && pick_faces(&known, "").is_empty());
+        // The faces go after the character's own sheet, every caption says which picture it is.
+        let mut refs = vec![Reference { file: f("sheet.png"), caption: "Image 1: Mu Jin model sheet".into() }, Reference { file: f("x.png"), caption: "Image 2: something else".into() }];
+        with_faces(&mut refs, &[f("a1.jpg"), f("a2.jpg")], "Mu Jin", 1, 3);
+        let got: Vec<(String, String)> = refs.iter().map(|r| (r.file.to_string_lossy().to_string(), r.caption.clone())).collect();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], ("sheet.png".to_string(), "Image 1: Mu Jin model sheet".to_string()));
+        assert!(got[1].0 == "a1.jpg" && got[1].1.starts_with("Image 2: Mu Jin's face as drawn in the manga") && got[2].1.starts_with("Image 3: Mu Jin's face"));
+    }
+
+    #[test]
     fn every_character_gets_a_voice_of_their_own() {
         let t = std::env::temp_dir().join(format!("mangavox-cast-test-{}-{}", std::process::id(), mv_create::now()));
         let who = |name: &str, gender: &str, age: &str| Speaker::of(&CastMember { name: name.into(), gender: gender.into(), age: age.into(), ..Default::default() });
@@ -1001,6 +1160,27 @@ mod tests {
         p.settings.mode = mv_create::RenderMode::Auto;
         p.settings.live_action = true;
         assert!(!whole_pages(&p, flux), "live action is always scene by scene");
+    }
+
+    #[test]
+    fn a_chapter_is_forecast_from_its_script_or_the_usual_chapter() {
+        let mut p = Project::default();
+        p.settings.video_model = video::LTX_VOICE.into();
+        p.settings.live_action = true;
+        p.settings.pages_per_chapter = 10;
+        p.cast.push(CastMember { name: "Kai".into(), role: "protagonist".into(), sheet: Some("s".into()), expressions: Some("e".into()), intro_chapter: 1, ..Default::default() });
+        p.chapter_mut(1);
+        p.normalize();
+        // Not written: forty scenes guessed; the script, forty pictures and forty clips are left.
+        let f = forecast(&p, 1);
+        assert_eq!((f.scenes, f.guessed, f.video_secs), (40, true, 240));
+        assert_eq!(f.left_secs, 180 + 40 * 60 + 40 * 300);
+        // Written with two scenes, one already filmed.
+        let panel = |clip: Option<&str>| Panel { clip: clip.map(str::to_string), ..Default::default() };
+        p.chapter_mut(1).pages = vec![Page { number: 1, image: Some("p.png".into()), panels: vec![panel(Some("c.mp4")), panel(None)], ..Default::default() }];
+        let f = forecast(&p, 1);
+        assert_eq!((f.scenes, f.guessed, f.video_secs, f.left_secs), (2, false, 12, 300));
+        assert_eq!((about(40), about(600), about(3 * 3600 + 20 * 60)), ("under a minute".to_string(), "about 10 min".to_string(), "about 3 h 20 min".to_string()));
     }
 
     #[test]
