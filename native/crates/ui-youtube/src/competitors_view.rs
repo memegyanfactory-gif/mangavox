@@ -30,10 +30,6 @@ pub(crate) enum VideoSort {
     Longest,
 }
 
-/// The channel list and the video list each scroll in a box of their own this tall, so the
-/// numbers beside them stay in view (the page itself no longer runs on and on).
-const LIST_H: f32 = 620.;
-const VIDEOS_H: f32 = 560.;
 /// Videos listed for a channel.
 const VIDEOS_SHOWN: usize = 300;
 
@@ -107,12 +103,13 @@ impl YouTubePage {
                 .gap(px(2.))
                 .flex_1()
                 .min_w(px(150.))
-                .p(px(16.))
+                .px(px(16.))
+                .py(px(10.))
                 .rounded(px(12.))
                 .border_1()
                 .border_color(yt::tone(0.2))
                 .child(yt::line(12., FontWeight::NORMAL, yt::TEXT_2, label))
-                .child(yt::text(24., 32., FontWeight::BOLD, yt::TEXT).whitespace_nowrap().child(value))
+                .child(yt::text(20., 26., FontWeight::BOLD, yt::TEXT).whitespace_nowrap().child(value))
                 .child(yt::line(12., FontWeight::NORMAL, yt::TEXT_2, sub))
         };
         let head = div()
@@ -142,7 +139,7 @@ impl YouTubePage {
             let last: Vec<_> = runs.iter().rev().take(48).rev().collect();
             let values: Vec<f64> = last.iter().map(|r| (r.new_videos + r.title_changes + r.thumb_changes) as f64).collect();
             let labels: Vec<String> = last.iter().map(|r| format!("{} · {} new videos, {} title and {} thumbnail changes", when::when(r.at), r.new_videos, r.title_changes, r.thumb_changes)).collect();
-            yt::card().child(yt::card_title("What changed, research by research")).child(yt::bar_chart("rv-activity", &values, &labels, yt::LINK, 56.))
+            yt::card().p(px(16.)).gap(px(8.)).child(yt::heading("What changed, research by research", None)).child(yt::bar_chart("rv-activity", &values, &labels, yt::LINK, 32.))
         });
 
         if channels.is_empty() {
@@ -244,14 +241,17 @@ impl YouTubePage {
                         .child(yt::text(12., 16., FontWeight::NORMAL, if gain > 0 { yt::GREEN } else { yt::TEXT_2 }).child(if gain != 0 { format!("{gain:+} · 7 d") } else { format!("{} videos", fmt_num(c.video_count)) })),
                 )
         });
+        // The page fills the window and doesn't scroll: the channel list and the open channel each
+        // scroll in their own panel.
         let sheet = yt::card()
             .w(px(400.))
             .flex_none()
+            .min_h_0()
             .gap(px(12.))
             .child(div().flex().items_center().gap(px(8.)).child(yt::card_title("Channels").flex_1()).child(yt::caption(format!("{shown} shown"))))
             .child(div().h(px(36.)).px(px(12.)).flex().items_center().rounded(px(18.)).bg(yt::tone(0.08)).child(Input::new(&self.rivals.search).appearance(false)))
             .child(sorts)
-            .child(div().id("rv-channels-scroll").flex().flex_col().gap(px(2.)).max_h(px(LIST_H)).overflow_y_scroll().children(rows))
+            .child(div().id("rv-channels-scroll").flex().flex_col().gap(px(2.)).flex_1().min_h_0().overflow_y_scroll().children(rows))
             .when(shown > self.rivals.show, |d| {
                 d.child(yt::pill("rv-more", format!("Show more ({} left)", shown - self.rivals.show)).on_click(cx.listener(|this, _, _, cx| {
                     this.rivals.show += 60;
@@ -275,11 +275,13 @@ impl YouTubePage {
         div()
             .flex()
             .flex_col()
-            .gap(px(yt::GAP))
-            .child(head)
-            .child(status)
-            .children(activity)
-            .child(div().flex().items_start().gap(px(yt::GAP)).child(sheet).child(detail))
+            .flex_1()
+            .min_h_0()
+            .gap(px(16.))
+            .child(head.flex_none())
+            .child(status.flex_none())
+            .children(activity.map(|a| a.flex_none()))
+            .child(div().flex().flex_1().min_h(px(320.)).gap(px(yt::GAP)).child(sheet).child(detail))
             .into_any_element()
     }
 
@@ -372,9 +374,11 @@ impl YouTubePage {
         }));
         let read = videos.iter().filter(|v| v.published_exact).count();
         let open_video = self.rivals.video.clone();
+        // Wide enough for the title beside its numbers; a narrow panel scrolls sideways instead.
         let table = div()
             .flex()
             .flex_col()
+            .min_w(px(860.))
             .child(yt::heading("Videos", Some(format!("{} tracked ({read} read in full, the rest are read as the hourly research gets to them) · click one for its history", sorted.len()))))
             .child(vsorts)
             .child(
@@ -396,7 +400,7 @@ impl YouTubePage {
                     .child(yt::th(70., true, "Per hour"))
                     .child(yt::th(70., true, "Changes")),
             )
-            .child(div().id("rv-videos-scroll").flex().flex_col().max_h(px(VIDEOS_H)).overflow_y_scroll().children(sorted.iter().take(VIDEOS_SHOWN).enumerate().map(|(i, v)| {
+            .child(div().flex().flex_col().children(sorted.iter().take(VIDEOS_SHOWN).enumerate().map(|(i, v)| {
                 let vid = v.id.clone();
                 let on = open_video.as_deref() == Some(v.id.as_str());
                 let changes = changes_of(v);
@@ -430,20 +434,31 @@ impl YouTubePage {
 
         let video_detail = open_video.and_then(|id| videos.iter().find(|v| v.id == id).cloned()).map(|v| self.video_history(&v, store));
 
-        yt::card()
-            .flex_1()
-            .min_w(px(460.))
-            .gap(px(20.))
-            .child(header)
-            .child(yt::divider())
-            .child(kpis)
-            .child(yt::divider())
-            .children(video_detail)
-            .child(table)
-            .child(yt::divider())
-            .children(subs_chart)
-            .child(timing)
-            .child(tags)
+        // Scrolls on its own; a new id per channel so each one opens at its top.
+        yt::card().flex_1().min_w(px(460.)).min_h_0().p(px(0.)).child(
+            div()
+                .id(SharedString::from(format!("rv-detail-{}", c.id)))
+                .flex_1()
+                .min_h_0()
+                .overflow_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(20.))
+                        .p(px(24.))
+                        .child(header)
+                        .child(yt::divider())
+                        .child(kpis)
+                        .child(yt::divider())
+                        .children(video_detail)
+                        .child(table)
+                        .child(yt::divider())
+                        .children(subs_chart)
+                        .child(timing)
+                        .child(tags),
+                ),
+        )
     }
 
     /// One competitor video's history: views hour by hour, titles, thumbnails, description edits.

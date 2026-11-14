@@ -530,29 +530,31 @@ impl YouTubePage {
             (None, Tab::Insights) => self.insights(cx),
             (None, Tab::Settings) => self.settings(window, cx),
         };
+        let inner = div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .gap(px(24.))
+            .px(px(32.))
+            .pb(px(40.))
+            .children(error.map(|e| {
+                inline_alert(AlertKind::Error, if signed_out { "Signed out" } else { "Something went wrong" }, e)
+                    .action(if signed_out { "Connect again" } else { "Retry" }, cx.listener(move |this, _, _, cx| {
+                        this.hub.update(cx, |h, cx| if signed_out { h.connect(cx) } else { h.refresh_now(cx) });
+                    }))
+                    .build()
+            }))
+            .child(content);
+        // Competitors fills the window instead: its panels each scroll on their own, so the page
+        // itself must not (GPUI hands every wheel turn to both the inner box and the page).
+        if self.focus.is_none() && matches!(self.tab, Tab::Competitors) {
+            return div().flex().flex_col().flex_1().min_h_0().child(inner.flex_1().min_h_0().pb(px(24.))).into_any_element();
+        }
         div()
             .relative()
             .flex_1()
             .min_h_0()
-            .child(
-                div().id("yt-body").size_full().overflow_y_scroll().track_scroll(&self.scroll).child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .min_w_0()
-                        .gap(px(24.))
-                        .px(px(32.))
-                        .pb(px(40.))
-                        .children(error.map(|e| {
-                            inline_alert(AlertKind::Error, if signed_out { "Signed out" } else { "Something went wrong" }, e)
-                                .action(if signed_out { "Connect again" } else { "Retry" }, cx.listener(move |this, _, _, cx| {
-                                    this.hub.update(cx, |h, cx| if signed_out { h.connect(cx) } else { h.refresh_now(cx) });
-                                }))
-                                .build()
-                        }))
-                        .child(content),
-                ),
-            )
+            .child(div().id("yt-body").size_full().overflow_y_scroll().track_scroll(&self.scroll).child(inner))
             .child(div().absolute().inset_0().child(Scrollbar::new(&self.scroll).id("yt-bar").axis(ScrollbarAxis::Vertical).mode(ScrollbarMode::Always).viewport_from_layout()))
             .into_any_element()
     }
