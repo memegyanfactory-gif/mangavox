@@ -450,6 +450,17 @@ impl AnimeDetail {
         self.lookup(episode, true, window, cx);
     }
 
+    /// Downloads the episode's best link when it is known; otherwise finds the links and shows
+    /// them, each with its own Download.
+    fn download(&mut self, episode: u32, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(req) = streams::best(&self.streams, Some(1), Some(episode)) {
+            crate::downloads::start(req, cx);
+            return;
+        }
+        self.lookup(episode, false, window, cx);
+        toast::show(cx, Toast::info("Finding sources: press Download on the one you want").icon(ph::DOWNLOAD_SIMPLE));
+    }
+
     /// [`Self::play`] from the hero (`from_list` false) or an episode card. When the links still have
     /// to be found, the progress and any failure show next to what was clicked: under the card's
     /// row, or in the hero. Before, a card far down the list reported into the hero, off screen.
@@ -667,7 +678,8 @@ impl AnimeDetail {
                                     .flex()
                                     .gap(px(10.))
                                     .child(look::hero_play("play-main", next.label.clone()).on_click(cx.listener(move |this, _, w, cx| this.play_at(ep, false, w, cx))))
-                                    .child(look::list_button("toggle-list", self.in_list == Some(true), self.saving).on_click(cx.listener(|this, _, _, cx| this.toggle_list(cx)))),
+                                    .child(look::list_button("toggle-list", self.in_list == Some(true), self.saving).on_click(cx.listener(|this, _, _, cx| this.toggle_list(cx))))
+                                    .child(mv_ui::btn("download-main", if self.is_movie() { "Download".to_string() } else { format!("Download E{ep}") }, mv_ui::ButtonKind::Secondary).icon(ph::DOWNLOAD_SIMPLE).tooltip("Save it to your Downloads folder to watch offline. It shows in Activity.").on_click(cx.listener(move |this, _, w, cx| this.download(ep, w, cx)))),
                             )
                             .when_some(next.progress.clone(), |c, (p, left)| c.child(look::resume_note("resume-bar", p, left))),
                     ),

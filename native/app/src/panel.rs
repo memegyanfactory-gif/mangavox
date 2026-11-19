@@ -117,7 +117,8 @@ fn section_header(icon: mv_ui::Ph, text: &'static str) -> Div {
 }
 
 fn activity(studio: bool, views: &Views, cx: &mut Context<Shell>) -> Div {
-    let cards = ui_manga::download_cards(cx);
+    let mut cards = ui_manga::download_cards(cx);
+    cards.extend(ui_media::download_cards(cx));
     let has_cards = !cards.is_empty();
     let downloads = mv_ui::activity::inline(cards);
     let studio_any = studio && ui_studio::panel::summary(cx).any;

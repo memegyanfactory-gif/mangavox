@@ -10,6 +10,7 @@ mod anime_home;
 mod common;
 mod detail_modal;
 mod discover;
+pub mod downloads;
 mod history;
 mod look;
 mod movie_detail;
@@ -19,6 +20,7 @@ pub mod remote;
 mod streams;
 
 pub use common::list_changed;
+pub use downloads::{cards as download_cards, downloads as media_downloads};
 pub use mv_media::addons::AddonRegistry;
 
 /// Gives the assistant the movie / series / anime tools (sources, play, download). Called once at startup.

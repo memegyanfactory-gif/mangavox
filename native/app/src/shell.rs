@@ -194,6 +194,9 @@ impl Shell {
         // follow Studio's.
         let dl = ui_manga::downloads(cx);
         subs.push(cx.observe(&dl, |_, _, cx| cx.notify()));
+        // Movie, series and anime downloads report into Activity too.
+        let media_dl = ui_media::media_downloads(cx);
+        subs.push(cx.observe(&media_dl, |_, _, cx| cx.notify()));
         let studio_runs = cx.new(StudioRuns::new);
         subs.push(cx.observe(&studio_runs, |_, _, cx| cx.notify()));
         // UI-thread heartbeat for the hang watchdog (mv_core::logging): logs "ui stalled N ms"
@@ -915,7 +918,7 @@ impl Shell {
             let dl = ui_manga::downloads(cx);
             let d = dl.read(cx);
             d.is_busy() && !d.is_paused()
-        };
+        } || ui_media::media_downloads(cx).read(cx).busy();
         let sum = if studio { ui_studio::panel::summary(cx) } else { ui_studio::panel::Summary::default() };
         let live = downloading || (studio && (sum.live || self.studio_runs.read(cx).live()));
         (live, sum.issues + crate::panel::failed_downloads(cx).len())
@@ -1746,6 +1749,9 @@ impl Render for Shell {
             toast::host(cx)
         } else {
             let mut cards = if self.route == Route::MangaDownloads || layout.shown { vec![] } else { ui_manga::download_cards(cx) };
+            if !layout.shown {
+                cards.extend(ui_media::download_cards(cx));
+            }
             if self.route != Route::Studio && !layout.shown {
                 cards.extend(self.studio_runs.read(cx).cards(&self.studio_runs));
             }

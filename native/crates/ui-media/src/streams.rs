@@ -394,6 +394,17 @@ fn source_row(key: (&'static str, usize), s: &AnimeTorrentStream, base: &PlayBas
                         .when(!d.tags.is_empty(), |x| x.child(div().min_w_0().text_color(Tokens::text_3()).truncate().child(SharedString::from(d.tags.clone())))),
                 ),
         )
+        .child({
+            // Saves this source for offline watching (Downloads/<Anime|Series|Movies>/...); the
+            // row itself still plays.
+            let dl = req.clone();
+            div().id("dl").flex_none().tooltip(tip("Download for offline watching")).child(
+                btn("download", "Download", ButtonKind::Ghost).small().icon(ph::DOWNLOAD_SIMPLE).on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    crate::downloads::start(dl.clone(), cx);
+                }),
+            )
+        })
         .child(icon(ph::PLAY.fill(), if best { Tokens::accent() } else { Tokens::text_3() }, isz::MD).group_hover(group, |s| s.text_color(Tokens::accent())))
         .on_click(move |_, w, cx| play_now(req.clone(), w, cx))
 }

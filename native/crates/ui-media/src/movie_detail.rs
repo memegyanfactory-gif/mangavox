@@ -460,6 +460,18 @@ impl MovieDetail {
         }
     }
 
+    /// Downloads the best link when it is known; otherwise finds the links and shows them, each
+    /// with its own Download.
+    fn download(&mut self, season: u32, episode: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let movie = !self.series();
+        if let Some(req) = streams::best(&self.streams, (!movie).then_some(season), (!movie).then_some(episode)) {
+            crate::downloads::start(req, cx);
+            return;
+        }
+        self.lookup(season, episode, false, window, cx);
+        toast::show(cx, Toast::info("Finding sources: press Download on the one you want").icon(mv_ui::ph::DOWNLOAD_SIMPLE));
+    }
+
     /// Play the best link right away when it is already known, otherwise look it up and play.
     fn play(&mut self, season: u32, episode: u32, window: &mut Window, cx: &mut Context<Self>) {
         let movie = !self.series();
@@ -572,7 +584,8 @@ impl MovieDetail {
                             .items_center()
                             .gap(px(10.))
                             .child(play_button("play-main", next.label.clone()).on_click(cx.listener(move |this, _, w, cx| this.play_at(ps, pe, false, w, cx))))
-                            .child(list_disc("toggle-list", self.in_list == Some(true), self.saving).on_click(cx.listener(|this, _, _, cx| this.toggle_list(cx)))),
+                            .child(list_disc("toggle-list", self.in_list == Some(true), self.saving).on_click(cx.listener(|this, _, _, cx| this.toggle_list(cx))))
+                            .child(mv_ui::btn("download-main", if self.series() { format!("Download S{ps} E{pe}") } else { "Download".to_string() }, mv_ui::ButtonKind::Secondary).icon(mv_ui::ph::DOWNLOAD_SIMPLE).tooltip("Save it to your Downloads folder to watch offline. It shows in Activity.").on_click(cx.listener(move |this, _, w, cx| this.download(ps, pe, w, cx)))),
                     )
                     .when_some(next.progress, |c, (p, left)| c.child(look::resume_note("resume-bar", p, left))),
             ),
