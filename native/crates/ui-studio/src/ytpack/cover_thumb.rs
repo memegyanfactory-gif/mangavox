@@ -49,7 +49,7 @@ fn paint(job: PaintJob) -> futures::future::BoxFuture<'static, anyhow::Result<()
         if std::fs::create_dir_all(Gallery::dir(&job.manga_id)).is_ok() && std::fs::copy(&job.out, Gallery::image(&job.manga_id, &id)).is_ok() {
             let mut g = Gallery::load(&job.manga_id);
             let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            g.thumbs.insert(0, Thumb { id, prompt: thumb::cover_prompt(&job.title), label: "Video thumbnail (from the cover)".into(), parent: None, model: model.name.to_string(), resolution: res.to_string(), cost: credits, created });
+            g.thumbs.insert(0, Thumb { id, prompt: thumb::cover_prompt(&job.title), label: "Video thumbnail (from the cover)".into(), parent: None, model: model.name.to_string(), resolution: res.to_string(), cost: credits, created, ..Default::default() });
             g.save(&job.manga_id);
         }
         Ok(())
@@ -75,7 +75,9 @@ mod tests {
         // A size the model does not offer falls back to its first.
         assert_eq!(choice(&p("seedream-v5-pro", "4K")).1, "1.5K");
         // A model without reference images cannot use the cover.
-        assert_eq!(choice(&p("nano-banana-pro", "2K")).0.id, "nano-banana-2-1");
+        assert_eq!(choice(&p("nano-banana-pro-flash", "2K")).0.id, "nano-banana-2-1");
+        // Nano Banana Pro takes pictures (two: the style references, or the one to edit).
+        assert_eq!(choice(&p("nano-banana-pro", "2K")).0.id, "nano-banana-pro");
         // Only Higgsfield has a key: its Soul model, which takes one reference.
         let hf = Keys { magnific: false, services: vec!["higgsfield"] };
         let (m, r) = super::choice(&p("", ""), &hf);

@@ -82,8 +82,10 @@ pub const TRACKS: &[Track] = &[
     t("Spy Glass", Style::Mystery, 0.5),
 ];
 
-/// A section never gets shorter than this; shorter cues join a neighbour.
-pub const MIN_SECTION: f64 = 30.0;
+/// A section never gets shorter than this; shorter cues join a neighbour. A minute, so a chapter
+/// of four or five minutes sits on two or three beds instead of changing music every half minute
+/// (the recaps this is modelled on keep one soft bed going for a long time).
+pub const MIN_SECTION: f64 = 60.0;
 /// Crossfade between sections, and when a track loops.
 pub const SECTION_XFADE: f64 = 4.0;
 pub const LOOP_XFADE: f64 = 3.0;
@@ -215,8 +217,10 @@ impl Pick {
 }
 
 /// The bed for a section from the pack: its mood's beds (else a related mood's), the three closest
-/// to a calmed energy (beds sit under a voice), minus `avoid`, one chosen from (seed, section) and
-/// rotated by `take`. `None` when the pack has nothing near the mood.
+/// to a calmed energy (beds sit under a voice), minus `avoid`, one chosen from (seed, mood) and
+/// rotated by `take`. `None` when the pack has nothing near the mood. The seed is the series'
+/// (see `chapter::build`) and the section's place is left out of the choice, so a mood comes back
+/// on the same bed all through a series: chapters joined into one video keep their music.
 pub fn pick_bed(beds: &[Bed], mood: &str, energy: f32, seed: u64, take: u32, index: usize, avoid: Option<&str>) -> Option<Bed> {
     let e = (energy / 10.0).clamp(0.0, 1.0) * 0.8;
     let mut order: Vec<&str> = vec![mood];
@@ -225,7 +229,8 @@ pub fn pick_bed(beds: &[Bed], mood: &str, energy: f32, seed: u64, take: u32, ind
     let mut c = order.into_iter().map(suits).find(|c| !c.is_empty())?;
     c.sort_by(|a, b| (a.energy - e).abs().total_cmp(&(b.energy - e).abs()).then(a.title.cmp(&b.title)));
     c.truncate(3);
-    let h = hash_str(&format!("{seed}|{index}|{mood}"));
+    let _ = index;
+    let h = hash_str(&format!("{seed}|{mood}"));
     Some(c[((h % c.len() as u64) as usize + take as usize) % c.len()].clone())
 }
 
@@ -410,7 +415,8 @@ fn merge_same(v: Vec<Section>) -> Vec<Section> {
 }
 
 /// The track for one section: the four of its genre closest in energy (minus `avoid`, the track
-/// before), one chosen from (seed, section) and rotated by `take`, so every new take changes it.
+/// before), one chosen from (seed, genre) and rotated by `take`, so every new take changes it and
+/// a genre comes back on the same track (see [`pick_bed`]).
 pub fn pick(style: Style, energy: f32, seed: u64, take: u32, index: usize, avoid: Option<&str>) -> &'static Track {
     let e = (energy / 10.0).clamp(0.0, 1.0);
     let mut c: Vec<&'static Track> = tracks(style).filter(|t| Some(t.title) != avoid).collect();
@@ -419,7 +425,8 @@ pub fn pick(style: Style, energy: f32, seed: u64, take: u32, index: usize, avoid
     if c.is_empty() {
         return tracks(style).next().expect("every style has tracks");
     }
-    let h = hash_str(&format!("{seed}|{index}|{}", style.key()));
+    let _ = index;
+    let h = hash_str(&format!("{seed}|{}", style.key()));
     c[((h % c.len() as u64) as usize + take as usize) % c.len()]
 }
 
@@ -483,7 +490,9 @@ pub fn arrange(sections: &[Section], tracks: &[&Prepared], duration: f64, len: u
 
 /// Adds section `k`'s track to `out`: it overlaps the next section by [`SECTION_XFADE`] (equal
 /// power, centred on the boundary); the first fades in over [`FADE_IN`], the last fades out over
-/// [`FADE_OUT`], ending two seconds after the narration (`duration`).
+/// [`FADE_OUT`], ending with the narration (`duration`): a chapter's video stops on its last word,
+/// so a fade that ran on after it was chopped off mid-way, and chapters joined into one recap cut
+/// from music at two thirds of its level straight into the next chapter's silence.
 pub fn place(out: &mut Stereo, sections: &[Section], k: usize, tr: &Prepared, duration: f64) {
     let len = out.len();
     let half = idx(SECTION_XFADE / 2.0);
@@ -497,7 +506,7 @@ pub fn place(out: &mut Stereo, sections: &[Section], k: usize, tr: &Prepared, du
     let buf = looped(&tr.audio, tr.from, tr.to, b - a, idx(LOOP_XFADE));
     let fin = if k == 0 { idx(FADE_IN) } else { 2 * half };
     let xout = if k == last { 0 } else { 2 * half };
-    let (stop, n) = (idx(duration + FADE_OUT - 1.0), idx(FADE_OUT));
+    let (stop, n) = (idx(duration), idx(FADE_OUT));
     for i in 0..buf.len() {
         let mut g = 1.0;
         if i < fin {
@@ -591,15 +600,19 @@ mod tests {
         let cues = [
             c(Style::Sad, "sad", 0.0, 61.0),
             c(Style::Mystery, "calm", 61.0, 80.0),
-            c(Style::Tension, "tense", 80.0, 99.0),
-            c(Style::Tension, "action", 99.0, 114.0),
-            c(Style::Lofi, "comedic", 114.0, 124.0),
-            c(Style::Sad, "sad", 124.0, 134.0),
-            c(Style::Mystery, "calm", 134.0, 149.0),
+            c(Style::Tension, "tense", 80.0, 120.0),
+            c(Style::Tension, "action", 120.0, 150.0),
+            c(Style::Lofi, "comedic", 150.0, 160.0),
+            c(Style::Sad, "sad", 160.0, 170.0),
+            c(Style::Mystery, "calm", 170.0, 230.0),
         ];
-        let got: Vec<(&str, f64, f64)> = sections(&cues, 149.0).iter().map(|s| (s.mood, s.start, s.end)).collect();
-        // The calm, comedic and sad scraps join the sad beds; the tension and the fight stay one tense bed.
-        assert_eq!(got, vec![("sad", 0.0, 80.0), ("tense", 80.0, 114.0), ("sad", 114.0, 149.0)]);
+        let got: Vec<(&str, f64, f64)> = sections(&cues, 230.0).iter().map(|s| (s.mood, s.start, s.end)).collect();
+        // The calm, comedic and sad scraps join the soft beds; the tension and the fight stay one tense bed.
+        assert_eq!(got, vec![("sad", 0.0, 80.0), ("tense", 80.0, 150.0), ("calm", 150.0, 230.0)]);
+        // Scenes that flip every half minute settle on few beds: nothing under a minute.
+        let flip: Vec<Cue> = (0..9).map(|k| if k % 2 == 0 { c(Style::Tension, "action", k as f64 * 30.0, (k + 1) as f64 * 30.0) } else { c(Style::Mystery, "calm", k as f64 * 30.0, (k + 1) as f64 * 30.0) }).collect();
+        let s = sections(&flip, 270.0);
+        assert!(s.len() <= 4 && s.iter().all(|s| s.end - s.start >= MIN_SECTION), "{s:?}");
     }
 
     #[test]
@@ -673,18 +686,22 @@ mod tests {
         // Nothing near the mood in the pack: a built-in track of the genre.
         let only_sad = [bed("sad", &["sad"], 0.2, "CC0")];
         assert!(matches!(&choose(&secs[1..2], &only_sad, 7, 0)[0], Pick::Track(t) if t.style == Style::Tension));
+        // A mood comes back on the same bed, wherever it falls in a chapter and whatever the chapter.
+        let again: Vec<String> = choose(&[secs[2], secs[0], secs[1], secs[0]], &beds, 7, 0).iter().map(|p| p.title().to_string()).collect();
+        assert_eq!((&again[1], &again[3], &again[2]), (&got[0], &got[0], &got[1]));
         // Takes rotate among the beds that suit.
         assert_ne!(pick_bed(&beds, "calm", 3.0, 1, 0, 0, None), pick_bed(&beds, "calm", 3.0, 1, 1, 0, None));
     }
 
     #[test]
-    fn the_end_fades_out_after_the_narration() {
+    fn the_end_fades_out_with_the_narration() {
         let sr = SR as usize;
         let ones = Prepared { audio: Stereo { l: vec![1.0; 40 * sr], r: vec![1.0; 40 * sr] }, from: 0, to: 40 * sr };
         let secs = [Section { style: Style::Lofi, mood: "calm", start: 0.0, end: 30.0, energy: 3.0 }];
         let mix = arrange(&secs, &[&ones], 30.0, 33 * sr);
-        assert!((mix.l[29 * sr] - 1.0).abs() < 1e-3);
-        assert!(mix.l[31 * sr] < 0.9 && mix.l[31 * sr] > 0.1);
-        assert!(mix.l[32 * sr + sr / 2].abs() < 1e-6);
+        assert!((mix.l[26 * sr] - 1.0).abs() < 1e-3);
+        assert!(mix.l[28 * sr + sr / 2] < 0.9 && mix.l[28 * sr + sr / 2] > 0.1);
+        // Silent by the chapter's last sample: nothing is cut where the next chapter is joined on.
+        assert!(mix.l[30 * sr - sr / 100] < 0.02 && mix.l[30 * sr].abs() < 1e-6);
     }
 }

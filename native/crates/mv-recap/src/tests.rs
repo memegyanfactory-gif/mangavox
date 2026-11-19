@@ -460,7 +460,7 @@ async fn hook_is_written_from_candidates_with_a_json_retry() {
     // answers them in turn), then the judge.
     let answers = [
         "not json".to_string(),
-        r#"{"genre":"fantasy","hero":"Ruko","question":"Why does his own guild want him dead?","seconds":60,"angles":[{"kind":"cold open","pitch":"the blade"},{"kind":"contrast","pitch":"friend and traitor"},{"kind":"question","pitch":"the guild"}]}"#.to_string(),
+        r#"{"genre":"fantasy","hero":"Ruko","question":"Why does his own guild want him dead?","seconds":60,"angles":[{"kind":"contrast","pitch":"friend and traitor"},{"kind":"roast","pitch":"the blade"},{"kind":"question","pitch":"the guild"}]}"#.to_string(),
         draft("A blade is drawn."),
         draft("Ruko's best friend draws a blade on him."),
         draft("You won't believe this."),
@@ -477,9 +477,9 @@ async fn hook_is_written_from_candidates_with_a_json_retry() {
     assert!(plan.contains("SCENE 2 (Chapter 2):\n[2] Kaito betrays the guild."), "{plan}");
     assert!(plan.contains("STORY SO FAR: Ruko trains."), "the story is given as context");
     let draft_user = &seen[2].messages[1].content;
-    assert!(draft_user.contains("about 52 words") && draft_user.contains("THE QUESTION the hook plants: Why does his own guild want him dead?") && draft_user.contains("YOUR ANGLE: cold open - the blade"), "{draft_user}");
+    assert!(draft_user.contains("about 52 words") && draft_user.contains("THE QUESTION the hook plants: Why does his own guild want him dead?") && draft_user.contains("YOUR ANGLE: roast - the blade"), "{draft_user}");
     let judge = &seen[5].messages[1].content;
-    assert!(judge.contains("DRAFT A (cold open: the blade):\n0. A blade is drawn.") && judge.contains("DRAFT C"), "{judge}");
+    assert!(judge.contains("DRAFT A (roast: the blade):\n0. A blade is drawn.") && judge.contains("DRAFT C"), "{judge}");
 }
 
 #[tokio::test]

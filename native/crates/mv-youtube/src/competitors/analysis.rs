@@ -62,7 +62,7 @@ fn rate_between(pts: &[Point], from: i64, to: i64) -> Option<f64> {
     (hours >= 0.5).then(|| b.value.saturating_sub(a.value) as f64 / hours)
 }
 
-fn points_gain(p: &[Point], now: i64, window: i64) -> i64 {
+pub(super) fn points_gain(p: &[Point], now: i64, window: i64) -> i64 {
     let (Some(last), Some(first)) = (p.last(), p.first()) else { return 0 };
     let base = p.iter().rev().find(|x| x.at <= now - window).unwrap_or(first);
     let span = last.at - base.at;
@@ -101,7 +101,8 @@ pub fn channel_stats(ch: &CompChannel, videos: &[CompVideo], now: i64, offset: i
         s.upload_days[d] += 1;
         s.upload_hours[h] += 1;
     }
-    s.title_changes = videos.iter().map(|v| v.titles.len().saturating_sub(1)).sum();
+    // Rewrites only: the same title stored in two languages is not a change (see `title_rewrites`).
+    s.title_changes = videos.iter().map(|v| super::overview::title_rewrites(v).len()).sum();
     s.thumb_changes = videos.iter().map(|v| v.thumbnails.len().saturating_sub(1)).sum();
     s.top_tags = top_counts(videos.iter().flat_map(|v| v.tags.iter().map(|t| t.to_lowercase())), 10, 1);
     s.subs_gained_7d = points_gain(&ch.subs_history, now, 7 * DAY);
@@ -109,7 +110,7 @@ pub fn channel_stats(ch: &CompChannel, videos: &[CompVideo], now: i64, offset: i
 }
 
 /// The `max` most frequent items seen at least `min` times, ties alphabetical.
-fn top_counts(items: impl Iterator<Item = String>, max: usize, min: u32) -> Vec<(String, u32)> {
+pub(super) fn top_counts(items: impl Iterator<Item = String>, max: usize, min: u32) -> Vec<(String, u32)> {
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
     for i in items.filter(|i| !i.trim().is_empty()) {
         *counts.entry(i).or_default() += 1;
@@ -123,7 +124,7 @@ fn top_counts(items: impl Iterator<Item = String>, max: usize, min: u32) -> Vec<
 // ------------------------------------------------------------------------------- brief
 
 /// Words that say nothing about why a title works.
-const STOP: &[&str] = &[
+pub(super) const STOP: &[&str] = &[
     "the", "and", "with", "from", "that", "this", "into", "have", "your", "what", "when", "will", "recap", "recaps", "manga", "manhwa", "manhua", "webtoon",
     "full", "story", "explained", "part", "chapter", "chapters", "ending", "episode", "episodes", "season",
 ];

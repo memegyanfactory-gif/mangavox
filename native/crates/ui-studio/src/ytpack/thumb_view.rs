@@ -106,6 +106,11 @@ pub(super) struct ThumbState {
     picked: Vec<usize>,
     /// Images the user added as references.
     extra: Vec<PathBuf>,
+    /// Pictures whose art style new thumbnails copy (saved in the prefs).
+    style: Vec<PathBuf>,
+    style_busy: bool,
+    /// "Make one for me": the best idea is generated as soon as the AI has designed them.
+    auto: bool,
     model: usize,
     /// The user picked `model` on this page (a refresh then keeps it).
     chose_model: bool,
@@ -150,6 +155,9 @@ impl ThumbState {
             picked: if cast.is_empty() { vec![] } else { vec![0] },
             cast,
             extra: vec![],
+            style: magnific::style_files(),
+            style_busy: false,
+            auto: false,
             model,
             chose_model: false,
             aspect: ASPECTS.iter().copied().find(|a| *a == prefs.aspect).unwrap_or("16:9"),
@@ -411,10 +419,10 @@ impl ThumbGen {
         // thumbnail: then another model with a key that can (Nano Banana 2.1 when none).
         // A picked model without a key asks for one (the warning under the picker says so too)
         // rather than quietly running on another service.
-        let needs_refs = base.is_some() || !self.th.picked.is_empty() || prompt.contains('@');
+        let needs_refs = base.is_some() || !self.th.picked.is_empty() || prompt.contains('@') || !self.th.style.is_empty();
         let picked = self.th.model();
         let model = if self.th.keys.has(picked) { magnific::usable(picked, &self.th.keys, needs_refs, self.th.aspect) } else { picked };
-        let Some(key) = magnific::key_for(model) else {
+        let Some(magnific_key) = magnific::key_for(model) else {
             self.th.error = Some(match model.via {
                 _ if self.th.keys.has(picked) => magnific::no_fit(&self.th.keys, needs_refs, self.th.aspect),
                 Via::Magnific => "Connect Magnific first: paste your API key on the left.".to_string(),
@@ -423,18 +431,40 @@ impl ThumbGen {
             cx.notify();
             return;
         };
+        // A model that can look at the finished picture places its labels (else they go to the
+        // places the prompt reserves for them).
+        let eyes = {
+            let (provider, model) = ui_assistant::assistant_model(cx);
+            serde_json::from_value::<mv_ai::AiProviderId>(serde_json::Value::String(provider)).ok().map(|p| (ui_assistant::registry(cx), p, model))
+        };
         let t = &mut self.th;
-        let first = usize::from(base.is_some());
         let just_cast: Vec<Cast> = t.cast.iter().map(|(c, _)| c.clone()).collect();
-        let (resolved, mut order) = thumbs::resolve(&prompt, &just_cast, first);
+        // The words are lettered on by the app afterwards: the image model draws the picture only
+        // (it misspells words). An edit keeps the labels of the thumbnail it changes, where they
+        // were (the picture does not move), unless it gives new ones.
+        let (art_prompt, mut labels) = thumbs::split_labels(&prompt);
+        let mut kept: Option<mv_recap::thumb::Lettering> = None;
+        if let (true, Some(parent)) = (labels.words.is_empty(), base.as_ref().and_then(|b| t.gallery.thumbs.iter().find(|x| &x.id == b))) {
+            labels.words = std::iter::once(parent.text.clone()).chain(parent.tags.iter().cloned()).filter(|w| !w.trim().is_empty()).collect();
+            kept = Some(parent.lettering.clone()).filter(|l| !l.is_empty());
+        }
+        let mut refs: Vec<magnific::Reference> = vec![];
+        if let Some(b) = &base {
+            // The picture without its labels when it was kept: the edit must not redraw the letters.
+            let art = Gallery::art(&self.manga_id, b);
+            refs.push(magnific::Reference { file: if art.is_file() { art } else { Gallery::image(&self.manga_id, b) }, caption: "Image 1: the thumbnail to edit".into() });
+        } else {
+            // The art style comes first: pictures to draw like, not words about a look.
+            for f in t.style.iter().filter(|f| f.is_file()).take(model.refs.min(magnific::MAX_STYLE)) {
+                refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}: {}", refs.len() + 1, thumbs::STYLE_CAPTION) });
+            }
+        }
+        let (first, style) = (refs.len(), if base.is_some() { 0 } else { refs.len() });
+        let (resolved, mut order) = thumbs::resolve(&art_prompt, &just_cast, first);
         for i in &t.picked {
             if !order.contains(i) {
                 order.push(*i);
             }
-        }
-        let mut refs: Vec<magnific::Reference> = vec![];
-        if let Some(b) = &base {
-            refs.push(magnific::Reference { file: Gallery::image(&self.manga_id, b), caption: "Image 1: the thumbnail to edit".into() });
         }
         let mut looks = vec![];
         for i in order.iter().take(model.refs.saturating_sub(refs.len())) {
@@ -447,11 +477,7 @@ impl ThumbGen {
                 refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}", refs.len() + 1) });
             }
         }
-        let full = if base.is_some() {
-            format!("Edit Image 1, a YouTube thumbnail. Keep its composition, characters and style; change only this: {}\n{}", resolved.trim(), thumbs::image_prompt(&self.title, "", &looks, first).split_once("\n\n").map(|(_, r)| r).unwrap_or(""))
-        } else {
-            thumbs::image_prompt(&self.title, &resolved, &looks, first)
-        };
+        let full = if base.is_some() { thumbs::edit_prompt(&resolved) } else { thumbs::image_prompt(&self.title, &resolved, &looks, first, style) };
         let id = now_id() + &format!("{}", t.jobs.len());
         let status = Arc::new(Mutex::new("Queued".to_string()));
         let aspect = if base.is_some() && model.auto_aspect { "auto" } else { t.aspect };
@@ -460,19 +486,59 @@ impl ThumbGen {
         t.tab = Tab::Creations;
         t.error = None;
         let out = Gallery::image(&self.manga_id, &id);
-        let thumb = Thumb { id: id.clone(), prompt, label, parent: base, model: model.name.to_string(), created: now(), resolution: res.to_string(), cost: model.cost_at(res) };
+        let thumb = Thumb { id: id.clone(), prompt, label, parent: base, model: model.name.to_string(), created: now(), resolution: res.to_string(), cost: model.cost_at(res), text: labels.label().to_string(), tags: labels.tags().to_vec(), ..Default::default() };
         let st = status.clone();
-        let used_key = key.clone();
-        let job = async move { magnific::generate(model, &key, &full, &refs, aspect, res, &out, move |s| *st.lock().unwrap_or_else(|e| e.into_inner()) = s.to_string()).await };
+        let api_key = magnific_key;
+        let used_key = api_key.clone();
+        let art = Gallery::art(&self.manga_id, &id);
+        let job = async move {
+            let say = {
+                let st = st.clone();
+                move |s: &str| *st.lock().unwrap_or_else(|e| e.into_inner()) = s.to_string()
+            };
+            magnific::generate(model, &api_key, &full, &refs, aspect, res, &out, move |s| *st.lock().unwrap_or_else(|e| e.into_inner()) = s.to_string()).await?;
+            if labels.words.is_empty() {
+                return Ok(mv_recap::thumb::Lettering::default());
+            }
+            // The picture is kept without its labels (for edits and for placing them again).
+            let (a2, o2) = (art.clone(), out.clone());
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                if let Some(d) = a2.parent() {
+                    std::fs::create_dir_all(d)?;
+                }
+                std::fs::copy(&o2, &a2)?;
+                Ok(())
+            })
+            .await??;
+            let lettering = match kept {
+                Some(l) => l,
+                None => {
+                    let fallback = mv_recap::thumb::default_lettering(labels.label(), labels.tags(), labels.hero_left);
+                    match eyes {
+                        Some((reg, provider, ai)) => {
+                            say("Looking at the picture to place the labels");
+                            place_labels(reg, provider, ai, &art, &labels).await.unwrap_or(fallback)
+                        }
+                        None => fallback,
+                    }
+                }
+            };
+            say("Lettering the labels");
+            let l2 = lettering.clone();
+            tokio::task::spawn_blocking(move || mv_recap::thumb::letter(&art, &l2, &out)).await??;
+            Ok(lettering)
+        };
         cx.spawn(async move |this, cx| {
             let res = mv_ui::bg::run(job).await.and_then(|r| r);
-            let _ = this.update(cx, |this, cx| {
+            let mut thumb = thumb;
+            let _ = this.update(cx, move |this, cx| {
                 this.th.jobs.retain(|j| j.id != id);
                 match res {
-                    Ok(()) => {
+                    Ok(lettering) => {
                         if model.via == Via::Magnific {
                             this.th.usage.add(thumb.cost);
                         }
+                        thumb.lettering = lettering;
                         super::video_thumb::learn_made(&thumb.prompt, &thumb.model, aspect);
                         this.th.gallery.thumbs.insert(0, thumb);
                         this.th.gallery.save(&this.manga_id);
@@ -526,6 +592,7 @@ impl ThumbGen {
 
     fn delete_thumb(&mut self, id: &str, cx: &mut Context<Self>) {
         let _ = std::fs::remove_file(Gallery::image(&self.manga_id, id));
+        let _ = std::fs::remove_file(Gallery::art(&self.manga_id, id));
         if let Some(t) = self.th.gallery.thumbs.iter().find(|t| t.id == id) {
             super::video_thumb::learn_deleted(&t.prompt);
         }
@@ -548,6 +615,104 @@ impl ThumbGen {
             });
         })
         .detach();
+    }
+
+    /// The whole thing in one go: the AI studies the manga (its story, its real cast, what the
+    /// people around the hero think of him), designs the thumbnails, and the best one is drawn in
+    /// the style pictures' style and lettered.
+    fn make_for_me(&mut self, cx: &mut Context<Self>) {
+        if self.th.designing {
+            return;
+        }
+        self.th.auto = true;
+        self.design(cx);
+        if !self.th.designing {
+            self.th.auto = false;
+        }
+    }
+
+    /// Adds an art style picture from the link on the clipboard (a YouTube video: its thumbnail).
+    fn paste_style(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = cx.read_from_clipboard().and_then(|c| c.text()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) else {
+            self.th.error = Some("Copy a YouTube video's link first: its thumbnail becomes the art style to match.".into());
+            cx.notify();
+            return;
+        };
+        if self.th.style_busy {
+            return;
+        }
+        self.th.style_busy = true;
+        self.th.error = None;
+        cx.spawn(async move |this, cx| {
+            let res = mv_ui::bg::run(async move { magnific::fetch_style(&link).await }).await.and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.th.style_busy = false;
+                match res {
+                    Ok(f) => {
+                        if !this.th.style.contains(&f) {
+                            this.th.style.push(f);
+                        }
+                        // The newest ones are the ones used.
+                        let n = this.th.style.len().saturating_sub(magnific::MAX_STYLE);
+                        this.th.style.drain(..n);
+                        this.save_style();
+                    }
+                    Err(e) => this.th.error = Some(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn save_style(&self) {
+        let mut p = magnific::Prefs::load();
+        p.style_refs = self.th.style.iter().map(|f| f.to_string_lossy().into_owned()).collect();
+        p.save();
+    }
+
+    /// The art style row: the pictures new thumbnails are drawn like.
+    fn style_row(&self, cx: &mut Context<Self>) -> Div {
+        let mut grid = div().flex().flex_wrap().gap(px(space::SM));
+        for (k, f) in self.th.style.iter().enumerate() {
+            grid = grid.child(
+                div()
+                    .id(("thg-style", k))
+                    .w(px(104.))
+                    .h(px(58.))
+                    .rounded(px(radius::LG))
+                    .overflow_hidden()
+                    .border_2()
+                    .border_color(Tokens::accent())
+                    .cursor_pointer()
+                    .tooltip(tip("New thumbnails are drawn in this picture's art style. Click to remove"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if k < this.th.style.len() {
+                            this.th.style.remove(k);
+                            this.save_style();
+                        }
+                        cx.notify();
+                    }))
+                    .child(img(f.clone()).size_full().object_fit(ObjectFit::Cover)),
+            );
+        }
+        grid = grid.child(
+            ref_tile("thg-style-add")
+                .tooltip(tip("Copy the link of a YouTube video whose thumbnail style you want, then click here. Up to 2 are used."))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.paste_style(cx)))
+                .child(icon_ph(if self.th.style_busy { ph::ARROWS_CLOCKWISE } else { ph::LINK }, Tokens::text_1(), icon_px::SM))
+                .child(div().text_size(px(10.)).text_color(Tokens::text_2()).child(if self.th.style_busy { "Getting" } else { "Paste link" })),
+        );
+        let m = self.th.model();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::SM))
+            .child(div().flex().items_center().child(div().flex_1().child(label_caps("Art style"))).child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{}/{}", self.th.style.len(), magnific::MAX_STYLE))))
+            .child(grid)
+            .when(self.th.style.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().child("No style picture: the look is described in words, which is weaker. Add two thumbnails from a channel whose style you want to match.")))
+            .when(!self.th.style.is_empty() && m.refs == 0, |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).whitespace_normal().child(format!("{} takes no pictures; Nano Banana 2.1 is used so the style can be matched.", m.name))))
     }
 
     /// Has the picked AI model study the manga and write thumbnail concepts.
@@ -582,8 +747,17 @@ impl ThumbGen {
                         this.th.gallery.analysis = analysis;
                         this.th.gallery.concepts = concepts;
                         this.th.gallery.save(&this.manga_id);
+                        // "Make one for me": the story is understood, now the best idea is drawn.
+                        if std::mem::take(&mut this.th.auto) {
+                            if let Some(c) = this.th.gallery.concepts.first().cloned() {
+                                this.start(c.full_prompt(), c.name, None, cx);
+                            }
+                        }
                     }
-                    Err(e) => this.th.error = Some(format!("The AI could not design thumbnails: {e:#}")),
+                    Err(e) => {
+                        this.th.auto = false;
+                        this.th.error = Some(format!("The AI could not design thumbnails: {e:#}"));
+                    }
                 }
                 cx.notify();
             });
@@ -919,7 +1093,7 @@ impl ThumbGen {
         );
         let head = div().flex().items_center().child(div().flex_1().child(label_caps("References"))).child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).child(format!("{used}/{}", m.refs.max(1))));
         let body = if self.th.cast.is_empty() { div().flex().flex_col().gap(px(space::SM)).child(muted("No face cards yet. Read a chapter so Studio learns the characters.")).child(grid) } else { grid };
-        div().flex().flex_col().gap(px(space::SM)).child(head).child(body).when(m.refs == 0, |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).child(format!("{} takes no references; Nano Banana 2.1 is used when you attach characters.", m.name))))
+div().flex().flex_col().gap(px(space::SM)).child(head).child(body).when(m.refs == 0, |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::warning()).child(format!("{} takes no references; Nano Banana 2.1 is used when you attach characters.", m.name)))).child(self.style_row(cx))
     }
 
     fn prompt_field(&self, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -1196,6 +1370,14 @@ impl ThumbGen {
                 )
             })
             .child(
+                btn("thg-auto", if self.th.designing && self.th.auto { "Studying the manga…" } else { "Make one for me" }, ButtonKind::Primary)
+                    .small()
+                    .icon(ph::SPARKLE)
+                    .loading(self.th.designing && self.th.auto)
+                    .tooltip("Studies the manga first (its story, its real characters, what everyone gets wrong about the hero), designs the thumbnails, then draws the best one in your art style pictures' style and letters its labels")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.make_for_me(cx))),
+            )
+            .child(
                 btn("thg-design", if self.th.designing { "Studying the manga…" } else if self.th.gallery.concepts.is_empty() { "Design with AI" } else { "Design again" }, ButtonKind::Secondary)
                     .small()
                     .icon(ph::MAGIC_WAND)
@@ -1444,7 +1626,8 @@ impl ThumbGen {
     }
 
     fn concept_card(&self, k: usize, c: &Concept, cx: &mut Context<Self>) -> Div {
-        let (p1, p2, name) = (c.prompt.clone(), c.prompt.clone(), c.name.clone());
+        // The prompt carries its title as its last line, so it can be read and changed in the box.
+        let (p1, p2, name) = (c.full_prompt(), c.full_prompt(), c.name.clone());
         let score = click::model().score_idea(&c.prompt, &c.text);
         div()
             .flex()
@@ -1456,7 +1639,7 @@ impl ThumbGen {
             .bg(Tokens::surface())
             .border_1()
             .border_color(Tokens::border())
-            .child(div().flex().items_center().gap(px(space::SM)).child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(c.name.clone())).when(!c.text.is_empty(), |d| d.child(badge(c.text.clone(), Tone::Accent))))
+            .child(div().flex().items_center().gap(px(space::SM)).child(div().flex_1().text_size(px(size::SM)).font_weight(FontWeight::BOLD).text_color(Tokens::text_1()).child(c.name.clone())).when(!c.text.is_empty(), |d| d.child(badge(c.text.clone(), Tone::Accent))).children(c.tags.iter().map(|t| badge(t.clone(), Tone::Neutral))))
             .when(!c.why.is_empty(), |d| d.child(div().text_size(px(size::XS)).text_color(Tokens::text_2()).whitespace_normal().child(c.why.clone())))
             .child(score_detail(SharedString::from(format!("thg-idea-score-{k}")), &score))
             .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().line_clamp(5).child(c.prompt.clone()))
@@ -1553,6 +1736,43 @@ async fn ask_concepts(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiP
         }
     }
     Err(anyhow!("the answer had no usable concept; try again or pick another model"))
+}
+
+/// Shows the finished picture (as a 1280x720 copy, the frame the labels are placed in) to the AI
+/// model and asks where its labels go. `None` when it cannot say (no eyes, a bad answer): the
+/// default places are used then.
+async fn place_labels(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiProviderId, model: String, art: &std::path::Path, labels: &thumbs::Labels) -> Option<mv_recap::thumb::Lettering> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let small = art.with_extension("see.jpg");
+    let (a, s2) = (art.to_path_buf(), small.clone());
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let img = image::open(&a)?.resize_exact(1280, 720, image::imageops::FilterType::Triangle).to_rgb8();
+        img.save_with_format(&s2, image::ImageFormat::Jpeg)?;
+        Ok(())
+    })
+    .await
+    .ok()?
+    .ok()?;
+    let (system, user) = thumbs::placement_prompt(labels);
+    let req = mv_ai::AiStepRequest {
+        request_id: format!("studio-thumb-place-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)),
+        provider_id: provider,
+        model,
+        messages: vec![mv_ai::AiMessage::system(system), mv_ai::AiMessage::user(user)],
+        tools: None,
+        effort: None,
+        access: None,
+        images: vec![small.clone()],
+        workspace: None,
+        lean: true,
+        mcp: None,
+    };
+    let r = reg.run_step_cancellable(req, mv_ai::emit_noop(), mv_ai::CancellationToken::new()).await;
+    let _ = std::fs::remove_file(&small);
+    if r.error.is_some() {
+        return None;
+    }
+    thumbs::parse_placement(&r.text, labels)
 }
 
 /// Opens Settings › Magnific.

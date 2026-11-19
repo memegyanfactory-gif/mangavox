@@ -19,11 +19,13 @@ use serde::{Deserialize, Serialize};
 use crate::trends::{channel_url, page_json, parse_channel, search_url};
 
 pub mod analysis;
+pub mod overview;
 pub mod scrape;
 pub mod store;
 pub mod track;
 
 pub use analysis::{brief, channel_stats, hourly_gains, velocity};
+pub use overview::{overview, title_rewrites, Overview};
 pub use store::{dir, CompStore};
 
 use scrape::{Fail, Net};

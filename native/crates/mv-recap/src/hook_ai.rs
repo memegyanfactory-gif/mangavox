@@ -56,7 +56,7 @@ pub const BANNED: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Angle {
-    /// "cold open", "question", "stakes first", "contrast", "premise".
+    /// "roast", "cold open", "question", "stakes first", "contrast", "premise".
     pub kind: String,
     /// What to open on and how, in a sentence.
     pub pitch: String,
@@ -116,12 +116,21 @@ const CRITERIA: [(&str, &str, u32); 7] = [
     ("no_spoilers", "No spoilers", 10),
 ];
 
+/// The angle every hook tries, whatever the plan says: the opening the biggest manhwa recap channels
+/// use. No teaser: the narrator names the hero and roasts what a loser he is in blunt, funny words,
+/// pivots on one line, and drops the absurd power and how the world reacts.
+pub const ROAST: &str = "roast";
+
+fn roast_angle() -> Angle {
+    Angle { kind: ROAST.into(), pitch: "Name the hero and roast how pathetic his life is in blunt, funny slang; pivot on one short line; then the absurd power he gets and the strongest people in his world noticing.".into() }
+}
+
 /// The default angles when the plan did not give three.
 fn default_angles() -> Vec<Angle> {
     vec![
+        roast_angle(),
         Angle { kind: "cold open".into(), pitch: "Drop the viewer into the most jaw-dropping moment from late in the story, mid-action.".into() },
         Angle { kind: "contrast".into(), pitch: "Open on two facts about the hero that should not both be true.".into() },
-        Angle { kind: "stakes first".into(), pitch: "Open on what is at risk and how little time is left.".into() },
     ]
 }
 
@@ -163,7 +172,8 @@ pub fn lint(script: &HookScript, seconds: u32) -> (u32, Vec<String>) {
 // ------------------------------------------------------------------ prompts
 
 const VOICE_RULES: &str = r#"HOW IT SOUNDS
-- One narrator, spoken aloud: present tense, short sentences (most under 14 words), contractions, a fan telling a friend about the craziest thing they've read. Vary the rhythm: a longer line, then a two-word punch.
+- One narrator, spoken aloud: short sentences (most under 14 words), contractions, a fan telling a friend about the craziest thing they've read. Vary the rhythm: a longer line, then a one- or two-word punch ("Wrong." "Perfect for a wimp.").
+- ATTITUDE: blunt, teasing, a little rude, never polite or literary. The narrator is on the hero's side but roasts him: "our guy", "our boy", "this damn guy", "this poor guy"; a loser is called a loser, a wimp, a coward, a scaredy-cat, broke, pathetic, trash, a nobody. Villains get it worse ("this psychopath", "these clowns"). Say what a friend would say out loud, not what a book would write: "scared out of his mind", "his life is trash", "he has never even held a girl's hand". Mild words only ("damn", "hell", "crap"): no f-word, no slurs, nothing sexual, so the video keeps its ads.
 - Concrete, never vague: names, numbers, actions you can see. Never: "epic", "journey", "you won't believe", "insane", "jaw-dropping", "in this video", "buckle up", "little did he know", "what happens next", "everything changes", "like and subscribe".
 - The hero's name early; everyone else by role ("the examiner", "his sister") unless the name matters. Explain any term in a few words or leave it out.
 - Plain spoken text: no markdown, emojis, brackets, stage directions or chapter numbers. Never describe the artwork (no "the panel", colours, clothes).
@@ -183,18 +193,26 @@ Decide:
 - "question": the ONE specific question the hook will plant and the video answers ("Why is the weakest hunter in Korea the only one the dungeon is afraid of?"). Specific to this story, never "what happens next?".
 - "peaks": the 3-6 strongest moments by their candidate ids (a power reveal in front of people who doubted him, a betrayal, a death, a twist, a huge contrast between who he was and who he becomes), strongest first, each with what happens in a few words.
 - "angles": three DIFFERENT ways to open, each a "kind" and a "pitch" (what the first seconds show and why it grabs). Kinds:
-  "cold open" (drop into the peak mid-action, then rewind), "question" (a narrow why/how the story answers), "stakes first" (what is at risk and how little time is left), "contrast" (two facts that should not both be true: the weakest / the only one they fear), "premise" (the story's own opening as a rising montage: who he was, the fall, the twist). Choose the three that suit THIS genre best; thrillers and twists favour a cold open, mysteries a question, action and survival stakes first, power-fantasies a contrast.
+  "roast" (ALWAYS one of the three: name the hero and roast how pathetic he is, pivot, then the absurd power and the world noticing; its pitch says what exactly is pathetic about him and what he gets), "cold open" (drop into the peak mid-action, then rewind), "question" (a narrow why/how the story answers), "stakes first" (what is at risk and how little time is left), "contrast" (two facts that should not both be true: the weakest / the only one they fear), "premise" (the story's own opening as a rising montage: who he was, the fall, the twist). Choose the three that suit THIS genre best; thrillers and twists favour a cold open, mysteries a question, action and survival stakes first, power-fantasies a contrast.
 {length}
 
 OUTPUT: STRICT JSON only, one object, no code fences:
-{{"genre": "...", "hero": "...", "question": "...", "seconds": 90, "peaks": [{{"ids": [812, 813], "what": "..."}}], "angles": [{{"kind": "cold open", "pitch": "..."}}, {{"kind": "contrast", "pitch": "..."}}, {{"kind": "question", "pitch": "..."}}]}}"#
+{{"genre": "...", "hero": "...", "question": "...", "seconds": 90, "peaks": [{{"ids": [812, 813], "what": "..."}}], "angles": [{{"kind": "roast", "pitch": "..."}}, {{"kind": "cold open", "pitch": "..."}}, {{"kind": "contrast", "pitch": "..."}}]}}"#
     )
 }
 
 /// How the hook is shaped for its length: the trailer shape for a long one, compressed for a short
 /// one.
-fn shape(seconds: u32) -> &'static str {
-    if seconds <= 30 {
+fn shape(seconds: u32, kind: &str) -> &'static str {
+    if kind == ROAST {
+        "THE SHAPE (the roast open, how the biggest manhwa recap channels start: no teaser, no trailer, it simply begins):
+  1. THE ROAST (line one, under 16 words): the hero's name and the most pathetic true thing about him, said bluntly: \"Ju Hayak is a broke loser who has never even held a girl's hand.\" Present tense, name first.
+  2. PILE ON (one to three short lines): the facts that make it worse, each one concrete and from the story: the debt, the job, who walks all over him. End on a verdict: \"His life is trash.\"
+  3. THE PIVOT (one short line on its own): \"But everything changed in one night.\" / \"Then he died.\" / \"Until the day the tower chose him.\"
+  4. THE POWER (one or two lines): what this damn guy gets, with its rank or number, said like you can't believe it either. Then how big it is: the strongest, richest, most feared people in his world all notice at once.
+  5. THE CATCH (the rest, building): what is ridiculous or dangerous about it (the wimp gets the scariest ability; it should not work, but his does), with a one-word reversal where it fits (\"Wrong.\"), each beat a fresh picture, sentences getting shorter.
+  Then the TURN (the \"outro\"). Keep the hero's weakness in the joke the whole way: the gap between how pathetic he is and how strong the thing he got is IS the hook."
+    } else if seconds <= 30 {
         "THE SHAPE (short): COLD OPEN in the very first line (the peak, mid-action) -> one or two lines that raise the stakes -> the turn. No pull back."
     } else {
         "THE SHAPE (the trailer editors' shape):
@@ -206,7 +224,7 @@ fn shape(seconds: u32) -> &'static str {
     }
 }
 
-fn draft_system(seconds: u32) -> String {
+fn draft_system(seconds: u32, kind: &str) -> String {
     let words = max_words(seconds);
     let lines = (seconds as usize / 4).clamp(3, 30);
     let lo = (lines / 2).max(2);
@@ -230,7 +248,7 @@ OUTPUT: STRICT JSON only, one object, no code fences, no commentary:
             {{"ids": [815], "text": "Every top hunter in the room goes silent."}}],
   "outro": "So how did a jobless twenty-five-year-old get this strong? It starts with one message on his phone.",
   "outro_id": 840}}"#,
-        shape = shape(seconds)
+        shape = shape(seconds, kind)
     )
 }
 
@@ -240,11 +258,11 @@ fn judge_system(seconds: u32) -> String {
         r#"You are the toughest editor at a top YouTube manga recap channel. Writers handed you several hooks (the first {seconds} seconds of a recap) for the same story. Score each one as a stranger scrolling YouTube would live it: would they still be watching at second 30?
 
 What each score means:
-- first_line: would line one ALONE stop the scroll? Specific, visual, raises a question, lands in under 8 seconds. Setup, a greeting or a vague opener scores under 8.
+- first_line: would line one ALONE stop the scroll? Specific, raises a question, lands in under 8 seconds: a moment you can see, or the hero named and roasted in one blunt, funny sentence. Setup, a greeting, a polite or vague opener scores under 8.
 - question: one clear question runs through it and every line sharpens it; scattered teasers score low.
-- escalation: each beat bigger than the last, in the trailer shape (cold open, pull back to who he was, build, a button twist, then the turn).
+- escalation: each beat bigger than the last: the trailer shape (cold open, pull back to who he was, build, a button twist, then the turn), or the roast open (the roast, pile on, one pivot line, the absurd power, the catch, then the turn).
 - concrete: names, actions, numbers you can see; hype words and vague claims ("an epic journey", "you won't believe") score low.
-- voice: sounds spoken by a fan, short punchy sentences, varied rhythm, not a summary.
+- voice: sounds spoken by a fan with attitude: blunt, teasing, slangy ("our guy", "this damn guy", "wimp", "loser", "his life is trash"), short punchy sentences, a one-word punch here and there. Polite, neutral or literary narration scores under 4, however correct.
 - pictures: the beats under each line show what it says.
 - no_spoilers: the ending and the big mystery are kept back.
 {list}
@@ -298,6 +316,11 @@ pub(crate) fn parse_plan(v: &Value, seconds: Option<u32>) -> HookPlan {
         .filter(|a| !a.kind.is_empty() || !a.pitch.is_empty())
         .collect();
     angles.dedup_by(|a, b| a.kind == b.kind && a.pitch == b.pitch);
+    // The roast open is always tried, first (the plan's own pitch for it when it gave one).
+    match angles.iter().position(|a| a.kind == ROAST) {
+        Some(k) => angles.swap(0, k),
+        None => angles.insert(0, roast_angle()),
+    }
     for d in default_angles() {
         if angles.len() >= DRAFTS {
             break;
@@ -332,7 +355,7 @@ pub(crate) async fn write_draft(llm: &dyn Llm, model: &ModelChoice, title: &str,
     }
     prompt += &format!("YOUR ANGLE: {} - {}\n\nCANDIDATES:\n\n{}", angle.kind, angle.pitch, candidates_text(candidates));
     prompt += "Write the hook in your angle. Reply with the JSON object only.";
-    let mut req = request(model, vec![AiMessage::system(draft_system(seconds)), AiMessage::user(prompt)], vec![], Some(workspace()));
+    let mut req = request(model, vec![AiMessage::system(draft_system(seconds, &angle.kind)), AiMessage::user(prompt)], vec![], Some(workspace()));
     req.effort = Some(mv_ai::AiEffort::Medium);
     let Ok(v) = ask_json(llm, req, cancel).await? else { bail!("the {} draft was not valid JSON", angle.kind) };
     let mut s = parse_hook(&v, candidates)?;
@@ -506,7 +529,10 @@ mod tests {
         let v = json!({"genre": "Revenge fantasy", "hero": "Ruko", "question": "Why does the dungeon fear him?", "seconds": 100, "angles": [{"kind": "Cold Open", "pitch": "the exam"}, {"kind": "cold open", "pitch": "the exam"}]});
         let p = parse_plan(&v, None);
         assert_eq!(p.seconds, 90);
-        assert_eq!(p.angles.iter().map(|a| a.kind.as_str()).collect::<Vec<_>>(), vec!["cold open", "contrast", "stakes first"]);
+        assert_eq!(p.angles.iter().map(|a| a.kind.as_str()).collect::<Vec<_>>(), vec!["roast", "cold open", "contrast"]);
+        // The plan's own roast pitch is kept and moved first.
+        let own = parse_plan(&json!({"angles": [{"kind": "question", "pitch": "q"}, {"kind": "roast", "pitch": "broke, then SSS rank"}]}), None);
+        assert_eq!((own.angles[0].kind.as_str(), own.angles[0].pitch.as_str(), own.angles[1].kind.as_str()), ("roast", "broke, then SSS rank", "question"));
         assert_eq!((p.hero.as_str(), p.question.as_str()), ("Ruko", "Why does the dungeon fear him?"));
         // A length the user chose is kept.
         assert_eq!(parse_plan(&v, Some(45)).seconds, 45);
@@ -543,9 +569,13 @@ mod tests {
 
     #[test]
     fn the_prompts_teach_the_shape_and_the_rubric() {
-        let d = draft_system(90);
+        let d = draft_system(90, "cold open");
         assert!(d.contains("COLD OPEN") && d.contains("PULL BACK") && d.contains("BUILD") && d.contains("BUTTON") && d.contains("at most 234 words"), "{d}");
-        assert!(draft_system(20).contains("No pull back."));
+        assert!(draft_system(20, "contrast").contains("No pull back."));
+        // The roast open has its own shape at any length, and every draft gets the attitude.
+        let r = draft_system(60, ROAST);
+        assert!(r.contains("THE ROAST") && r.contains("THE PIVOT") && r.contains("THE CATCH") && !r.contains("PULL BACK"), "{r}");
+        assert!(draft_system(20, ROAST).contains("THE ROAST") && d.contains("ATTITUDE") && r.contains("no f-word"));
         let j = judge_system(90);
         assert!(CRITERIA.iter().all(|(k, _, _)| j.contains(k)) && j.contains("fixes"));
         assert_eq!(CRITERIA.iter().map(|c| c.2).sum::<u32>(), 100);

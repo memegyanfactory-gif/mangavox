@@ -25,6 +25,7 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Context as _, Result};
 use futures::future::BoxFuture;
 use image::{imageops, DynamicImage, RgbImage};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// The manga's AI image (one per manga, in its Studio folder).
@@ -47,6 +48,8 @@ const OUT_H: u32 = 720;
 const LOOK_VERSION: u64 = 1;
 
 static FONT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../python/fonts/Inter-ExtraBold.ttf"));
+/// The face of a made thumbnail's labels: tall, condensed and heavy, like the recap channels' Impact.
+static TITLE_FONT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../python/fonts/Anton-Regular.ttf"));
 
 // ------------------------------------------------------------------ the badge text
 
@@ -613,11 +616,236 @@ impl Canvas {
     }
 }
 
+// ------------------------------------------------------------------ the labels of a made thumbnail
+
+/// The labels' colour (the outline is black).
+const LABEL_YELLOW: [u8; 4] = [0xFF, 0xE6, 0x00, 0xFF];
+/// The frame every lettering position is given in, whatever the picture's real size.
+pub const LETTER_W: f32 = 1280.;
+pub const LETTER_H: f32 = 720.;
+
+/// One label: `text` in capitals with its top-left corner at (`x`, `y`), letters `size` high.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Label {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+}
+
+/// A thick arrow from `from` to its tip at `to`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Arrow {
+    pub from: [f32; 2],
+    pub to: [f32; 2],
+    pub width: f32,
+}
+
+/// What is lettered on a made thumbnail, in a 1280x720 frame: the way the recap channels the
+/// thumbnails are modelled on do it. Not a title: one big role tag beside the hero's head with an
+/// arrow at him ("JOBLESS"), and one or two small tags beside someone or something else
+/// ("BLANK CHECK", "SUSPICIOUS...").
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Lettering {
+    pub labels: Vec<Label>,
+    pub arrows: Vec<Arrow>,
+}
+
+impl Lettering {
+    pub fn is_empty(&self) -> bool {
+        self.labels.iter().all(|l| l.text.trim().is_empty())
+    }
+}
+
+fn title_face() -> Option<ttf_parser::Face<'static>> {
+    ttf_parser::Face::parse(TITLE_FONT, 0).ok()
+}
+
+/// Width of `text` (as lettered: capitals) at `size`, in the lettering frame.
+pub fn label_width(text: &str, size: f32) -> f32 {
+    let Some(f) = title_face() else { return 0. };
+    text.to_uppercase().chars().filter_map(|c| glyph(&f, c)).map(|g| f.glyph_hor_advance(g).unwrap_or(0) as f32).sum::<f32>() * size / f.units_per_em() as f32
+}
+
+/// The big label's size, and the small tags'.
+pub const LABEL_SIZE: f32 = 96.;
+pub const TAG_SIZE: f32 = 42.;
+
+/// Where the labels go when nobody has looked at the picture: the layout of the thumbnail this is
+/// modelled on, which the art prompt asks the picture to leave room for. The hero fills one side
+/// third (`hero_left`: the left one); `label` sits at the top beside his head with the arrow at
+/// him, the first tag under it, the second at the top on the far side. A label too wide for its
+/// room is made smaller.
+pub fn default_lettering(label: &str, tags: &[String], hero_left: bool) -> Lettering {
+    let mut out = Lettering::default();
+    let label = label.trim();
+    // `x` for a text that starts at `left` when the hero is on the left, mirrored otherwise.
+    let place = |text: &str, size: f32, left: f32| if hero_left { left } else { LETTER_W - left - label_width(text, size) };
+    if !label.is_empty() {
+        let room = 520.;
+        let size = LABEL_SIZE * (room / label_width(label, LABEL_SIZE).max(1.)).min(1.);
+        out.labels.push(Label { text: label.into(), x: place(label, size, 372.), y: 4., size });
+        let (from, to) = (368., 312.);
+        out.arrows.push(Arrow { from: [if hero_left { from } else { LETTER_W - from }, 62.], to: [if hero_left { to } else { LETTER_W - to }, 84.], width: 22. });
+    }
+    for (k, tag) in tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).take(2).enumerate() {
+        let (left, y, base, room) = if k == 0 { (384., 146., TAG_SIZE, 420.) } else { (884., 22., TAG_SIZE * 0.9, 360.) };
+        let size = base * (room / label_width(tag, base).max(1.)).min(1.);
+        out.labels.push(Label { text: tag.into(), x: place(tag, size, left), y, size });
+    }
+    out
+}
+
+/// A small repeatable random stream (the same label always tilts the same way).
+struct Wobble(u64);
+
+impl Wobble {
+    fn of(text: &str) -> Wobble {
+        Wobble(text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)) | 1)
+    }
+    /// -0.5 ..= 0.5
+    fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    }
+}
+
+/// The outlines of `label`'s letters: each one tilted a few degrees and bounced a little, like
+/// hand-cut comic lettering. `k` scales the lettering frame to the picture.
+fn label_paths(f: &ttf_parser::Face, label: &Label, k: f32) -> Vec<tiny_skia::Path> {
+    let size = label.size * k;
+    let s = size / f.units_per_em() as f32;
+    let cap = f.capital_height().map(|c| c as f32).unwrap_or(0.72 * f.units_per_em() as f32) * s;
+    let mut rng = Wobble::of(&label.text);
+    let (mut x, baseline) = (label.x * k, label.y * k + cap + size * 0.08);
+    let mut out = vec![];
+    for c in label.text.to_uppercase().chars() {
+        let Some(g) = glyph(f, c) else { continue };
+        let adv = f.glyph_hor_advance(g).unwrap_or(0) as f32 * s;
+        if !c.is_whitespace() {
+            let (dy, turn) = (rng.next() * size * 0.07, rng.next() * 7.);
+            let mut pb = tiny_skia::PathBuilder::new();
+            f.outline_glyph(g, &mut Pen { pb: &mut pb, x, y: baseline + dy, s });
+            if let Some(p) = pb.finish().and_then(|p| p.transform(tiny_skia::Transform::from_rotate_at(turn, x + adv / 2., baseline - cap / 2.))) {
+                out.push(p);
+            }
+        }
+        x += adv;
+    }
+    out
+}
+
+/// A thick arrow: a shaft and a wide head, as one outline.
+fn arrow_path(a: &Arrow, k: f32) -> Option<tiny_skia::Path> {
+    let (x0, y0, x1, y1) = (a.from[0] * k, a.from[1] * k, a.to[0] * k, a.to[1] * k);
+    let len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+    if len < 1. {
+        return None;
+    }
+    let (ux, uy) = ((x1 - x0) / len, (y1 - y0) / len);
+    let (nx, ny) = (-uy, ux);
+    let w = a.width.max(4.) * k / 2.;
+    let head = (w * 2.6).min(len * 0.75);
+    let (bx, by) = (x1 - ux * head, y1 - uy * head);
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(x0 + nx * w, y0 + ny * w);
+    pb.line_to(bx + nx * w, by + ny * w);
+    pb.line_to(bx + nx * w * 2.2, by + ny * w * 2.2);
+    pb.line_to(x1, y1);
+    pb.line_to(bx - nx * w * 2.2, by - ny * w * 2.2);
+    pb.line_to(bx - nx * w, by - ny * w);
+    pb.line_to(x0 - nx * w, y0 - ny * w);
+    pb.close();
+    pb.finish()
+}
+
+/// Letters `lettering` on the text-free thumbnail art at `art` and saves it as PNG at `out`:
+/// heavy condensed yellow capitals with a thick black outline, each letter slightly tilted, and
+/// thick yellow arrows. The art is drawn by an image model, which misspells words: this is why the
+/// words are never part of it. Nothing to letter: the art as it is. Blocking.
+pub fn letter(art: &Path, lettering: &Lettering, out: &Path) -> Result<()> {
+    let img = image::open(art).with_context(|| format!("could not read {}", art.display()))?.to_rgb8();
+    let k = img.width() as f32 / LETTER_W;
+    let mut px = Canvas::from_rgb(img)?;
+    if let Some(f) = title_face() {
+        let black = paint([0, 0, 0, 255]);
+        let outline = |width: f32| tiny_skia::Stroke { width, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+        for a in &lettering.arrows {
+            if let Some(p) = arrow_path(a, k) {
+                px.0.stroke_path(&p, &black, &outline(a.width.max(4.) * k * 0.55), tiny_skia::Transform::identity(), None);
+                px.fill(&p, LABEL_YELLOW);
+            }
+        }
+        for label in lettering.labels.iter().filter(|l| !l.text.trim().is_empty() && l.size > 1.) {
+            let letters = label_paths(&f, label, k);
+            let stroke = outline(label.size * k * 0.2);
+            // Every outline, then every fill: no letter's outline covers its neighbour.
+            for p in &letters {
+                px.0.stroke_path(p, &black, &stroke, tiny_skia::Transform::identity(), None);
+            }
+            for p in &letters {
+                px.fill(p, LABEL_YELLOW);
+            }
+        }
+    }
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let part = out.with_extension("part.png");
+    px.into_rgb()?.save_with_format(&part, image::ImageFormat::Png)?;
+    std::fs::rename(&part, out)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::FutureExt as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_made_thumbnail_gets_its_labels() {
+        // The default places: the big label beside the hero's head with an arrow at him, tags apart.
+        let l = default_lettering("jobless", &["blank check".into(), "suspicious...".into(), "ignored".into()], true);
+        assert_eq!(l.labels.len(), 3);
+        assert_eq!((l.labels[0].x, l.labels[0].y, l.labels[0].size), (372., 4., LABEL_SIZE));
+        assert_eq!((l.arrows.len(), l.arrows[0].to), (1, [312., 84.]));
+        assert!(l.labels[1].y > 100. && l.labels[2].x > 800. && l.labels[1].size < 50.);
+        // Hero on the right: mirrored, and still inside the frame.
+        let r = default_lettering("jobless", &["blank check".into()], false);
+        assert!((r.labels[0].x + label_width("jobless", r.labels[0].size) - (LETTER_W - 372.)).abs() < 0.5 && r.arrows[0].to[0] > r.arrows[0].from[0]);
+        // A long label shrinks to its room.
+        let long = default_lettering("the strongest hunter alive", &[], true);
+        assert!(long.labels[0].size < LABEL_SIZE && label_width("the strongest hunter alive", long.labels[0].size) <= 521.);
+        assert!(default_lettering(" ", &[], true).is_empty());
+
+        let d = tempfile::tempdir().unwrap();
+        let (art, out) = (d.path().join("a.png"), d.path().join("t.png"));
+        RgbImage::from_pixel(1920, 1080, image::Rgb([40, 90, 200])).save(&art).unwrap();
+        letter(&art, &l, &out).unwrap();
+        let img = image::open(&out).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (1920, 1080), "the picture keeps its size; positions scale to it");
+        let near = |p: &image::Rgb<u8>, c: [u8; 4]| (0..3).all(|k| p.0[k].abs_diff(c[k]) < 40);
+        let count = |c: [u8; 4], x0: u32, x1: u32, y0: u32, y1: u32| (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| near(img.get_pixel(x, y), c)).count();
+        // The big label (frame x 372.., y 4..): yellow letters outlined in black; the arrow left of it.
+        assert!(count(LABEL_YELLOW, 558, 1300, 0, 200) > 8000 && count([0, 0, 0, 255], 558, 1300, 0, 200) > 6000);
+        assert!(count(LABEL_YELLOW, 440, 556, 60, 160) > 300, "the arrow");
+        // The two tags, and nothing over the hero's side or the lower half.
+        assert!(count(LABEL_YELLOW, 570, 1200, 215, 300) > 1000 && count(LABEL_YELLOW, 1320, 1900, 20, 110) > 1000);
+        assert_eq!(count(LABEL_YELLOW, 0, 430, 0, 1080) + count(LABEL_YELLOW, 0, 1920, 540, 1080), 0);
+        // The same label is drawn the same way each time (the tilt is not random between runs).
+        let again = d.path().join("t2.png");
+        letter(&art, &l, &again).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&again).unwrap());
+        // Nothing to letter: the art as it is.
+        letter(&art, &Lettering::default(), &out).unwrap();
+        assert_eq!(image::open(&out).unwrap().to_rgb8().get_pixel(600, 60).0, [40, 90, 200]);
+    }
 
     #[test]
     fn badge_labels() {

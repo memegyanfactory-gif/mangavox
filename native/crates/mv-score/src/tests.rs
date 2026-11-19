@@ -271,3 +271,26 @@ fn levels_sit_well_under_the_voice() {
     assert_eq!(Level::ALL.map(|l| l.offset_lu()), [-21.0, -17.0, -13.0]);
     assert_eq!(MusicSettings::default().duck_db, 6.0);
 }
+
+#[test]
+fn pages_the_story_cuts_are_off_the_music_timeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = fake_chapter(dir.path());
+    let all = narration(&ch);
+    // The story leaves page 1 out (every beat marked "skip"); page 2 keeps one of its two beats.
+    let beats = serde_json::json!({"beats": [
+        {"page": 0, "text": "a"}, {"page": 1, "text": "", "skip": true}, {"page": 2, "text": "", "skip": true},
+        {"page": 2, "text": "b"}, {"page": 3, "text": "c"}, {"page": 4, "text": "d"}, {"page": 5, "text": "e"},
+    ]});
+    std::fs::write(ch.output_dir.join("narration.studio.json"), beats.to_string()).unwrap();
+    let cut = narration(&ch);
+    assert_eq!(cut.iter().map(|(s, _)| s.page).collect::<Vec<_>>(), vec![0, 2, 3, 4, 5]);
+    // The pages after the cut move up by its length, with no hole: where the video plays them.
+    let gone = all[1].0.end - all[1].0.start;
+    assert!((cut[1].0.start - cut[0].0.end).abs() < 1e-9);
+    assert!((cut[4].0.end - (all[5].0.end - gone)).abs() < 1e-6);
+    // Everything marked "skip" would leave nothing: kept as it is.
+    let none = serde_json::json!({"beats": (0..6).map(|p| serde_json::json!({"page": p, "skip": true})).collect::<Vec<_>>()});
+    std::fs::write(ch.output_dir.join("narration.studio.json"), none.to_string()).unwrap();
+    assert_eq!(narration(&ch).len(), 6);
+}

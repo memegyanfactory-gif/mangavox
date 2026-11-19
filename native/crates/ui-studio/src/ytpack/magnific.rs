@@ -96,7 +96,7 @@ const HF_RES: &[&str] = &["720p", "1080p"];
 /// a model that takes none.
 pub static CATALOG: &[ImageModel] = &[
     ImageModel { id: "nano-banana-2-1", name: "Google Nano Banana 2.1", provider: "Google", path: "text-to-image/nano-banana-2-1", shape: Shape::Banana, refs: 14, speed: "~42s", resolutions: K124, credits: Some((50., 145.)), web_unlimited: None, featured: true, new: true, auto_aspect: true, via: MG },
-    ImageModel { id: "nano-banana-pro", name: "Google Nano Banana Pro", provider: "Google", path: "text-to-image/nano-banana-pro", shape: Shape::Banana, refs: 0, speed: "~41s", resolutions: K124, credits: Some((75., 150.)), web_unlimited: None, featured: false, new: false, auto_aspect: true, via: MG },
+    ImageModel { id: "nano-banana-pro", name: "Google Nano Banana Pro", provider: "Google", path: "text-to-image/nano-banana-pro", shape: Shape::Banana, refs: 2, speed: "~41s", resolutions: K124, credits: Some((75., 150.)), web_unlimited: None, featured: false, new: false, auto_aspect: true, via: MG },
     ImageModel { id: "nano-banana-pro-flash", name: "Google Nano Banana Pro Flash", provider: "Google", path: "text-to-image/nano-banana-pro-flash", shape: Shape::Banana, refs: 0, speed: "~20s", resolutions: K124, credits: None, web_unlimited: None, featured: false, new: false, auto_aspect: true, via: MG },
     ImageModel { id: "nano-banana", name: "Google Nano Banana", provider: "Google", path: "gemini-2-5-flash-image-preview", shape: Shape::Gemini, refs: 3, speed: "~13s", resolutions: NONE, credits: None, web_unlimited: Some("any size"), featured: false, new: false, auto_aspect: false, via: MG },
     ImageModel { id: "gpt-image-2-5", name: "GPT 2.5", provider: "GPT", path: "text-to-image/gpt-image-2-5", shape: Shape::Named, refs: 16, speed: "~37s", resolutions: K124, credits: Some((15., 940.)), web_unlimited: None, featured: true, new: false, auto_aspect: false, via: MG },
@@ -324,6 +324,69 @@ pub struct Prefs {
     pub resolution: String,
     /// The manga the Thumbnails page opens on.
     pub manga: String,
+    /// Pictures whose art style new thumbnails copy (files in [`style_dir`]): thumbnails of a
+    /// channel the owner wants to match. Sent before every other reference.
+    pub style_refs: Vec<String>,
+}
+
+/// Style pictures sent with one thumbnail.
+pub const MAX_STYLE: usize = 2;
+
+/// Where the art style pictures are kept.
+pub fn style_dir() -> PathBuf {
+    mv_core::paths::studio().join("thumb_style")
+}
+
+/// The saved art style pictures that are still on disk, at most [`MAX_STYLE`].
+pub fn style_files() -> Vec<PathBuf> {
+    Prefs::load().style_refs.iter().map(PathBuf::from).filter(|p| p.is_file()).take(MAX_STYLE).collect()
+}
+
+/// The video id in a YouTube link (watch, youtu.be, shorts, a thumbnail's own address) or a bare id.
+pub fn youtube_id(s: &str) -> Option<String> {
+    let s = s.trim();
+    let ok = |id: &str| (id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).then(|| id.to_string());
+    let cut = |rest: &str| ok(rest.split(['&', '?', '/', '#']).next().unwrap_or(""));
+    for mark in ["v=", "youtu.be/", "/shorts/", "/vi/", "/embed/"] {
+        if let Some(i) = s.find(mark) {
+            return cut(&s[i + mark.len()..]);
+        }
+    }
+    (!s.contains('/') && !s.contains('.')).then(|| ok(s)).flatten()
+}
+
+/// Downloads the picture `link` means into [`style_dir`]: a YouTube video's thumbnail (any link to
+/// the video), or an image address. Returns the saved file.
+pub async fn fetch_style(link: &str) -> Result<PathBuf> {
+    let link = link.trim();
+    let (name, urls) = match youtube_id(link) {
+        Some(id) => (format!("yt-{id}.jpg"), vec![format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg"), format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")]),
+        None if link.starts_with("http://") || link.starts_with("https://") => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            link.hash(&mut h);
+            (format!("web-{:016x}.jpg", h.finish()), vec![link.to_string()])
+        }
+        None => bail!("That is not a YouTube link or a picture's address."),
+    };
+    let http = client()?;
+    for url in urls {
+        let Ok(r) = http.get(&url).send().await else { continue };
+        if !r.status().is_success() {
+            continue;
+        }
+        let Ok(bytes) = r.bytes().await else { continue };
+        // A real picture, not an error page or YouTube's tiny grey placeholder.
+        let Ok(img) = image::load_from_memory(&bytes) else { continue };
+        if img.width() < 320 {
+            continue;
+        }
+        let out = style_dir().join(&name);
+        std::fs::create_dir_all(style_dir())?;
+        img.to_rgb8().save_with_format(&out, image::ImageFormat::Jpeg)?;
+        return Ok(out);
+    }
+    bail!("Could not download that picture.")
 }
 
 impl Prefs {

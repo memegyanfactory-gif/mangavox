@@ -59,7 +59,7 @@ fn subs_gain(c: &CompChannel, now: i64) -> i64 {
     last - week
 }
 
-fn thumb_src(store: &competitors::CompStore, v: &CompVideo) -> String {
+pub(crate) fn thumb_src(store: &competitors::CompStore, v: &CompVideo) -> String {
     match v.thumbnails.last() {
         Some(t) if !t.file.is_empty() => store.thumb_path(t).to_string_lossy().into_owned(),
         Some(t) if !t.url.is_empty() => t.url.clone(),
@@ -70,6 +70,7 @@ fn thumb_src(store: &competitors::CompStore, v: &CompVideo) -> String {
 impl YouTubePage {
     pub(crate) fn competitors(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let tracker = rivals::tracker(cx);
+        let overview = tracker.update(cx, |t, cx| t.overview(cx));
         let t = tracker.read(cx);
         let now = hub::now();
         let running = t.running;
@@ -117,7 +118,11 @@ impl YouTubePage {
             .flex_wrap()
             .gap(px(12.))
             .child(tile("Channels tracked", fmt_num(channels.len() as u64), format!("{} pinned", channels.iter().filter(|c| c.pinned).count())))
-            .child(tile("Their videos", fmt_num(total_videos), format!("{new_videos_24h} new in 24 hours")))
+            .child(match &overview {
+                // What is stored and can be analysed, not what the channels say they have uploaded.
+                Some(o) => tile("Videos tracked", fmt_num(o.videos as u64), format!("{} read in full · {new_videos_24h} new in 24 hours", fmt_num(o.read_in_full as u64))),
+                None => tile("Their videos", fmt_num(total_videos), format!("{new_videos_24h} new in 24 hours")),
+            })
             .child(tile("Changes spotted", fmt_num(changes_24h as u64), "Titles, thumbnails, descriptions · 24 h".into()))
             .child(tile(
                 "Research",
@@ -173,7 +178,8 @@ impl YouTubePage {
             .collect();
         match self.rivals.sort {
             Sort::Subscribers => list.sort_by_key(|c| std::cmp::Reverse(c.subscribers)),
-            Sort::Growth => list.sort_by_key(|c| std::cmp::Reverse(subs_gain(c, now))),
+            // Channels read only once have no gain yet: they follow, biggest first.
+            Sort::Growth => list.sort_by_key(|c| std::cmp::Reverse((subs_gain(c, now), c.subscribers))),
             Sort::Newest => list.sort_by_key(|c| std::cmp::Reverse(c.first_seen)),
             Sort::Pinned => list.sort_by_key(|c| (!c.pinned, std::cmp::Reverse(c.subscribers))),
         }
@@ -261,15 +267,22 @@ impl YouTubePage {
 
         let detail = match open.and_then(|id| list.iter().find(|c| c.id == id).cloned()) {
             Some(c) => self.channel_detail(&c, &store, now, cx).into_any_element(),
-            None => yt::card()
-                .flex_1()
-                .min_w(px(420.))
-                .items_center()
-                .py(px(48.))
-                .child(yt::icon_of(ph::BINOCULARS, 48., yt::TEXT_3))
-                .child(yt::text(16., 22., FontWeight::MEDIUM, yt::TEXT).child("Pick a channel"))
-                .child(hint("Its subscribers over time, when it uploads, its keywords, and every video with its views hour by hour and the titles and thumbnails it changed."))
-                .into_any_element(),
+            // Nothing picked: the whole niche at a glance, scrolling on its own.
+            None => match overview {
+                Some(o) => {
+                    let body = self.rivals_overview(&o, &store, cx);
+                    yt::card().flex_1().min_w(px(460.)).min_h_0().p(px(0.)).child(div().id("rv-overview").flex_1().min_h_0().overflow_y_scroll().child(body)).into_any_element()
+                }
+                None => yt::card()
+                    .flex_1()
+                    .min_w(px(420.))
+                    .items_center()
+                    .py(px(48.))
+                    .child(spinner("rv-ov-spin", yt::c(yt::LINK), 24.))
+                    .child(yt::text(16., 22., FontWeight::MEDIUM, yt::TEXT).child("Reading what the research gathered"))
+                    .child(hint("What is working across every channel shows here in a moment. Pick a channel on the left for its own numbers."))
+                    .into_any_element(),
+            },
         };
 
         div()
@@ -313,8 +326,21 @@ impl YouTubePage {
                     .flex_col()
                     .flex_none()
                     .gap(px(8.))
+                    .child(yt::pill_icon("rv-back", ph::ARROW_LEFT, "All channels").on_click(cx.listener(|this, _, _, cx| {
+                        this.rivals.channel = None;
+                        this.rivals.video = None;
+                        cx.notify();
+                    })))
                     .child(yt::pill_icon("rv-pin", ph::BOOKMARK_SIMPLE, if pinned { "Unpin" } else { "Pin: check every hour" }).on_click(cx.listener(move |_, _, _, cx| rivals::tracker(cx).update(cx, |t, cx| t.set_pinned(&id, !pinned, cx)))))
-                    .child(yt::pill_icon("rv-open", ph::ARROW_SQUARE_OUT, "Open channel").on_click(move |_, _, cx| cx.open_url(&url))),
+                    .child(yt::pill_icon("rv-open", ph::ARROW_SQUARE_OUT, "Open channel").on_click(move |_, _, cx| cx.open_url(&url)))
+                    .child({
+                        let id = c.id.clone();
+                        yt::pill_icon("rv-hide", ph::EYE_SLASH, "Not a recap channel").tooltip(mv_ui::tip("Takes it off the list and out of every comparison")).on_click(cx.listener(move |this, _, _, cx| {
+                            this.rivals.channel = None;
+                            this.rivals.video = None;
+                            rivals::tracker(cx).update(cx, |t, cx| t.set_hidden(&id, true, cx));
+                        }))
+                    }),
             );
 
         let kpi = |label: &'static str, value: String| div().flex().flex_col().flex_1().min_w(px(110.)).child(yt::line(12., FontWeight::NORMAL, yt::TEXT_2, label)).child(yt::text(20., 28., FontWeight::BOLD, yt::TEXT).whitespace_nowrap().child(value));
@@ -358,7 +384,8 @@ impl YouTubePage {
             .child(div().flex().flex_wrap().gap(px(6.)).children(c.keywords.iter().take(14).map(|k| tag_chip(k.clone(), None))).children(stats.top_tags.iter().take(16).map(|(t, n)| tag_chip(t.clone(), Some(*n)))));
 
         let mut sorted = videos.clone();
-        let changes_of = |v: &CompVideo| v.titles.len().saturating_sub(1) + v.thumbnails.len().saturating_sub(1) + v.descriptions.len().saturating_sub(1);
+        // Title rewrites only: the same title stored in two languages is not a change.
+        let changes_of = |v: &CompVideo| competitors::title_rewrites(v).len() + v.thumbnails.len().saturating_sub(1) + v.descriptions.len().saturating_sub(1);
         match self.rivals.vsort {
             VideoSort::Newest => sorted.sort_by_key(|v| std::cmp::Reverse(v.published_at)),
             VideoSort::Views => sorted.sort_by_key(|v| std::cmp::Reverse(v.views)),
@@ -427,7 +454,8 @@ impl YouTubePage {
                     .child(yt::col(70., true).child(yt::text(13., 18., FontWeight::NORMAL, yt::TEXT).child(if v.views == 0 && !v.published_exact { "—".to_string() } else { fmt_num(v.views) })))
                     .child(yt::col(60., true).child(yt::text(13., 18., FontWeight::NORMAL, yt::TEXT_2).child(dash(v.likes))))
                     .child(yt::col(70., true).child(yt::text(13., 18., FontWeight::NORMAL, yt::TEXT_2).child(dash(v.comments))))
-                    .child(yt::col(70., true).child(yt::text(13., 18., FontWeight::NORMAL, yt::TEXT_2).child(format!("{:.0}", competitors::velocity(v, now)))))
+                    // Two readings give the rate now; one only the average since it went up.
+                    .child(yt::col(70., true).child(div().flex().flex_col().items_end().child(yt::text(13., 18., FontWeight::NORMAL, yt::TEXT_2).child(format!("{:.0}", competitors::velocity(v, now)))).child(yt::caption(if v.views_history.len() > 1 { "now" } else { "average" }))))
                     .child(yt::col(70., true).child(if changes > 0 { yt::badge(format!("{changes}×"), 0x0f0f0f, yt::c(yt::AMBER).into()).into_any_element() } else { yt::caption("—").into_any_element() }))
             })))
             .when(sorted.len() > VIDEOS_SHOWN, |d| d.child(yt::caption(format!("The first {VIDEOS_SHOWN} of {} in this order.", sorted.len()))));
@@ -498,7 +526,7 @@ impl YouTubePage {
                             )))
                             .child(yt::caption({
                                 let age_h = ((hub::now() - v.published_at).max(3600) as f64) / 3600.;
-                                let mut parts = vec![format!("{} long", if v.duration_secs > 0 { yt::duration(v.duration_secs) } else { "length not read yet".into() }), format!("{} views a day since it went up", fmt_num((v.views as f64 / (age_h / 24.).max(1. / 24.)) as u64)), format!("{:.0} views an hour right now", competitors::velocity(v, hub::now()))];
+                                let mut parts = vec![format!("{} long", if v.duration_secs > 0 { yt::duration(v.duration_secs) } else { "length not read yet".into() }), format!("{} views a day since it went up", fmt_num((v.views as f64 / (age_h / 24.).max(1. / 24.)) as u64)), if v.views_history.len() > 1 { format!("{:.0} views an hour right now", competitors::velocity(v, hub::now())) } else { "read once so far: its rate right now shows after the next reading".into() }];
                                 if let (Some(l), true) = (v.likes, v.views > 0) {
                                     parts.push(format!("{:.1}% of viewers liked it", l as f64 * 100. / v.views as f64));
                                 }
@@ -515,12 +543,16 @@ impl YouTubePage {
             )
             .child(div().flex().flex_col().gap(px(8.)).child(yt::heading("Views gained, hour by hour", Some(if gains.is_empty() { "Builds up with each hourly research pass".into() } else { format!("Last {} readings", values.len()) }))).when(!values.is_empty(), |d| d.child(yt::bar_chart("rv-gains", &values, &labels, yt::GREEN, 80.))))
             .when(v.titles.len() > 1, |d| {
+                let n = competitors::title_rewrites(v).len();
                 d.child(
                     div()
                         .flex()
                         .flex_col()
                         .gap(px(6.))
-                        .child(yt::heading(format!("Title changed {} time{}", v.titles.len() - 1, if v.titles.len() == 2 { "" } else { "s" }), None))
+                        .child(yt::heading(
+                            if n == 0 { "Title history".to_string() } else { format!("Title rewritten {n} time{}", if n == 1 { "" } else { "s" }) },
+                            (n < v.titles.len() - 1).then(|| "YouTube also showed this title in another language; that is not counted as a rewrite.".to_string()),
+                        ))
                         .children(v.titles.iter().rev().enumerate().map(|(i, t)| {
                             div().flex().gap(px(12.)).min_w_0().child(yt::text(12., 18., FontWeight::NORMAL, yt::TEXT_2).w(px(150.)).flex_none().whitespace_nowrap().child(when::when(t.at))).child(yt::para(13., if i == 0 { yt::TEXT } else { yt::TEXT_2 }, 2, t.value.clone()).flex_1())
                         })),
@@ -543,7 +575,7 @@ impl YouTubePage {
     }
 }
 
-fn tag_chip(label: String, n: Option<u32>) -> Div {
+pub(crate) fn tag_chip(label: String, n: Option<u32>) -> Div {
     div()
         .flex()
         .flex_none()

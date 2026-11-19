@@ -14,6 +14,7 @@ mod automation_view;
 mod chart;
 mod comments_view;
 mod competitors_view;
+mod competitors_overview;
 mod content;
 pub mod hub;
 mod page;

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gpui_kit::*;
 use mv_ui::bg;
-use mv_youtube::competitors::{self, Budget, CompChannel, CompStore, RunSummary};
+use mv_youtube::competitors::{self, Budget, CompChannel, CompStore, Overview, RunSummary};
 
 use crate::hub::now;
 
@@ -26,6 +26,9 @@ pub struct Tracker {
     pub error: Option<String>,
     /// Bumped after every pass, so views know to re-read a channel's videos.
     pub version: u64,
+    /// The whole niche at a glance, with the version it was worked out at (see [`Tracker::overview`]).
+    overview: Option<(u64, Arc<Overview>)>,
+    overview_busy: bool,
 }
 
 struct TrackerGlobal(Entity<Tracker>);
@@ -36,7 +39,7 @@ pub fn tracker(cx: &mut App) -> Entity<Tracker> {
         return g.0.clone();
     }
     let store = CompStore::default();
-    let e = cx.new(|_| Tracker { channels: store.channels(), runs: store.runs(), store, running: false, step: Arc::default(), error: None, version: 0 });
+    let e = cx.new(|_| Tracker { channels: store.channels(), runs: store.runs(), store, running: false, step: Arc::default(), error: None, version: 0, overview: None, overview_busy: false });
     cx.set_global(TrackerGlobal(e.clone()));
     e
 }
@@ -107,6 +110,37 @@ impl Tracker {
             }
         })
         .detach();
+    }
+
+    /// The niche overview of everything tracked. Reading every channel's videos takes a moment, so
+    /// it is worked out in the background: the last one is returned meanwhile (`None` the first
+    /// time), and the views are told when the new one is ready.
+    pub fn overview(&mut self, cx: &mut Context<Self>) -> Option<Arc<Overview>> {
+        let fresh = self.overview.as_ref().is_some_and(|(v, _)| *v == self.version);
+        if !fresh && !self.overview_busy {
+            self.overview_busy = true;
+            let (store, version) = (CompStore::new(self.store.root().to_path_buf()), self.version);
+            cx.spawn(async move |this, cx| {
+                let o = bg::run(async move { competitors::overview(&store, now(), crate::hub::utc_offset()) }).await;
+                let _ = this.update(cx, |t, cx| {
+                    t.overview_busy = false;
+                    if let Ok(o) = o {
+                        t.overview = Some((version, Arc::new(o)));
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        self.overview.as_ref().map(|(_, o)| o.clone())
+    }
+
+    /// Takes a channel that is not a recap channel off the list and out of the overview.
+    pub fn set_hidden(&mut self, id: &str, hidden: bool, cx: &mut Context<Self>) {
+        let _ = self.store.set_hidden(id, hidden);
+        self.channels = self.store.channels();
+        self.version += 1;
+        cx.notify();
     }
 
     pub fn set_pinned(&mut self, id: &str, pinned: bool, cx: &mut Context<Self>) {

@@ -55,9 +55,51 @@ pub fn load_score(ch: &ChapterRef) -> Option<Score> {
     read_json::<Score>(&score_json(ch)).filter(|s| s.version == Score::VERSION)
 }
 
+/// The pages the story leaves out (every beat of the page marked "skip"), as `sync_map.py`'s
+/// `_skipped_pages` finds them: the video cuts them, picture and sound. `first` is the first page
+/// with audio (beats may count pages from 1 where the audio counts from 0).
+fn skipped_pages(ch: &ChapterRef, first: usize) -> std::collections::HashSet<usize> {
+    let beats = ["narration.studio.json", "narration.json"].iter().find_map(|f| {
+        let v = read_json::<serde_json::Value>(&ch.output_dir.join(f))?;
+        v.get("beats").and_then(|b| b.as_array()).filter(|b| !b.is_empty()).cloned()
+    });
+    let Some(beats) = beats else { return Default::default() };
+    let page = |b: &serde_json::Value| b.get("page").and_then(|p| p.as_i64()).unwrap_or(0);
+    let offset = first as i64 - beats.iter().map(page).min().unwrap_or(0);
+    let mut flags: std::collections::HashMap<i64, bool> = Default::default();
+    for b in &beats {
+        let skip = b.get("skip").and_then(|s| s.as_bool()).unwrap_or(false);
+        let f = flags.entry(page(b) + offset).or_insert(true);
+        *f = *f && skip;
+    }
+    flags.into_iter().filter(|&(p, all)| all && p >= 0).map(|(p, _)| p as usize).collect()
+}
+
 /// Each page's narration on the video timeline, exactly as `sync_map.py` lays it out: pages in
-/// order, each as long as its `audio/page_NNNN.wav`, pages without audio skipped.
+/// order, each as long as its `audio/page_NNNN.wav`, pages without audio skipped, and so are the
+/// pages the story leaves out (they have a short silent clip on disk the video never plays: counted
+/// here, they pushed every music cue and the ducking later than the picture, half a minute by the
+/// end of a chapter).
 pub fn narration(ch: &ChapterRef) -> Vec<(Span, PathBuf)> {
+    let all = narration_clips(ch);
+    let skip = all.first().map(|(s, _)| skipped_pages(ch, s.page)).unwrap_or_default();
+    if skip.is_empty() || all.iter().all(|(s, _)| skip.contains(&s.page)) {
+        return all;
+    }
+    let mut t = 0.0;
+    all.into_iter()
+        .filter(|(s, _)| !skip.contains(&s.page))
+        .map(|(s, p)| {
+            let d = s.end - s.start;
+            let span = Span { page: s.page, start: t, end: t + d };
+            t += d;
+            (span, p)
+        })
+        .collect()
+}
+
+/// Every page's narration clip laid end to end, before the story's cuts.
+fn narration_clips(ch: &ChapterRef) -> Vec<(Span, PathBuf)> {
     let audio = ch.output_dir.join("audio");
     let mut count = list_pages(&ch.pages_dir).len();
     if count == 0 {
@@ -189,8 +231,11 @@ pub fn build(ch: &ChapterRef, settings: &MusicSettings, preview: bool) -> Result
     let narr = narration(ch);
     let narration = Narration::load(&narr.iter().map(|(s, p)| (s.start, p.clone())).collect::<Vec<_>>());
     let seed = hash_str(&ch.chapter_id);
+    // The beds are picked for the series, not the chapter, so a recap of many chapters keeps the
+    // same few tracks from one chapter to the next instead of changing music at every join.
+    let series = if ch.manga_id.is_empty() { seed } else { hash_str(&ch.manga_id) };
     let library = match settings.source {
-        Source::Library => match crate::library::render(&score.cues, score.duration, seed, settings.take) {
+        Source::Library => match crate::library::render(&score.cues, score.duration, series, settings.take) {
             Ok(r) => Some(r),
             Err(e) => {
                 eprintln!("mv-score: studio library unavailable, using the synth score: {e:#}");

@@ -154,9 +154,13 @@ async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
             (logic::thumbnail_prompt(&g.title, &just_cast, &refs, &story, &hook), "Package idea".to_string())
         }
     };
-    let (resolved, order) = super::thumbs::resolve(&prompt, &just_cast, 0);
+    // The picture is drawn without words; the title is lettered on afterwards (see `thumbs::split_title`).
+    let (art_prompt, labels) = super::thumbs::split_labels(&prompt);
+    // The art style pictures go first (see `magnific::Prefs::style_refs`), the characters after.
+    let style_files = magnific::style_files();
+    let (resolved, order) = super::thumbs::resolve(&art_prompt, &just_cast, style_files.len());
     // `resolve` only finds references at an @Name, so this is what the approval assumed.
-    let (model, res, aspect) = final_model(str_arg(&a, "aspect"), !order.is_empty() || prompt.contains('@'));
+    let (model, res, aspect) = final_model(str_arg(&a, "aspect"), !order.is_empty() || prompt.contains('@') || !style_files.is_empty());
     let keys = magnific::Keys::load();
     let Some(key) = magnific::key_for(model) else {
         if keys.any() {
@@ -165,13 +169,19 @@ async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
         return Err(format!("{} needs a {} key. The user adds it in Settings → AI services.", model.name, model.service_label()));
     };
     let mut refs: Vec<magnific::Reference> = vec![];
+    for f in style_files.iter().take(model.refs.min(magnific::MAX_STYLE)) {
+        refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}: {}", refs.len() + 1, super::thumbs::STYLE_CAPTION) });
+    }
+    let style = refs.len();
+    // Fewer style pictures fitted than were counted for: name the characters' images again.
+    let (resolved, order) = if style == style_files.len() { (resolved, order) } else { super::thumbs::resolve(&art_prompt, &just_cast, style) };
     let mut looks = vec![];
-    for i in order.iter().take(model.refs) {
+    for i in order.iter().take(model.refs.saturating_sub(style)) {
         let (c, f) = &cast[*i];
         refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}: {}", refs.len() + 1, c.name) });
         looks.push((c.name.clone(), super::thumbs::look_of(c)));
     }
-    let full = super::thumbs::image_prompt(&g.title, &resolved, &looks, 0);
+    let full = super::thumbs::image_prompt(&g.title, &resolved, &looks, style, style);
     let tid = format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
     let out = super::thumbs::Gallery::image(&g.id, &tid);
     if let Some(dir) = out.parent() {
@@ -188,10 +198,26 @@ async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
         .await
     };
     mv_ui::bg::run(job).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))?;
+    let lettering = mv_recap::thumb::default_lettering(labels.label(), labels.tags(), labels.hero_left);
+    if !lettering.is_empty() {
+        let (art, o3, l3) = (super::thumbs::Gallery::art(&g.id, &tid), out.clone(), lettering.clone());
+        let lettered = mv_ui::bg::run(async move {
+            if let Some(d) = art.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            std::fs::copy(&o3, &art)?;
+            mv_recap::thumb::letter(&art, &l3, &o3)
+        })
+        .await;
+        // The picture is made and paid for either way: labels that could not be lettered are said, not fatal.
+        if let Err(e) = lettered.and_then(|r| r) {
+            eprintln!("thumbnail labels not lettered: {e:#}");
+        }
+    }
     let cost = model.cost_at(&res);
     magnific::record(model, cost);
     let mut gallery = super::thumbs::Gallery::load(&g.id);
-    gallery.thumbs.insert(0, super::thumbs::Thumb { id: tid.clone(), prompt, label, parent: None, model: model.name.to_string(), resolution: res.clone(), cost, created: super::now() });
+    gallery.thumbs.insert(0, super::thumbs::Thumb { id: tid.clone(), prompt, label, parent: None, model: model.name.to_string(), resolution: res.clone(), cost, created: super::now(), text: labels.label().to_string(), tags: labels.tags().to_vec(), lettering });
     gallery.save(&g.id);
     super::video_thumb::learn_made(&gallery.thumbs[0].prompt, model.name, &aspect);
     // The new thumbnail can be the one the manga's videos show: draw their posters again.
@@ -320,16 +346,16 @@ mod tests {
     fn the_model_switches_only_when_it_cannot_do_the_job() {
         let first = &magnific::CATALOG[0];
         // A model without references, asked for @characters: the first model, at a size it has.
-        let (m, res, _) = pick_model(model("nano-banana-pro"), "4K".into(), "16:9".into(), true);
+        let (m, res, _) = pick_model(model("nano-banana-pro-flash"), "4K".into(), "16:9".into(), true);
         assert_eq!(m.id, first.id);
         assert!(first.resolutions.contains(&res.as_str()));
         // Without references it stays.
-        assert_eq!(pick_model(model("nano-banana-pro"), "2K".into(), "16:9".into(), false).0.id, "nano-banana-pro");
+        assert_eq!(pick_model(model("nano-banana-pro-flash"), "2K".into(), "16:9".into(), false).0.id, "nano-banana-pro-flash");
         // No aspect control: only squares stay.
         assert_eq!(pick_model(model("nano-banana"), "".into(), "16:9".into(), false).0.id, first.id);
         assert_eq!(pick_model(model("nano-banana"), "".into(), "1:1".into(), false).0.id, "nano-banana");
         // The approval quotes the model the run uses.
-        let (m, res, _) = pick_model(model("nano-banana-pro"), "4K".into(), "16:9".into(), true);
+        let (m, res, _) = pick_model(model("nano-banana-pro-flash"), "4K".into(), "16:9".into(), true);
         assert_eq!(credits_note(&[m.cost_at(&res)]), format!(" (about {:.0} Magnific credits)", first.cost_at(&res)));
     }
 
