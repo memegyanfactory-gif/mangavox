@@ -411,6 +411,9 @@ pub struct Project {
     /// and the effects bank (fire, aura, sparks on black, placed in any cut).
     pub plates: Vec<crate::anime::Plate>,
     pub fx: Vec<crate::anime::FxElement>,
+    /// Anime: the props characters sit, lean or lie on, left out of their plate and drawn on the
+    /// characters' cel layer from a prop sheet, the way TV anime does (see `anime::Prop`).
+    pub props: Vec<crate::anime::Prop>,
 }
 
 impl Project {

@@ -162,6 +162,67 @@ pub struct FxElement {
     pub clip: Option<String>,
 }
 
+/// A prop characters rest on (a bench, a crate, a plank stack). As in TV anime: designed once on a
+/// prop sheet, left out of the background plate, and drawn on the characters' cel layer together
+/// with them in every cut of that plate, so whoever sits on it touches it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Prop {
+    #[serde(deserialize_with = "lenient_text")]
+    pub id: String,
+    /// "plank stack".
+    #[serde(deserialize_with = "lenient_text")]
+    pub what: String,
+    /// The plate it belongs to (and is left out of).
+    #[serde(deserialize_with = "lenient_text")]
+    pub plate: String,
+    /// Its prop sheet.
+    pub image: Option<String>,
+}
+
+/// The props the boards' cuts rest on, one per plate and thing: new ones added, unused undrawn
+/// ones dropped. Returns whether anything changed.
+pub fn sync_props(p: &mut Project) -> bool {
+    let mut want: Vec<(String, String)> = vec![];
+    for c in p.chapters.iter().flat_map(|ch| ch.anime.cuts.iter()) {
+        if let Some(what) = c.touched().filter(|_| c.has_cast() && !c.plate.is_empty()) {
+            if !want.iter().any(|(pl, w)| *pl == c.plate && *w == what) {
+                want.push((c.plate.clone(), what));
+            }
+        }
+    }
+    let before = p.props.clone();
+    p.props.retain(|x| x.image.is_some() || want.iter().any(|(pl, w)| *pl == x.plate && *w == x.what));
+    for (plate, what) in want {
+        if !p.props.iter().any(|x| x.plate == plate && x.what == what) {
+            // A plate painted before it was known shows it: painted again without it.
+            if let Some(pl) = p.plates.iter_mut().find(|x| x.id == plate) {
+                pl.image = None;
+            }
+            p.props.push(Prop { id: crate::project::slug(&format!("{plate} {what}")), what, plate, image: None });
+        }
+    }
+    p.props != before
+}
+
+/// A prop's design sheet: the one object, on a plain light background, from a few sides.
+pub fn prop_sheet(p: &Project, x: &Prop, refs: &[String]) -> String {
+    let place = p.plates.iter().find(|pl| pl.id == x.plate);
+    let mut s = format!(
+        "Anime prop design sheet (設定) for a TV anime: {} {}. The single object only, drawn three times on a plain flat light-grey background: front view, three-quarter view and side view, the same size and scale, clean line art and flat cel colours, {}. No people, no hands, no ground scenery, no text, no labels.",
+        x.what,
+        place.map(|pl| format!("from {}", pl.location)).unwrap_or_default(),
+        ANIME_LOOK,
+    );
+    if let Some(pl) = place {
+        let _ = write!(s, " Its light and wear match the place: {}.", pl.light);
+    }
+    if !refs.is_empty() {
+        let _ = write!(s, "\nReference images: {}. Keep the manga's design of it.", refs.join("; "));
+    }
+    s
+}
+
 /// An effect placed in a cut.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -522,8 +583,12 @@ pub struct Cut {
     // What was made (relative paths); never taken from the AI.
     /// The animatic's version: the manga panel under the cut's camera move.
     pub rough: Option<String>,
-    /// The characters drawn on the chroma screen.
+    /// The characters drawn on the chroma screen (lifted from `layout`).
     pub layer: Option<String>,
+    /// The cut's own background: the place painted from this cut's camera (its layout BG).
+    pub bg: Option<String>,
+    /// The layout: the characters and their props drawn into `bg`, lit and shadowed by it.
+    pub layout: Option<String>,
     /// The composited key frame (plate + characters) a `full` cut is animated from.
     pub key: Option<String>,
     /// The animation: the character layer animated (`layered`) or the whole frame (`full`).
@@ -531,6 +596,13 @@ pub struct Cut {
     pub voice: Option<String>,
     /// The finished cut.
     pub comp: Option<String>,
+}
+
+/// Words that put someone's weight on something.
+const CONTACT: &[&str] = &["sit", "sits", "sitting", "seated", "sat", "lean", "leans", "leaning", "lying", "lies", "lie", "kneel", "kneels", "kneeling", "knelt", "perched", "slumped", "slumps", "sprawled", "propped", "straddling", "crouched", "squatting", "resting", "rests"];
+
+fn words(t: &str) -> Vec<String> {
+    t.to_lowercase().split(|ch: char| !ch.is_alphabetic() && ch != '\'').filter(|w| !w.is_empty()).map(str::to_string).collect()
 }
 
 impl Cut {
@@ -547,6 +619,56 @@ impl Cut {
 
     pub fn has_cast(&self) -> bool {
         !self.plate_only && self.characters.iter().any(|c| !c.name.trim().is_empty())
+    }
+
+    /// Someone in the cut sits, leans, lies or kneels on something in the place.
+    pub fn touches_set(&self) -> bool {
+        self.touched().is_some() || self.texts().iter().any(|t| words(t).iter().any(|w| CONTACT.contains(&w.as_str())))
+    }
+
+    /// What someone in the cut rests on ("plank stack" from "sitting on the plank stack, elbows on
+    /// knees"), when the board names it. Drawn alone on the screen and laid over a plate that has
+    /// it, they would float in front of it (the first painted test sat two characters in the air
+    /// before the planks): so it is left out of the plate and drawn on their cel layer with them.
+    pub fn touched(&self) -> Option<String> {
+        // ("in" is left out: "leaning in toward him", "sitting back in surprise".)
+        const ON: &[&str] = &["on", "onto", "against", "atop", "upon", "across"];
+        const SKIP: &[&str] = &["the", "a", "an", "his", "her", "their", "its", "some", "top", "of", "edge", "end", "side", "corner"];
+        // Not a prop: a body part, a pronoun, a feeling, or the place itself (walls, steps, a
+        // counter, a truck stay in the background, as anime keeps them).
+        const NOT: &[&str] = &[
+            "ground", "floor", "knees", "knee", "lap", "hands", "hand", "back", "side", "front", "shock", "silence", "thought", "despair", "pain", "air", "seiza", "place", "hip", "hips", "shoulder", "shoulders", "arm", "arms", "elbow", "elbows", "chest", "head", "legs", "leg", "heels", "feet", "foot", "it", "him", "her", "them", "me", "us", "toward", "towards", "surprise", "wall", "walls", "building", "truck", "car", "bus", "van", "counter", "door", "doorway", "window", "pillar", "railing", "fence", "gate", "stairs", "steps", "step", "road", "street", "tree", "altar", "throne",
+        ];
+        for t in self.texts() {
+            let w = words(&t);
+            for (i, x) in w.iter().enumerate() {
+                if !CONTACT.contains(&x.as_str()) {
+                    continue;
+                }
+                let Some(at) = w.iter().skip(i + 1).take(3).position(|y| ON.contains(&y.as_str())).map(|k| i + 2 + k) else { continue };
+                let mut thing: Vec<&str> = vec![];
+                for y in w.iter().skip(at) {
+                    if thing.is_empty() && SKIP.contains(&y.as_str()) {
+                        continue;
+                    }
+                    if ["with", "and", "while", "as", "looking", "facing", "his", "her", "their", "near", "next", "beside", "behind"].contains(&y.as_str()) || thing.len() == 3 {
+                        break;
+                    }
+                    thing.push(y);
+                }
+                let thing = thing.join(" ");
+                // Its last word names the thing ("plank stack", "rusty bench").
+                if !thing.is_empty() && !thing.split(' ').any(|x| NOT.contains(&x)) {
+                    return Some(thing);
+                }
+            }
+        }
+        None
+    }
+
+    /// The board's words about the cut's people and picture, clause by clause.
+    fn texts(&self) -> Vec<String> {
+        self.characters.iter().map(|x| x.pose.clone()).chain([self.action.clone(), self.picture.clone(), self.composition.clone()]).flat_map(|t| t.split([',', '.', ';', '(', ')']).map(str::to_string).collect::<Vec<_>>()).filter(|t| !t.trim().is_empty()).collect()
     }
 
     /// The cut has a line said aloud (not a thought, not narration).
@@ -868,6 +990,10 @@ pub fn plate(p: &Project, pl: &Plate, refs: &[String]) -> String {
     if !refs.is_empty() {
         let _ = write!(s, "\nReference images: {}. Keep the manga's architecture, props and layout of this place, redrawn as colour anime background art without any person in it.", refs.join("; "));
     }
+    let props: Vec<String> = p.props.iter().filter(|x| x.plate == pl.id).map(|x| x.what.clone()).collect();
+    if !props.is_empty() {
+        let _ = write!(s, "\nLeave OUT the {}: characters sit or lean on {}, so {} drawn on the characters' own layer over this background. Keep the open ground where {} would stand clear and level.", props.join(" and "), if props.len() == 1 { "it" } else { "them" }, if props.len() == 1 { "it is" } else { "they are" }, if props.len() == 1 { "it" } else { "they" });
+    }
     s
 }
 
@@ -901,6 +1027,21 @@ pub fn layer(p: &Project, c: &Cut, aspect: &str, refs: &[String]) -> String {
         "\nDraw ONLY the characters (and anything they hold or wear) on a perfectly flat, uniform {screen} chroma-key background ({hex}): no floor, no scenery, no props on the ground, no cast shadow on the background, no gradient, no vignette, no text, no speech balloons. Place and size them in frame exactly as this shot needs, so they line up with the background plate. Light them as the plate is lit{}; clean crisp edges against the {screen}.",
         if light.is_empty() { String::new() } else { format!(" ({light})") }
     );
+    let props: Vec<&Prop> = p.props.iter().filter(|x| x.plate == c.plate).collect();
+    if !props.is_empty() {
+        let touched = c.touched();
+        let names: Vec<String> = props.iter().map(|x| x.what.clone()).collect();
+        let _ = write!(
+            s,
+            "\nALSO draw on this layer, on the same {screen} screen, the {} (they are not in the background plate), exactly as on {} prop sheet{}: placed where this shot shows {} in the place, at the plate's scale and perspective, standing on the plate's ground.{}",
+            names.join(" and "),
+            if names.len() == 1 { "its" } else { "their" },
+            if names.len() == 1 { "" } else { "s" },
+            if names.len() == 1 { "it" } else { "them" },
+            // "sitting, legs dangling" names no thing: in this place it is the prop.
+            touched.or_else(|| c.touches_set().then(|| names.join(" and "))).map(|t| format!(" Whoever sits, leans or lies on the {t} rests on it: their weight on it, hands and feet touching it, one drawing with them.")).unwrap_or_default()
+        );
+    }
     if !refs.is_empty() {
         let _ = write!(s, "\nReference images: {}. Every character must match their model sheet exactly (face, hair, eyes, outfit, colours).", refs.join("; "));
     }
@@ -910,12 +1051,112 @@ pub fn layer(p: &Project, c: &Cut, aspect: &str, refs: &[String]) -> String {
     s
 }
 
+/// Where the camera stands for a cut, in the words a layout artist uses: the horizon's height in
+/// the frame (it is the camera's eye level), how far the lines converge, and how high the lens is.
+pub fn perspective(c: &Cut) -> String {
+    let (horizon, height) = match c.angle.as_str() {
+        "low" => ("low in the frame, about a quarter up from the bottom", "the lens below the characters' waists, looking up"),
+        "worm's eye" | "ground level" => ("at or below the bottom edge", "the lens at the ground, looking up"),
+        "high" => ("high in the frame, about three quarters up", "the lens above their heads, looking down"),
+        "bird's eye" => ("above the top edge (looking straight down)", "the lens high overhead"),
+        "dutch" => ("tilted about 15 degrees, crossing the middle", "the lens at eye level, rolled"),
+        _ => ("across the middle, at the characters' eye level", "the lens at the characters' eye level"),
+    };
+    let lens = match c.lens.as_str() {
+        "wide" => "a wide lens: strong convergence, near things large, depth stretched",
+        "tele" => "a long lens: almost parallel lines, depth compressed, the background close and large",
+        "fisheye" => "a fisheye: curved lines, strong distortion at the edges",
+        _ => "a normal lens: natural convergence",
+    };
+    format!("Camera: {height}; the horizon line {horizon}; {lens}. Every line of the place converges to vanishing points on that horizon.")
+}
+
+/// The cut's own background: the plate's place painted again from this cut's camera (a real
+/// layout BG, not a crop of a wide picture), empty and ready for what will be drawn into it.
+pub fn cut_bg(p: &Project, c: &Cut, aspect: &str, refs: &[String]) -> String {
+    let pl = p.plates.iter().find(|x| x.id == c.plate);
+    let props: Vec<String> = p.props.iter().filter(|x| x.plate == c.plate).map(|x| x.what.clone()).collect();
+    let mut s = format!(
+        "Anime background art (美術) for ONE cut of a TV anime, {aspect} frame: {}{}. {} {} Re-draw the place of the background plate from THIS camera position and framing (as a background artist paints each cut from its layout), not a crop: the same architecture, props, materials, colours and light, seen from here. {} Painted background only: NO people, NO characters, NO creatures, no text.",
+        pl.map(|x| x.location.as_str()).unwrap_or("the place"),
+        pl.filter(|x| !x.light.is_empty()).map(|x| format!(", {}", x.light)).unwrap_or_default(),
+        shot_line(c),
+        perspective(c),
+        ANIME_LOOK,
+    );
+    if !props.is_empty() {
+        let _ = write!(s, " Leave out the {}: {} drawn later with the characters; keep the ground where {} stand{} clear and level.", props.join(" and "), if props.len() == 1 { "it is" } else { "they are" }, if props.len() == 1 { "it would" } else { "they would" }, "");
+    }
+    if !refs.is_empty() {
+        let _ = write!(s, "\nReference images: {}.", refs.join("; "));
+    }
+    s
+}
+
+/// The cut's layout frame: the characters and their props drawn INTO the cut's background, in
+/// its perspective and light, with their shadows (Image 1 is that background).
+pub fn layout_frame(p: &Project, c: &Cut, aspect: &str, refs: &[String]) -> String {
+    let light = p.plates.iter().find(|x| x.id == c.plate).map(|x| x.light.clone()).filter(|l| !l.is_empty()).unwrap_or_else(|| "the background's light".into());
+    let mut s = format!("{}, {aspect} frame. {} {}", ANIME_LOOK, shot_line(c), c.picture);
+    for x in &c.characters {
+        let fixed = p.character(&x.name).map(|m| look_of(m, &x.outfit)).unwrap_or_else(|| x.name.clone());
+        let place = match (x.side.trim(), x.facing.trim()) {
+            ("", "") => String::new(),
+            (side, "") => format!(" On the {side} of the frame."),
+            ("", facing) => format!(" Facing {facing}."),
+            (side, facing) => format!(" On the {side} of the frame, facing {facing}."),
+        };
+        let _ = write!(s, "\n  • {fixed}. Expression: {}. Pose: {}.{place}", x.expression, x.pose);
+    }
+    let props: Vec<String> = p.props.iter().filter(|x| x.plate == c.plate).map(|x| x.what.clone()).collect();
+    if !props.is_empty() {
+        let touched = c.touched().or_else(|| c.touches_set().then(|| props.join(" and ")));
+        let _ = write!(s, "\nProps: draw the {} where this shot shows {} in the place, exactly as on {} prop sheet{}.{}", props.join(" and "), if props.len() == 1 { "it" } else { "them" }, if props.len() == 1 { "its" } else { "their" }, if props.len() == 1 { "" } else { "s" }, touched.map(|t| format!(" Whoever sits, leans or lies on the {t} rests on it: weight on it, hands and feet touching it.")).unwrap_or_default());
+    }
+    let _ = write!(
+        s,
+        "\nIMAGE 1 IS THIS CUT'S BACKGROUND: keep it exactly as it is (the same place, framing, horizon and perspective, every object where it is) and draw the characters and props INTO it.\n\
+PERSPECTIVE: {} Everyone and every prop stands on that background's ground plane: feet and the props' bases on the ground at the right depth, each sized by distance, their eye lines and the props' edges converging to the same vanishing points as the background.\n\
+LIGHT: the characters are lit by the scene's light ({light}), from the same direction and in the same colour as the background, with a rim of light where they stand against something bright, and darker where the place is in shade.\n\
+SHADOWS: each character and prop casts a soft shadow on the ground, away from the light, and a small dark contact shadow where feet, seats and props touch the ground.\n\
+No text, no speech balloons, no watermark.",
+        perspective(c)
+    );
+    if !refs.is_empty() {
+        let _ = write!(s, "\nReference images: {}. Every character must match their model sheet exactly (face, hair, eyes, outfit, colours).", refs.join("; "));
+    }
+    if !c.notes.trim().is_empty() {
+        let _ = write!(s, "\nDirector's notes, follow them: {}", c.notes.trim());
+    }
+    s
+}
+
+/// The cel lifted from the layout (Image 1): the characters and props kept exactly, everything
+/// else a flat chroma screen.
+pub fn cel(p: &Project, c: &Cut) -> String {
+    let cast: Vec<&CastMember> = c.characters.iter().filter_map(|x| p.character(&x.name)).collect();
+    let (screen, hex) = screen_for(&cast);
+    let props: Vec<String> = p.props.iter().filter(|x| x.plate == c.plate).map(|x| x.what.clone()).collect();
+    let keep = if props.is_empty() { "every person in the frame, those in the background too (and what they hold or wear)".to_string() } else { format!("every person in the frame, those in the background too (and what they hold or wear), and the {}", props.join(" and ")) };
+    format!("Edit Image 1. Keep {keep} EXACTLY as they are: the same position, size, pose, line art, colours and lighting, pixel for pixel. Replace everything else, the whole background, the ground and every shadow on it, with a perfectly flat, uniform {screen} ({hex}). No floor, no cast shadows, no gradient, no vignette, no text. Clean crisp edges against the {screen}.")
+}
+
 /// A whole frame drawn at once (a cut with no one from the cast in it that is not just the
 /// plate: an insert of an object, a crowd, a monster).
 pub fn frame(p: &Project, c: &Cut, aspect: &str, refs: &[String]) -> String {
     let mut s = format!("{}, {aspect} frame. {} {}", ANIME_LOOK, shot_line(c), c.picture);
+    if c.has_cast() {
+        for x in &c.characters {
+            let fixed = p.character(&x.name).map(|m| look_of(m, &x.outfit)).unwrap_or_else(|| x.name.clone());
+            let _ = write!(s, "\n  • {fixed}. Expression: {}. Pose: {}.", x.expression, x.pose);
+        }
+    }
     if let Some(pl) = p.plates.iter().find(|x| x.id == c.plate) {
         let _ = write!(s, "\nSetting: {} — {} — {}.", pl.location, pl.view, pl.light);
+        let props: Vec<String> = p.props.iter().filter(|x| x.plate == pl.id).map(|x| x.what.clone()).collect();
+        if !props.is_empty() {
+            let _ = write!(s, "\nThe place's {} stand where they belong in it, as on their prop sheets.", props.join(", "));
+        }
     }
     s.push_str("\nNo text, no speech balloons, no watermark.");
     if !refs.is_empty() {
@@ -977,6 +1218,9 @@ fn camera_json(c: &Cut, kind: &str) -> Value {
 #[derive(Default)]
 pub struct CompParts<'a> {
     pub plate: Option<&'a std::path::Path>,
+    /// The cut's layout frame, when the layer was lifted from it: its shadows are carried back
+    /// under the layer (or it stands in for the plate when the plate drifted from it).
+    pub layout: Option<&'a std::path::Path>,
     /// The character layer, and whether it is an animation (else one drawing).
     pub layer: Option<(&'a std::path::Path, bool)>,
     /// The whole frame animated by the video model (a `full` cut).
@@ -992,7 +1236,8 @@ pub fn comp_job(c: &Cut, kind: &str, out: &std::path::Path, parts: CompParts<'_>
     let step = if kind == "action" { 2 } else { 3 };
     let chars: Vec<Value> = parts
         .layer
-        .map(|(f, animated)| serde_json::json!({ "path": f, "key": "green", "step": if animated { step } else { 1 }, "shadow": size_rank(&c.size) <= 3 }))
+        // Lifted from a lit layout, a layer keeps its own light and the layout's shadows.
+        .map(|(f, animated)| if parts.layout.is_some() { serde_json::json!({ "path": f, "key": "green", "step": if animated { step } else { 1 }, "shadow": false, "match": 0.08 }) } else { serde_json::json!({ "path": f, "key": "green", "step": if animated { step } else { 1 }, "shadow": size_rank(&c.size) <= 3 }) })
         .into_iter()
         .collect();
     let fxs: Vec<Value> = parts.fx.iter().map(|(f, u, e)| serde_json::json!({ "path": f, "blend": if e.blend == "over" { "over" } else { "screen" }, "x": u.x, "y": u.y, "scale": u.scale, "front": u.front, "opacity": u.opacity })).collect();
@@ -1011,6 +1256,7 @@ pub fn comp_job(c: &Cut, kind: &str, out: &std::path::Path, parts: CompParts<'_>
     serde_json::json!({
         "out": out, "width": w, "height": h, "fps": 24, "seconds": c.seconds.max(pacing::CUT_MIN), "seed": seed,
         "plate": parts.plate.map(|p| serde_json::json!({ "path": p })),
+        "layout": parts.layout.map(|p| serde_json::json!({ "path": p })),
         "base": parts.base.map(|b| serde_json::json!({ "path": b, "step": if c.camera == "fix" { step } else { 1 } })),
         "chars": chars, "fx": fxs, "camera": camera,
         "grade": if finish { c.grade.as_str() } else { "neutral" },
@@ -1136,6 +1382,30 @@ mod tests {
         assert!(l.contains("magenta") && l.contains("#FF00FF") && l.contains("noon sun") && l.contains("Image 1: Mira model sheet"));
         assert!(l.contains("medium shot, low angle, wide-angle lens") && l.contains("Composition: Mira large on the left third.") && l.contains("On the left of the frame, facing right."));
         assert_eq!(c.render_kind(), "layered");
+        assert!(!c.touches_set() && c.touched().is_none());
+        // Sitting on a prop: it is found, left out of the plate and drawn on the layer with her.
+        let mut sat = c.clone();
+        sat.characters[0].pose = "sitting on the plank stack, elbows on knees".into();
+        assert_eq!(sat.touched().as_deref(), Some("plank stack"));
+        assert!(sat.touches_set() && sat.render_kind() == "layered");
+        let mut q = p.clone();
+        q.chapters = vec![crate::project::Chapter { number: 1, ..Default::default() }];
+        q.chapters[0].anime.cuts = vec![sat.clone()];
+        assert!(sync_props(&mut q) && !sync_props(&mut q), "added once");
+        assert_eq!((q.props[0].what.as_str(), q.props[0].plate.as_str()), ("plank stack", "street"));
+        let pl = q.plates.iter().find(|x| x.id == "street").cloned().unwrap_or(Plate { id: "street".into(), ..Default::default() });
+        assert!(plate(&q, &pl, &[]).contains("Leave OUT the plank stack"));
+        let l = layer(&q, &sat, "16:9", &[]);
+        assert!(l.contains("ALSO draw on this layer") && l.contains("rests on it"), "{l}");
+        assert!(prop_sheet(&q, &q.props[0], &[]).contains("plank stack"));
+        // On the ground, on her knees, in shock: nothing to draw.
+        for pose in ["kneeling on the ground", "sitting in shock", "leaning on his knees", "situation tense, standing", "leaning in toward him", "leaning back in surprise", "one hand resting on it", "leaning on the truck side", "seated at the base of the altar steps"] {
+            sat.characters[0].pose = pose.into();
+            assert_eq!(sat.touched(), None, "{pose}");
+        }
+        // A bench a few words on.
+        sat.characters[0].pose = "slumped against a rusty bench, eyes closed".into();
+        assert_eq!(sat.touched().as_deref(), Some("rusty bench"));
         let m = motion(&c);
         assert!(m.contains("Locked-off camera") && m.contains("Mira speaks") && m.contains("Only the mouth and eyes move"));
         // Heard over her back: no mouth to move.
@@ -1152,11 +1422,11 @@ mod tests {
         let job = comp_job(&c, "dialogue", std::path::Path::new("o.mp4"), CompParts { base: Some(std::path::Path::new("clip.mp4")), ..Default::default() }, "16:9", true);
         assert_eq!(job["camera"]["move"], "fix");
         assert_eq!(job["width"], 1920);
-        // A still under a slow push: 0.8% a second over five seconds.
+        // A still under a slow push: at least 8%, so the whole frame visibly moves.
         c.motion = "camera".into();
         let job = comp_job(&c, "dialogue", std::path::Path::new("o.mp4"), CompParts { plate: Some(std::path::Path::new("p.png")), layer: Some((std::path::Path::new("l.png"), false)), ..Default::default() }, "16:9", true);
         assert_eq!(job["camera"]["move"], "push_in");
-        assert!((job["camera"]["zoom"].as_f64().unwrap() - 0.04).abs() < 1e-6);
+        assert!((job["camera"]["zoom"].as_f64().unwrap() - 0.08).abs() < 1e-6);
         assert_eq!(job["chars"][0]["step"], 1);
     }
 

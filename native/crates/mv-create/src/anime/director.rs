@@ -166,6 +166,8 @@ pub async fn board(ask: &Ask, mut p: Project, n: u32, note: &str, status: &Statu
 pub fn prune_plates(p: &mut Project) {
     let used: std::collections::HashSet<String> = p.chapters.iter().flat_map(|c| c.anime.cuts.iter().map(|x| x.plate.clone())).collect();
     p.plates.retain(|pl| pl.image.is_some() || used.contains(&pl.id));
+    // The props the new board's characters rest on.
+    super::sync_props(p);
 }
 
 /// Draws up one scene again (with the user's note), then checks and revises that scene.

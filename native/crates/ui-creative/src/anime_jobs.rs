@@ -26,8 +26,10 @@ pub(crate) enum Made {
     Animatic { chapter: u32, rel: String },
     Plate { id: String, rel: String },
     Fx { id: String, rel: String },
-    /// `layer`: the characters on the screen; `key`: the whole frame (a cut without the cast).
-    Layer { chapter: u32, cut: u32, layer: Option<String>, key: Option<String> },
+    Prop { id: String, rel: String },
+    /// `layer`: the characters on the screen; `key`: the whole frame (a cut without the cast);
+    /// `bg` and `layout`: the cut's own background and the frame drawn into it (layout first).
+    Layer { chapter: u32, cut: u32, layer: Option<String>, key: Option<String>, bg: Option<String>, layout: Option<String> },
     Anim { chapter: u32, cut: u32, rel: String, key: Option<String>, voice: Option<String> },
     Comp { chapter: u32, cut: u32, rel: String, voice: Option<String>, seconds: f32 },
     Episode { chapter: u32, rel: String },
@@ -130,6 +132,20 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
                     }
                 }
             }
+            // The place is often worded differently in the panels than in the plate: the panels its
+            // own cuts adapt show it all the same.
+            if refs.len() < 2 {
+                for ch in &p.chapters {
+                    for i in ch.anime.cuts.iter().filter(|c| c.plate == pl.id).flat_map(|c| c.from.iter().take(1)) {
+                        if let Some(sp) = ch.anime.panels.get(*i).filter(|sp| sp.story()) {
+                            let f = p.file(&sp.file);
+                            if refs.len() < 3 && !refs.iter().any(|r| r.file == f) {
+                                refs.push(Reference { file: f, caption: "the manga's drawing of this place (ignore its people, balloons and text)".into() });
+                            }
+                        }
+                    }
+                }
+            }
             let refs = numbered(refs.into_iter().filter(|r| r.file.is_file()).collect(), |i| if i == 0 { format!("{} as the manga draws it", pl.location) } else { "the manga's drawing of this place".to_string() });
             let prompt = anime::plate(p, &pl, &captions(&refs));
             let out = p.new_image("plates", &format!("plate-{}", pl.id));
@@ -142,6 +158,27 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
             let id = f.id.clone();
             image_job(p, keys, format!("Effect · {}", f.what), anime::fx(&f), vec![], 1., out, status, move |rel| Made::Fx { id, rel })
         }
+        Task::PropEl(id) => {
+            let x = p.props.iter().find(|x| &x.id == id).cloned().ok_or_else(|| anyhow!("that prop is gone"))?;
+            // The panels of the cuts where someone rests on it: the manga's design of it.
+            let mut refs: Vec<Reference> = vec![];
+            for ch in &p.chapters {
+                for c in ch.anime.cuts.iter().filter(|c| c.plate == x.plate && c.touched().as_deref() == Some(x.what.as_str())) {
+                    if let Some(sp) = c.from.first().and_then(|i| ch.anime.panels.get(*i)) {
+                        let f = p.file(&sp.file);
+                        if refs.len() < 3 && !refs.iter().any(|r| r.file == f) {
+                            refs.push(Reference { file: f, caption: String::new() });
+                        }
+                    }
+                }
+            }
+            let refs = numbered(refs.into_iter().filter(|r| r.file.is_file()).collect(), |_| format!("the {} as the manga draws it (ignore its people, balloons and text)", x.what));
+            let prompt = anime::prop_sheet(p, &x, &captions(&refs));
+            let out = p.new_image("props", &format!("prop-{}", x.id));
+            let id = x.id.clone();
+            image_job(p, keys, format!("Prop · {}", x.what), prompt, refs, 16. / 9., out, status, move |rel| Made::Prop { id, rel })
+        }
+        Task::Layer { chapter, cut } if cut_of(p, *chapter, *cut)?.has_cast() => layout_job(p, keys, *chapter, *cut, status),
         Task::Layer { chapter, cut } => {
             let c = cut_of(p, *chapter, *cut)?;
             let aspect_f = if p.settings.video_aspect == "9:16" { 9. / 16. } else { 16. / 9. };
@@ -158,6 +195,13 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
                 for m in &cast {
                     if let Some(f) = existing(p, m.expressions.as_ref()) {
                         refs.push((f, format!("{} expression sheet", m.name)));
+                    }
+                }
+            }
+            if c.has_cast() {
+                for x in p.props.iter().filter(|x| x.plate == c.plate) {
+                    if let Some(f) = existing(p, x.image.as_ref()) {
+                        refs.push((f, format!("the {} prop sheet: draw it exactly like this, on the layer", x.what)));
                     }
                 }
             }
@@ -178,7 +222,7 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
             let prompt = if has_cast { anime::layer(p, &c, aspect, &captions(&refs)) } else { anime::frame(p, &c, aspect, &captions(&refs)) };
             let out = p.new_image("layers", &format!("ch{chapter:03}-c{cut:03}-{}", if has_cast { "layer" } else { "frame" }));
             let (chapter, cut) = (*chapter, *cut);
-            image_job(p, keys, format!("Chapter {chapter} · cut {cut} · {}", if has_cast { "characters" } else { "frame" }), prompt, refs, aspect_f, out, status, move |rel| if has_cast { Made::Layer { chapter, cut, layer: Some(rel), key: None } } else { Made::Layer { chapter, cut, layer: None, key: Some(rel) } })
+            image_job(p, keys, format!("Chapter {chapter} · cut {cut} · {}", if has_cast { "characters" } else { "frame" }), prompt, refs, aspect_f, out, status, move |rel| if has_cast { Made::Layer { chapter, cut, layer: Some(rel), key: None, bg: None, layout: None } } else { Made::Layer { chapter, cut, layer: None, key: Some(rel), bg: None, layout: None } })
         }
         Task::Anim { chapter, cut } => anim_job(p, *chapter, *cut, status),
         Task::Comp { chapter, cut } => comp_job(p, *chapter, *cut, status),
@@ -215,6 +259,78 @@ fn image_job(p: &Project, keys: &Keys, label: String, prompt: String, refs: Vec<
         Ok(Outcome::Anime(done(rel_in(&dir, &out))))
     };
     Ok(Job { label, credits: jobs::cost(p, m, res), model: (!web).then_some(m), fut: fut.boxed() })
+}
+
+/// A cut with the cast, drawn layout first as a TV anime cut is: (1) the place painted again from
+/// this cut's camera (its own background, horizon and perspective), (2) the characters and the
+/// props they touch drawn INTO it, lit by its light, with cast and contact shadows, (3) the
+/// characters lifted onto the chroma screen from that frame, for animation. The background is
+/// kept when it was made before (a redraw of the characters reuses it).
+fn layout_job(p: &Project, keys: &Keys, chapter: u32, n: u32, status: Arc<Mutex<String>>) -> Result<Job> {
+    let c = cut_of(p, chapter, n)?;
+    let m = jobs::image_model(p, keys);
+    let res = jobs::resolution(p, m);
+    let web = p.settings.web_images;
+    let k = if web { String::new() } else { jobs::key(m)? };
+    let aspect_f = if p.settings.video_aspect == "9:16" { 9. / 16. } else { 16. / 9. };
+    let aspect = layout::nearest(aspect_f, jobs::shapes(p, m));
+    let cap = jobs::ref_cap(p, m).max(2);
+    let ch = p.chapter(chapter).cloned().unwrap_or_default();
+    let panel = c.from.first().and_then(|i| ch.anime.panels.get(*i)).map(|sp| p.file(&sp.file)).filter(|f| f.is_file());
+    let plate = p.plates.iter().find(|x| x.id == c.plate).and_then(|x| existing(p, x.image.as_ref()));
+    // (1) The cut's background: the plate re-seen from this camera, the panel's framing.
+    let mut bg_refs: Vec<Reference> = vec![];
+    if let Some(f) = &plate {
+        bg_refs.push(Reference { file: f.clone(), caption: "the background plate: the place to paint again from this cut's camera".into() });
+    }
+    if let Some(f) = &panel {
+        bg_refs.push(Reference { file: f.clone(), caption: "the manga panel this cut adapts: its framing and camera angle (ignore its people, balloons and text)".into() });
+    }
+    let bg_refs = numbered(bg_refs, |_| String::new());
+    let bg_prompt = anime::cut_bg(p, &c, aspect, &captions(&bg_refs));
+    let dir = p.dir();
+    let made_bg = existing(p, c.bg.as_ref());
+    let bg_out = made_bg.clone().unwrap_or_else(|| p.new_image("layers", &format!("ch{chapter:03}-c{n:03}-bg")));
+    // (2) The layout: Image 1 is that background; then the sheets, prop sheets and the panel.
+    let mut more: Vec<Reference> = vec![];
+    for x in c.characters.iter().filter_map(|x| p.character(&x.name)) {
+        if let Some(f) = existing(p, x.sheet.as_ref()) {
+            more.push(Reference { file: f, caption: format!("{} model sheet (face, hair, eyes, outfit and colours must match)", x.name) });
+        }
+    }
+    for x in p.props.iter().filter(|x| x.plate == c.plate) {
+        if let Some(f) = existing(p, x.image.as_ref()) {
+            more.push(Reference { file: f, caption: format!("the {} prop sheet: draw it exactly like this", x.what) });
+        }
+    }
+    if let Some(f) = &panel {
+        more.push(Reference { file: f.clone(), caption: "the manga panel this shot adapts: its people, their acting and the framing (ignore its balloons, text and screentone)".into() });
+    }
+    more.truncate(cap - 1);
+    let mut lay_refs = vec![Reference { file: bg_out.clone(), caption: "this cut's background (keep it exactly, draw into it)".into() }];
+    lay_refs.extend(more);
+    let lay_refs = numbered(lay_refs, |_| String::new());
+    let lay_prompt = anime::layout_frame(p, &c, aspect, &captions(&lay_refs));
+    let lay_out = p.new_image("layers", &format!("ch{chapter:03}-c{n:03}-layout"));
+    // (3) The cel lifted from the layout.
+    let cel_prompt = anime::cel(p, &c);
+    let cel_out = p.new_image("layers", &format!("ch{chapter:03}-c{n:03}-layer"));
+    let images = if made_bg.is_some() { 2. } else { 3. };
+    let credits = jobs::cost(p, m, res) * images;
+    let st = status.clone();
+    let fut = async move {
+        if made_bg.is_none() {
+            set(&st, "Painting the cut's background from its camera");
+            jobs::paint(web, m, &k, &bg_prompt, &bg_refs, aspect, res, &bg_out, |s| set(&st, format!("Background · {s}"))).await?;
+        }
+        set(&st, "Drawing the characters into it, lit and shadowed");
+        jobs::paint(web, m, &k, &lay_prompt, &lay_refs, aspect, res, &lay_out, |s| set(&st, format!("Layout · {s}"))).await?;
+        set(&st, "Lifting the characters onto their layer");
+        let cel_refs = vec![Reference { file: lay_out.clone(), caption: "Image 1: the cut's layout frame".into() }];
+        jobs::paint(web, m, &k, &cel_prompt, &cel_refs, aspect, res, &cel_out, |s| set(&st, format!("Cel · {s}"))).await?;
+        Ok(Outcome::Anime(Made::Layer { chapter, cut: n, layer: Some(rel_in(&dir, &cel_out)), key: None, bg: Some(rel_in(&dir, &bg_out)), layout: Some(rel_in(&dir, &lay_out)) }))
+    };
+    Ok(Job { label: format!("Chapter {chapter} · cut {n} · layout, characters and layer"), credits, model: (!web).then_some(m), fut: fut.boxed() })
 }
 
 /// The chapter's real pages, from the downloaded manga, cut into panels inside the project.
@@ -396,7 +512,12 @@ fn anim_job(p: &Project, chapter: u32, n: u32, status: Arc<Mutex<String>>) -> Re
     let key_out = dir.join("layers").join(format!("ch{chapter:03}-c{n:03}-key-{}.png", mv_create::now()));
     // The key frame is the cut's first frame: before the camera has moved.
     let still_cut = Cut { camera: "fix".into(), shake: 0., ..c.clone() };
-    let still_job = anime::comp_job(&still_cut, &kind, &key_out, CompParts { plate: plate.as_deref(), layer: layer.as_deref().map(|l| (l, false)), ..Default::default() }, &p.settings.video_aspect, false);
+    let laid = existing(p, c.layout.as_ref());
+    let still_job = match &laid {
+        // Drawn layout first, the frame is whole already: lit, shadowed, in perspective.
+        Some(l) => anime::comp_job(&still_cut, &kind, &key_out, CompParts { plate: Some(l), ..Default::default() }, &p.settings.video_aspect, false),
+        None => anime::comp_job(&still_cut, &kind, &key_out, CompParts { plate: plate.as_deref(), layer: layer.as_deref().map(|l| (l, false)), ..Default::default() }, &p.settings.video_aspect, false),
+    };
     let key = match vm.via {
         VideoVia::Magnific => Some(ui_studio::images::key().ok_or_else(|| anyhow!("Connect Magnific first: add the API key in Settings › Magnific."))?),
         VideoVia::Service(id) => Some(mv_ai::service_key(mv_core::paths::config(), id).ok_or_else(|| anyhow!("{} needs a {} key: add it in Settings › AI services.", vm.name, mv_ai::service_def(id).map(|d| d.label).unwrap_or(id)))?),
@@ -475,6 +596,8 @@ fn comp_job(p: &Project, chapter: u32, n: u32, status: Arc<Mutex<String>>) -> Re
     let drawn_key = existing(p, c.key.as_ref()).filter(|_| !c.has_cast());
     let layer = existing(p, c.layer.as_ref());
     let anim = existing(p, c.anim.as_ref()).filter(|_| needs_anim(p, &c));
+    let laid = existing(p, c.layout.as_ref());
+    let cut_bg = existing(p, c.bg.as_ref());
     let fx: Vec<(PathBuf, mv_create::anime::FxUse, mv_create::anime::FxElement)> = c
         .fx
         .iter()
@@ -509,13 +632,21 @@ fn comp_job(p: &Project, chapter: u32, n: u32, status: Arc<Mutex<String>>) -> Re
         let job = if c.render_kind() == "full" && anim.is_some() {
             anime::comp_job(&c, &kind, &out, CompParts { base: anim.as_deref(), fx: &fx_refs, ..Default::default() }, &aspect, true)
         } else {
-            let bg = drawn_key.as_deref().or(plate.as_deref());
-            let fg = match (&anim, &layer) {
-                (Some(a), _) => Some((a.as_path(), true)),
-                (None, Some(l)) => Some((l.as_path(), false)),
-                _ => None,
-            };
-            anime::comp_job(&c, &kind, &out, CompParts { plate: bg, layer: fg, base: None, fx: &fx_refs }, &aspect, true)
+            match (&laid, &anim) {
+                // A held drawing: the layout frame is the picture, under the camera.
+                (Some(l), None) => anime::comp_job(&c, &kind, &out, CompParts { plate: Some(l), fx: &fx_refs, ..Default::default() }, &aspect, true),
+                // Animated characters over the cut's own background, with the layout's shadows.
+                (Some(l), Some(a)) => anime::comp_job(&c, &kind, &out, CompParts { plate: cut_bg.as_deref().or(plate.as_deref()), layout: Some(l), layer: Some((a.as_path(), true)), base: None, fx: &fx_refs }, &aspect, true),
+                (None, _) => {
+                    let bg = drawn_key.as_deref().or(plate.as_deref());
+                    let fg = match (&anim, &layer) {
+                        (Some(a), _) => Some((a.as_path(), true)),
+                        (None, Some(l)) => Some((l.as_path(), false)),
+                        _ => None,
+                    };
+                    anime::comp_job(&c, &kind, &out, CompParts { plate: bg, layer: fg, fx: &fx_refs, ..Default::default() }, &aspect, true)
+                }
+            }
         };
         run_comp("comp", job, &dir.join("anim").join("work"), "composite the cut", &st).await?;
         Ok(Outcome::Anime(Made::Comp { chapter, cut: n, rel: rel_in(&dir, &out), voice: voice_rel, seconds: c.seconds }))
@@ -555,15 +686,34 @@ pub(crate) fn apply(p: &mut Project, made: Made) {
                 }
             }
         }
+        Made::Prop { id, rel } => {
+            // A new design: the layers that carry it are drawn again.
+            let plate = p.props.iter().find(|x| x.id == id).map(|x| x.plate.clone());
+            if let Some(x) = p.props.iter_mut().find(|x| x.id == id) {
+                let redo = x.image.is_some();
+                x.image = Some(rel);
+                if redo {
+                    for ch in &mut p.chapters {
+                        for c in ch.anime.cuts.iter_mut().filter(|c| Some(&c.plate) == plate.as_ref() && c.has_cast()) {
+                            c.layer = None;
+                            c.anim = None;
+                            c.comp = None;
+                        }
+                    }
+                }
+            }
+        }
         Made::Fx { id, rel } => {
             if let Some(x) = p.fx.iter_mut().find(|x| x.id == id) {
                 x.image = Some(rel);
             }
         }
-        Made::Layer { chapter, cut, layer, key } => {
+        Made::Layer { chapter, cut, layer, key, bg, layout } => {
             if let Some(c) = p.chapter_mut(chapter).anime.cuts.iter_mut().find(|c| c.number == cut) {
                 c.layer = layer;
                 c.key = key;
+                c.bg = bg;
+                c.layout = layout;
                 c.anim = None;
                 c.comp = None;
             }
@@ -607,6 +757,11 @@ pub(crate) fn merge_board(live: &mut Project, done: &Project, n: u32) {
     for f in &done.fx {
         if !live.fx.iter().any(|x| x.id == f.id) {
             live.fx.push(f.clone());
+        }
+    }
+    for x in &done.props {
+        if !live.props.iter().any(|y| y.id == x.id) {
+            live.props.push(x.clone());
         }
     }
     let Some(a) = done.chapter(n).map(|c| c.anime.clone()) else { return };
@@ -802,6 +957,12 @@ pub(crate) fn stage(p: &Project, n: u32) -> AStage {
     for f in &p.fx {
         if f.image.is_none() && a.cuts.iter().any(|c| c.fx.iter().any(|u| u.id == f.id)) {
             assets.push(Task::FxEl(f.id.clone()));
+        }
+    }
+    // Props before any layer: every layer of their plate draws them from the sheet.
+    for x in &p.props {
+        if x.image.is_none() && a.cuts.iter().any(|c| c.plate == x.plate) {
+            assets.push(Task::PropEl(x.id.clone()));
         }
     }
     if !assets.is_empty() {

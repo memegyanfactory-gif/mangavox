@@ -234,3 +234,31 @@ class CompositeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LayoutGroundTests(unittest.TestCase):
+    """A layer lifted from a layout frame: its shadows go under it, or the layout is the plate."""
+
+    def setUp(self):
+        self.t = ac.torch_mod()
+        self.dev = "cpu"
+        h, w = 180, 320
+        self.bg = self.t.full((3, h, w), 0.7)
+        self.alpha = self.t.zeros((1, h, w))
+        self.alpha[:, 60:150, 140:180] = 1.0  # a figure
+
+    def test_the_layouts_shadow_is_carried_under_the_layer(self):
+        lay = self.bg.clone()
+        lay[:, 152:162, 100:220] = 0.35  # a cast shadow on the ground by the feet
+        plate, shade = ac.layout_ground(self.bg, lay, self.alpha)
+        self.assertTrue(self.t.equal(plate, self.bg))
+        self.assertIsNotNone(shade)
+        self.assertGreater(float(shade[0, 157, 125]), 0.2)
+        self.assertLess(float(shade[0, 70, 130]), 0.01, "not around the head")
+        self.assertLess(float(shade[0, 20, 20]), 0.01)
+
+    def test_a_drifted_background_gives_way_to_the_layout(self):
+        lay = self.bg.clone() * 0.5  # the whole place came back different
+        plate, shade = ac.layout_ground(self.bg, lay, self.alpha)
+        self.assertIsNone(shade)
+        self.assertAlmostEqual(float(plate.mean()), 0.35, places=2)

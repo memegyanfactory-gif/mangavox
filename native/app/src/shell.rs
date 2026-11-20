@@ -1233,9 +1233,8 @@ impl Shell {
         };
 
         // The side panel: a toggle on every page (Studio's own panel there), with the issue count
-        // or a breathing dot over its corner, and in Studio mode a chat button that opens it on Chat.
+        // or a breathing dot over its corner.
         let on_studio = self.route == Route::Studio;
-        let studio = mv_ui::mode::studio_enabled(cx);
         let panel = mv_ui::panel::state(cx);
         let panel_toggle = (!welcome).then(|| {
             let open = if on_studio { ui_studio::panel::side_panel_open(cx) } else { panel.open };
@@ -1263,17 +1262,8 @@ impl Shell {
             });
             div().relative().flex_none().child(button).children(mark)
         });
-        let chat_button = (studio && !on_studio && !welcome).then(|| {
-            let on_chat = panel.open && panel.tab == PanelTab::Chat;
-            icon_button("panel-chat", glyphs::ASSISTANT, if on_chat { "Close the assistant chat" } else { "Chat with the assistant" }).selected(on_chat).occlude().on_click(cx.listener(|_, _, _, cx| {
-                let now = mv_ui::panel::state(cx);
-                if now.open && now.tab == PanelTab::Chat {
-                    mv_ui::panel::set_open(false, cx);
-                } else {
-                    mv_ui::panel::show(PanelTab::Chat, cx);
-                }
-            }))
-        });
+        // The assistant has no button of its own up here: it is the Chat tab of the panel the
+        // Activity button opens (one way in, not two buttons doing the same thing).
 
         TitleBar::new().h(px(TITLE_BAR_H)).bg(Tokens::base()).border_b_1().border_color(Tokens::border()).child(
             div()
@@ -1289,7 +1279,7 @@ impl Shell {
                 .child(div().flex().flex_1().min_w_0().items_center().gap(px(2.)).children(toggle).when(!welcome, |d| d.child(back_el).children(forward_el)).child(self.crumbs_el(cx)))
                 .child(search)
                 // Private mode: only on Manga, Anime and Movies pages (see privacy.rs).
-                .child(div().flex().flex_1().min_w_0().justify_end().items_center().gap(px(4.)).children(crate::privacy::title_controls(&self.route)).children(chat_button).children(panel_toggle)),
+                .child(div().flex().flex_1().min_w_0().justify_end().items_center().gap(px(4.)).children(crate::privacy::title_controls(&self.route)).children(panel_toggle)),
         )
     }
 

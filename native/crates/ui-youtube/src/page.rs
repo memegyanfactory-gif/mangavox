@@ -162,7 +162,9 @@ impl YouTubePage {
             s.set_value(account.client_secret.clone(), window, cx);
             s
         });
-        let mut subs = vec![cx.observe(&hub, |this, _, cx| {
+        // One chat at a time: the growth chat steps aside while the app's side panel is open.
+        let panel_sub = cx.observe_global::<mv_ui::panel::SidePanel>(|_, cx| cx.notify());
+        let mut subs = vec![panel_sub, cx.observe(&hub, |this, _, cx| {
             this.update_context(cx);
             cx.notify();
         })];
@@ -488,12 +490,18 @@ impl YouTubePage {
                 d.child(yt::pill_icon("yt-start", ph::UPLOAD_SIMPLE, format!("Upload {planned} planned")).on_click(cx.listener(|this, _, _, cx| this.hub.update(cx, |h, cx| h.start_uploads(cx)))))
             })
             .when(uploading, |d| d.child(yt::pill_icon("yt-stop", ph::PAUSE, "Pause after this one").on_click(cx.listener(|this, _, _, cx| this.hub.update(cx, |h, cx| h.stop_uploads(cx))))))
-            .when(!self.side_open, |d| {
+            .when(!self.chat_shown(cx), |d| {
                 d.child(yt::icon_btn("yt-side-open", glyphs::ASSISTANT, "Show growth chat").on_click(cx.listener(|this, _, _, cx| {
                     this.side_open = true;
+                    mv_ui::panel::set_open(false, cx);
                     cx.notify();
                 })))
             })
+    }
+
+    /// Whether the growth chat shows: opened, and the app's side panel is not open beside it.
+    fn chat_shown(&self, cx: &App) -> bool {
+        self.side_open && !mv_ui::panel::state(cx).open
     }
 
     fn body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -593,7 +601,8 @@ impl Render for YouTubePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let vw = f32::from(window.viewport_size().width);
         // Narrow windows: the chat takes its turn instead of squeezing the page.
-        let side = (self.side_open && vw > 1280.).then(|| self.side(window, cx));
+        // The app's side panel (Activity, Issues, Chat) takes the same place: one at a time.
+        let side = (self.chat_shown(cx) && vw > 1280.).then(|| self.side(window, cx));
         let nav = self.nav(cx);
         let title = self.title_row(cx);
         let body = self.body(window, cx);

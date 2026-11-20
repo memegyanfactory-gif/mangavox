@@ -383,6 +383,9 @@ impl CreativePage {
         for f in &fx {
             row = row.child(tile(self, format!("fx-{}", f.id), existing(p, f.image.as_ref()), f.what.clone(), format!("effect · {}", if f.blend == "over" { "keyed" } else { "screened (light)" }), Task::FxEl(f.id.clone()), cx));
         }
+        for x in p.props.iter().filter(|x| used.contains(&x.plate.as_str())) {
+            row = row.child(tile(self, format!("prop-{}", x.id), existing(p, x.image.as_ref()), x.what.clone(), "prop · left out of its background, drawn with the characters".into(), Task::PropEl(x.id.clone()), cx));
+        }
         Some(div().flex().flex_col().gap(px(space::SM)).child(mv_ui::section_label(format!("Backgrounds and effects · {} plates for {} cuts", plates.len(), a.cuts.len()))).child(row))
     }
 

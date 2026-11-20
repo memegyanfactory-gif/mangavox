@@ -142,9 +142,9 @@ impl YouTubePage {
 
         let activity = (runs.len() > 1).then(|| {
             let last: Vec<_> = runs.iter().rev().take(48).rev().collect();
-            let values: Vec<f64> = last.iter().map(|r| (r.new_videos + r.title_changes + r.thumb_changes) as f64).collect();
-            let labels: Vec<String> = last.iter().map(|r| format!("{} · {} new videos, {} title and {} thumbnail changes", when::when(r.at), r.new_videos, r.title_changes, r.thumb_changes)).collect();
-            yt::card().p(px(16.)).gap(px(8.)).child(yt::heading("What changed, research by research", None)).child(yt::bar_chart("rv-activity", &values, &labels, yt::LINK, 32.))
+            let points: Vec<RunPoint> = last.iter().map(|r| RunPoint { at: r.at, videos: r.new_videos as u64, changes: (r.title_changes + r.thumb_changes) as u64, label: format!("{}
+{} new videos · {} title and {} thumbnail changes", when::when(r.at), r.new_videos, r.title_changes, r.thumb_changes) }).collect();
+            research_chart(&points)
         });
 
         if channels.is_empty() {
@@ -588,4 +588,82 @@ pub(crate) fn tag_chip(label: String, n: Option<u32>) -> Div {
         .max_w(px(220.))
         .child(yt::line(12., FontWeight::NORMAL, yt::TEXT, label))
         .children(n.map(|n| yt::text(11., 14., FontWeight::NORMAL, yt::TEXT_2).flex_none().child(format!("{n}"))))
+}
+
+/// One research run on the chart.
+struct RunPoint {
+    at: i64,
+    videos: u64,
+    changes: u64,
+    label: String,
+}
+
+/// The research runs as a clean column chart: new videos in blue with the title and thumbnail
+/// changes stacked on top in amber, a scale with light gridlines, short dates under it and the
+/// full counts on hover.
+fn research_chart(points: &[RunPoint]) -> Div {
+    const H: f32 = 120.;
+    let max = points.iter().map(|p| p.videos + p.changes).max().unwrap_or(0).max(1);
+    // A round top for the scale (620 -> 700, 98 -> 100), so the gridlines carry plain numbers.
+    let step = 10f64.powi((max as f64).log10().floor() as i32).max(1.);
+    let top = ((max as f64 / step).ceil() * step).max(1.);
+    let y = |v: u64| (v as f64 / top) as f32 * H;
+    let legend = |color: u32, name: &'static str| div().flex().items_center().gap(px(6.)).child(div().size(px(8.)).rounded_full().bg(yt::c(color))).child(yt::line(12., FontWeight::NORMAL, yt::TEXT_2, name));
+    let grid = |frac: f32, label: String| {
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(H * frac))
+            // No height: the label and the line are centred on the value's own height.
+            .h(px(0.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(div().w(px(36.)).flex().justify_end().child(yt::line(11., FontWeight::NORMAL, yt::TEXT_3, label)))
+            .child(div().flex_1().h(px(1.)).bg(yt::tone(if frac == 0. { 0.18 } else { 0.07 })))
+    };
+    let bars = div().absolute().left(px(44.)).right_0().top_0().bottom_0().flex().items_end().gap(px(6.)).children(points.iter().enumerate().map(|(i, p)| {
+        let changes = if p.changes > 0 { y(p.changes).max(3.) } else { 0. };
+        let videos = if p.videos > 0 { y(p.videos).max(2.) } else { 0. };
+        div()
+            .id(("rv-bar", i))
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .justify_end()
+            .rounded_t(px(4.))
+            .overflow_hidden()
+            .opacity(0.9)
+            .hover(|s| s.opacity(1.).bg(yt::tone(0.05)))
+            .tooltip(mv_ui::tip(p.label.clone()))
+            .when(changes > 0., |d| d.child(div().w_full().h(px(changes)).bg(yt::c(yt::AMBER))))
+            .when(videos > 0., |d| d.child(div().w_full().h(px(videos)).bg(yt::c(yt::LINK))))
+            .when(videos + changes == 0., |d| d.child(div().w_full().h(px(1.)).bg(yt::tone(0.15))))
+    }));
+    let short = |t: i64| when::when(t).split(", ").next().unwrap_or_default().to_string();
+    let dates = div()
+        .flex()
+        .justify_between()
+        .pl(px(44.))
+        .child(yt::line(11., FontWeight::NORMAL, yt::TEXT_3, points.first().map(|p| short(p.at)).unwrap_or_default()))
+        .when(points.len() > 4, |d| d.child(yt::line(11., FontWeight::NORMAL, yt::TEXT_3, short(points[points.len() / 2].at))))
+        .child(yt::line(11., FontWeight::NORMAL, yt::TEXT_3, points.last().map(|p| short(p.at)).unwrap_or_default()));
+    let latest = points.last().map(|p| format!("Last run: {} new videos, {} changes", fmt_num(p.videos), fmt_num(p.changes))).unwrap_or_default();
+    yt::card()
+        .p(px(16.))
+        .gap(px(12.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap(px(16.))
+                .child(div().flex_1().min_w(px(200.)).flex().flex_col().gap(px(2.)).child(yt::heading("What changed, research by research", None)).child(yt::line(12., FontWeight::NORMAL, yt::TEXT_3, latest)))
+                .child(legend(yt::LINK, "New videos"))
+                .child(legend(yt::AMBER, "Title and thumbnail changes")),
+        )
+        .child(div().relative().h(px(H)).mt(px(6.)).child(grid(0., "0".into())).child(grid(0.5, fmt_num((top / 2.) as u64))).child(grid(1., fmt_num(top as u64))).child(bars))
+        .child(dates)
 }

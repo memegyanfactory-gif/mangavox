@@ -26,7 +26,10 @@
   const human = () =>
     [...document.querySelectorAll("iframe")].some((f) => {
       const r = f.getBoundingClientRect();
-      return r.width > 60 && r.height > 40 && /recaptcha|hcaptcha|turnstile|challenges\.cloudflare|captcha/i.test(f.src || "");
+      // The page always carries an invisible reCAPTCHA badge (hidden by CSS): only a check the
+      // user can see counts.
+      const shown = f.checkVisibility ? f.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) : getComputedStyle(f).visibility !== "hidden";
+      return shown && r.width > 60 && r.height > 40 && /recaptcha|hcaptcha|turnstile|challenges\.cloudflare|captcha/i.test(f.src || "");
     });
 
   // The generator's form (the page is an app that loads after the document does).
@@ -37,10 +40,15 @@
     return fail(out ? "signin" : "site", out ? "You are not signed in to Magnific." : "The image generator did not load (" + location.pathname + ").");
   }
 
+  // Signed out, the page still shows the form (with Log in / Sign up at the top) but no offer.
+  const visible = (e) => e.getBoundingClientRect().width > 0;
+  if ([...document.querySelectorAll("a,button")].some((e) => visible(e) && /^(log in|sign in)$/i.test(text(e)))) return fail("signin", "You are not signed in to Magnific.");
+
   // Model: Google Nano Banana 2.1.
   const MODEL = "Google Nano Banana 2.1";
-  const trigger = q("tti-mode-selector-v3-trigger");
-  if (!trigger) return fail("site", "The model menu was not found.");
+  // The form shows before its model menu has loaded.
+  const trigger = await until(() => q("tti-mode-selector-v3-trigger"), 20000, 500);
+  if (!trigger) return fail("site", "The model menu was not found (" + location.pathname + ").");
   if (text(trigger) !== MODEL) {
     trigger.click();
     const opt = await until(() => q("tti-model-selector-popover-model-imagen-nano-banana-2-1"), 6000);
@@ -140,12 +148,18 @@
   const label = text(go || q("image-generate-button"));
   const state = "size " + text(q("image-output-axes-trigger")) + ", images " + text(q("number-images-value")) + ", unlimited mode " + text(q("unlimited-mode-toggle-button")) + ", button: " + label.slice(0, 60);
   if (!go) return fail("site", "The Generate button did not become ready (" + state + ").");
-  if (text(q("tti-mode-selector-v3-trigger")) !== MODEL || text(q("image-output-axes-trigger")) !== "1K" || text(q("number-images-value")) !== "1" || text(q("unlimited-mode-toggle-button")) !== "ON" || !/unlimited/i.test(label)) {
+  // "Generate Unlimited", or, once the fast allowance is used, "Generate Relax mode", which the page
+  // itself calls "Credit-free generations" (slower, still free).
+  const relaxFree = /relax mode/i.test(label) && [...document.querySelectorAll("body *")].some((e) => { const t = text(e); return t.length < 120 && /relax mode/i.test(t) && /credit-free/i.test(t); });
+  if (text(q("tti-mode-selector-v3-trigger")) !== MODEL || text(q("image-output-axes-trigger")) !== "1K" || text(q("number-images-value")) !== "1" || text(q("unlimited-mode-toggle-button")) !== "ON" || !(/unlimited/i.test(label) || relaxFree)) {
     return fail("paid", "Magnific does not show this picture as Unlimited (" + state + "), so nothing was generated.");
   }
 
   const ids = () => [...document.querySelectorAll('img[src*="/production/"]')].map((i) => (i.src.match(/production\/(\d+)\//) || [])[1]).filter(Boolean);
-  const before = new Set(ids());
+  // Picture ids only grow. The last run's picture can show up on the page after this run began
+  // (it was then taken for this one, one picture behind): only an id above every one seen before,
+  // and above the last one this routine returned, is this run's.
+  const floor = Math.max(Number(window.__mangavoxLast || 0), ...ids().map(Number), 0);
   go.click();
 
   // One picture is made at a time: wait for it before anything else is asked for.
@@ -154,8 +168,13 @@
   while (Date.now() < end) {
     await sleep(2000);
     if (human()) return fail("human", "Magnific is asking to confirm you are a person.");
-    id = ids().find((x) => !before.has(x));
-    if (id) break;
+    const fresh = ids().map(Number).filter((x) => x > floor);
+    if (fresh.length) {
+      // Let the page settle, then take the newest.
+      await sleep(1500);
+      id = String(Math.max(...ids().map(Number).filter((x) => x > floor)));
+      break;
+    }
     const alert = [...document.querySelectorAll('[role="alert"]')].map(text).find((t) => t.length > 8 && /error|fail|limit|wrong|try again|not allowed|blocked|violat/i.test(t));
     if (alert) return fail("site", "Magnific said: " + alert.slice(0, 200));
   }
@@ -185,5 +204,6 @@
   }
   const clear = q("clear-prompt-button");
   if (clear && !clear.disabled) clear.click();
+  window.__mangavoxLast = Number(id);
   return { ok: true, data, w: bm.width, h: bm.height, id };
 })(__PARAMS__)

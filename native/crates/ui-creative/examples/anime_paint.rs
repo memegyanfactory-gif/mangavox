@@ -22,15 +22,41 @@ fn main() -> Result<()> {
     std::env::set_var("MANGAVOX_DATA", mv_core::paths::root());
     let mut p = Project::list().into_iter().find(|x| &x.title == title).ok_or_else(|| anyhow!("no project called {title}"))?;
     let m = CATALOG.iter().find(|m| m.id == "nano-banana-2-1").ok_or_else(|| anyhow!("Nano Banana 2.1 is not in the catalog"))?;
-    let key = images::key().ok_or_else(|| anyhow!("no Magnific key"))?;
+    // `MANGAVOX_PAINT_WEB=1`: painted on Magnific's website in the app's own browser (its profile,
+    // so its sign-in), on the Unlimited offer at 1K, instead of the API's credits.
+    let web = std::env::var("MANGAVOX_PAINT_WEB").is_ok_and(|v| v == "1");
+    if web {
+        let wall = mv_webwall::WebWall::start(mv_webwall::WallConfig { profile_dir: mv_core::paths::root().join("webview"), ..Default::default() }).map_err(|e| anyhow!("the app's browser: {e}"))?;
+        mv_webwall::set_global(wall);
+    }
+    let key = if web { String::new() } else { images::key().ok_or_else(|| anyhow!("no Magnific key"))? };
+    let res = if web { "1K".to_string() } else { res };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let mut spent = 0.;
+    // The props the board's characters rest on (a plate painted with one in it is painted again).
+    if mv_create::anime::sync_props(&mut p) {
+        p.save()?;
+    }
     let ch = p.chapter(n).cloned().ok_or_else(|| anyhow!("no chapter {n}"))?;
     let chosen: Vec<Cut> = ch.anime.cuts.iter().filter(|c| want.contains(&c.number)).cloned().collect();
     if chosen.is_empty() {
         bail!("none of those cuts are in chapter {n}");
     }
     let mut paint = |prompt: &str, refs: Vec<Reference>, aspect: &str, res: &str, out: &Path, what: &str| -> Result<()> {
+        if web {
+            println!("  painting {what} on the website ({} refs, 1K Unlimited)", refs.len());
+            // Signed out: the window stays up for the owner to sign in; tried again for 15 minutes.
+            for _ in 0..45 {
+                match rt.block_on(ui_creative::paint_on_website(prompt, &refs, aspect, out, |s| println!("    · {s}"))) {
+                    Err(e) if e.to_string().starts_with("Sign in to Magnific") || e.to_string().contains("confirm you are a person") => {
+                        println!("    · waiting for you in the Magnific window (sign in, or the check for a person)");
+                        std::thread::sleep(std::time::Duration::from_secs(20));
+                    }
+                    r => return r,
+                }
+            }
+            bail!("nobody signed in to Magnific in the window");
+        }
         println!("  painting {what} ({} refs, {res}, ~{} credits)", refs.len(), m.cost_at(res));
         rt.block_on(images::generate(m, &key, prompt, &refs, aspect, res, out, |s| println!("    · {s}")))?;
         spent += m.cost_at(res);
@@ -65,7 +91,21 @@ fn main() -> Result<()> {
         p.save()?;
     }
 
-    // 2. The plates the cuts sit on.
+    // 2. The props the chosen cuts' plates carry: a design sheet each, from the panels where
+    // someone rests on it.
+    let props: Vec<mv_create::anime::Prop> = p.props.iter().filter(|x| chosen.iter().any(|c| c.plate == x.plate) && existing(&p, x.image.as_ref()).is_none()).cloned().collect();
+    for x in &props {
+        let refs = number(ch.anime.cuts.iter().filter(|c| c.plate == x.plate && c.touched().as_deref() == Some(x.what.as_str())).filter_map(|c| c.from.first().and_then(|i| ch.anime.panels.get(*i))).take(3).map(|sp| (p.file(&sp.file), format!("the {} as the manga draws it (ignore its people, balloons and text)", x.what))).collect());
+        let out = p.new_image("props", &format!("prop-{}", x.id));
+        paint(&anime::prop_sheet(&p, x, &refs.iter().map(|r| r.caption.clone()).collect::<Vec<_>>()), refs, "16:9", "1K", &out, &format!("the {} prop sheet", x.what))?;
+        let rel = p.rel(&out);
+        if let Some(y) = p.props.iter_mut().find(|y| y.id == x.id) {
+            y.image = Some(rel);
+        }
+        p.save()?;
+    }
+
+    // 3. The plates the cuts sit on (without their props).
     let plates: Vec<String> = chosen.iter().map(|c| c.plate.clone()).fold(vec![], |mut v, x| {
         if !v.contains(&x) {
             v.push(x);
@@ -78,7 +118,17 @@ fn main() -> Result<()> {
             continue;
         }
         let place = pl.location.to_lowercase();
-        let refs = number(ch.anime.panels.iter().filter(|sp| sp.story() && !place.is_empty() && (sp.location.to_lowercase().contains(&place) || place.contains(&sp.location.to_lowercase()))).take(2).map(|sp| (p.file(&sp.file), "the manga's drawing of this place".to_string())).collect());
+        // By place name, else the panels the plate's own cuts adapt (as the app does).
+        let mut found: Vec<(PathBuf, String)> = ch.anime.panels.iter().filter(|sp| sp.story() && !place.is_empty() && (sp.location.to_lowercase().contains(&place) || place.contains(&sp.location.to_lowercase()))).take(2).map(|sp| (p.file(&sp.file), "the manga's drawing of this place".to_string())).collect();
+        for i in ch.anime.cuts.iter().filter(|c| &c.plate == id).flat_map(|c| c.from.iter().take(1)) {
+            if let Some(sp) = ch.anime.panels.get(*i).filter(|sp| sp.story()) {
+                let f = p.file(&sp.file);
+                if found.len() < 3 && !found.iter().any(|(x, _)| *x == f) {
+                    found.push((f, "the manga's drawing of this place (ignore its people, balloons and text)".into()));
+                }
+            }
+        }
+        let refs = number(found);
         let out = p.new_image("plates", &format!("plate-{}", pl.id));
         paint(&anime::plate(&p, &pl, &refs.iter().map(|r| r.caption.clone()).collect::<Vec<_>>()), refs, "16:9", &res, &out, &format!("the plate {}", pl.id))?;
         let rel = p.rel(&out);
@@ -88,62 +138,89 @@ fn main() -> Result<()> {
         p.save()?;
     }
 
-    // 3. Each cut's characters on the chroma screen, 4. composited.
+    // 4. Each cut layout first, as the app draws it: the cut's own background from its camera,
+    // the characters and props drawn into it (lit, shadowed), the cel lifted from that frame.
+    // 5. Composited: the layout under the camera; and, to check the animated path, the cel over
+    // the cut's background with the layout's shadows (saved as "-cel.png").
     let python = mv_core::paths::root().join("models").join("vfx").join("venv").join("Scripts").join("python.exe");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("..").join("python").join("anime_comp.py");
+    let comp = |job: serde_json::Value, cmd: &str, dir: &Path, number: u32| -> Result<()> {
+        let work = dir.join("anim").join("work");
+        std::fs::create_dir_all(&work)?;
+        let f = work.join(format!("{cmd}-paint.json"));
+        std::fs::write(&f, serde_json::to_vec(&job)?)?;
+        let o = std::process::Command::new(&python).arg(&script).arg(cmd).arg(&f).output().context("could not run the compositor")?;
+        let text = String::from_utf8_lossy(&o.stdout);
+        if !text.lines().any(|l| l.contains("\"ok\": true")) {
+            bail!("the compositor failed on cut {number}: {}{}", text.lines().last().unwrap_or(""), String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or(""));
+        }
+        Ok(())
+    };
     for c in &chosen {
         let kind = ch.anime.kind_of(c).to_string();
-        let mut refs: Vec<(PathBuf, String)> = vec![];
-        for x in &c.characters {
-            if let Some(m) = p.character(&x.name) {
-                if let Some(f) = existing(&p, m.sheet.as_ref()) {
-                    refs.push((f, format!("{} design sheet (face, hair, eyes, outfit and colours must match)", m.name)));
-                }
-            }
-        }
-        for i in c.from.iter().take(1) {
-            if let Some(sp) = ch.anime.panels.get(*i) {
-                refs.push((p.file(&sp.file), "the manga panel this shot adapts: keep its people, their outfits and acting, redrawn as a colour anime frame in the framing asked for (ignore its balloons, text and screentone)".into()));
-            }
-        }
         let plate = p.plates.iter().find(|x| x.id == c.plate).and_then(|x| existing(&p, x.image.as_ref()));
+        let panel = c.from.first().and_then(|i| ch.anime.panels.get(*i)).map(|sp| p.file(&sp.file)).filter(|f| f.is_file());
+        if !c.has_cast() {
+            let mut refs: Vec<(PathBuf, String)> = vec![];
+            if let Some(f) = &panel {
+                refs.push((f.clone(), "the manga panel this shot adapts".into()));
+            }
+            if let Some(f) = &plate {
+                refs.push((f.clone(), "the background of this shot".into()));
+            }
+            let refs = number(refs);
+            let out = p.new_image("layers", &format!("ch{n:03}-c{:03}-frame", c.number));
+            paint(&anime::frame(&p, c, "16:9", &refs.iter().map(|r| r.caption.clone()).collect::<Vec<_>>()), refs, "16:9", &res, &out, &format!("cut {}'s frame", c.number))?;
+            continue;
+        }
+        // (1) The cut's background.
+        let mut refs: Vec<(PathBuf, String)> = vec![];
         if let Some(f) = &plate {
-            refs.push((f.clone(), if c.has_cast() { "the background plate this frame sits on: match its light, colour and perspective, but do NOT draw it".into() } else { "the background of this shot".into() }));
+            refs.push((f.clone(), "the background plate: the place to paint again from this cut's camera".into()));
+        }
+        if let Some(f) = &panel {
+            refs.push((f.clone(), "the manga panel this cut adapts: its framing and camera angle (ignore its people, balloons and text)".into()));
         }
         let refs = number(refs);
-        let caps: Vec<String> = refs.iter().map(|r| r.caption.clone()).collect();
-        let has_cast = c.has_cast();
-        let prompt = if has_cast { anime::layer(&p, c, "16:9", &caps) } else { anime::frame(&p, c, "16:9", &caps) };
-        let out = p.new_image("layers", &format!("ch{n:03}-c{:03}-{}", c.number, if has_cast { "layer" } else { "frame" }));
-        paint(&prompt, refs, "16:9", &res, &out, &format!("cut {}'s {}", c.number, if has_cast { "characters" } else { "frame" }))?;
-        let rel = p.rel(&out);
-        if let Some(x) = p.chapter_mut(n).anime.cuts.iter_mut().find(|x| x.number == c.number) {
-            if has_cast {
-                x.layer = Some(rel.clone());
-            } else {
-                x.key = Some(rel.clone());
+        let bg = p.new_image("layers", &format!("ch{n:03}-c{:03}-bg", c.number));
+        paint(&anime::cut_bg(&p, c, "16:9", &refs.iter().map(|r| r.caption.clone()).collect::<Vec<_>>()), refs, "16:9", &res, &bg, &format!("cut {}'s background", c.number))?;
+        // (2) The layout drawn into it.
+        let mut refs: Vec<(PathBuf, String)> = vec![(bg.clone(), "this cut's background (keep it exactly, draw into it)".into())];
+        for x in c.characters.iter().filter_map(|x| p.character(&x.name)) {
+            if let Some(f) = existing(&p, x.sheet.as_ref()) {
+                refs.push((f, format!("{} model sheet (face, hair, eyes, outfit and colours must match)", x.name)));
             }
+        }
+        for x in p.props.iter().filter(|x| x.plate == c.plate) {
+            if let Some(f) = existing(&p, x.image.as_ref()) {
+                refs.push((f, format!("the {} prop sheet: draw it exactly like this", x.what)));
+            }
+        }
+        if let Some(f) = &panel {
+            refs.push((f.clone(), "the manga panel this shot adapts: its people, their acting and the framing (ignore its balloons, text and screentone)".into()));
+        }
+        let refs = number(refs);
+        let lay = p.new_image("layers", &format!("ch{n:03}-c{:03}-layout", c.number));
+        paint(&anime::layout_frame(&p, c, "16:9", &refs.iter().map(|r| r.caption.clone()).collect::<Vec<_>>()), refs, "16:9", &res, &lay, &format!("cut {}'s layout", c.number))?;
+        // (3) The cel.
+        let cel = p.new_image("layers", &format!("ch{n:03}-c{:03}-layer", c.number));
+        paint(&anime::cel(&p, c), vec![Reference { file: lay.clone(), caption: "Image 1: the cut's layout frame".into() }], "16:9", &res, &cel, &format!("cut {}'s cel", c.number))?;
+        let (bg_rel, lay_rel, cel_rel) = (p.rel(&bg), p.rel(&lay), p.rel(&cel));
+        if let Some(x) = p.chapter_mut(n).anime.cuts.iter_mut().find(|x| x.number == c.number) {
+            x.bg = Some(bg_rel);
+            x.layout = Some(lay_rel);
+            x.layer = Some(cel_rel);
         }
         p.save()?;
-        // Composite: the plate (or the whole frame) under the camera, the characters keyed over it.
         let cut_file = p.dir().join("cuts").join(format!("ch{n:03}-c{:03}-{}.mp4", c.number, mv_create::now()));
-        let still = cut_file.with_extension("png");
-        let (bg, fg) = if has_cast { (plate.as_deref(), Some((out.as_path(), false))) } else { (Some(out.as_path()), None) };
-        let job = anime::comp_job(c, &kind, &cut_file, CompParts { plate: bg, layer: fg, ..Default::default() }, &p.settings.video_aspect, true);
-        for (cmd, mut j) in [("comp", job.clone()), ("still", job)] {
-            if cmd == "still" {
-                j["out"] = serde_json::json!(still);
-            }
-            let work = p.dir().join("anim").join("work");
-            std::fs::create_dir_all(&work)?;
-            let f = work.join(format!("{cmd}-paint.json"));
-            std::fs::write(&f, serde_json::to_vec(&j)?)?;
-            let o = std::process::Command::new(&python).arg(&script).arg(cmd).arg(&f).output().context("could not run the compositor")?;
-            let text = String::from_utf8_lossy(&o.stdout);
-            if !text.lines().any(|l| l.contains("\"ok\": true")) {
-                bail!("the compositor failed on cut {}: {}{}", c.number, text.lines().last().unwrap_or(""), String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or(""));
-            }
-        }
+        let job = anime::comp_job(c, &kind, &cut_file, CompParts { plate: Some(&lay), ..Default::default() }, &p.settings.video_aspect, true);
+        comp(job.clone(), "comp", &p.dir(), c.number)?;
+        let mut still = job;
+        still["out"] = serde_json::json!(cut_file.with_extension("png"));
+        comp(still, "still", &p.dir(), c.number)?;
+        let mut check = anime::comp_job(c, &kind, &cut_file, CompParts { plate: Some(&bg), layout: Some(&lay), layer: Some((cel.as_path(), false)), ..Default::default() }, &p.settings.video_aspect, true);
+        check["out"] = serde_json::json!(cut_file.with_file_name(format!("ch{n:03}-c{:03}-cel.png", c.number)));
+        comp(check, "still", &p.dir(), c.number)?;
         let rel = p.rel(&cut_file);
         if let Some(x) = p.chapter_mut(n).anime.cuts.iter_mut().find(|x| x.number == c.number) {
             x.comp = Some(rel);

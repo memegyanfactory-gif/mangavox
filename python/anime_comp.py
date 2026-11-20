@@ -45,6 +45,8 @@ panels job: {"pages": [path, ...], "out_dir": dir, "rtl": true, "min_area": 0.03
 comp / still job:
   {"out": path, "width": 1920, "height": 1080, "fps": 24, "seconds": 3.5,
    "plate": {"path": img, "move": "push_in"} | null,
+   "layout": {"path": img} | null  (the cut's layout frame the first char layer was lifted from:
+           its shadows are carried under the layer; if the plate drifted from it, it is the plate)
    "base": {"path": video_or_image, "step": 1, "fit": "cover" | "contain" | "scan"} | null
            (a "full" cut: the animated clip itself; or, for the animatic, the manga panel)
    "card": {"title": "...", "text": "..."} | null   (animatic: a cut with no picture yet)
@@ -552,6 +554,35 @@ def light_wrap(fg, alpha, bg, amount, radius):
     return fg * (1 - k) + fg.maximum(wrap) * k
 
 
+def layout_ground(bg, layout, cel_alpha):
+    """The background a lifted layer goes over, and the shadows to lay under it. The layout frame
+    (characters drawn into the cut's background, lit, with cast and contact shadows) is divided by
+    the background: where it is darker near the characters and not under them, that is shadow.
+    When the image model moved the background while drawing into it (they differ away from the
+    characters), the layout itself is the background: it already holds them, lit and grounded."""
+    t = torch_mod()
+    F = t.nn.functional
+    h, w = bg.shape[1:]
+    lay = F.interpolate(layout[None], size=(h, w), mode="bilinear", align_corners=False)[0]
+    a = F.interpolate(cel_alpha[None], size=(h, w), mode="bilinear", align_corners=False)[0].clamp(0, 1)
+    near = (gblur(a, h / 14) > 0.01).float()
+    away = 1 - near
+    lb, ll = lum_of(bg), lum_of(lay)
+    drift = float(((ll - lb).abs() * away).sum() / away.sum().clamp(min=1))
+    if drift > 0.06:
+        return lay, None
+    # Not on or right around them (their edges differ between the two pictures) and only on the
+    # ground, below the middle of where they stand: shadows fall on the floor.
+    under = (gblur(a, h / 70) > 0.05).float()
+    rows = (a[0].max(dim=1).values > 0.5).nonzero()
+    ground = t.zeros_like(a)
+    if rows.numel():
+        ground[:, (int(rows[0]) + int(rows[-1])) // 2:, :] = 1.0
+    shade = (1 - ll / (lb + 0.03)).clamp(0, 0.85) * near * (1 - under) * ground
+    shade = t.where(shade > 0.06, shade, t.zeros_like(shade))
+    return bg, gblur(shade, h / 300)
+
+
 def contact_shadow(alpha, strength=0.45):
     """A soft shadow under a full figure: an ellipse at their feet, blurred, so they stand on
     the plate instead of floating over it. None for a close-up (no floor in frame)."""
@@ -875,6 +906,10 @@ class Cut:
         self.layers += [(Source(c["path"]), dict(c, book=True)) for c in (job.get("book") or []) if c.get("path")]
         self.fx = [(Source(x["path"]), x) for x in (job.get("fx") or []) if x.get("path")]
         self.cache = {}
+        self.shadow_t = None
+        lay = job.get("layout")
+        if lay and lay.get("path") and self.plate_t is not None and self.layers:
+            self.plate_t, self.shadow_t = layout_ground(self.plate_t, tens(Source(lay["path"]).frames[0], self.dev), self.drawing(self.layers[0][0], 0, self.layers[0][1].get("key", "green"))[1])
         # The base zoom every layer shares, from what the camera travels over.
         lw, lh = (self.plate.w, self.plate.h) if self.plate else (W, H)
         if self.base is not None and self.base_fit == "scan":
@@ -948,6 +983,9 @@ class Cut:
             # Plate, effects and characters are seen through one camera: what stands on the
             # plate's ground stays on it. Only BOOK foregrounds, nearer the lens, slide further.
             frame = frame_through(self.plate_t, z, ox, oy, W, H) if self.plate_t is not None else torch_mod().zeros((3, H, W), device=self.dev)
+            if self.shadow_t is not None:
+                # The layout's own cast and contact shadows, carried onto the clean background.
+                frame = frame * (1 - frame_through(self.shadow_t, z, ox, oy, W, H, "zeros"))
             for src, opt in self.fx:
                 if not opt.get("front", True):
                     frame = blend(frame, frame_through(self.fx_layer(src, opt, t), z, ox, oy, W, H, "zeros"), opt.get("blend", "screen"), float(opt.get("opacity", 1.0)))

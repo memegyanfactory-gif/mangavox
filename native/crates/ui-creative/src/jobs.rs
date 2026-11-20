@@ -32,6 +32,8 @@ pub(crate) enum Task {
     Plate(String),
     /// An effects element of the bank, by id.
     FxEl(String),
+    /// A prop's design sheet (something characters rest on), by id.
+    PropEl(String),
     /// A cut's characters on the chroma screen (or its whole frame when no one is in it).
     Layer { chapter: u32, cut: u32 },
     /// A cut animated (the character layer, or the whole key frame).
@@ -336,7 +338,7 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
             image_job(format!("{} · location", l.name), prompts::location(p, &l), refs, None, layout::nearest(16. / 9., shapes(p, m)), out, Box::new(move |rel| Outcome::Location { id, rel }), Box::new(rel))
         }
         Task::Page { chapter, page } => page_job(p, m, res, *chapter, *page, status),
-        Task::Panels { .. } | Task::Rough { .. } | Task::Animatic { .. } | Task::Plate(_) | Task::FxEl(_) | Task::Layer { .. } | Task::Anim { .. } | Task::Comp { .. } | Task::Episode { .. } => crate::anime_jobs::build(p, task, keys, status),
+        Task::Panels { .. } | Task::Rough { .. } | Task::Animatic { .. } | Task::Plate(_) | Task::FxEl(_) | Task::PropEl(_) | Task::Layer { .. } | Task::Anim { .. } | Task::Comp { .. } | Task::Episode { .. } => crate::anime_jobs::build(p, task, keys, status),
         Task::Clip { chapter, page, panel } => clip_job(p, *chapter, *page, *panel, status),
         Task::Stitch { chapter } => {
             let ch = p.chapter(*chapter).ok_or_else(|| anyhow!("no chapter {chapter}"))?;
@@ -1009,7 +1011,7 @@ pub(crate) fn estimate(p: &Project, keys: &Keys, tasks: &[Task]) -> (usize, f64)
     let mut images = 0;
     for t in tasks {
         images += match t {
-            Task::Sheet(_) | Task::Expressions(_) | Task::Location(_) | Task::Plate(_) | Task::FxEl(_) | Task::Layer { .. } => 1,
+            Task::Sheet(_) | Task::Expressions(_) | Task::Location(_) | Task::Plate(_) | Task::FxEl(_) | Task::PropEl(_) | Task::Layer { .. } => 1,
             Task::Page { chapter, page } => p.chapter(*chapter).and_then(|c| c.pages.iter().find(|x| x.number == *page)).map(|pg| images_per_page(p, m, pg.panels.len())).unwrap_or(1),
             _ => 0,
         };

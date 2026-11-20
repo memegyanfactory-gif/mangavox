@@ -90,7 +90,9 @@ pub fn camera_extent(kind: &str, camera: &str, seconds: f32, amount: f32) -> (f3
     let s = seconds.clamp(CUT_MIN, CUT_MAX);
     match camera {
         "pan_left" | "pan_right" | "tilt_up" | "tilt_down" => ((p.travel * s * a).clamp(0.03, 0.9), 0.),
-        "push_in" | "pull_out" => (0., (p.zoom * s * a).clamp(0.015, 0.35)),
+        // At least 8%: less reads as the characters breathing over a still background, not a
+        // camera moving through the whole frame.
+        "push_in" | "pull_out" => (0., (p.zoom * s * a).clamp(0.08, 0.35)),
         // A fast move toward the subject: most of it in the cut's first second.
         "track_in" => (0., (0.14 * a).clamp(0.08, 0.4)),
         // A whip covers half a frame or more and settles.
@@ -137,7 +139,8 @@ mod tests {
         let (t, z) = camera_extent("dialogue", "pan_right", 6., 1.);
         assert!((t - 0.12).abs() < 0.001 && z == 0.);
         let (t, z) = camera_extent("dialogue", "push_in", 5., 1.);
-        assert!(t == 0. && (z - 0.04).abs() < 0.001);
+        // The measured 0.8% a second gives 4%: raised to the 8% a push needs to read.
+        assert!(t == 0. && (z - 0.08).abs() < 0.001);
         assert!(camera_extent("action", "pan_left", 2., 1.).0 > 0.2);
         assert_eq!(camera_extent("dread", "fix", 5., 1.), (0., 0.));
         // A director's "three times as far" is kept, within what a plate can give.

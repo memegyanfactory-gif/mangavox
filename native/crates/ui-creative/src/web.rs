@@ -85,7 +85,7 @@ fn no_answer(e: &str) -> String {
 }
 
 /// Makes one picture on Magnific's website and saves it as PNG at `out`.
-pub(crate) async fn generate(prompt: &str, refs: &[Reference], aspect: &str, out: &Path, on_status: impl Fn(&str)) -> Result<()> {
+pub async fn generate(prompt: &str, refs: &[Reference], aspect: &str, out: &Path, on_status: impl Fn(&str)) -> Result<()> {
     let wall = browser()?;
     on_status("Waiting for the picture before it");
     let _turn = TURN.lock().await;

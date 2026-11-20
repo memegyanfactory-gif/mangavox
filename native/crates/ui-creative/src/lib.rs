@@ -13,6 +13,8 @@ mod manga;
 mod motion;
 mod page;
 mod web;
+/// One picture made on Magnific's website in the app's browser (for the headless painting runner).
+pub use web::generate as paint_on_website;
 
 /// The one Creative page of the app. Every visit shows the same page, so a paint queue or an AI
 /// answer still running from an earlier visit is never raced by a second copy of the project.
