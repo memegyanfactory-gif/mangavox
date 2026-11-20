@@ -29,6 +29,8 @@ pub struct Thumb {
     pub text: String,
     pub tags: Vec<String>,
     pub lettering: mv_recap::thumb::Lettering,
+    /// The last time it was put in a feed of competing thumbnails (see `feed`).
+    pub feed: Option<super::feed::FeedResult>,
 }
 
 /// A thumbnail idea from the AI.
@@ -46,15 +48,65 @@ pub struct Concept {
     pub tags: Vec<String>,
     /// The side of the picture the hero is on: "left" or "right".
     pub side: String,
+    /// The part of the big label drawn red ("SSS" of "SSS-RANK").
+    pub key: String,
+    /// Which of the [`STRATEGIES`] it uses (its style pictures go with it).
+    pub strategy: String,
 }
 
 impl Concept {
-    /// The prompt as the prompt box holds it: the art, then its labels line (see [`split_labels`]).
+    /// The prompt as the prompt box holds it: the art, then its strategy and labels lines (see
+    /// [`split_labels`]).
     pub fn full_prompt(&self) -> String {
-        let mut labels = vec![self.text.clone()];
-        labels.extend(self.tags.iter().cloned());
-        with_labels(&self.prompt, &labels, self.side.trim().to_lowercase() != "right")
+        let mut words = vec![self.text.clone()];
+        words.extend(self.tags.iter().cloned());
+        with_labels(&self.prompt, &Labels { words, hero_left: self.side.trim().to_lowercase() != "right", key: self.key.clone(), strategy: self.strategy.clone() })
     }
+}
+
+// ---------------------------------------------------------------- the strategies
+
+/// One way a recap thumbnail sells its story, chosen from the story's hook.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Strategy {
+    pub name: &'static str,
+    /// The story's hook it suits.
+    pub hook: &'static str,
+    pub scene: &'static str,
+    pub labels: &'static str,
+    /// Two thumbnails of a channel drawn in the wanted style showing this kind of scene (YouTube
+    /// video ids): sent as style pictures when the owner has set none of their own.
+    pub refs: [&'static str; 2],
+}
+
+/// The strategies, best first: ordered by how they did when put in a feed of competing thumbnails,
+/// the first two by what the owner actually clicked in a feed of ~900 real recap thumbnails (the
+/// Click Lab, 2026-11-19/20: a big glamorous woman reacting to something absurd was clicked every
+/// time it showed; a quest box won only when it took a quarter of the frame).
+/// "hero and admirers" is the fallback when nothing above fits.
+pub const STRATEGIES: &[Strategy] = &[
+    Strategy { name: "glamorous reaction", hook: "the hero does something absurd, funny or outrageous and an adult woman of the story sees it", scene: "a big glamorous adult woman of the story filling half the frame with a huge comic reaction (shock, jaw drop, blush) beside the absurd thing the hero is doing, in a bright daylight place from the story", labels: "the absurd thing named in 1-3 words (100 KG SWORD, +99 CURSED), a short line from her", refs: ["kUc91Dw4QN8", "NWaw3KHneQ0"] },
+    Strategy { name: "quest box", hook: "the system gives him a ridiculous task or reward", scene: "a big empty glowing system window taking a quarter of the frame (drawn blank: the quest is lettered into it), the hero reacting to it, a woman of the story reacting to him", labels: "the quest itself as the big label (TAME A DRAGON, LOSE 100 KG), a reward or warning tag", refs: ["htP3o93ZVtE", "kUc91Dw4QN8"] },
+    Strategy { name: "awakening comparison", hook: "he awakens or tests far above everyone", scene: "everyone at one table or line with the same object (orb, crystal, card); his is huge and blazing, theirs small and dull; they stare in shock", labels: "SSS-RANK on his, D-RANK / C-RANK on theirs", refs: ["9gsvfXt4_Mc", "RmDVez05OOU"] },
+    Strategy { name: "number gap", hook: "he gains faster or has far more", scene: "two piles, two counters or two panels side by side, one tiny and one absurd; a rival points and shouts", labels: "2 XP / 100K XP, +2 / +50", refs: ["RmDVez05OOU", "Ghz-3sM5rik"] },
+    Strategy { name: "impact frame", hook: "he beats someone far above him", scene: "the single frame of the hit landing: the opponent folding backwards, speed lines, dust, an onlooker recoiling", labels: "NEW HUNTER on him, S-RANK on the one being hit", refs: ["e-hk_OWpqhE", "TYPyx44rHx0"] },
+    Strategy { name: "beaten champion", hook: "he has already won", scene: "the hero crouched or seated, bored, a hand on the head of a floored top-ranker, a crowd in the stands", labels: "BORED on him, #1-RANK on them", refs: ["ERGRXI6e6Hg", "QxZWEjXxdjc"] },
+    Strategy { name: "one gesture", hook: "he stops something without effort", scene: "a close-up of two faces: an attack halted by one finger", labels: "SO SLOW..., TOP 1 HERO", refs: ["FUhNMBrbf84", "2d-Dv27roPg"] },
+    Strategy { name: "kneeling giant", hook: "a giant power submits to someone small", scene: "a huge figure on one knee before a small calm one", labels: "TOP 1 or DEATH GOD on the giant, a tag on the small one", refs: ["-seaUuYO4pw", "df9yotykOkU"] },
+    Strategy { name: "rank irony", hook: "he looks weak and ranks low on paper", scene: "two characters side by side with rank tags; the low-ranked one is smirking", labels: "SS-RANK HUNTER / F-RANK HUNTER", refs: ["fBev9We2HME", "_iwaj2wFYDc"] },
+    Strategy { name: "before and after", hook: "he transforms through training", scene: "a split screen with a white line down the middle: the weak version and the monstrous one", labels: "BEFORE / AFTER, DAY 1 / DAY 359", refs: ["hNJ3vF0A3YQ", "j2ezQRfWoHA"] },
+    Strategy { name: "arrival", hook: "he arrives and everyone reacts", scene: "the hero in the foreground ignoring a crowd of pointing, shouting people", labels: "1ST DAY, NEW STUDENT", refs: ["LioJPryMe40", "G3CpSi-WfNk"] },
+    Strategy { name: "hero and admirers", hook: "nothing above fits; the draw is the cast", scene: "the hero large at one side, two or three adult women filling the frame, each with a different attitude", labels: "a role tag on him, one or two small tags", refs: ["ZUnHllU0Tk0", "r453L33Cads"] },
+];
+
+/// The strategy called `name` (any case), if it is one.
+pub fn strategy(name: &str) -> Option<&'static Strategy> {
+    let n = name.trim().to_lowercase();
+    STRATEGIES.iter().find(|s| s.name == n)
+}
+
+fn strategy_table() -> String {
+    STRATEGIES.iter().enumerate().map(|(k, s)| format!("{}. \"{}\": when {}. Scene: {}. Labels: {}.", k + 1, s.name, s.hook, s.scene, s.labels)).collect::<Vec<_>>().join("\n")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -154,10 +206,14 @@ pub fn resolve(prompt: &str, cast: &[Cast], first: usize) -> (String, Vec<usize>
 /// What a prompt asks for besides the picture.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Labels {
-    /// The big label on the hero first, then the small tags.
+    /// The big label first, then the small tags.
     pub words: Vec<String>,
-    /// The hero is on the left of the picture (the labels are laid out from his side).
+    /// The hero is on the left of the picture (the default places are laid out from his side).
     pub hero_left: bool,
+    /// The part of the big label drawn red.
+    pub key: String,
+    /// The strategy's name (empty: none given).
+    pub strategy: String,
 }
 
 impl Labels {
@@ -169,15 +225,27 @@ impl Labels {
     }
 }
 
-/// `prompt` with its labels as the last line: `Labels: JOBLESS | BLANK CHECK | SUSPICIOUS... (hero left)`.
-/// The picture is drawn without any words (image models misspell them); the app letters them on.
-pub fn with_labels(prompt: &str, words: &[String], hero_left: bool) -> String {
+/// `prompt` with its strategy and labels as its last lines:
+/// `Strategy: awakening comparison` and `Labels: *SSS*-RANK | D-RANK | C-RANK (hero left)`, the red
+/// key between stars. The picture is drawn without any words (image models misspell them); the app
+/// letters them on.
+pub fn with_labels(prompt: &str, l: &Labels) -> String {
     let (art, _) = split_labels(prompt);
-    let words: Vec<&str> = words.iter().map(|w| w.trim().trim_matches('"')).filter(|w| !w.is_empty()).collect();
-    if words.is_empty() {
-        return art;
+    let mut out = art;
+    if let Some(s) = strategy(&l.strategy) {
+        out.push_str(&format!("\nStrategy: {}", s.name));
     }
-    format!("{art}\nLabels: {} (hero {})", words.join(" | "), if hero_left { "left" } else { "right" })
+    let words: Vec<String> = l.words.iter().map(|w| w.trim().trim_matches('"').to_string()).filter(|w| !w.is_empty()).collect();
+    if let Some(first) = words.first() {
+        let key = l.key.trim().trim_matches('*');
+        let big = match (!key.is_empty()).then(|| first.to_lowercase().find(&key.to_lowercase())).flatten() {
+            Some(i) => format!("{}*{}*{}", &first[..i], &first[i..i + key.len()], &first[i + key.len()..]),
+            None => first.clone(),
+        };
+        let rest: Vec<String> = std::iter::once(big).chain(words[1..].iter().cloned()).collect();
+        out.push_str(&format!("\nLabels: {} (hero {})", rest.join(" | "), if l.hero_left { "left" } else { "right" }));
+    }
+    out
 }
 
 fn quoted(s: &str) -> Option<(usize, usize)> {
@@ -187,12 +255,13 @@ fn quoted(s: &str) -> Option<(usize, usize)> {
     Some((from, from + len))
 }
 
-/// A prompt as (the art to draw, the labels to letter on it). The labels are the `Labels:` line
-/// (`Title: "..."` is read as one label); a prompt written the older way, with the words inside it
-/// (`bold text: "..."`), gives them up the same way, so the image model is never asked to write.
+/// A prompt as (the art to draw, what goes with it). The labels are the `Labels:` line (`Title:
+/// "..."` is read as one label), the strategy the `Strategy:` line; a prompt written the older way,
+/// with the words inside it (`bold text: "..."`), gives them up the same way, so the image model is
+/// never asked to write.
 pub fn split_labels(prompt: &str) -> (String, Labels) {
     let mut art: Vec<&str> = vec![];
-    let mut out = Labels { words: vec![], hero_left: true };
+    let mut out = Labels { hero_left: true, ..Default::default() };
     for line in prompt.lines() {
         let t = line.trim_start();
         let low = t.to_lowercase();
@@ -203,6 +272,17 @@ pub fn split_labels(prompt: &str) -> (String, Labels) {
             };
             out.hero_left = !side.contains("right");
             out.words = words.split('|').map(|w| w.trim().trim_matches(|c| c == '"' || c == '\u{201c}' || c == '\u{201d}').trim().to_string()).filter(|w| !w.is_empty()).take(3).collect();
+            // The red key: between stars in the big label.
+            if let Some(first) = out.words.first_mut() {
+                if let (Some(a), Some(b)) = (first.find('*'), first.rfind('*')) {
+                    if b > a {
+                        out.key = first[a + 1..b].trim().to_string();
+                    }
+                }
+                *first = first.replace('*', "");
+            }
+        } else if let Some(rest) = low.starts_with("strategy:").then(|| &t["strategy:".len()..]) {
+            out.strategy = strategy(rest).map(|s| s.name.to_string()).unwrap_or_default();
         } else if low.starts_with("title:") {
             let rest = &t["title:".len()..];
             let text = quoted(rest).map(|(a, b)| rest[a..b].trim().to_string()).unwrap_or_else(|| rest.trim().to_string());
@@ -260,7 +340,7 @@ pub fn image_prompt(title: &str, resolved: &str, refs: &[(String, String)], firs
             p.push_str(&format!("\n- Image {}: {name}{}", first + k + 1, if look.is_empty() { String::new() } else { format!(", {look}") }));
         }
     }
-    p.push_str("\n\nAbsolutely no text anywhere: no letters, no numbers, no labels, no arrows, no speech bubbles, no sound effects, no signs with writing, no signature, no watermark, no logo, no border.");
+    p.push_str("\n\nAbsolutely no text anywhere (an empty window or box the scene asks for stays blank): no letters, no numbers, no labels, no arrows, no speech bubbles, no sound effects, no signs with writing, no signature, no watermark, no logo, no border.");
     p
 }
 
@@ -270,16 +350,38 @@ pub fn edit_prompt(change: &str) -> String {
     format!("Edit Image 1. Keep everything exactly as it is: the same characters, faces, hair, poses and positions, the same background and the same art style. Make only this change: {}\nDo not add or remove anyone or anything else. No text, no letters, no arrows, no watermark, no border.", change.trim())
 }
 
-// ---------------------------------------------------------------- where the labels go
+// ---------------------------------------------------------------- the crop and where the labels go
+
+/// Asks a model that can see the finished picture (attached, 1280x720) how to crop it tighter.
+pub fn crop_prompt() -> (String, String) {
+    let system = "You crop a finished YouTube thumbnail so it works in a feed, where it is seen at 320x180 for under a second. You are shown the picture; it is 1280 wide and 720 high, x from the left, y from the top.\n\
+Choose ONE 16:9 rectangle that keeps the main character's face, the key object of the scene (what the story is about: a glowing orb, a raised hand, a pile of gold) and one or two reacting faces as large as possible, and cuts bystanders, empty sky, floor and anything small. Never cut a face in half; keep the main character's whole head. The rectangle is at least 820 wide (the picture must stay sharp) and fits inside the picture; when the picture is already tight, give the whole picture.\n\
+Reply with JSON only: {\"crop\":[x,y,width,height]}";
+    (system.to_string(), "Look at the picture and give the crop.".to_string())
+}
+
+/// The model's crop, or `None` when it is unusable or barely changes anything (then none is made).
+pub fn parse_crop(raw: &str) -> Option<[f32; 4]> {
+    let v = mv_recap::extract_json(raw)?;
+    let a = v.get("crop")?.as_array()?;
+    let n: Vec<f32> = a.iter().filter_map(Value::as_f64).map(|x| x as f32).collect();
+    let [x, y, w, _] = <[f32; 4]>::try_from(n).ok()?;
+    // 16:9 from its width, moved inside the frame.
+    let w = w.clamp(820., 1280.);
+    let h = w * 9. / 16.;
+    let c = [x.clamp(0., 1280. - w), y.clamp(0., 720. - h), w, h];
+    (mv_recap::thumb::crop_ok(&c) && w < 1250.).then_some(c)
+}
 
 /// Asks a model that can see the finished picture (attached, 1280x720) where its labels go.
 pub fn placement_prompt(labels: &Labels) -> (String, String) {
     let system = "You place the labels on a finished YouTube thumbnail, the way the big manhwa recap channels do. You are shown the picture; it is 1280 wide and 720 high, x from the left, y from the top. Labels are heavy yellow capitals with a black outline.\n\
-- The BIG label (letters about 96 high, about 44 wide each) sits in the top part of the picture right beside the main character's head, on the side away from the frame edge, over background, never over a face. An arrow runs from its near end to the edge of his hair.\n\
-- Each SMALL tag (letters about 42 high, about 20 wide each) sits beside the person or object it names, over background, hair or clothes, never over a face or a hand.\n\
+- The BIG label (letters about 128 high, about 60 wide each) sits beside the key object of the scene or the main character's head, over background, never over a face. An arrow runs from its near end to the thing it names (the object, or the edge of his hair): give that point as \"points_at\".\n\
+- Each SMALL tag (letters about 50 high, about 24 wide each) sits beside the person or object it names, over background, hair or clothes, never over a face or a hand.\n\
+- When the picture has a big empty glowing window or box, the BIG label goes INSIDE it, as large as fits, and \"points_at\" is the hero's head.\n\
 - Nothing in the bottom-right corner (YouTube puts the video length there), nothing cut by the frame, labels never overlap.\n\
-Reply with JSON only: {\"hero_head\":[x,y],\"label\":{\"x\":0,\"y\":0,\"size\":96},\"tags\":[{\"x\":0,\"y\":0,\"size\":42}]} where each x,y is the label's top-left corner and hero_head is the point on the edge of his hair the arrow points at. Give one entry in \"tags\" per small tag, in the order given.";
-    let mut user = format!("The big label, on the main character (he is on the {} of the picture): \"{}\"\n", if labels.hero_left { "left" } else { "right" }, labels.label().to_uppercase());
+Reply with JSON only: {\"points_at\":[x,y],\"label\":{\"x\":0,\"y\":0,\"size\":128},\"tags\":[{\"x\":0,\"y\":0,\"size\":50}]} where each x,y is the label's top-left corner. Give one entry in \"tags\" per small tag, in the order given.";
+    let mut user = format!("The big label (the main character is on the {} of the picture): \"{}\"\n", if labels.hero_left { "left" } else { "right" }, labels.label().to_uppercase());
     for (k, t) in labels.tags().iter().enumerate() {
         user.push_str(&format!("Small tag {}: \"{}\"\n", k + 1, t.to_uppercase()));
     }
@@ -290,10 +392,10 @@ Reply with JSON only: {\"hero_head\":[x,y],\"label\":{\"x\":0,\"y\":0,\"size\":9
 /// The model's placement as a lettering, or `None` when it is unusable (then the default places
 /// are kept): every label inside the frame, a readable size, and no two labels overlapping.
 pub fn parse_placement(raw: &str, labels: &Labels) -> Option<mv_recap::thumb::Lettering> {
-    use mv_recap::thumb::{label_width, Arrow, Label, Lettering, LETTER_H, LETTER_W};
+    use mv_recap::thumb::{label_width, Arrow, Label, Lettering, LABEL_SIZE, LETTER_H, LETTER_W, TAG_SIZE};
     let v = mv_recap::extract_json(raw)?;
     let num = |o: &Value, k: &str| o.get(k).and_then(Value::as_f64).map(|n| n as f32);
-    let place = |o: &Value, text: &str, lo: f32, hi: f32, base: f32| -> Option<Label> {
+    let place = |o: &Value, text: &str, lo: f32, hi: f32, base: f32, key: &str| -> Option<Label> {
         let mut size = num(o, "size").unwrap_or(base).clamp(lo, hi);
         let (x, y) = (num(o, "x")?, num(o, "y")?);
         // Too wide for where it was put: smaller, down to the smallest readable.
@@ -302,28 +404,29 @@ pub fn parse_placement(raw: &str, labels: &Labels) -> Option<mv_recap::thumb::Le
         if w > room {
             size = (size * room / w).max(lo * 0.8);
         }
-        let l = Label { text: text.to_string(), x, y, size };
+        let l = Label { text: text.to_string(), x, y, size, key: key.to_string() };
         (x >= 0. && y >= -4. && x + label_width(text, size) <= LETTER_W && y + size * 1.1 <= LETTER_H && !(x + label_width(text, size) > 1040. && y + size > 600.)).then_some(l)
     };
     let label = labels.label();
     if label.is_empty() {
         return None;
     }
-    let big = place(v.get("label")?, label, 64., 110., 96.)?;
-    let mut out = Lettering { labels: vec![big.clone()], arrows: vec![] };
-    let head = v.get("hero_head").and_then(Value::as_array).filter(|a| a.len() == 2).and_then(|a| Some([a[0].as_f64()? as f32, a[1].as_f64()? as f32]));
-    if let Some(to) = head.filter(|h| (0. ..=LETTER_W).contains(&h[0]) && (0. ..=LETTER_H).contains(&h[1])) {
-        // From the label's end nearest the head, at mid height, stopping short of the hair.
+    let big = place(v.get("label")?, label, 100., 140., LABEL_SIZE, &labels.key)?;
+    let mut out = Lettering { labels: vec![big.clone()], ..Default::default() };
+    let target = v.get("points_at").or_else(|| v.get("hero_head")).and_then(Value::as_array).filter(|a| a.len() == 2).and_then(|a| Some([a[0].as_f64()? as f32, a[1].as_f64()? as f32]));
+    if let Some(to) = target.filter(|h| (0. ..=LETTER_W).contains(&h[0]) && (0. ..=LETTER_H).contains(&h[1])) {
+        // From the label's end nearest the target, under its middle or at mid height.
         let (left, right) = (big.x - 6., big.x + label_width(label, big.size) + 6.);
-        let from = [if (to[0] - left).abs() <= (to[0] - right).abs() { left } else { right }, big.y + big.size * 0.6];
+        let below = to[1] > big.y + big.size * 1.3 && (left..=right).contains(&to[0]);
+        let from = if below { [to[0].clamp(left + 20., right - 20.), big.y + big.size * 1.12] } else { [if (to[0] - left).abs() <= (to[0] - right).abs() { left } else { right }, big.y + big.size * 0.6] };
         let len = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
         if len >= 30. {
-            out.arrows.push(Arrow { from, to, width: 22. });
+            out.arrows.push(Arrow { from, to, width: 30. });
         }
     }
     let tags = v.get("tags").and_then(Value::as_array).cloned().unwrap_or_default();
     for (text, o) in labels.tags().iter().zip(&tags) {
-        if let Some(l) = place(o, text, 30., 52., 42.) {
+        if let Some(l) = place(o, text, 38., 60., TAG_SIZE, "") {
             out.labels.push(l);
         }
     }
@@ -356,27 +459,35 @@ const CLICK_GUIDE: &str = "What the biggest recap channels' thumbnails do (study
 - Label and arrow: a yellow arrow at the hero with a 1-2 word yellow label ('MC', 'NEWBIE', 'S-RANK?'), or one short line a character says.\n\
 - Romance beat, when the story has one: a heroine blushing at the oblivious hero.\n\
 - The hook as a scene: show the premise happening (what he does, to whom, where) instead of a generic pose.\n\
-Overused by small channels, and below average in the data: the generic aura / lightning power pose, the hero alone holding a weapon, split or multi-panel frames, dark caves and night voids, status windows and stat numbers, kneeling crowds, tiny-hero-versus-giant shots. Use one only when it IS this story's hook, and even then put people reacting in the frame.\n\
+Overused by small channels, and below average in the data: the generic aura / lightning power pose, the hero alone holding a weapon, split or multi-panel frames, dark caves and night voids, small status windows and stat numbers (a system window only works BIG: a quarter of the frame), kneeling crowds, tiny-hero-versus-giant shots. Use one only when it IS this story's hook, and even then put people reacting in the frame.\n\
 Rules: one clear scene, readable faces, 2-3 dominant colours, nothing small. Never invent powers, weapons, places or events that are not in the story: exaggerate what is there.";
 
-/// How a concept is designed and its prompt written: the recipe the channel's own accepted
-/// thumbnails are made with (each rule is there because breaking it gave a rejected picture).
+/// How a concept is designed and its prompt written: the system the channel's thumbnails are made
+/// with, tested by putting them in feeds of competing thumbnails (each rule is there because a
+/// thumbnail that broke it lost the click).
 const RECIPE: &str = "HOW TO DESIGN EACH ONE\n\
+- A STORY, NOT A POSE: one situation with a visible gap the viewer reads in a second (a giant blazing orb beside three small dull ones; a mountain of gold beside two coins; a bored hero with a hand on a beaten champion). A group portrait of people standing around loses to a story scene.\n\
+- THE STRATEGY: pick it from the story's hook, from the STRATEGY TABLE below, preferring the higher ones (they won more often in the feed). \"hero and admirers\" only when nothing above fits the hook.\n\
 - THE CAST IS REAL: only this series' own characters, by their handles, each with their real hair, eyes, accessories and outfit from the character list. A fan must recognise everyone at a glance.\n\
-- THE HERO: very large in the foreground at one side (the left or right third), from the chest up, cropped by the frame. A cold, unimpressed, closed-mouth face, his fringe throwing a shadow across his eyes; turned three-quarters, looking down or away and ignoring everyone. ONE power cue only that is true to the story (one glowing eye with a flame trail, an orb in his hand, an aura). He never grins at the viewer.\n\
-- THE OTHERS: two or three of the series' other main characters filling the rest of the frame at slightly different depths, large: each from the top of the head near the top edge down to the thighs. Each has a DIFFERENT attitude towards the hero (smug, annoyed with arms crossed, flirty, mocking, suspicious): several are judging or underestimating him, and that is the hook. When the story has adult women around the hero, they are the ones to draw, as the main attraction: glamorous grown adults with a mature beautiful face and a very voluptuous anime hourglass figure (a full bust, a narrow waist, wide hips, thick thighs), in their own outfit cut tight and fashionable, fully clothed, in a casual confident pose (hand on hip, arms crossed with a hip cocked, twirling hair, looking over a shoulder). Limits that always hold: adults only, clothed, nothing explicit or see-through; a character who is a child or teenager in the story is drawn plainly or left out, and a story without adult women gets rivals, mentors or enemies instead.\n\
-- THE PLACE: a crisp, detailed anime background from the story with bright daylight and a vivid blue sky with clouds (tall windows over a skyline, a courtyard, an arena, a classroom). Never a plain wall, never night without a strong glow.\n\
-- CLEAN: no sparkles, hearts, particles or wind effects. One glow, everything else crisp.\n\
-HOW TO WRITE ITS PROMPT (four short paragraphs for an image model; no style words at all, the style comes from reference pictures)\n\
-1. \"Exactly N people and nobody else: one young man and three adult women. No extra people, no duplicates.\"\n\
-2. \"LEFT THIRD, foreground, very large, from the chest up and cropped by the left and bottom edges: ...\" the hero: age, hair, the shadow over his eyes, expression, where he looks, the one power cue, his clothes with colours.\n\
-3. \"CENTRE AND RIGHT, ...\" the others, one line each (\"- Centre: ...\", \"- Far right, nearest the camera, cropped by the right edge: ...\"): who they are in a few words, hair, eyes, accessories, outfit with colours, pose, expression, and where they look.\n\
-4. \"BACKGROUND: ...\".\n\
-Simple poses, nothing in mid-air, and never any words, labels, arrows or bubbles to draw: the app letters them on afterwards, so they are always spelled right.\n\
+- THREE OR FOUR BIG SHAPES: the hero, the hook object, one or two reacting faces; frame them tight and cut bystanders. At feed size anything smaller than a face is noise.\n\
+- ONE FOCAL POINT: the brightest, most saturated thing in the picture is the hook object or the hero's face.\n\
+- REACTIONS: every face but the hero's reacts (shock, disbelief, a blush, anger). A calm bystander is wasted space. The hero stays calm, bored or smirking while the thing he does is huge.\n\
+- COLOUR: bright, high-key and flat, the way the channels the owner clicks most colour theirs: a story-true place in sunny daylight (a blue sky with big clouds, a colourful street, an arena with banners) or one strong saturated colour pair (gold on deep violet, red on teal), clean flat shading, never dark and painterly. NEVER a white, grey or pale background: it catches the eye in a feed and loses the click.\n\
+- FUNNY AND FLIRTY: a gag alone sits in the middle; a gag WITH an adult woman of the story reacting big to it (shocked, flustered, blushing) wins. When the story has one, let her be large in the frame.\n\
+- WOMEN, when the story has adult women around the hero: glamorous grown adults with a mature beautiful face and a voluptuous anime hourglass figure, in their own outfit cut tight and fashionable, fully clothed, in a confident pose. Limits that always hold: adults only, clothed, nothing explicit or see-through; a character who is a child or teenager in the story is drawn plainly or left out.\n\
+HOW TO WRITE ITS PROMPT (short paragraphs for an image model; no style words at all, the style comes from reference pictures)\n\
+1. \"Exactly N people and nobody else: ... No extra people, no duplicates.\"\n\
+2. The scene of the strategy, framed tight: where the hero is, how large and cropped by which edges, his expression, the hook object and how it shows the gap.\n\
+3. Each other character, one line each: who they are in a few words, hair, eyes, accessories, outfit with colours, where they are and how they react.\n\
+4. \"BACKGROUND: ...\" with its colour pair and its one glow.\n\
+Simple poses, nothing in mid-air, and never any words, numbers, labels, arrows or bubbles to draw: the app letters them on afterwards, so they are always spelled right.\n\
 THE LABELS (not a title; the picture carries the thumbnail and the words are tags)\n\
-- `text`: ONE big label of one or two words that names the hero with irony: the weakest-sounding tag on the strongest person (JOBLESS, F-RANK, NEW STUDENT, BETRAYED, BORED, TRASH?). Never the manga's or a character's name.\n\
-- `tags`: one or two small tags of one to three words, each for another character or an object in the picture (BLANK CHECK on the cheque she holds, SUSPICIOUS... on the one glaring, S-RANK, TOP 1).\n\
-- `side`: \"left\" or \"right\", the side the hero is on.";
+- `text`: ONE big label of one to three words for the hook object or the hero (SSS-RANK on his orb, JOBLESS on the hero, 100K XP on his counter). Irony wins: the weakest-sounding tag on the strongest person. Never the manga's or a character's name.\n\
+- `key`: the part of `text` drawn red, the shocking part (\"SSS\" of \"SSS-RANK\", \"100K\").\n\
+- `tags`: AT MOST two small tags of one to three words for other characters or objects (D-RANK, C-RANK; #1-RANK on the beaten one), or one short line of dialogue.\n\
+- `side`: \"left\" or \"right\", the side the hero is on.\n\
+- `strategy`: the strategy's name exactly as in the table.\n\
+STRATEGY TABLE (best first)\n";
 
 /// System and user prompt for 4 thumbnail concepts; the answer is JSON only.
 pub fn concepts_prompt(b: &Brief) -> (String, String) {
@@ -384,9 +495,10 @@ pub fn concepts_prompt(b: &Brief) -> (String, String) {
     let learned = super::click::model().thumbnail_digest();
     let system = format!(
         "You are a thumbnail art director for a top manhwa recap channel. You know why viewers click and you design thumbnails that are clickbait but honest to the story.\n\n{CLICK_GUIDE}\n\n{learned}\n\
-{RECIPE}\n\n\
-First find this story's hook: its premise in one sentence and what everyone around the hero gets wrong about him. Then write 6 different concepts that sell that hook, the strongest first: vary who stands with the hero, their attitudes, the place, his power cue and the labels. Where this recipe and the older craft guide above disagree, the recipe wins (it is what the channel's accepted thumbnails are made with). In each prompt, name characters ONLY with these handles so their face references get attached: {}.\n\
-Reply with JSON only: {{\"analysis\":\"2-3 sentences: the hook and what this manga's thumbnails should sell\",\"concepts\":[{{\"name\":\"short name\",\"why\":\"one sentence: who is in it, what each thinks of him, and why it gets the click\",\"prompt\":\"\",\"text\":\"JOBLESS\",\"tags\":[\"BLANK CHECK\",\"SUSPICIOUS...\"],\"side\":\"left\"}}]}}",
+{RECIPE}{}\n\n\
+First find this story's hook: its premise in one sentence and its single most surprising gap (a weak person holds absurd power, a nobody's reward dwarfs everyone's, the liar is believed), said in under ten words. Then write 6 different concepts that sell that hook, the strongest first, using at least three different strategies from the table (the best fit first). Where this system and the older craft guide above disagree, this system wins. In each prompt, name characters ONLY with these handles so their face references get attached: {}.\n\
+Reply with JSON only: {{\"analysis\":\"2-3 sentences: the hook in under ten words, then the strategy that shows it best and why\",\"concepts\":[{{\"name\":\"short name\",\"strategy\":\"awakening comparison\",\"why\":\"one sentence: the gap it shows and why it gets the click\",\"prompt\":\"\",\"text\":\"SSS-RANK\",\"key\":\"SSS\",\"tags\":[\"D-RANK\",\"C-RANK\"],\"side\":\"left\"}}]}}",
+        strategy_table(),
         if names.is_empty() { "(no characters known yet; describe the hero instead)".to_string() } else { names.join(", ") }
     );
     let mut u = format!("Manga: {}\n", b.title);
@@ -425,8 +537,9 @@ pub fn improve_prompt(b: &Brief, draft: &str) -> (String, String) {
     let learned = super::click::model().thumbnail_digest();
     let system = format!(
         "You are a thumbnail art director for a top manhwa recap channel. You turn a rough idea into one image prompt that an image model (Nano Banana, GPT image, Seedream, Flux) renders into a thumbnail people click, while staying honest to the story.\n\n{CLICK_GUIDE}\n\n{learned}\n\
-{RECIPE}\n\n\
-Write the prompt's paragraphs, then on its own last line the labels, exactly like this: Labels: JOBLESS | BLANK CHECK | SUSPICIOUS... (hero left)\nName characters ONLY with these handles so their face references get attached: {}. Keep every handle the draft used, and the draft's labels when it has them. Reply with those two things only: no heading, no quotes, no markdown.",
+{RECIPE}{}\n\n\
+Write the prompt's paragraphs, then on their own last two lines the strategy and the labels, exactly like this (the red part of the big label between stars):\nStrategy: awakening comparison\nLabels: *SSS*-RANK | D-RANK | C-RANK (hero left)\nName characters ONLY with these handles so their face references get attached: {}. Keep every handle the draft used, and the draft's strategy and labels when it has them. Reply with those things only: no heading, no quotes, no markdown.",
+        strategy_table(),
         if names.is_empty() { "(no characters known yet)".to_string() } else { names.join(", ") }
     );
     let ask = if draft.trim().is_empty() {
@@ -468,7 +581,8 @@ pub fn parse_concepts(raw: &str) -> Option<(String, Vec<Concept>)> {
             let (prompt, inside) = split_labels(&s(c, "prompt"));
             let text = Some(s(c, "text")).filter(|t| !t.is_empty()).unwrap_or_else(|| inside.label().to_string());
             let tags: Vec<String> = c.get("tags").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).take(2).collect();
-            Concept { name: s(c, "name"), why: s(c, "why"), prompt, text, tags, side: s(c, "side") }
+            let strategy = strategy(&s(c, "strategy")).map(|x| x.name.to_string()).unwrap_or_default();
+            Concept { name: s(c, "name"), why: s(c, "why"), prompt, text, tags, side: s(c, "side"), key: s(c, "key").trim_matches('*').to_string(), strategy }
         })
         .filter(|c| !c.prompt.is_empty())
         .take(6)
@@ -512,56 +626,77 @@ mod tests {
 
     #[test]
     fn the_labels_ride_on_the_prompt_and_never_reach_the_image_model() {
-        let c = Concept { prompt: "Exactly 2 people and nobody else: @Ruko, left third.".into(), text: "jobless".into(), tags: vec!["blank check".into()], side: "Left".into(), ..Default::default() };
+        let c = Concept { prompt: "Exactly 2 people and nobody else: @Ruko, left third.".into(), text: "sss-rank".into(), key: "sss".into(), tags: vec!["d-rank".into()], side: "Left".into(), strategy: "Awakening Comparison".into(), ..Default::default() };
         let full = c.full_prompt();
-        assert_eq!(full, "Exactly 2 people and nobody else: @Ruko, left third.\nLabels: jobless | blank check (hero left)");
+        assert_eq!(full, "Exactly 2 people and nobody else: @Ruko, left third.\nStrategy: awakening comparison\nLabels: *sss*-rank | d-rank (hero left)");
         let (art, l) = split_labels(&full);
-        assert_eq!((art.as_str(), l.label(), l.tags(), l.hero_left), (c.prompt.as_str(), "jobless", &["blank check".to_string()][..], true));
-        // The hero's side, setting labels again, and no labels.
-        assert!(!split_labels("A scene.\nlabels: \"F-RANK\" | TOP 1 | a | too many (hero right)").1.hero_left);
-        assert_eq!(split_labels("A scene.\nlabels: \"F-RANK\" | TOP 1 | a | too many (hero right)").1.words, vec!["F-RANK", "TOP 1", "a"]);
-        assert_eq!(with_labels(&full, &["BORED".into()], false), "Exactly 2 people and nobody else: @Ruko, left third.\nLabels: BORED (hero right)");
-        assert_eq!(with_labels(&full, &[" ".into()], true), c.prompt);
+        assert_eq!((art.as_str(), l.label(), l.tags(), l.hero_left, l.key.as_str(), l.strategy.as_str()), (c.prompt.as_str(), "sss-rank", &["d-rank".to_string()][..], true, "sss", "awakening comparison"));
+        // The hero's side, at most three words, an unknown strategy, setting labels again, and none.
+        let r = split_labels("A scene.\nstrategy: dance battle\nlabels: \"F-RANK\" | TOP 1 | a | too many (hero right)").1;
+        assert_eq!((r.hero_left, r.words.clone(), r.strategy.as_str(), r.key.as_str()), (false, vec!["F-RANK".to_string(), "TOP 1".into(), "a".into()], "", ""));
+        let again = Labels { words: vec!["BORED".into()], hero_left: false, ..Default::default() };
+        assert_eq!(with_labels(&full, &again), "Exactly 2 people and nobody else: @Ruko, left third.\nLabels: BORED (hero right)");
+        assert_eq!(with_labels(&full, &Labels { words: vec![" ".into()], ..Default::default() }), c.prompt);
         // A title line, and a prompt written the older way: one label each.
         assert_eq!(split_labels("A scene.\ntitle: \"He Wins\" key: wins").1.words, vec!["He Wins"]);
         let (art, l) = split_labels("@Ruko grins, right third, bold yellow text: \"HE EATS SWORDS\". Onlookers gasp.");
         assert_eq!((art.as_str(), l.label()), ("@Ruko grins, right third. Onlookers gasp.", "HE EATS SWORDS"));
-        assert_eq!(split_labels("Just a scene."), ("Just a scene.".to_string(), Labels { words: vec![], hero_left: true }));
+        assert_eq!(split_labels("Just a scene."), ("Just a scene.".to_string(), Labels { hero_left: true, ..Default::default() }));
 
         // With style pictures attached the style is theirs: no style words, the characters after them.
         let p = image_prompt("Sword Eater", &full, &[("Ruko".into(), "black hair".into())], 2, 2);
         assert!(p.starts_with(SAME_ARTIST) && p.contains("Images 1 to 2 are the art style references.") && p.contains("Image 3: Ruko, black hair"), "{p}");
         assert!(p.contains("Exactly 2 people") && p.contains("Absolutely no text") && p.contains("no sparkles"), "{p}");
-        assert!(!p.to_lowercase().contains("jobless") && !p.contains("Labels:") && !p.contains("glossy"), "{p}");
+        assert!(!p.to_lowercase().contains("sss-rank") && !p.contains("Labels:") && !p.contains("Strategy:") && !p.contains("glossy"), "{p}");
         // Without any, the style is described.
         let plain = image_prompt("Sword Eater", &full, &[], 0, 0);
         assert!(plain.contains("modern anime key-visual style") && !plain.contains("same artist"), "{plain}");
         assert!(edit_prompt("make her jacket red\nLabels: X").contains("Make only this change: make her jacket red\n"));
-        // The AI is told the same.
+        // The AI is told the same, with every strategy.
         let b = Brief { title: "T", cast: &cast(), story: &[], comparable: &[], reference: &[], hook: "" };
         let (system, _) = concepts_prompt(&b);
-        assert!(system.contains("THE CAST IS REAL") && system.contains("Exactly N people") && system.contains("\"tags\"") && system.contains("adults only") && !system.contains("bold text:"), "{system}");
-        assert!(improve_prompt(&b, "").0.contains("Labels: JOBLESS | BLANK CHECK | SUSPICIOUS... (hero left)"));
+        assert!(system.contains("A STORY, NOT A POSE") && system.contains("NEVER a white") && system.contains("AT MOST two small tags") && system.contains("adults only") && !system.contains("bold text:"), "{system}");
+        assert!(STRATEGIES.iter().all(|s| system.contains(&format!("\"{}\"", s.name))), "{system}");
+        assert!(improve_prompt(&b, "").0.contains("Labels: *SSS*-RANK | D-RANK | C-RANK (hero left)"));
+        // Every strategy has its style pair; a name finds its strategy whatever its case.
+        assert!(STRATEGIES.iter().all(|s| s.refs.iter().all(|r| super::super::magnific::youtube_id(r).as_deref() == Some(*r))));
+        assert_eq!(strategy(" Beaten Champion ").map(|s| s.refs[1]), Some("QxZWEjXxdjc"));
+        assert_eq!(STRATEGIES.last().map(|s| s.name), Some("hero and admirers"));
+        // What the owner's own clicks taught comes first.
+        assert_eq!(STRATEGIES[0].name, "glamorous reaction");
+        assert!(system.contains("FUNNY AND FLIRTY") && system.contains("high-key") && system.contains("a quarter of the frame"), "{system}");
+        assert!(placement_prompt(&Labels::default()).0.contains("INSIDE it"));
     }
 
     #[test]
-    fn a_model_that_sees_the_picture_places_the_labels() {
-        let labels = Labels { words: vec!["jobless".into(), "blank check".into(), "suspicious...".into()], hero_left: true };
+    fn a_model_that_sees_the_picture_crops_it_and_places_the_labels() {
+        // The crop: 16:9 from its width, moved inside the frame; none when it is barely a crop.
+        assert!(crop_prompt().0.contains("at least 820 wide"));
+        assert_eq!(parse_crop(r#"{"crop":[200,100,1000,500]}"#), Some([200., 100., 1000., 562.5]));
+        assert_eq!(parse_crop(r#"{"crop":[600,400,1000,562]}"#), Some([280., 157.5, 1000., 562.5]));
+        assert_eq!(parse_crop(r#"{"crop":[0,0,1280,720]}"#), None);
+        assert_eq!(parse_crop(r#"{"crop":[0,0]}"#), None);
+        assert_eq!(parse_crop("no"), None);
+
+        let labels = Labels { words: vec!["sss-rank".into(), "d-rank".into(), "c-rank".into()], hero_left: true, key: "sss".into(), ..Default::default() };
         let (system, user) = placement_prompt(&labels);
-        assert!(system.contains("1280 wide and 720 high") && user.contains("\"JOBLESS\"") && user.contains("Small tag 2: \"SUSPICIOUS...\"") && user.contains("on the left"));
-        let l = parse_placement(r#"Here: {"hero_head":[312,84],"label":{"x":372,"y":4,"size":96},"tags":[{"x":384,"y":146,"size":42},{"x":884,"y":22,"size":38}]}"#, &labels).unwrap();
-        assert_eq!(l.labels.iter().map(|x| (x.text.as_str(), x.x, x.y, x.size)).collect::<Vec<_>>(), vec![("jobless", 372., 4., 96.), ("blank check", 384., 146., 42.), ("suspicious...", 884., 22., 38.)]);
-        // The arrow runs from the label's near end to his hair.
+        assert!(system.contains("1280 wide and 720 high") && system.contains("about 128 high") && user.contains("\"SSS-RANK\"") && user.contains("Small tag 2: \"C-RANK\"") && user.contains("on the left"));
+        let l = parse_placement(r#"Here: {"points_at":[312,84],"label":{"x":372,"y":4,"size":128},"tags":[{"x":384,"y":200,"size":50},{"x":900,"y":22,"size":46}]}"#, &labels).unwrap();
+        assert_eq!(l.labels.iter().map(|x| (x.text.as_str(), x.x, x.y, x.size, x.key.as_str())).collect::<Vec<_>>(), vec![("sss-rank", 372., 4., 128., "sss"), ("d-rank", 384., 200., 50., ""), ("c-rank", 900., 22., 46., "")]);
+        // The arrow runs from the label's near end to what it names.
         assert_eq!((l.arrows.len(), l.arrows[0].to), (1, [312., 84.]));
         assert!(l.arrows[0].from[0] < 372. && l.arrows[0].from[0] > 312.);
+        // A target under the label: the arrow drops from under it. The older key still works.
+        let down = parse_placement(r#"{"hero_head":[520,436],"label":{"x":400,"y":0,"size":128}}"#, &labels).unwrap();
+        assert!(down.arrows[0].from[1] > 128. && (down.arrows[0].from[0] - 520.).abs() < 1.);
         // Off the frame, over the length badge, or on top of each other: not used.
-        assert!(parse_placement(r#"{"label":{"x":1250,"y":700,"size":96}}"#, &labels).is_none());
+        assert!(parse_placement(r#"{"label":{"x":1250,"y":700,"size":128}}"#, &labels).is_none());
         assert!(parse_placement(r#"{"label":{"x":372,"y":4},"tags":[{"x":380,"y":10}]}"#, &labels).is_none());
         assert!(parse_placement("no json", &labels).is_none());
         // A tag that cannot be placed is left out; a label put too far right is made smaller.
-        let l = parse_placement(r#"{"label":{"x":1040,"y":10,"size":110},"tags":[{"x":9000,"y":1}]}"#, &labels).unwrap();
+        let l = parse_placement(r#"{"label":{"x":800,"y":10,"size":140},"tags":[{"x":9000,"y":1}]}"#, &labels).unwrap();
         assert_eq!(l.labels.len(), 1);
-        assert!(l.labels[0].size < 110. && l.arrows.is_empty());
+        assert!(l.labels[0].size < 140. && l.arrows.is_empty());
     }
 
     #[test]
@@ -572,8 +707,8 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].text, "HE EATS SWORDS");
         // Words left inside a prompt become the title; the picture is asked for without them.
-        let (_, c) = parse_concepts(r#"{"concepts":[{"name":"n","prompt":"@Arhan grins, bold text: \"LEVEL 999\".","tags":["TOP 1"," ","S-RANK","x"],"side":"right"}]}"#).unwrap();
-        assert_eq!((c[0].prompt.as_str(), c[0].text.as_str(), c[0].tags.clone(), c[0].side.as_str()), ("@Arhan grins.", "LEVEL 999", vec!["TOP 1".to_string(), "S-RANK".to_string()], "right"));
-        assert!(c[0].full_prompt().ends_with("Labels: LEVEL 999 | TOP 1 | S-RANK (hero right)"));
+        let (_, c) = parse_concepts(r#"{"concepts":[{"name":"n","strategy":"Number Gap","prompt":"@Arhan grins, bold text: \"LEVEL 999\".","key":"*999*","tags":["TOP 1"," ","S-RANK","x"],"side":"right"}]}"#).unwrap();
+        assert_eq!((c[0].prompt.as_str(), c[0].text.as_str(), c[0].tags.clone(), c[0].side.as_str(), c[0].key.as_str(), c[0].strategy.as_str()), ("@Arhan grins.", "LEVEL 999", vec!["TOP 1".to_string(), "S-RANK".to_string()], "right", "999", "number gap"));
+        assert!(c[0].full_prompt().ends_with("Strategy: number gap\nLabels: LEVEL *999* | TOP 1 | S-RANK (hero right)"));
     }
 }

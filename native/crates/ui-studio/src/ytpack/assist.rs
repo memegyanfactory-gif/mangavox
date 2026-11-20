@@ -156,8 +156,13 @@ async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
     };
     // The picture is drawn without words; the title is lettered on afterwards (see `thumbs::split_title`).
     let (art_prompt, labels) = super::thumbs::split_labels(&prompt);
-    // The art style pictures go first (see `magnific::Prefs::style_refs`), the characters after.
-    let style_files = magnific::style_files();
+    // The art style pictures go first (the owner's, see `magnific::Prefs::style_refs`, else the two
+    // that go with the idea's strategy), the characters after.
+    let mut style_files = magnific::style_files();
+    if style_files.is_empty() && !labels.strategy.is_empty() {
+        let name = labels.strategy.clone();
+        style_files = mv_ui::bg::run(async move { magnific::strategy_style(&name).await }).await.unwrap_or_default();
+    }
     let (resolved, order) = super::thumbs::resolve(&art_prompt, &just_cast, style_files.len());
     // `resolve` only finds references at an @Name, so this is what the approval assumed.
     let (model, res, aspect) = final_model(str_arg(&a, "aspect"), !order.is_empty() || prompt.contains('@') || !style_files.is_empty());
@@ -198,7 +203,7 @@ async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
         .await
     };
     mv_ui::bg::run(job).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))?;
-    let lettering = mv_recap::thumb::default_lettering(labels.label(), labels.tags(), labels.hero_left);
+    let lettering = mv_recap::thumb::default_lettering(labels.label(), &labels.key, labels.tags(), labels.hero_left);
     if !lettering.is_empty() {
         let (art, o3, l3) = (super::thumbs::Gallery::art(&g.id, &tid), out.clone(), lettering.clone());
         let lettered = mv_ui::bg::run(async move {
@@ -217,7 +222,7 @@ async fn make_thumbnail(a: Map<String, Value>) -> ToolResult {
     let cost = model.cost_at(&res);
     magnific::record(model, cost);
     let mut gallery = super::thumbs::Gallery::load(&g.id);
-    gallery.thumbs.insert(0, super::thumbs::Thumb { id: tid.clone(), prompt, label, parent: None, model: model.name.to_string(), resolution: res.clone(), cost, created: super::now(), text: labels.label().to_string(), tags: labels.tags().to_vec(), lettering });
+    gallery.thumbs.insert(0, super::thumbs::Thumb { id: tid.clone(), prompt, label, parent: None, model: model.name.to_string(), resolution: res.clone(), cost, created: super::now(), text: labels.label().to_string(), tags: labels.tags().to_vec(), lettering, feed: None });
     gallery.save(&g.id);
     super::video_thumb::learn_made(&gallery.thumbs[0].prompt, model.name, &aspect);
     // The new thumbnail can be the one the manga's videos show: draw their posters again.

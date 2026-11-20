@@ -355,6 +355,22 @@ pub fn youtube_id(s: &str) -> Option<String> {
     (!s.contains('/') && !s.contains('.')).then(|| ok(s)).flatten()
 }
 
+/// The style pictures that go with a thumbnail strategy (see `thumbs::STRATEGIES`), downloaded
+/// once into [`style_dir`] and kept. Empty for no strategy, or when they cannot be had.
+pub async fn strategy_style(name: &str) -> Vec<PathBuf> {
+    let Some(st) = super::thumbs::strategy(name) else { return vec![] };
+    let mut out = vec![];
+    for id in st.refs {
+        let kept = style_dir().join(format!("yt-{id}.jpg"));
+        if kept.is_file() {
+            out.push(kept);
+        } else if let Ok(f) = fetch_style(id).await {
+            out.push(f);
+        }
+    }
+    out
+}
+
 /// Downloads the picture `link` means into [`style_dir`]: a YouTube video's thumbnail (any link to
 /// the video), or an image address. Returns the saved file.
 pub async fn fetch_style(link: &str) -> Result<PathBuf> {

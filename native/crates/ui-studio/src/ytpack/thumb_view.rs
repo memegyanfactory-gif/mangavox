@@ -109,6 +109,8 @@ pub(super) struct ThumbState {
     /// Pictures whose art style new thumbnails copy (saved in the prefs).
     style: Vec<PathBuf>,
     style_busy: bool,
+    /// The thumbnail being put in a feed of competitors right now.
+    feeding: Option<String>,
     /// "Make one for me": the best idea is generated as soon as the AI has designed them.
     auto: bool,
     model: usize,
@@ -157,6 +159,7 @@ impl ThumbState {
             extra: vec![],
             style: magnific::style_files(),
             style_busy: false,
+            feeding: None,
             auto: false,
             model,
             chose_model: false,
@@ -419,7 +422,7 @@ impl ThumbGen {
         // thumbnail: then another model with a key that can (Nano Banana 2.1 when none).
         // A picked model without a key asks for one (the warning under the picker says so too)
         // rather than quietly running on another service.
-        let needs_refs = base.is_some() || !self.th.picked.is_empty() || prompt.contains('@') || !self.th.style.is_empty();
+        let needs_refs = base.is_some() || !self.th.picked.is_empty() || prompt.contains('@') || !self.th.style.is_empty() || prompt.to_lowercase().contains("\nstrategy:");
         let picked = self.th.model();
         let model = if self.th.keys.has(picked) { magnific::usable(picked, &self.th.keys, needs_refs, self.th.aspect) } else { picked };
         let Some(magnific_key) = magnific::key_for(model) else {
@@ -446,38 +449,21 @@ impl ThumbGen {
         let mut kept: Option<mv_recap::thumb::Lettering> = None;
         if let (true, Some(parent)) = (labels.words.is_empty(), base.as_ref().and_then(|b| t.gallery.thumbs.iter().find(|x| &x.id == b))) {
             labels.words = std::iter::once(parent.text.clone()).chain(parent.tags.iter().cloned()).filter(|w| !w.trim().is_empty()).collect();
+            labels.key = parent.lettering.labels.first().map(|l| l.key.clone()).unwrap_or_default();
             kept = Some(parent.lettering.clone()).filter(|l| !l.is_empty());
         }
-        let mut refs: Vec<magnific::Reference> = vec![];
-        if let Some(b) = &base {
-            // The picture without its labels when it was kept: the edit must not redraw the letters.
+        // The picture without its labels when it was kept: the edit must not redraw the letters.
+        let base_art = base.as_ref().map(|b| {
             let art = Gallery::art(&self.manga_id, b);
-            refs.push(magnific::Reference { file: if art.is_file() { art } else { Gallery::image(&self.manga_id, b) }, caption: "Image 1: the thumbnail to edit".into() });
-        } else {
-            // The art style comes first: pictures to draw like, not words about a look.
-            for f in t.style.iter().filter(|f| f.is_file()).take(model.refs.min(magnific::MAX_STYLE)) {
-                refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}: {}", refs.len() + 1, thumbs::STYLE_CAPTION) });
+            if art.is_file() {
+                art
+            } else {
+                Gallery::image(&self.manga_id, b)
             }
-        }
-        let (first, style) = (refs.len(), if base.is_some() { 0 } else { refs.len() });
-        let (resolved, mut order) = thumbs::resolve(&art_prompt, &just_cast, first);
-        for i in &t.picked {
-            if !order.contains(i) {
-                order.push(*i);
-            }
-        }
-        let mut looks = vec![];
-        for i in order.iter().take(model.refs.saturating_sub(refs.len())) {
-            let (c, f) = &t.cast[*i];
-            refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}: {}", refs.len() + 1, c.name) });
-            looks.push((c.name.clone(), thumbs::look_of(c)));
-        }
-        for f in &t.extra {
-            if refs.len() < model.refs {
-                refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}", refs.len() + 1) });
-            }
-        }
-        let full = if base.is_some() { thumbs::edit_prompt(&resolved) } else { thumbs::image_prompt(&self.title, &resolved, &looks, first, style) };
+        });
+        let own_style: Vec<PathBuf> = t.style.iter().filter(|f| f.is_file()).cloned().collect();
+        let strategy = labels.strategy.clone();
+        let (cast, picked, extra, title) = (t.cast.clone(), t.picked.clone(), t.extra.clone(), self.title.clone());
         let id = now_id() + &format!("{}", t.jobs.len());
         let status = Arc::new(Mutex::new("Queued".to_string()));
         let aspect = if base.is_some() && model.auto_aspect { "auto" } else { t.aspect };
@@ -496,6 +482,44 @@ impl ThumbGen {
                 let st = st.clone();
                 move |s: &str| *st.lock().unwrap_or_else(|e| e.into_inner()) = s.to_string()
             };
+            // The art style comes first: pictures to draw like, not words about a look. The owner's
+            // own style pictures, else the two that show the idea's strategy in the wanted style.
+            let style_files = if base_art.is_some() {
+                vec![]
+            } else if !own_style.is_empty() {
+                own_style
+            } else if !strategy.is_empty() {
+                say("Getting the style pictures for this kind of scene");
+                magnific::strategy_style(&strategy).await
+            } else {
+                vec![]
+            };
+            let mut refs: Vec<magnific::Reference> = vec![];
+            if let Some(a) = &base_art {
+                refs.push(magnific::Reference { file: a.clone(), caption: "Image 1: the thumbnail to edit".into() });
+            }
+            for f in style_files.iter().take(model.refs.min(magnific::MAX_STYLE)) {
+                refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}: {}", refs.len() + 1, thumbs::STYLE_CAPTION) });
+            }
+            let (first, style) = (refs.len(), if base_art.is_some() { 0 } else { refs.len() });
+            let (resolved, mut order) = thumbs::resolve(&art_prompt, &just_cast, first);
+            for i in &picked {
+                if !order.contains(i) {
+                    order.push(*i);
+                }
+            }
+            let mut looks = vec![];
+            for i in order.iter().take(model.refs.saturating_sub(refs.len())) {
+                let (c, f) = &cast[*i];
+                refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}: {}", refs.len() + 1, c.name) });
+                looks.push((c.name.clone(), thumbs::look_of(c)));
+            }
+            for f in &extra {
+                if refs.len() < model.refs {
+                    refs.push(magnific::Reference { file: f.clone(), caption: format!("Image {}", refs.len() + 1) });
+                }
+            }
+            let full = if base_art.is_some() { thumbs::edit_prompt(&resolved) } else { thumbs::image_prompt(&title, &resolved, &looks, first, style) };
             magnific::generate(model, &api_key, &full, &refs, aspect, res, &out, move |s| *st.lock().unwrap_or_else(|e| e.into_inner()) = s.to_string()).await?;
             if labels.words.is_empty() {
                 return Ok(mv_recap::thumb::Lettering::default());
@@ -512,16 +536,13 @@ impl ThumbGen {
             .await??;
             let lettering = match kept {
                 Some(l) => l,
-                None => {
-                    let fallback = mv_recap::thumb::default_lettering(labels.label(), labels.tags(), labels.hero_left);
-                    match eyes {
-                        Some((reg, provider, ai)) => {
-                            say("Looking at the picture to place the labels");
-                            place_labels(reg, provider, ai, &art, &labels).await.unwrap_or(fallback)
-                        }
-                        None => fallback,
+                None => match eyes {
+                    Some((reg, provider, ai)) => {
+                        say("Looking at the picture to crop it and place the labels");
+                        place_labels(reg, provider, ai, &art, &labels).await
                     }
-                }
+                    None => mv_recap::thumb::default_lettering(labels.label(), &labels.key, labels.tags(), labels.hero_left),
+                },
             };
             say("Lettering the labels");
             let l2 = lettering.clone();
@@ -629,6 +650,49 @@ impl ThumbGen {
         if !self.th.designing {
             self.th.auto = false;
         }
+    }
+
+    /// Puts thumbnail `id` in a feed of the competing recaps and has the AI model judge it blind.
+    fn feed_test(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.th.feeding.is_some() {
+            return;
+        }
+        let (provider, model) = ui_assistant::assistant_model(cx);
+        let Ok(provider) = serde_json::from_value::<mv_ai::AiProviderId>(serde_json::Value::String(provider)) else {
+            self.th.error = Some("Pick an AI model that can see pictures first (model button at the top).".into());
+            cx.notify();
+            return;
+        };
+        let reg = ui_assistant::registry(cx);
+        let ids = super::feed::competitor_ids(&self.saved.comparable(), &self.saved.videos, &self.saved.reference_recent);
+        let last = self.th.gallery.thumbs.iter().find(|t| t.id == id).and_then(|t| t.feed.as_ref()).map(|f| f.cell);
+        let cell = super::feed::next_cell(last, now());
+        let (mid, ours, out) = (self.manga_id.clone(), Gallery::image(&self.manga_id, &id), super::feed::image(&self.manga_id, &id, cell));
+        self.th.feeding = Some(id.clone());
+        self.th.error = None;
+        cx.spawn(async move |this, cx| {
+            let job = async move {
+                super::feed::build(&mid, &ours, &ids, cell, &out).await?;
+                let text = ask_vision(reg, provider, model, super::feed::judge_prompt(), out).await.ok_or_else(|| anyhow!("The AI model gave no answer about the feed; pick a model that can see pictures."))?;
+                super::feed::parse_judgement(&text, cell, now()).ok_or_else(|| anyhow!("The AI model's answer about the feed could not be read; try again."))
+            };
+            let res = mv_ui::bg::run(job).await.and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.th.feeding = None;
+                match res {
+                    Ok(r) => {
+                        if let Some(t) = this.th.gallery.thumbs.iter_mut().find(|t| t.id == id) {
+                            t.feed = Some(r);
+                        }
+                        this.th.gallery.save(&this.manga_id);
+                    }
+                    Err(e) => this.th.error = Some(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Adds an art style picture from the link on the clipboard (a YouTube video: its thumbnail).
@@ -1587,6 +1651,35 @@ div().flex().flex_col().gap(px(space::SM)).child(head).child(body).when(m.refs =
                 btn("thg-reuse", "Use", ButtonKind::Ghost).small().icon(ph::TEXT_T).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_prompt(prompt.clone(), window, cx))),
             )))
             .child(row("Made with", div().text_size(px(size::XS)).text_color(Tokens::text_2()).child(format!("{} · {} · {}", t.model, t.resolution, if t.cost == 0. { "unlimited".to_string() } else { format!("{} credits", t.cost.round()) }))))
+            .child(row("Feed test", {
+                let feeding = self.th.feeding.as_deref() == Some(t.id.as_str());
+                let id = t.id.clone();
+                let shown = t.feed.as_ref().map(|f| (f.clone(), super::feed::image(&self.manga_id, &t.id, f.cell))).filter(|(_, p)| p.is_file());
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SM))
+                    .max_w(px(860.))
+                    .child(
+                        div().flex().items_center().gap(px(space::SM)).child(
+                            btn("thg-feed", if feeding { "Putting it in a feed…" } else if shown.is_some() { "Test again" } else { "Test in feed" }, ButtonKind::Secondary)
+                                .small()
+                                .icon(ph::BINOCULARS)
+                                .loading(feeding)
+                                .tooltip("Puts it among the other recaps' thumbnails at the size YouTube shows them, in a different place each time, and asks the AI model, without telling it which is yours, what it would look at and click. Look at the feed yourself too. YouTube Studio's Test & compare is the real measure.")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.feed_test(id.clone(), cx))),
+                        ),
+                    )
+                    .when_some(shown, |d, (f, path)| {
+                        let good = f.clicked && f.score >= f.best_other;
+                        d.child(div().text_size(px(size::SM)).font_weight(FontWeight::SEMIBOLD).text_color(if good { Tokens::success() } else { Tokens::warning() }).whitespace_normal().child(f.summary()))
+                            .when(!f.tip.is_empty(), |d| d.child(div().flex().items_start().gap(px(4.)).text_size(px(size::XS)).text_color(Tokens::text_2()).whitespace_normal().child(icon_ph(ph::LIGHTBULB, Tokens::warning(), 12.)).child(div().flex_1().child(format!("To pull harder: {}", f.tip)))))
+                            .child(div().w_full().rounded(px(radius::LG)).overflow_hidden().child(img(path).w_full().object_fit(ObjectFit::Contain)))
+                            // In the Click Lab the AI judges' favourites got none of the owner's
+                            // clicks and their lowest-scored one got all of them.
+                            .child(div().text_size(px(size::XS)).text_color(Tokens::text_3()).whitespace_normal().child("The AI judge is a hint, not your viewers: go by which one your own eye picks in the feed above."))
+                    })
+            }))
             .when_some(self.th.scores.get(&t.id), |d, s| d.child(row("Click score", score_detail("thg-view-score", s))))
     }
 
@@ -1738,41 +1831,48 @@ async fn ask_concepts(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiP
     Err(anyhow!("the answer had no usable concept; try again or pick another model"))
 }
 
-/// Shows the finished picture (as a 1280x720 copy, the frame the labels are placed in) to the AI
-/// model and asks where its labels go. `None` when it cannot say (no eyes, a bad answer): the
-/// default places are used then.
-async fn place_labels(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiProviderId, model: String, art: &std::path::Path, labels: &thumbs::Labels) -> Option<mv_recap::thumb::Lettering> {
+/// Asks the AI model about `image` (attached); its answer, or `None` when it gave none.
+async fn ask_vision(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiProviderId, model: String, prompt: (String, String), image: PathBuf) -> Option<String> {
     static N: AtomicU64 = AtomicU64::new(0);
-    let small = art.with_extension("see.jpg");
-    let (a, s2) = (art.to_path_buf(), small.clone());
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let img = image::open(&a)?.resize_exact(1280, 720, image::imageops::FilterType::Triangle).to_rgb8();
-        img.save_with_format(&s2, image::ImageFormat::Jpeg)?;
-        Ok(())
-    })
-    .await
-    .ok()?
-    .ok()?;
-    let (system, user) = thumbs::placement_prompt(labels);
     let req = mv_ai::AiStepRequest {
-        request_id: format!("studio-thumb-place-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)),
+        request_id: format!("studio-thumb-see-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)),
         provider_id: provider,
         model,
-        messages: vec![mv_ai::AiMessage::system(system), mv_ai::AiMessage::user(user)],
+        messages: vec![mv_ai::AiMessage::system(prompt.0), mv_ai::AiMessage::user(prompt.1)],
         tools: None,
         effort: None,
         access: None,
-        images: vec![small.clone()],
+        images: vec![image],
         workspace: None,
         lean: true,
         mcp: None,
     };
     let r = reg.run_step_cancellable(req, mv_ai::emit_noop(), mv_ai::CancellationToken::new()).await;
-    let _ = std::fs::remove_file(&small);
-    if r.error.is_some() {
-        return None;
+    r.error.is_none().then_some(r.text)
+}
+
+/// Shows the finished picture to the AI model twice: first to crop it tighter (the hero, the hook
+/// object and the reacting faces filling the frame), then, cut, to place its labels. What it cannot
+/// answer falls back: no crop, or the default places.
+async fn place_labels(reg: std::sync::Arc<mv_ai::Registry>, provider: mv_ai::AiProviderId, model: String, art: &std::path::Path, labels: &thumbs::Labels) -> mv_recap::thumb::Lettering {
+    let fallback = || mv_recap::thumb::default_lettering(labels.label(), &labels.key, labels.tags(), labels.hero_left);
+    let see = art.with_extension("see.jpg");
+    let show = |crop: Option<[f32; 4]>| {
+        let (a, s) = (art.to_path_buf(), see.clone());
+        tokio::task::spawn_blocking(move || mv_recap::thumb::crop_art(&a, crop, &s))
+    };
+    if !matches!(show(None).await, Ok(Ok(()))) {
+        return fallback();
     }
-    thumbs::parse_placement(&r.text, labels)
+    let crop = ask_vision(reg.clone(), provider, model.clone(), thumbs::crop_prompt(), see.clone()).await.and_then(|t| thumbs::parse_crop(&t));
+    let placed = match crop {
+        Some(_) if !matches!(show(crop).await, Ok(Ok(()))) => None,
+        _ => ask_vision(reg, provider, model, thumbs::placement_prompt(labels), see.clone()).await.and_then(|t| thumbs::parse_placement(&t, labels)),
+    };
+    let _ = std::fs::remove_file(&see);
+    let mut l = placed.unwrap_or_else(fallback);
+    l.crop = crop;
+    l
 }
 
 /// Opens Settings › Magnific.

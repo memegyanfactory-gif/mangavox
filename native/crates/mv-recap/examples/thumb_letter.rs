@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
         serde_json::from_slice(&std::fs::read(&a[2])?)?
     } else {
         anyhow::ensure!(a.len() >= 4, "a label is needed");
-        mv_recap::thumb::default_lettering(&a[3], &a[4..], a[2] != "right")
+        mv_recap::thumb::default_lettering(&a[3], "", &a[4..], a[2] != "right")
     };
     mv_recap::thumb::letter(a[0].as_ref(), &l, a[1].as_ref())
 }

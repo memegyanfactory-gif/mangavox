@@ -156,7 +156,16 @@ pub async fn board(ask: &Ask, mut p: Project, n: u32, note: &str, status: &Statu
         status(format!("Storyboarding scene {} of {}: {title} ({so_far} cuts so far)", i + 1, scenes.len()));
         board_one(ask, &mut p, n, *scene, |p| board::storyboard_scene(p, n, *scene, note)).await.map_err(|e| if stopped(&e) { e } else { anyhow!("scene {scene} could not be boarded: {e:#}") })?;
     }
-    revise(ask, p, n, None, status).await
+    let mut p = revise(ask, p, n, None, status).await?;
+    prune_plates(&mut p);
+    Ok(p)
+}
+
+/// Drops the plates no cut of any chapter uses and nobody has painted (a board drawn again
+/// leaves the old board's plates behind otherwise).
+pub fn prune_plates(p: &mut Project) {
+    let used: std::collections::HashSet<String> = p.chapters.iter().flat_map(|c| c.anime.cuts.iter().map(|x| x.plate.clone())).collect();
+    p.plates.retain(|pl| pl.image.is_some() || used.contains(&pl.id));
 }
 
 /// Draws up one scene again (with the user's note), then checks and revises that scene.
@@ -263,6 +272,12 @@ mod tests {
         // (The wide master plays its lines over a drifting camera; the single is of the listener.)
         assert!(a.cuts[0].seconds >= 4.5 && !a.cuts[0].mouth && a.cuts[0].motion == "camera" && !a.cuts[1].mouth);
         assert_eq!(p.plates.len(), 1);
+        // A plate left from an old board goes; a painted one stays.
+        let mut q = p.clone();
+        q.plates.push(crate::anime::Plate { id: "old".into(), ..Default::default() });
+        q.plates.push(crate::anime::Plate { id: "painted".into(), image: Some("plates/x.png".into()), ..Default::default() });
+        prune_plates(&mut q);
+        assert_eq!(q.plates.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), vec!["street", "painted"]);
     }
 
     #[tokio::test]

@@ -9,7 +9,9 @@ voices it, text chunking, and the audio post-processing every engine shares.
   * Engine adapters: `chatterbox_params` (exaggeration / cfg_weight / temperature: a calm
     narrator, lifted only for real moments) and `kokoro_speed` (Kokoro and Piper only get a speed).
   * Text: 1-3 sentences or <= 250 characters per chunk (Chatterbox caps at ~40 s), shouts
-    on their own, silence decided here and inserted in post instead of by the model.
+    on their own. Neighbouring sentences that fit in JOIN_UP_TO characters are voiced together,
+    so the model carries the melody (and its own short pause) across them; the silence between
+    chunks is decided here: never two gaps alike, and a faint room tone instead of digital black.
   * Audio: WAV in/out at the engine's native rate, silence trimming, chapter loudness
     normalisation to about -16 LUFS (ITU-R BS.1770 K-weighting with gating), peak limiting at -1 dBFS.
 
@@ -182,22 +184,27 @@ def kokoro_speed(kind, intensity, strength: float = 1.0) -> float:
     return round(clamp(base + 0.008 * i, 0.90, 1.10), 3)
 
 
-def sentence_gap_ms(kind, intensity) -> int:
-    """500-900 ms between sentences: calmer and slower scenes breathe longer."""
+def sentence_gap_ms(kind, intensity, text: str = "") -> int:
+    """260-620 ms of silence between sentences (each chunk keeps about 130 ms of its own
+    around the words, so what is heard is roughly 0.4-0.75 s): calmer and slower scenes breathe
+    longer. `text` (the sentence that follows) moves the gap up to 12% either way, always the
+    same way for the same words: a reader never pauses for exactly as long twice."""
     kind = normalize_kind(kind)
-    gap = 900 - 40 * clamp(_num(intensity, DEFAULT_INTENSITY), 0, 10)
+    gap = 600 - 35 * clamp(_num(intensity, DEFAULT_INTENSITY), 0, 10)
     if kind in FAST_KINDS:
-        gap -= 100
+        gap -= 80
     elif kind in SLOW_KINDS:
-        gap += 100
-    return int(clamp(gap, 500, 900))
+        gap += 60
+    if text:
+        gap *= 0.88 + 0.24 * ((zlib.crc32(text.encode("utf-8")) & 0xFFFF) / 0xFFFF)
+    return int(clamp(gap, 260, 620))
 
 
 def minor_gap_ms(kind, boundary: str) -> int:
-    """250-350 ms at commas and ellipses."""
+    """140-220 ms at commas and ellipses (plus the chunk's own 130 ms)."""
     if boundary == "ellipsis":
-        return 350
-    return 300 if normalize_kind(kind) in SLOW_KINDS else 250
+        return 220
+    return 170 if normalize_kind(kind) in SLOW_KINDS else 140
 
 
 REVEAL_LEAD_MS = 300
@@ -423,6 +430,9 @@ def _split_long(s: str, max_chars: int) -> list:
     return out
 
 
+JOIN_UP_TO = 170
+
+
 def split_chunks(text: str, max_chars: int = 250, max_sentences: int = 3) -> list:
     """Chunks of 1-3 sentences (<= max_chars), each {text, boundary, shout}: `boundary` is
     what ends the chunk (sentence | ellipsis | comma | end) and decides the silence after it.
@@ -454,9 +464,12 @@ def split_chunks(text: str, max_chars: int = 250, max_sentences: int = 3) -> lis
             continue
         joined = " ".join(x[0] for x in cur)
         fits = cur and len(cur) < max_sentences and len(joined) + 1 + len(t) <= max_chars
-        # Keep sentences apart (so the gap between them is ours) unless they are short.
+        # Sentences voiced together flow into each other the way a reader's do (one melody, the
+        # model's own pause); voiced apart, each starts afresh. Short ones always join, and two
+        # that fit in JOIN_UP_TO characters do: long enough to flow, short enough to stay steady.
         short = cur and (len(joined) < 40 or len(t) < 40)
-        if fits and short and cur[-1][1] == "sentence":
+        pair = cur and len(cur) == 1 and len(joined) + 1 + len(t) <= JOIN_UP_TO
+        if fits and (short or pair) and cur[-1][1] == "sentence":
             cur.append((t, b, False))
         else:
             if cur:
@@ -486,7 +499,7 @@ def plan_chunks(units: list, max_chars: int = 250) -> list:
             elif prev["boundary"] in ("ellipsis", "comma"):
                 pause = minor_gap_ms(u["kind"], prev["boundary"])
             else:
-                pause = sentence_gap_ms(u["kind"], u["intensity"])
+                pause = sentence_gap_ms(u["kind"], u["intensity"], c["text"])
             if ci == 0 and normalize_kind(u["kind"]) == "reveal":
                 pause += REVEAL_LEAD_MS
             if ci == 0 and ui > 0 and u.get("speaker") != units[ui - 1].get("speaker"):
@@ -579,15 +592,51 @@ def concat(parts):
     return out
 
 
+ROOM_TONE_DB = -74.0  # RMS of the room tone under a page, dBFS: felt, not heard
+
+
+def fade_edges(x, sr: int, in_ms: float = 8.0, out_ms: float = 30.0):
+    """A chunk eased in and out, so where it meets the silence there is no step to hear."""
+    if np is None or len(x) < 4:
+        return x
+    x = np.array(x, dtype=np.float32)
+    a, b = min(len(x) // 2, int(sr * in_ms / 1000.0)), min(len(x) // 2, int(sr * out_ms / 1000.0))
+    if a > 1:
+        x[:a] *= np.linspace(0.0, 1.0, a, dtype=np.float32)
+    if b > 1:
+        x[-b:] *= np.linspace(1.0, 0.0, b, dtype=np.float32)
+    return x
+
+
+def room_tone(n: int, sr: int, level_db: float = ROOM_TONE_DB):
+    """`n` samples of soft low noise (white noise through a one-pole low-pass at about 1.5 kHz),
+    the same for the same length. A recorded voice is never over digital black between its
+    sentences; a stitched one is, and the ear reads the cut-outs as a machine."""
+    if np is None or n <= 0:
+        return silence(0, sr)
+    rng = np.random.default_rng(n & 0xFFFFFFFF)
+    w = rng.standard_normal(n).astype(np.float32)
+    k = float(math.exp(-2.0 * math.pi * 1500.0 / sr))
+    # y[i] = (1 - k) * w[i] + k * y[i - 1], as a short FIR (k**60 is far below the tone itself).
+    taps = ((1.0 - k) * k ** np.arange(60)).astype(np.float32)
+    y = np.convolve(w, taps)[:n]
+    rms = float(np.sqrt(np.mean(y ** 2))) or 1.0
+    return (y * (10 ** (level_db / 20.0) / rms)).astype(np.float32)
+
+
 def assemble_page(chunks: list, sr: int, lead_ms: float = 0, tail_ms: float = 0):
     """A page from its chunks [(samples, pause_before_ms)]: each chunk trimmed of the
-    model's own leading/trailing silence, then our silences in between."""
+    model's own leading/trailing silence and eased in and out, our silences in between, and
+    one room tone under all of it."""
     parts = [silence(lead_ms, sr)]
     for x, pause in chunks:
         parts.append(silence(pause, sr))
-        parts.append(trim_silence(x, sr))
+        parts.append(fade_edges(trim_silence(x, sr), sr))
     parts.append(silence(tail_ms, sr))
-    return concat(parts)
+    page = concat(parts)
+    if np is not None and len(page):
+        page = page + room_tone(len(page), sr)
+    return page
 
 
 def ffmpeg_binary() -> str | None:

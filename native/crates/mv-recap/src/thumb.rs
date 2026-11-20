@@ -624,7 +624,11 @@ const LABEL_YELLOW: [u8; 4] = [0xFF, 0xE6, 0x00, 0xFF];
 pub const LETTER_W: f32 = 1280.;
 pub const LETTER_H: f32 = 720.;
 
-/// One label: `text` in capitals with its top-left corner at (`x`, `y`), letters `size` high.
+/// The red of a label's key word.
+const LABEL_RED: [u8; 4] = [0xFF, 0x2B, 0x2B, 0xFF];
+
+/// One label: `text` in capitals with its top-left corner at (`x`, `y`), letters `size` high. The
+/// `key` part of it (a word or part of one, "SSS" in "SSS-RANK") is drawn red, the rest yellow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Label {
@@ -632,6 +636,7 @@ pub struct Label {
     pub x: f32,
     pub y: f32,
     pub size: f32,
+    pub key: String,
 }
 
 /// A thick arrow from `from` to its tip at `to`.
@@ -644,14 +649,17 @@ pub struct Arrow {
 }
 
 /// What is lettered on a made thumbnail, in a 1280x720 frame: the way the recap channels the
-/// thumbnails are modelled on do it. Not a title: one big role tag beside the hero's head with an
-/// arrow at him ("JOBLESS"), and one or two small tags beside someone or something else
-/// ("BLANK CHECK", "SUSPICIOUS...").
+/// thumbnails are modelled on do it. Not a title: one big label beside the hero or the hook object
+/// with an arrow to it ("SSS-RANK", its key word red), and at most two small tags ("D-RANK"). The
+/// picture is first cut to `crop` (x, y, width, height in the 1280x720 frame of the art, 16:9) so
+/// the hero, the hook object and the reacting faces fill it; the labels are placed in the cut picture.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Lettering {
     pub labels: Vec<Label>,
     pub arrows: Vec<Arrow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop: Option<[f32; 4]>,
 }
 
 impl Lettering {
@@ -670,31 +678,37 @@ pub fn label_width(text: &str, size: f32) -> f32 {
     text.to_uppercase().chars().filter_map(|c| glyph(&f, c)).map(|g| f.glyph_hor_advance(g).unwrap_or(0) as f32).sum::<f32>() * size / f.units_per_em() as f32
 }
 
-/// The big label's size, and the small tags'.
-pub const LABEL_SIZE: f32 = 96.;
-pub const TAG_SIZE: f32 = 42.;
+/// The big label's size, and the small tags': big enough to read in a feed at 320x180, where a
+/// thumbnail is actually seen.
+pub const LABEL_SIZE: f32 = 128.;
+pub const TAG_SIZE: f32 = 50.;
 
-/// Where the labels go when nobody has looked at the picture: the layout of the thumbnail this is
-/// modelled on, which the art prompt asks the picture to leave room for. The hero fills one side
-/// third (`hero_left`: the left one); `label` sits at the top beside his head with the arrow at
-/// him, the first tag under it, the second at the top on the far side. A label too wide for its
-/// room is made smaller.
-pub fn default_lettering(label: &str, tags: &[String], hero_left: bool) -> Lettering {
+/// A crop that can be used: about 16:9, inside the frame, and not so small the picture goes soft.
+pub fn crop_ok(c: &[f32; 4]) -> bool {
+    let [x, y, w, h] = *c;
+    w >= 760. && x >= -1. && y >= -1. && x + w <= LETTER_W + 1. && y + h <= LETTER_H + 1. && ((w / h.max(1.)) - 16. / 9.).abs() < 0.06
+}
+
+/// Where the labels go when nobody has looked at the picture: the layout the art prompt asks the
+/// picture to leave room for. The hero fills one side third (`hero_left`: the left one); `label`
+/// sits at the top beside his head with the arrow at him, the first tag under it, the second at
+/// the top on the far side. A label too wide for its room is made smaller.
+pub fn default_lettering(label: &str, key: &str, tags: &[String], hero_left: bool) -> Lettering {
     let mut out = Lettering::default();
     let label = label.trim();
     // `x` for a text that starts at `left` when the hero is on the left, mirrored otherwise.
     let place = |text: &str, size: f32, left: f32| if hero_left { left } else { LETTER_W - left - label_width(text, size) };
     if !label.is_empty() {
-        let room = 520.;
+        let room = 600.;
         let size = LABEL_SIZE * (room / label_width(label, LABEL_SIZE).max(1.)).min(1.);
-        out.labels.push(Label { text: label.into(), x: place(label, size, 372.), y: 4., size });
-        let (from, to) = (368., 312.);
-        out.arrows.push(Arrow { from: [if hero_left { from } else { LETTER_W - from }, 62.], to: [if hero_left { to } else { LETTER_W - to }, 84.], width: 22. });
+        out.labels.push(Label { text: label.into(), x: place(label, size, 372.), y: 2., size, key: key.trim().into() });
+        let (from, to) = (366., 312.);
+        out.arrows.push(Arrow { from: [if hero_left { from } else { LETTER_W - from }, 72.], to: [if hero_left { to } else { LETTER_W - to }, 100.], width: 30. });
     }
     for (k, tag) in tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).take(2).enumerate() {
-        let (left, y, base, room) = if k == 0 { (384., 146., TAG_SIZE, 420.) } else { (884., 22., TAG_SIZE * 0.9, 360.) };
-        let size = base * (room / label_width(tag, base).max(1.)).min(1.);
-        out.labels.push(Label { text: tag.into(), x: place(tag, size, left), y, size });
+        let (left, y, room) = if k == 0 { (384., 162., 420.) } else { (930., 24., 330.) };
+        let size = TAG_SIZE * (room / label_width(tag, TAG_SIZE).max(1.)).min(1.);
+        out.labels.push(Label { text: tag.into(), x: place(tag, size, left), y, size, key: String::new() });
     }
     out
 }
@@ -715,24 +729,29 @@ impl Wobble {
     }
 }
 
-/// The outlines of `label`'s letters: each one tilted a few degrees and bounced a little, like
-/// hand-cut comic lettering. `k` scales the lettering frame to the picture.
-fn label_paths(f: &ttf_parser::Face, label: &Label, k: f32) -> Vec<tiny_skia::Path> {
+/// The outlines of `label`'s letters, each with whether it is part of the red key: each letter
+/// tilted a few degrees and bounced a little, like hand-cut comic lettering. `k` scales the
+/// lettering frame to the picture.
+fn label_paths(f: &ttf_parser::Face, label: &Label, k: f32) -> Vec<(tiny_skia::Path, bool)> {
     let size = label.size * k;
     let s = size / f.units_per_em() as f32;
     let cap = f.capital_height().map(|c| c as f32).unwrap_or(0.72 * f.units_per_em() as f32) * s;
     let mut rng = Wobble::of(&label.text);
     let (mut x, baseline) = (label.x * k, label.y * k + cap + size * 0.08);
+    let text: Vec<char> = label.text.to_uppercase().chars().collect();
+    let key: Vec<char> = label.key.trim().to_uppercase().chars().collect();
+    // The letters of the first place the key appears.
+    let red = (!key.is_empty()).then(|| (0..=text.len().saturating_sub(key.len())).find(|&i| text[i..].starts_with(&key))).flatten().map(|i| i..i + key.len());
     let mut out = vec![];
-    for c in label.text.to_uppercase().chars() {
-        let Some(g) = glyph(f, c) else { continue };
+    for (i, c) in text.iter().enumerate() {
+        let Some(g) = glyph(f, *c) else { continue };
         let adv = f.glyph_hor_advance(g).unwrap_or(0) as f32 * s;
         if !c.is_whitespace() {
             let (dy, turn) = (rng.next() * size * 0.07, rng.next() * 7.);
             let mut pb = tiny_skia::PathBuilder::new();
             f.outline_glyph(g, &mut Pen { pb: &mut pb, x, y: baseline + dy, s });
             if let Some(p) = pb.finish().and_then(|p| p.transform(tiny_skia::Transform::from_rotate_at(turn, x + adv / 2., baseline - cap / 2.))) {
-                out.push(p);
+                out.push((p, red.as_ref().is_some_and(|r| r.contains(&i))));
             }
         }
         x += adv;
@@ -764,12 +783,35 @@ fn arrow_path(a: &Arrow, k: f32) -> Option<tiny_skia::Path> {
     pb.finish()
 }
 
-/// Letters `lettering` on the text-free thumbnail art at `art` and saves it as PNG at `out`:
-/// heavy condensed yellow capitals with a thick black outline, each letter slightly tilted, and
-/// thick yellow arrows. The art is drawn by an image model, which misspells words: this is why the
-/// words are never part of it. Nothing to letter: the art as it is. Blocking.
+/// `img` cut to `crop` (in its 1280x720 frame) and scaled back to its own size.
+fn cropped(img: RgbImage, crop: Option<[f32; 4]>) -> RgbImage {
+    let Some(c) = crop.filter(crop_ok) else { return img };
+    let (w, h) = img.dimensions();
+    let k = w as f32 / LETTER_W;
+    let x = (c[0].max(0.) * k).round() as u32;
+    let y = (c[1].max(0.) * k).round() as u32;
+    let cw = ((c[2] * k).round() as u32).min(w - x.min(w - 1)).max(1);
+    let ch = ((c[3] * k).round() as u32).min(h - y.min(h - 1)).max(1);
+    let part = imageops::crop_imm(&img, x.min(w - 1), y.min(h - 1), cw, ch).to_image();
+    imageops::resize(&part, w, h, imageops::FilterType::Lanczos3)
+}
+
+/// The art cut to the lettering's crop, as the labels are placed on it (a 1280x720 frame).
+pub fn crop_art(art: &Path, crop: Option<[f32; 4]>, out: &Path) -> Result<()> {
+    let img = image::open(art).with_context(|| format!("could not read {}", art.display()))?.to_rgb8();
+    let img = cropped(img, crop);
+    let small = imageops::resize(&img, LETTER_W as u32, LETTER_H as u32, imageops::FilterType::Triangle);
+    save_jpeg(&small, out, 90)
+}
+
+/// Letters `lettering` on the text-free thumbnail art at `art` and saves it as PNG at `out`: the
+/// art cut to its crop, then heavy condensed capitals with a thick black outline (yellow, the key
+/// word red), each letter slightly tilted, and thick yellow arrows. The art is drawn by an image
+/// model, which misspells words: this is why the words are never part of it. Nothing to letter:
+/// the art as it is (still cut to its crop). Blocking.
 pub fn letter(art: &Path, lettering: &Lettering, out: &Path) -> Result<()> {
     let img = image::open(art).with_context(|| format!("could not read {}", art.display()))?.to_rgb8();
+    let img = cropped(img, lettering.crop);
     let k = img.width() as f32 / LETTER_W;
     let mut px = Canvas::from_rgb(img)?;
     if let Some(f) = title_face() {
@@ -783,13 +825,13 @@ pub fn letter(art: &Path, lettering: &Lettering, out: &Path) -> Result<()> {
         }
         for label in lettering.labels.iter().filter(|l| !l.text.trim().is_empty() && l.size > 1.) {
             let letters = label_paths(&f, label, k);
-            let stroke = outline(label.size * k * 0.2);
+            let stroke = outline(label.size * k * 0.18);
             // Every outline, then every fill: no letter's outline covers its neighbour.
-            for p in &letters {
+            for (p, _) in &letters {
                 px.0.stroke_path(p, &black, &stroke, tiny_skia::Transform::identity(), None);
             }
-            for p in &letters {
-                px.fill(p, LABEL_YELLOW);
+            for (p, red) in &letters {
+                px.fill(p, if *red { LABEL_RED } else { LABEL_YELLOW });
             }
         }
     }
@@ -811,18 +853,18 @@ mod tests {
     #[test]
     fn a_made_thumbnail_gets_its_labels() {
         // The default places: the big label beside the hero's head with an arrow at him, tags apart.
-        let l = default_lettering("jobless", &["blank check".into(), "suspicious...".into(), "ignored".into()], true);
+        let l = default_lettering("sss-rank", "sss", &["d-rank".into(), "c-rank".into(), "ignored".into()], true);
         assert_eq!(l.labels.len(), 3);
-        assert_eq!((l.labels[0].x, l.labels[0].y, l.labels[0].size), (372., 4., LABEL_SIZE));
-        assert_eq!((l.arrows.len(), l.arrows[0].to), (1, [312., 84.]));
-        assert!(l.labels[1].y > 100. && l.labels[2].x > 800. && l.labels[1].size < 50.);
+        assert_eq!((l.labels[0].x, l.labels[0].y, l.labels[0].size, l.labels[0].key.as_str()), (372., 2., LABEL_SIZE, "sss"));
+        assert_eq!((l.arrows.len(), l.arrows[0].to), (1, [312., 100.]));
+        assert!(l.labels[1].y > 140. && l.labels[2].x > 800. && l.labels[1].size <= TAG_SIZE);
         // Hero on the right: mirrored, and still inside the frame.
-        let r = default_lettering("jobless", &["blank check".into()], false);
+        let r = default_lettering("jobless", "", &["blank check".into()], false);
         assert!((r.labels[0].x + label_width("jobless", r.labels[0].size) - (LETTER_W - 372.)).abs() < 0.5 && r.arrows[0].to[0] > r.arrows[0].from[0]);
         // A long label shrinks to its room.
-        let long = default_lettering("the strongest hunter alive", &[], true);
-        assert!(long.labels[0].size < LABEL_SIZE && label_width("the strongest hunter alive", long.labels[0].size) <= 521.);
-        assert!(default_lettering(" ", &[], true).is_empty());
+        let long = default_lettering("the strongest hunter alive", "", &[], true);
+        assert!(long.labels[0].size < LABEL_SIZE && label_width("the strongest hunter alive", long.labels[0].size) <= 601.);
+        assert!(default_lettering(" ", "", &[], true).is_empty());
 
         let d = tempfile::tempdir().unwrap();
         let (art, out) = (d.path().join("a.png"), d.path().join("t.png"));
@@ -832,11 +874,12 @@ mod tests {
         assert_eq!(img.dimensions(), (1920, 1080), "the picture keeps its size; positions scale to it");
         let near = |p: &image::Rgb<u8>, c: [u8; 4]| (0..3).all(|k| p.0[k].abs_diff(c[k]) < 40);
         let count = |c: [u8; 4], x0: u32, x1: u32, y0: u32, y1: u32| (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| near(img.get_pixel(x, y), c)).count();
-        // The big label (frame x 372.., y 4..): yellow letters outlined in black; the arrow left of it.
-        assert!(count(LABEL_YELLOW, 558, 1300, 0, 200) > 8000 && count([0, 0, 0, 255], 558, 1300, 0, 200) > 6000);
-        assert!(count(LABEL_YELLOW, 440, 556, 60, 160) > 300, "the arrow");
+        // The big label (frame x 372.., y 2..): "SSS" red, "-RANK" yellow, outlined in black.
+        assert!(count(LABEL_RED, 558, 860, 0, 230) > 5000 && count(LABEL_YELLOW, 860, 1500, 0, 230) > 5000 && count([0, 0, 0, 255], 558, 1500, 0, 230) > 6000);
+        assert_eq!(count(LABEL_RED, 0, 1920, 240, 1080), 0, "only the key is red");
+        assert!(count(LABEL_YELLOW, 440, 556, 80, 190) > 300, "the arrow");
         // The two tags, and nothing over the hero's side or the lower half.
-        assert!(count(LABEL_YELLOW, 570, 1200, 215, 300) > 1000 && count(LABEL_YELLOW, 1320, 1900, 20, 110) > 1000);
+        assert!(count(LABEL_YELLOW, 570, 1100, 245, 330) > 1000 && count(LABEL_YELLOW, 1390, 1900, 30, 120) > 1000);
         assert_eq!(count(LABEL_YELLOW, 0, 430, 0, 1080) + count(LABEL_YELLOW, 0, 1920, 540, 1080), 0);
         // The same label is drawn the same way each time (the tilt is not random between runs).
         let again = d.path().join("t2.png");
@@ -845,6 +888,30 @@ mod tests {
         // Nothing to letter: the art as it is.
         letter(&art, &Lettering::default(), &out).unwrap();
         assert_eq!(image::open(&out).unwrap().to_rgb8().get_pixel(600, 60).0, [40, 90, 200]);
+
+        // The crop: the right half of a picture that is red on the left and blue on the right,
+        // brought back to full size; a crop that is not 16:9 or too small is ignored.
+        let mut split = RgbImage::from_pixel(1920, 1080, image::Rgb([200, 30, 30]));
+        for y in 0..1080 {
+            for x in 960..1920 {
+                split.put_pixel(x, y, image::Rgb([30, 30, 200]));
+            }
+        }
+        split.save(&art).unwrap();
+        let blue = Lettering { crop: Some([640., 0., 640., 360.]), ..Default::default() };
+        assert!(!crop_ok(&[640., 0., 640., 360.]), "too small to stay sharp");
+        let wide = Lettering { crop: Some([320., 180., 960., 540.]), ..Default::default() };
+        assert!(crop_ok(&[320., 180., 960., 540.]) && !crop_ok(&[0., 0., 900., 700.]) && !crop_ok(&[500., 0., 960., 540.]));
+        letter(&art, &wide, &out).unwrap();
+        let c = image::open(&out).unwrap().to_rgb8();
+        assert_eq!(c.dimensions(), (1920, 1080));
+        // The cut runs from x 480 to 1440 of the original: its middle (the colour line) is now at 960.
+        assert!(c.get_pixel(200, 540).0[0] > 150 && c.get_pixel(1700, 540).0[2] > 150);
+        letter(&art, &blue, &out).unwrap();
+        assert!(image::open(&out).unwrap().to_rgb8().get_pixel(200, 540).0[0] > 150, "an unusable crop leaves the picture whole");
+        let small = d.path().join("s.jpg");
+        crop_art(&art, wide.crop, &small).unwrap();
+        assert_eq!(image::open(&small).unwrap().to_rgb8().dimensions(), (1280, 720));
     }
 
     #[test]

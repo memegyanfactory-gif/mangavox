@@ -6,6 +6,7 @@
 mod assist;
 mod click;
 mod cover_thumb;
+mod feed;
 mod image_api;
 mod logic;
 pub(crate) mod magnific;
