@@ -6,6 +6,7 @@
 //!
 //! This crate is the engine (data, prompts, layout, lettering, PDF, video); `ui-creative` is the
 //! page, and it runs the image models through Studio's catalog.
+pub mod anime;
 mod disk;
 mod letter;
 pub mod layout;

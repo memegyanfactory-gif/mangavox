@@ -104,6 +104,13 @@ pub struct Settings {
     /// Pictures are made on Magnific's website, in the app's browser window where the user is
     /// signed in (its unlimited offer), instead of through an API key.
     pub web_images: bool,
+    /// Anime: the manga is adapted as a TV anime (drawn, coloured, animated cut by cut from an
+    /// AI director's storyboard and composited in layers) instead of live action.
+    pub anime: bool,
+    /// Music under the anime episode (a file on this PC; empty: none).
+    pub music: String,
+    /// Anime: how much the director may add to the manga ("faithful", "cinematic", "expanded").
+    pub expansion: String,
 }
 
 impl Default for Settings {
@@ -123,6 +130,9 @@ impl Default for Settings {
             live_action: false,
             voice: String::new(),
             web_images: false,
+            anime: false,
+            music: String::new(),
+            expansion: "faithful".into(),
         }
     }
 }
@@ -257,6 +267,12 @@ pub struct PanelChar {
     pub outfit: String,
     #[serde(deserialize_with = "lenient_text")]
     pub pose: String,
+    /// Anime cuts: where they stand in the frame (left, centre, right) and which way they face
+    /// (left, right, camera, away), so a conversation keeps its sides from cut to cut.
+    #[serde(deserialize_with = "lenient_text")]
+    pub side: String,
+    #[serde(deserialize_with = "lenient_text")]
+    pub facing: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -313,6 +329,8 @@ pub struct Chapter {
     pub summary: String,
     pub pages: Vec<Page>,
     pub video: Option<String>,
+    /// The anime of this chapter: the manga's panels as read, the storyboard and what was made.
+    pub anime: crate::anime::AnimeChapter,
 }
 
 impl Chapter {
@@ -389,6 +407,10 @@ pub struct Project {
     pub chapters: Vec<Chapter>,
     pub chat: Vec<ChatLine>,
     pub settings: Settings,
+    /// Anime: background plates (one per place, view and light, reused by every cut set there)
+    /// and the effects bank (fire, aura, sparks on black, placed in any cut).
+    pub plates: Vec<crate::anime::Plate>,
+    pub fx: Vec<crate::anime::FxElement>,
 }
 
 impl Project {

@@ -30,7 +30,7 @@ mod types;
 
 pub use brain::{safe_id, Brain, ChapterRecap};
 pub use export::export_for_pipeline;
-pub use json::extract_json;
+pub use json::{extract_json, extract_whole_json};
 pub use llm::retry_now;
 pub use manual::{load_manual, reset_manual_page, set_manual_page, ManualPage, ManualPanels};
 pub use auto::{read_chapter_smart, write_story_anyway_smart, write_story_for_manga_smart};

@@ -41,6 +41,12 @@ impl CreativePage {
     /// manga's own characters and story (from what Studio read of it), with realistic casting
     /// sheets and scenes filmed by LTX 2.3 with their voice.
     pub(crate) fn adapt(&mut self, m: crate::page::LibManga, cx: &mut Context<Self>) {
+        self.adapt_as(m, false, cx)
+    }
+
+    /// Starts an adaptation of a downloaded manga, as live action or (`anime`) as a TV anime
+    /// made cut by cut from an AI director's storyboard.
+    pub(crate) fn adapt_as(&mut self, m: crate::page::LibManga, anime: bool, cx: &mut Context<Self>) {
         if self.busy() {
             self.error = Some("Wait for the AI or the painting to finish, or stop it, before starting another manga.".into());
             cx.notify();
@@ -51,12 +57,13 @@ impl CreativePage {
             cx.notify();
             return;
         }
-        let mut p = Project::new(&format!("{} (live action)", m.title));
+        let mut p = Project::new(&format!("{} ({})", m.title, if anime { "anime" } else { "live action" }));
         p.settings.image_model = jobs::image_model(&p, &self.keys).id.to_string();
-        p.settings.live_action = true;
+        p.settings.live_action = !anime;
+        p.settings.anime = anime;
         p.settings.color = true;
         p.settings.rtl = false;
-        p.settings.video_model = mv_create::video::LTX_VOICE.to_string();
+        p.settings.video_model = if anime { "mg-kling-3-turbo-720p".to_string() } else { mv_create::video::LTX_VOICE.to_string() };
         p.adapts = Some(m.title.clone());
         if let Err(e) = p.save() {
             self.error = Some(format!("Could not create the project: {e:#}"));
@@ -67,12 +74,24 @@ impl CreativePage {
         self.p = Some(p);
         self.chapter = 1;
         // Stays where the user started it: the Video page shows the steps as they go.
-        if self.mode != crate::page::Mode::Video {
+        if !matches!(self.mode, crate::page::Mode::Video | crate::page::Mode::Anime) {
             self.tab = crate::page::Tab::Chat;
         }
         self.error = None;
-        let brief = format!("A faithful live-action adaptation of my downloaded manga \"{}\": the same characters with their own traits as real people, the same story.", m.title);
-        self.note(format!("Adapting “{}” as live action: reading what Studio knows of its characters and story.", m.title));
+        if anime {
+            // The anime's cast and story come from the chapter's own pages, read panel by panel;
+            // it opens on the first chapter that is downloaded.
+            let first = m.chapters.first().copied().unwrap_or(1);
+            self.chapter = first;
+            self.edit(|p| {
+                p.chapter_mut(first);
+            });
+            self.note(format!("“{}” as an anime: pick a chapter and press Make. The AI reads its pages, finds its cast, divides it into scenes and storyboards it; you watch the animatic before anything is drawn.", m.title));
+            cx.notify();
+            return;
+        }
+        let brief = adapt_brief(anime, &m.title);
+        self.note(format!("Adapting “{}” as {}: reading what Studio knows of its characters and story.", m.title, if anime { "an anime" } else { "live action" }));
         self.thinking = Some(Arc::new(Mutex::new(String::new())));
         self.tick(cx);
         self.run_ops(VecDeque::from([Op::CreateSeries { brief, inspirations: vec![m.title] }]), cx);
@@ -112,6 +131,9 @@ impl CreativePage {
         let n = if p.chapter(n).is_some() { n } else { p.first_chapter() };
         self.auto = Some(n);
         self.chapter = n;
+        if p.settings.anime {
+            return self.anime_step(&p, n, cx);
+        }
         let stage = jobs::stage(&p, n);
         let mark = (stage.index(), stage.tasks().len());
         if self.auto_last == Some(mark) {
@@ -124,7 +146,7 @@ impl CreativePage {
         match stage {
             jobs::Stage::Series => match p.adapts.clone() {
                 Some(title) if Brainbox::current(self.ai_cancel.clone(), cx).is_ok() => {
-                    let brief = format!("A faithful live-action adaptation of my downloaded manga \"{title}\": the same characters with their own traits as real people, the same story.");
+                    let brief = adapt_brief(p.settings.anime, &title);
                     self.thinking = Some(Arc::new(Mutex::new(String::new())));
                     self.tick(cx);
                     self.run_ops(VecDeque::from([Op::CreateSeries { brief, inspirations: vec![title] }]), cx);
@@ -149,6 +171,51 @@ impl CreativePage {
                 self.auto = None;
                 self.note(format!("Chapter {n}'s video is ready."));
                 mv_ui::toast::show(cx, mv_ui::toast::Toast::success(format!("Chapter {n}'s video is ready")).icon(ph::FILM_STRIP));
+            }
+        }
+    }
+
+    /// The next stage of an automatic anime episode. It runs from the pages to the animatic, then
+    /// waits for the animatic to be watched and approved before anything is painted.
+    fn anime_step(&mut self, p: &Project, n: u32, cx: &mut Context<Self>) {
+        use crate::anime_jobs::AStage;
+        let stage = crate::anime_jobs::stage(p, n);
+        let mark = (100 + stage.order(), stage.tasks().len());
+        if self.auto_last == Some(mark) {
+            self.auto = None;
+            self.note(format!("The automatic anime stopped: {} job{} of this step could not be made. See the notes above, then press Continue.", mark.1.max(1), if mark.1.max(1) == 1 { "" } else { "s" }));
+            return;
+        }
+        self.auto_last = Some(mark);
+        if stage.asks_ai() {
+            if let Err(e) = Brainbox::current(self.ai_cancel.clone(), cx) {
+                self.auto = None;
+                self.error = Some(e);
+                return;
+            }
+        }
+        let op = |this: &mut Self, what: String, op: Op, cx: &mut Context<Self>| {
+            this.thinking = Some(Arc::new(Mutex::new(what)));
+            this.tick(cx);
+            this.run_ops(VecDeque::from([op]), cx);
+        };
+        match stage {
+            AStage::Panels => self.enqueue(vec![jobs::Task::Panels { chapter: n }], cx),
+            AStage::Read => op(self, format!("Reading chapter {n}'s panels"), Op::ReadAnime { chapter: n }, cx),
+            AStage::Cast => op(self, format!("Gathering chapter {n}'s characters and places"), Op::CastAnime { chapter: n }, cx),
+            AStage::Scenes => op(self, format!("Dividing chapter {n} into scenes"), Op::ScenesAnime { chapter: n }, cx),
+            AStage::Board => op(self, format!("Storyboarding chapter {n}"), Op::BoardAnime { chapter: n, note: String::new() }, cx),
+            AStage::Rough(t) | AStage::Sheets(t) | AStage::Assets(t) | AStage::Cuts(t) => self.enqueue(t, cx),
+            AStage::Approve => {
+                self.auto = None;
+                self.note(format!("Chapter {n}'s animatic is ready: watch it, then press Draw it (or storyboard a scene again first). Nothing has been painted yet."));
+                mv_ui::toast::show(cx, mv_ui::toast::Toast::success(format!("Chapter {n}'s animatic is ready to watch")).icon(ph::FILM_STRIP));
+            }
+            AStage::Edit => self.enqueue(vec![jobs::Task::Episode { chapter: n }], cx),
+            AStage::Done => {
+                self.auto = None;
+                self.note(format!("Chapter {n}'s anime episode is ready."));
+                mv_ui::toast::show(cx, mv_ui::toast::Toast::success(format!("Chapter {n}'s anime episode is ready")).icon(ph::FILM_STRIP));
             }
         }
     }
@@ -237,6 +304,11 @@ impl CreativePage {
         })
         .detach();
         cx.notify();
+    }
+
+    /// [`Self::run_ops`] for the other pages of Creative.
+    pub(crate) fn run_ops_pub(&mut self, ops: Vec<Op>, cx: &mut Context<Self>) {
+        self.run_ops(ops.into(), cx)
     }
 
     /// Runs the director's ops one after another (the writing ones call the AI again).
@@ -355,6 +427,67 @@ impl CreativePage {
                     Ok(())
                 });
             }
+            Op::ReadAnime { chapter } => {
+                let (ask, st) = (ai.asker(), ai::status_into(status.clone()));
+                let fut = async move { mv_create::anime::director::read(&ask, &p, chapter, &st).await };
+                self.ai_step(ops, cx, fut, move |this, panels, _| {
+                    let story = panels.iter().filter(|x| x.story()).count();
+                    let total = panels.len();
+                    this.edit(|p| p.chapter_mut(chapter).anime.panels = panels);
+                    this.note(format!("Chapter {chapter} read: {story} story panels of {total}."));
+                    Ok(())
+                });
+            }
+            Op::CastAnime { chapter } => {
+                let (ask, st) = (ai.asker(), ai::status_into(status.clone()));
+                // What Studio already knows of the manga helps with names and roles.
+                let found = p.adapts.as_deref().and_then(|t| self.find_manga(t));
+                let fut = async move {
+                    let notes = match found {
+                        Some(m) => tokio::task::spawn_blocking(move || inspiration_notes(&m.id, &m.title, 60, 30)).await.unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    mv_create::anime::director::cast(&ask, p, chapter, &notes, &st).await
+                };
+                self.ai_step(ops, cx, fut, move |this, (done, added), _| {
+                    this.edit(|live| crate::anime_jobs::merge_cast(live, &done, chapter));
+                    this.note(format!("Chapter {chapter}'s characters gathered from its pages: {} in the cast ({added} new), {} places.", done.cast.len(), done.locations.len()));
+                    Ok(())
+                });
+            }
+            Op::ScenesAnime { chapter } => {
+                let (ask, st) = (ai.asker(), ai::status_into(status.clone()));
+                let fut = async move { mv_create::anime::director::scenes(&ask, p, chapter, &st).await };
+                self.ai_step(ops, cx, fut, move |this, done, _| {
+                    this.edit(|live| crate::anime_jobs::merge_board(live, &done, chapter));
+                    let a = done.chapter(chapter).map(|c| c.anime.clone()).unwrap_or_default();
+                    let secs: f32 = a.scenes.iter().map(|s| s.seconds).sum();
+                    this.note(format!("Chapter {chapter} divided into {} scenes, about {}:{:02} in all.", a.scenes.len(), (secs / 60.) as u32, (secs % 60.) as u32));
+                    Ok(())
+                });
+            }
+            Op::BoardAnime { chapter, note } => {
+                let (ask, st) = (ai.asker(), ai::status_into(status.clone()));
+                let fut = async move { mv_create::anime::director::board(&ask, p, chapter, &note, &st).await };
+                self.ai_step(ops, cx, fut, move |this, done, _| {
+                    this.edit(|live| crate::anime_jobs::merge_board(live, &done, chapter));
+                    let a = done.chapter(chapter).map(|c| c.anime.clone()).unwrap_or_default();
+                    let secs = a.seconds();
+                    let open = if a.issues.is_empty() { "The check found nothing to fix.".to_string() } else { format!("The check still notes {} thing{} (shown on the board).", a.issues.len(), if a.issues.len() == 1 { "" } else { "s" }) };
+                    this.note(format!("Chapter {chapter} storyboarded: {} cuts in {} scenes, {}:{:02}. {open}", a.cuts.len(), a.scenes.len(), (secs / 60.) as u32, (secs % 60.) as u32));
+                    Ok(())
+                });
+            }
+            Op::BoardScene { chapter, scene, note } => {
+                let (ask, st) = (ai.asker(), ai::status_into(status.clone()));
+                let fut = async move { mv_create::anime::director::board_scene(&ask, p, chapter, scene, &note, &st).await };
+                self.ai_step(ops, cx, fut, move |this, done, _| {
+                    this.edit(|live| crate::anime_jobs::merge_board(live, &done, chapter));
+                    let n = done.chapter(chapter).map(|c| c.anime.cuts.iter().filter(|c| c.scene == scene).count()).unwrap_or(0);
+                    this.note(format!("Scene {scene} of chapter {chapter} storyboarded again: {n} cuts. Its animatic is made again with the rest."));
+                    Ok(())
+                });
+            }
             Op::EditPage { chapter, page, instruction } => {
                 set("Rewriting the page");
                 let Some(pg) = p.chapter(chapter).and_then(|c| c.pages.iter().find(|x| x.number == page)).cloned() else {
@@ -377,7 +510,9 @@ impl CreativePage {
 
     /// Chapter `n` has pages or clips queued or being made.
     pub(crate) fn chapter_painting(&self, n: u32) -> bool {
-        let mine = |t: &jobs::Task| matches!(t, jobs::Task::Page { chapter, .. } | jobs::Task::Clip { chapter, .. } | jobs::Task::Stitch { chapter } if *chapter == n);
+        let mine = |t: &jobs::Task| {
+            matches!(t, jobs::Task::Page { chapter, .. } | jobs::Task::Clip { chapter, .. } | jobs::Task::Stitch { chapter } | jobs::Task::Panels { chapter } | jobs::Task::Rough { chapter, .. } | jobs::Task::Animatic { chapter } | jobs::Task::Layer { chapter, .. } | jobs::Task::Anim { chapter, .. } | jobs::Task::Comp { chapter, .. } | jobs::Task::Episode { chapter } if *chapter == n)
+        };
         self.queue.iter().any(mine) || self.running.as_ref().is_some_and(|r| r.label.starts_with(&format!("Chapter {n} ")))
     }
 
@@ -669,4 +804,13 @@ fn inspiration_notes(id: &str, title: &str, cast: usize, lines: usize) -> String
         s.push_str(&format!("\nStory notes:\n{notes}"));
     }
     s
+}
+
+/// What the series is written from when a downloaded manga is adapted.
+pub(crate) fn adapt_brief(anime: bool, title: &str) -> String {
+    if anime {
+        format!("A faithful TV anime adaptation of my downloaded manga \"{title}\": the same characters with their own looks and outfits, the same story, directed like a high-end anime.")
+    } else {
+        format!("A faithful live-action adaptation of my downloaded manga \"{title}\": the same characters with their own traits as real people, the same story.")
+    }
 }

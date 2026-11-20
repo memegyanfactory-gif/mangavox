@@ -4,6 +4,8 @@ use gpui_kit::*;
 use mv_ui::Route;
 
 mod ai;
+mod anime_jobs;
+mod anime_view;
 mod cast;
 mod chat;
 mod jobs;

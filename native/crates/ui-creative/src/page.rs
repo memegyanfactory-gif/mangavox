@@ -24,6 +24,8 @@ pub(crate) enum Tab {
     Characters,
     Manga,
     Video,
+    /// Anime: a manga chapter made into a TV anime episode, cut by cut (`anime_view`).
+    Anime,
     /// Manga to Blender: assets, previz and chapter renders (`ui-3d`).
     ThreeD,
 }
@@ -36,17 +38,20 @@ pub(crate) enum Mode {
     Manga,
     /// Turn a manga into a video: one list of steps, then the scenes.
     Video,
+    /// Turn a manga chapter into an anime episode: the AI directs, the cuts are composited.
+    Anime,
     /// Manga to Blender.
     ThreeD,
 }
 
 impl Mode {
-    pub(crate) const ALL: [Mode; 3] = [Mode::Manga, Mode::Video, Mode::ThreeD];
+    pub(crate) const ALL: [Mode; 4] = [Mode::Manga, Mode::Anime, Mode::Video, Mode::ThreeD];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Mode::Manga => "Make a manga",
             Mode::Video => "Make a video",
+            Mode::Anime => "Make an anime",
             Mode::ThreeD => "3D (Blender)",
         }
     }
@@ -55,6 +60,7 @@ impl Mode {
         match self {
             Mode::Manga => "Write your own series with the AI and paint its pages",
             Mode::Video => "Turn a downloaded manga into a live-action video, step by step",
+            Mode::Anime => "A manga chapter becomes an anime episode: the AI reads the pages, storyboards it like a director, and every cut is drawn, animated and composited",
             Mode::ThreeD => "Manga to Blender: assets, previz and renders",
         }
     }
@@ -64,6 +70,7 @@ impl Mode {
         match self {
             Mode::Manga => &[(Tab::Chat, "Chat"), (Tab::Characters, "Characters"), (Tab::Manga, "Pages")],
             Mode::Video => &[(Tab::Video, "Video"), (Tab::Characters, "Characters")],
+            Mode::Anime => &[(Tab::Anime, "Anime"), (Tab::Characters, "Characters")],
             Mode::ThreeD => &[(Tab::ThreeD, "3D")],
         }
     }
@@ -714,6 +721,7 @@ impl CreativePage {
                 .icon(match m {
                     Mode::Manga => ph::BOOK_OPEN,
                     Mode::Video => ph::FILM_STRIP,
+                    Mode::Anime => ph::FILM_SLATE,
                     Mode::ThreeD => ph::CUBE,
                 })
                 .checked(m == mode)
@@ -792,6 +800,7 @@ impl Render for CreativePage {
             // The 3D pipeline works from the downloaded manga, so it needs no Creative project.
             (_, Tab::ThreeD) => self.three_d.clone().map(|v| v.into_any_element()).unwrap_or_else(|| div().into_any_element()),
             (None, Tab::Video) => self.video_tab(cx).into_any_element(),
+            (_, Tab::Anime) => self.anime_tab(cx).into_any_element(),
             (None, _) => self.welcome(cx).into_any_element(),
             (Some(_), Tab::Chat) => self.chat_tab(cx).into_any_element(),
             (Some(_), Tab::Characters) => self.cast_tab(cx).into_any_element(),

@@ -21,6 +21,25 @@ pub(crate) enum Task {
     Page { chapter: u32, page: u32 },
     Clip { chapter: u32, page: u32, panel: usize },
     Stitch { chapter: u32 },
+    // Anime (see `anime_jobs`).
+    /// Cut the chapter's real pages into panels.
+    Panels { chapter: u32 },
+    /// The animatic's version of a cut: voiced, and shown from the manga panel it adapts.
+    Rough { chapter: u32, cut: u32 },
+    /// The animatic: every cut joined with its voice.
+    Animatic { chapter: u32 },
+    /// A background plate, by id.
+    Plate(String),
+    /// An effects element of the bank, by id.
+    FxEl(String),
+    /// A cut's characters on the chroma screen (or its whole frame when no one is in it).
+    Layer { chapter: u32, cut: u32 },
+    /// A cut animated (the character layer, or the whole key frame).
+    Anim { chapter: u32, cut: u32 },
+    /// A cut voiced and composited.
+    Comp { chapter: u32, cut: u32 },
+    /// The cuts joined into the episode.
+    Episode { chapter: u32 },
 }
 
 pub(crate) enum Outcome {
@@ -30,6 +49,7 @@ pub(crate) enum Outcome {
     Page { chapter: u32, page: u32, rel: String, panels: Vec<Option<String>>, model: String },
     Clip { chapter: u32, page: u32, panel: usize, rel: String },
     Stitch { chapter: u32, rel: String },
+    Anime(crate::anime_jobs::Made),
 }
 
 pub(crate) struct Job {
@@ -59,7 +79,7 @@ pub(crate) fn shapes(p: &Project, m: &ImageModel) -> &'static [&'static str] {
 }
 
 /// Reference pictures one image may carry.
-fn ref_cap(p: &Project, m: &ImageModel) -> usize {
+pub(crate) fn ref_cap(p: &Project, m: &ImageModel) -> usize {
     if p.settings.web_images {
         crate::web::MAX_REFS
     } else {
@@ -68,7 +88,7 @@ fn ref_cap(p: &Project, m: &ImageModel) -> usize {
 }
 
 /// Credits one image costs: none on the website's unlimited offer.
-fn cost(p: &Project, m: &ImageModel, res: &str) -> f64 {
+pub(crate) fn cost(p: &Project, m: &ImageModel, res: &str) -> f64 {
     if p.settings.web_images {
         0.
     } else {
@@ -78,7 +98,7 @@ fn cost(p: &Project, m: &ImageModel, res: &str) -> f64 {
 
 /// One picture: on Magnific's website (signed in, one at a time) or through the model's API.
 #[allow(clippy::too_many_arguments)]
-async fn paint(web: bool, m: &'static ImageModel, key: &str, prompt: &str, refs: &[Reference], aspect: &str, res: &str, out: &std::path::Path, on_status: impl Fn(&str)) -> Result<()> {
+pub(crate) async fn paint(web: bool, m: &'static ImageModel, key: &str, prompt: &str, refs: &[Reference], aspect: &str, res: &str, out: &std::path::Path, on_status: impl Fn(&str)) -> Result<()> {
     if web {
         crate::web::generate(prompt, refs, aspect, out, on_status).await
     } else {
@@ -88,7 +108,7 @@ async fn paint(web: bool, m: &'static ImageModel, key: &str, prompt: &str, refs:
 
 /// The faces Studio cut out of the manga's pages for each character (`<brain>/faces`), by the
 /// names and aliases it knows them under. Read once per manga.
-fn manga_faces(title: &str, name: &str) -> Vec<PathBuf> {
+pub(crate) fn manga_faces(title: &str, name: &str) -> Vec<PathBuf> {
     type Known = Vec<(Vec<String>, Vec<PathBuf>)>;
     static CACHE: Mutex<Option<(String, Known)>> = Mutex::new(None);
     let norm = |s: &str| s.trim().to_lowercase();
@@ -136,7 +156,7 @@ fn pick_faces(known: &[(Vec<String>, Vec<PathBuf>)], name: &str) -> Vec<PathBuf>
 
 /// Puts a character's manga faces among the references (after the first `keep`), numbers every
 /// caption again and keeps at most `cap`.
-fn with_faces(refs: &mut Vec<Reference>, faces: &[PathBuf], name: &str, keep: usize, cap: usize) {
+pub(crate) fn with_faces(refs: &mut Vec<Reference>, faces: &[PathBuf], name: &str, keep: usize, cap: usize) {
     let at = keep.min(refs.len());
     for (i, f) in faces.iter().enumerate() {
         refs.insert(at + i, Reference { file: f.clone(), caption: format!("Image 0: {name}'s face as drawn in the manga (the real person has this face, hair and marks)") });
@@ -232,14 +252,14 @@ fn captions(refs: &[Reference]) -> Vec<String> {
     refs.iter().map(|r| r.caption.clone()).collect()
 }
 
-fn key(m: &ImageModel) -> Result<String> {
+pub(crate) fn key(m: &ImageModel) -> Result<String> {
     images::key_for(m).ok_or_else(|| match m.via {
         Via::Magnific => anyhow!("Connect Magnific first: add the API key in Settings › Magnific."),
         Via::Service(_) => anyhow!("{} needs a {} key: add it in Settings › AI services.", m.name, m.service_label()),
     })
 }
 
-fn set(status: &Arc<Mutex<String>>, s: impl Into<String>) {
+pub(crate) fn set(status: &Arc<Mutex<String>>, s: impl Into<String>) {
     *status.lock().unwrap_or_else(|e| e.into_inner()) = s.into();
 }
 
@@ -250,6 +270,7 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
     let one = cost(p, m, res);
     let web = p.settings.web_images;
     let cap = ref_cap(p, m);
+    let anime = p.settings.anime;
     // `face_of`: (the manga adapted, the character, how many leading references stay first). The
     // character's own face as the manga draws it is looked up when the job runs and attached.
     let image_job = |label: String, prompt: String, refs: Vec<Reference>, face_of: Option<(String, String, usize)>, aspect: &'static str, out: PathBuf, done: Box<dyn FnOnce(String) -> Outcome + Send>, rel_of: Box<dyn Fn(&std::path::Path) -> String + Send>| -> Result<Job> {
@@ -262,7 +283,11 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
                 let faces = tokio::task::spawn_blocking(move || manga_faces(&title, &who)).await.unwrap_or_default();
                 if !faces.is_empty() {
                     with_faces(&mut refs, &faces, &name, keep, cap);
-                    prompt.push_str(&format!("\nThe attached face pictures show {name} as the manga draws them. The real person must have this same face shape, hairstyle, hair colour, eye colour and marks, so they are recognisably {name}. Do not copy the drawing style: a real photographed human."));
+                    if anime {
+                        prompt.push_str(&format!("\nThe attached face pictures show {name} as the manga draws them. Draw the same character, recognisably {name}: the same face shape, hairstyle, hair colour, eye colour and marks, as a clean colour anime design (no screentone)."));
+                    } else {
+                        prompt.push_str(&format!("\nThe attached face pictures show {name} as the manga draws them. The real person must have this same face shape, hairstyle, hair colour, eye colour and marks, so they are recognisably {name}. Do not copy the drawing style: a real photographed human."));
+                    }
                 }
             }
             paint(web, m, &k, &prompt, &refs, aspect, res, &out, move |s| set(&st, s)).await?;
@@ -287,7 +312,7 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
             }
             // Drawn manga takes its line and tone from the style pages; live action must not (a
             // manga page as a reference pulls a photograph towards a drawing).
-            if !p.settings.live_action {
+            if !p.settings.live_action && !p.settings.anime {
                 for r in p.style_refs.iter().take(2) {
                     refs.push(Reference { file: p.file(r), caption: format!("Image {}: art style reference (style only, not its characters)", refs.len() + 1) });
                 }
@@ -311,6 +336,7 @@ pub(crate) fn build(p: &Project, task: &Task, keys: &Keys, status: Arc<Mutex<Str
             image_job(format!("{} · location", l.name), prompts::location(p, &l), refs, None, layout::nearest(16. / 9., shapes(p, m)), out, Box::new(move |rel| Outcome::Location { id, rel }), Box::new(rel))
         }
         Task::Page { chapter, page } => page_job(p, m, res, *chapter, *page, status),
+        Task::Panels { .. } | Task::Rough { .. } | Task::Animatic { .. } | Task::Plate(_) | Task::FxEl(_) | Task::Layer { .. } | Task::Anim { .. } | Task::Comp { .. } | Task::Episode { .. } => crate::anime_jobs::build(p, task, keys, status),
         Task::Clip { chapter, page, panel } => clip_job(p, *chapter, *page, *panel, status),
         Task::Stitch { chapter } => {
             let ch = p.chapter(*chapter).ok_or_else(|| anyhow!("no chapter {chapter}"))?;
@@ -478,7 +504,7 @@ fn clip_job(p: &Project, chapter: u32, page: u32, i: usize, status: Arc<Mutex<St
 /// The sound of a scene for LTX: its lines spoken with the project's voice (Studio's voice when
 /// none is picked), or silence of `seconds` when nobody speaks. Returns the file and how long the
 /// clip should be (the voice and a moment after it, at most [`LONGEST_SCENE`]).
-async fn scene_voice(spoken: Vec<prompts::Delivery>, cast: Vec<Speaker>, cast_dir: PathBuf, voice: String, dir: PathBuf, seconds: u32, st: &Arc<Mutex<String>>) -> Result<(PathBuf, f64)> {
+pub(crate) async fn scene_voice(spoken: Vec<prompts::Delivery>, cast: Vec<Speaker>, cast_dir: PathBuf, voice: String, dir: PathBuf, seconds: u32, st: &Arc<Mutex<String>>) -> Result<(PathBuf, f64)> {
     if spoken.is_empty() {
         set(st, "Nobody speaks: a silent track");
         let out = dir.join("silence.wav");
@@ -692,7 +718,7 @@ pub(crate) struct Speaker {
 }
 
 impl Speaker {
-    fn of(c: &mv_create::CastMember) -> Speaker {
+    pub(crate) fn of(c: &mv_create::CastMember) -> Speaker {
         Speaker { name: c.name.clone(), gender: c.gender.trim().to_lowercase(), years: c.years(), about: format!("{} {} {} {}", c.role, c.age, c.appearance, c.personality), personality: c.personality.clone() }
     }
 }
@@ -794,6 +820,7 @@ pub(crate) fn apply(p: &mut Project, o: Outcome) {
             }
         }
         Outcome::Stitch { chapter, rel } => p.chapter_mut(chapter).video = Some(rel),
+        Outcome::Anime(made) => crate::anime_jobs::apply(p, made),
     }
 }
 
@@ -982,7 +1009,7 @@ pub(crate) fn estimate(p: &Project, keys: &Keys, tasks: &[Task]) -> (usize, f64)
     let mut images = 0;
     for t in tasks {
         images += match t {
-            Task::Sheet(_) | Task::Expressions(_) | Task::Location(_) => 1,
+            Task::Sheet(_) | Task::Expressions(_) | Task::Location(_) | Task::Plate(_) | Task::FxEl(_) | Task::Layer { .. } => 1,
             Task::Page { chapter, page } => p.chapter(*chapter).and_then(|c| c.pages.iter().find(|x| x.number == *page)).map(|pg| images_per_page(p, m, pg.panels.len())).unwrap_or(1),
             _ => 0,
         };

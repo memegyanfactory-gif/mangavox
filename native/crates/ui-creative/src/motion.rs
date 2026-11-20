@@ -812,7 +812,7 @@ fn size_label(bytes: u64) -> String {
 
 /// What Studio read of chapter `n` of the manga `title` (its story up to the end of that
 /// chapter), when it has read it.
-fn chapter_recap(title: &str, n: u32) -> Option<String> {
+pub(crate) fn chapter_recap(title: &str, n: u32) -> Option<String> {
     let norm = |s: &str| s.trim().to_lowercase();
     let groups = ui_studio::data::load().ok()?;
     let g = groups.iter().find(|g| norm(&g.title) == norm(title))?;
@@ -842,7 +842,7 @@ fn prompt_box(title: &'static str, text: String) -> Div {
 }
 
 /// Shows the file `f` selected in its folder.
-fn reveal(f: &std::path::Path) {
+pub(crate) fn reveal(f: &std::path::Path) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("explorer").arg(format!("/select,{}", f.display())).spawn();
@@ -855,7 +855,7 @@ fn reveal(f: &std::path::Path) {
 
 /// Opens the folder `dir` in the file manager (the nearest folder above it that exists, while
 /// nothing has been made in it yet).
-fn open_folder(dir: &std::path::Path) {
+pub(crate) fn open_folder(dir: &std::path::Path) {
     let dir = dir.ancestors().find(|d| d.is_dir()).unwrap_or(dir);
     #[cfg(windows)]
     {

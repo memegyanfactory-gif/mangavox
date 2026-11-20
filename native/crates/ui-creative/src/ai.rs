@@ -27,7 +27,12 @@ impl Brainbox {
         Ok(Brainbox { reg: ui_assistant::registry(cx), provider, model, cancel })
     }
 
-    pub(crate) async fn json(&self, mut messages: Vec<AiMessage>) -> Result<Value> {
+    pub(crate) async fn json(&self, messages: Vec<AiMessage>) -> Result<Value> {
+        self.json_seeing(messages, vec![]).await
+    }
+
+    /// The same, with pictures attached for a model that can see.
+    pub(crate) async fn json_seeing(&self, mut messages: Vec<AiMessage>, images: Vec<std::path::PathBuf>) -> Result<Value> {
         static N: AtomicU64 = AtomicU64::new(0);
         for attempt in 0..2 {
             let req = mv_ai::AiStepRequest {
@@ -38,7 +43,7 @@ impl Brainbox {
                 tools: None,
                 effort: None,
                 access: None,
-                images: Vec::new(),
+                images: images.clone(),
                 workspace: None,
                 lean: true,
                 mcp: None,
@@ -50,12 +55,13 @@ impl Brainbox {
             if let Some(e) = r.error {
                 bail!(e);
             }
-            if let Some(v) = mv_recap::extract_json(&r.text) {
+            // A reply cut off mid-object is no answer (its first inner object is not the whole).
+            if let Some(v) = mv_recap::extract_whole_json(&r.text) {
                 return Ok(v);
             }
             if attempt == 0 {
                 messages.push(AiMessage::assistant(r.text));
-                messages.push(AiMessage::user("Your previous answer was not valid JSON. Reply with the JSON object only."));
+                messages.push(AiMessage::user("Your previous answer was not one complete JSON object. Reply with the whole JSON object only."));
             }
         }
         Err(anyhow!("the AI's answer was not valid JSON; try again or pick another model"))
@@ -133,4 +139,20 @@ fn tidy(p: &Project, pg: &mut Page) {
             }
         }
     }
+}
+
+impl Brainbox {
+    /// This model as the anime director's way to ask (`mv_create::anime::director`).
+    pub(crate) fn asker(&self) -> mv_create::anime::director::Ask {
+        let me = self.clone();
+        Arc::new(move |q: mv_create::anime::director::Query| {
+            let me = me.clone();
+            Box::pin(async move { me.json_seeing(vec![AiMessage::system(q.system), AiMessage::user(q.user)], q.images).await })
+        })
+    }
+}
+
+/// A step's status line as the director reports into it.
+pub(crate) fn status_into(status: Arc<Mutex<String>>) -> mv_create::anime::director::Status {
+    Arc::new(move |s: String| *status.lock().unwrap_or_else(|e| e.into_inner()) = s)
 }

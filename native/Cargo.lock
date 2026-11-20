@@ -5874,6 +5874,7 @@ dependencies = [
  "image",
  "mv-ai",
  "mv-core",
+ "mv-recap",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

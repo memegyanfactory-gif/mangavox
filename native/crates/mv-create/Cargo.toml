@@ -19,4 +19,6 @@ base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+# The headless director example reads the AI's JSON the way Creative does.
+mv-recap = { path = "../mv-recap" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

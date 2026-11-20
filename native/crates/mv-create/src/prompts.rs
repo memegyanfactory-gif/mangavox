@@ -83,6 +83,16 @@ pub enum Op {
     EditPage { chapter: u32, page: u32, instruction: String },
     Propose(Proposal),
     Settings { color: Option<bool>, rtl: Option<bool>, pages_per_chapter: Option<u32> },
+    /// Anime: the vision model reads the chapter's panels.
+    ReadAnime { chapter: u32 },
+    /// Anime: the cast and places are gathered from the pages as read.
+    CastAnime { chapter: u32 },
+    /// Anime: the chapter is divided into scenes.
+    ScenesAnime { chapter: u32 },
+    /// Anime: the director draws up the chapter's storyboard, scene by scene, and revises it.
+    BoardAnime { chapter: u32, note: String },
+    /// Anime: one scene is boarded again.
+    BoardScene { chapter: u32, scene: u32, note: String },
 }
 
 fn num(v: &Value, k: &str) -> u32 {
@@ -316,7 +326,9 @@ pub fn page_digest(pages: &[Page]) -> String {
 // ------------------------------------------------------------------ image prompts
 
 fn medium(p: &Project) -> &'static str {
-    if p.settings.live_action {
+    if p.settings.anime {
+        crate::anime::ANIME_LOOK
+    } else if p.settings.live_action {
         "photorealistic live-action film still shot on a cinema camera: real human actors, natural skin texture and pores, real fabric, cinematic lighting, shallow depth of field, 35mm lens; NOT a drawing, NOT anime, NOT 3D render"
     } else if p.settings.color {
         "full-colour manga art, cel shading"
@@ -357,6 +369,19 @@ pub fn sheet(p: &Project, c: &CastMember, has_refs: bool) -> String {
             if has_refs { "\nThe attached images show the character as drawn: keep their face shape, hair, outfit and marks, but as a real person, not a drawing." } else { "" }
         );
     }
+    if p.settings.anime {
+        return format!(
+            "Official TV anime character design sheet (settei) for \"{}\", {}. Art direction: {}.\nThe same character four times side by side on a plain white background: front view, three-quarter view, side profile and back view, full body head to toe, neutral standing pose, consistent proportions, plus a large head close-up in the corner. Flat cel colours with one shadow tone, clean even lineart, the exact colours of hair, eyes, skin and every piece of the outfit. Character: {}. Age {}; {}. No scenery, no text except the name \"{}\" small at the top.{}",
+            c.name,
+            medium(p),
+            p.bible.art_style,
+            look(c, ""),
+            if c.age.is_empty() { "unknown" } else { &c.age },
+            c.personality,
+            c.name,
+            if has_refs { "\nThe attached images show the character as the manga draws them: keep their face, hairstyle, marks and outfit design exactly, redrawn as a colour anime design." } else { "" }
+        );
+    }
     format!(
         "Professional manga character model sheet for \"{}\". {}. Art direction: {}.\nShow the same character four times side by side on a plain white background: front view, three-quarter view, side profile and back view, full body head to toe, neutral standing pose, consistent proportions, plus a large head close-up in the corner. Character: {}. Age {}; {}.\nClean line art, consistent design in every view, no scenery, no text except the name \"{}\" small at the top.{}",
         c.name,
@@ -377,6 +402,15 @@ pub fn expressions(p: &Project, c: &CastMember) -> String {
             "Photorealistic expression sheet of the real person in the attached casting sheet, playing \"{}\": the identical face, eyes, hair and outfit collar. {}.\nA 3x3 grid of head-and-shoulders portraits on a plain light-grey background: neutral, happy laugh, angry shout, sad tears, shocked, determined, smug grin, embarrassed, scared. Each expression natural and readable, acted the way this person would ({}). Thin gaps between cells, no text.",
             c.name,
             medium(p),
+            c.personality
+        );
+    }
+    if p.settings.anime {
+        return format!(
+            "TV anime expression sheet (settei) for \"{}\", the same character as in the attached design sheet: identical face, eyes, hair, colours and outfit collar. {}. Art direction: {}.\nA 3x3 grid of head-and-shoulders portraits on white: neutral, happy laugh, angry shout, sad tears, shocked, determined, smug grin, embarrassed blush, scared. Each expression strong and readable in that character's personality ({}), flat cel colours. Thin grid lines between cells, no other text.",
+            c.name,
+            medium(p),
+            p.bible.art_style,
             c.personality
         );
     }
@@ -679,7 +713,7 @@ mod tests {
     #[test]
     fn prompts_carry_the_fixed_look() {
         let p = project();
-        let panel = Panel { shot: "close-up".into(), characters: vec![crate::project::PanelChar { name: "kai".into(), expression: "grin".into(), outfit: "lab".into(), pose: String::new() }], lines: vec![crate::project::Line { speaker: "Kai".into(), text: "Science!".into(), kind: "shout".into() }], ..Default::default() };
+        let panel = Panel { shot: "close-up".into(), characters: vec![crate::project::PanelChar { name: "kai".into(), expression: "grin".into(), outfit: "lab".into(), ..Default::default() }], lines: vec![crate::project::Line { speaker: "Kai".into(), text: "Science!".into(), kind: "shout".into() }], ..Default::default() };
         let pg = Page { number: 1, layout: "splash".into(), panels: vec![panel.clone()], ..Default::default() };
         let full = page(&p, 1, &pg, &["Image 1: Kai model sheet".into()]);
         assert!(full.contains("spiky white hair") && full.contains("torn lab coat"));
