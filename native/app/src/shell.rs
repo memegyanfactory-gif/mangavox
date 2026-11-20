@@ -327,7 +327,6 @@ impl Shell {
             .or_else(|| ui_studio::open(route, window, cx))
             .or_else(|| ui_phone::open(route, window, cx))
             .or_else(|| ui_youtube::open(route, window, cx))
-            .or_else(|| ui_creative::open(route, window, cx))
             .or_else(|| ui_welcome::open(route, window, cx))
             .unwrap_or_else(|| {
                 let title = route_title(route).into();
@@ -686,7 +685,6 @@ impl Shell {
             Route::Thumbnails => vec![here("Thumbnails")],
             Route::YouTubeVideos => vec![here("YouTube videos")],
             Route::Automation => vec![here("Automation")],
-            Route::Creative => vec![here("Creative")],
             Route::Reader { manga_id, chapter_id } => vec![
                 section_crumb,
                 link(self.manga_names.get(manga_id).cloned().unwrap_or_else(|| "Manga".into()), CrumbTo::Manga(manga_id.clone())).loading(self.looking_up.contains(manga_id)),
@@ -1423,17 +1421,6 @@ impl Shell {
                 .child(nav_item("nav-youtube-videos", ph::MONITOR_PLAY, "YouTube videos", yv_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::YouTubeVideos, w, cx))))
                 .child(nav_item("nav-automation", ph::ROBOT, "Automation", au_active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Automation, w, cx))))
         });
-        // Creative is its own group under Studio's, not one of Studio's pages.
-        let creative = mv_ui::mode::studio_enabled(cx).then(|| {
-            let active = owner.as_ref() == Some(&Route::Creative);
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .map(|d| if rail { d.pt(px(10.)).border_t_1().border_color(Tokens::border()) } else { d.child(section_label("Create").px(px(10.))) })
-                .child(nav_item("nav-creative", ph::PAINT_BRUSH, "Creative", active, rail).on_click(cx.listener(|this, _, w, cx| this.go(Route::Creative, w, cx))))
-        });
-
         let settings = nav_item("nav-settings", glyphs::SETTINGS, "Settings", matches!(self.route, Route::Settings { .. }), rail)
             .kbd(Shortcut::Settings.keys())
             .on_click(cx.listener(|this, _, w, cx| this.go(Route::Settings { tab: None }, w, cx)));
@@ -1476,7 +1463,7 @@ impl Shell {
                     .when(rail, |d| d.items_center())
                     .child(div().flex().flex_col().gap(px(2.)).w_full().when(rail, |d| d.items_center()).children(items))
                     .children(studio)
-                    .children(creative),
+                    ,
             )
             .child(
                 div()
@@ -1673,7 +1660,6 @@ fn route_title(route: &Route) -> &'static str {
         Route::Thumbnails => "Thumbnails",
         Route::YouTubeVideos => "YouTube videos",
         Route::Automation => "Automation",
-        Route::Creative => "Creative",
         Route::Settings { .. } => "Settings",
         Route::Welcome => "Welcome",
         _ => "MangaVox",

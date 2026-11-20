@@ -43,9 +43,6 @@ pub enum Route {
     /// publish on YouTube → collect results, with a full-auto switch (the YouTube page's
     /// Automation section).
     Automation,
-    /// Creative: original manga written and painted with AI, exported as PDF or images, animated
-    /// into video. A page of its own, apart from Studio.
-    Creative,
     // App
     Settings { tab: Option<String> },
     /// First-run setup (full window; also "Run welcome setup again" in Settings › About).

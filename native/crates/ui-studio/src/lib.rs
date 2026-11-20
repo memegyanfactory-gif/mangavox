@@ -89,11 +89,6 @@ pub fn open(route: &Route, window: &mut Window, cx: &mut App) -> Option<AnyView>
     }
 }
 
-/// Studio's image models (Magnific and the services in Settings › AI services), for other pages
-/// that make images (Creative).
-pub mod images {
-    pub use crate::ytpack::magnific::{generate, key, key_for, record, usable, ImageModel, Keys, Reference, Shape, Via, CATALOG, KEY_REJECTED};
-}
 
 /// Settings › Magnific: the API key, the thumbnail defaults and the credits spent.
 pub fn magnific_settings(window: &mut Window, cx: &mut App) -> AnyView {

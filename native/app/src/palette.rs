@@ -149,7 +149,6 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
                 row("Hook", ph::LIGHTNING, Cmd::Go(Route::Hook)).keys(["hook", "cold open", "intro hook", "teaser", "trailer"]).current(*c.route == Route::Hook),
                 row("Thumbnails", ph::IMAGES, Cmd::Go(Route::Thumbnails)).keys(["thumbnail", "magnific", "image", "cover art"]).current(*c.route == Route::Thumbnails),
                 row("YouTube videos", ph::MONITOR_PLAY, Cmd::Go(Route::YouTubeVideos)).keys(["preview", "watch page", "rendered", "my videos", "related"]).current(*c.route == Route::YouTubeVideos),
-                row("Creative", ph::PAINT_BRUSH, Cmd::Go(Route::Creative)).keys(["create manga", "original manga", "character sheet", "comic", "pdf", "make a manga"]).current(*c.route == Route::Creative),
             ],
         });
     }

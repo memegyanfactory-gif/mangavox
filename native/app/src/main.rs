@@ -70,7 +70,7 @@ fn init_sources() {
         Ok(http) => {
             let mut ctx = mv_sources::SourceCtx::new(http);
             if let Some(w) = wall {
-                // Also for pages that drive a signed-in site in it (Creative's web image maker).
+                // Also for pages that drive a signed-in site in it.
                 mv_webwall::set_global(w.clone());
                 ctx = ctx.with_solver(w);
             }

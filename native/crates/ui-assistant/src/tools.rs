@@ -221,7 +221,6 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::Thumbnails => "thumbnails",
         Route::YouTubeVideos => "youtube-videos",
         Route::Automation => "automation",
-        Route::Creative => "creative",
         Route::Settings { .. } => "settings",
         Route::Welcome => "welcome",
         Route::Back => "back",
@@ -238,7 +237,7 @@ pub fn section_name(route: &Route) -> &'static str {
 
 // ── Tool table ───────────────────────────────────────────────────────────────────
 
-pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "youtube", "suggestions", "thumbnails", "youtube-videos", "automation", "creative", "mobile", "settings"];
+pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "youtube", "suggestions", "thumbnails", "youtube-videos", "automation", "mobile", "settings"];
 pub const SETTINGS_TABS: &[&str] = &["providers", "models", "profile", "playback", "sources", "extensions", "addons", "streaming", "storage", "themes", "mode", "about"];
 
 fn obj(properties: Value, required: &[&str]) -> Value {
@@ -956,7 +955,6 @@ pub fn route_for_page(page: &str) -> Option<Route> {
         "thumbnails" => Route::Thumbnails,
         "youtube-videos" => Route::YouTubeVideos,
         "automation" => Route::Automation,
-        "creative" => Route::Creative,
         "settings" => Route::Settings { tab: None },
         _ => return None,
     })
