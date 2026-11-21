@@ -117,6 +117,69 @@ fn save(path: &Path, img: &image::RgbImage) {
     }
 }
 
+/// Longest side of a picture shown large (picture viewers, the animatic stage): a full-HD view.
+pub const DISPLAY_MAX: u32 = 1920;
+/// Decoded large pictures kept in memory (and on the GPU) at most, in bytes: about 24 full-HD
+/// pictures, kept apart from the thumbnails' [`BUDGET`].
+pub const DISPLAY_BUDGET: usize = 192 << 20;
+
+/// Size of a `w` x `h` picture scaled so its longest side is at most `max` (never enlarged).
+pub fn fit_within(w: u32, h: u32, max: u32) -> (u32, u32) {
+    let long = w.max(h);
+    if long <= max || long == 0 {
+        return (w, h);
+    }
+    let scale = |v: u32| ((v as u64 * max as u64) / long as u64).max(1) as u32;
+    (scale(w), scale(h))
+}
+
+/// RGBA pixels of `src` with its longest side at most [`DISPLAY_MAX`]. Nothing is saved: large
+/// views open a handful of pictures, and the in-memory cache keeps the recent ones.
+pub fn load_display(src: &Path) -> anyhow::Result<RgbaImage> {
+    let img = decode(&std::fs::read(src)?)?;
+    let (w, h) = fit_within(img.width(), img.height(), DISPLAY_MAX);
+    if (w, h) == (img.width(), img.height()) {
+        return Ok(img.into_rgba8());
+    }
+    Ok(img.resize_exact(w, h, FilterType::Triangle).into_rgba8())
+}
+
+/// A picture file a user hands in, checked before it is kept: at most `max_bytes`, a real PNG,
+/// JPG or WebP (whatever its name says), at most `max_side` px on a side, and it decodes to the
+/// end. Answers the extension of its real format; the error is a plain phrase ("it is not a
+/// picture"), never a path.
+pub fn check_upload(path: &Path, max_side: u32, max_bytes: u64) -> anyhow::Result<&'static str> {
+    let len = std::fs::metadata(path).map_err(|_| anyhow::anyhow!("it could not be opened"))?.len();
+    if len > max_bytes {
+        anyhow::bail!("it is larger than {} MB", max_bytes / 1_000_000);
+    }
+    let bytes = std::fs::read(path).map_err(|_| anyhow::anyhow!("it could not be opened"))?;
+    let reader = ImageReader::new(Cursor::new(&bytes)).with_guessed_format().map_err(|_| anyhow::anyhow!("it is not a picture"))?;
+    let ext = match reader.format() {
+        Some(image::ImageFormat::Png) => "png",
+        Some(image::ImageFormat::Jpeg) => "jpg",
+        Some(image::ImageFormat::WebP) => "webp",
+        _ => anyhow::bail!("it is not a PNG, JPG or WebP picture"),
+    };
+    let (w, h) = reader.into_dimensions().map_err(|_| anyhow::anyhow!("it is not a picture"))?;
+    if w == 0 || h == 0 {
+        anyhow::bail!("it is not a picture");
+    }
+    if w > max_side || h > max_side {
+        anyhow::bail!("it is larger than {max_side} pixels on a side");
+    }
+    decode(&bytes).map_err(|_| anyhow::anyhow!("it is damaged and could not be read to the end"))?;
+    Ok(ext)
+}
+
+/// Pixels as GPUI draws them (BGRA).
+fn render_image(mut px: RgbaImage) -> Arc<RenderImage> {
+    for p in px.chunks_exact_mut(4) {
+        p.swap(0, 2);
+    }
+    Arc::new(RenderImage::new(vec![image::Frame::new(px)]))
+}
+
 /// GPUI asset: a cover file decoded at display size on the background executor.
 enum ThumbAsset {}
 
@@ -125,14 +188,19 @@ impl Asset for ThumbAsset {
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
 
     fn load(src: Self::Source, _: &mut App) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
-        async move {
-            let mut px = load(&src).map_err(|e| ImageCacheError::Other(Arc::new(e)))?;
-            // GPUI draws BGRA.
-            for p in px.chunks_exact_mut(4) {
-                p.swap(0, 2);
-            }
-            Ok(Arc::new(RenderImage::new(vec![image::Frame::new(px)])))
-        }
+        async move { load(&src).map(render_image).map_err(|e| ImageCacheError::Other(Arc::new(e))) }
+    }
+}
+
+/// GPUI asset: a picture decoded at most [`DISPLAY_MAX`] on a side on the background executor.
+enum DisplayAsset {}
+
+impl Asset for DisplayAsset {
+    type Source = Arc<Path>;
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+    fn load(src: Self::Source, _: &mut App) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        async move { load_display(&src).map(render_image).map_err(|e| ImageCacheError::Other(Arc::new(e))) }
     }
 }
 
@@ -142,28 +210,50 @@ struct Entry {
     image: Option<Arc<RenderImage>>,
 }
 
-/// Loaded thumbnails by path, for the byte budget (GPUI's asset map itself never evicts).
-#[derive(Default)]
-struct Lru {
+/// Loaded images of asset kind `A` by path, for the byte budget (GPUI's asset map itself never
+/// evicts).
+struct Lru<A> {
     map: HashMap<Arc<Path>, Entry>,
     bytes: usize,
+    kind: std::marker::PhantomData<fn() -> A>,
 }
 
-impl Global for Lru {}
+impl<A> Default for Lru<A> {
+    fn default() -> Self {
+        Self { map: HashMap::new(), bytes: 0, kind: std::marker::PhantomData }
+    }
+}
+
+impl<A: 'static> Global for Lru<A> {}
 
 /// `img` source for a local cover at display size; drop-in for `img(path)`.
 pub fn cover_source(path: PathBuf) -> ImageSource {
     let src: Arc<Path> = path.into();
     ImageSource::Custom(Arc::new(move |window, cx| {
         let out = window.use_asset::<ThumbAsset>(&src, cx);
-        touch(&src, out.as_ref(), window, cx);
+        touch::<ThumbAsset>(&src, out.as_ref(), BUDGET, window, cx);
         out
     }))
 }
 
-fn touch(src: &Arc<Path>, out: Option<&Result<Arc<RenderImage>, ImageCacheError>>, window: &mut Window, cx: &mut App) {
+/// `img` source for a local picture shown large (a viewer, a stage): decoded off the UI thread
+/// at most [`DISPLAY_MAX`] on a side and kept in a cache bounded by [`DISPLAY_BUDGET`], so
+/// stepping through hundreds of pictures never keeps them all. Drop-in for `img(path)`.
+pub fn display_source(path: PathBuf) -> ImageSource {
+    let src: Arc<Path> = path.into();
+    ImageSource::Custom(Arc::new(move |window, cx| {
+        let out = window.use_asset::<DisplayAsset>(&src, cx);
+        touch::<DisplayAsset>(&src, out.as_ref(), DISPLAY_BUDGET, window, cx);
+        out
+    }))
+}
+
+fn touch<A>(src: &Arc<Path>, out: Option<&Result<Arc<RenderImage>, ImageCacheError>>, budget: usize, window: &mut Window, cx: &mut App)
+where
+    A: Asset<Source = Arc<Path>> + 'static,
+{
     let now = Instant::now();
-    let lru = cx.default_global::<Lru>();
+    let lru = cx.default_global::<Lru<A>>();
     let e = lru.map.entry(src.clone()).or_insert(Entry { used: now, bytes: 0, image: None });
     e.used = now;
     if e.image.is_none() {
@@ -174,7 +264,7 @@ fn touch(src: &Arc<Path>, out: Option<&Result<Arc<RenderImage>, ImageCacheError>
             lru.bytes += e.bytes;
         }
     }
-    if lru.bytes <= BUDGET {
+    if lru.bytes <= budget {
         return;
     }
     // Over budget: drop the least recently drawn images that are not on screen.
@@ -182,7 +272,7 @@ fn touch(src: &Arc<Path>, out: Option<&Result<Arc<RenderImage>, ImageCacheError>
     old.sort_unstable_by_key(|(t, _)| *t);
     let mut evicted = Vec::new();
     for (_, k) in old {
-        if lru.bytes <= BUDGET * 3 / 4 {
+        if lru.bytes <= budget * 3 / 4 {
             break;
         }
         if let Some(e) = lru.map.remove(&k) {
@@ -191,7 +281,7 @@ fn touch(src: &Arc<Path>, out: Option<&Result<Arc<RenderImage>, ImageCacheError>
         }
     }
     for (k, img) in evicted {
-        cx.remove_asset::<ThumbAsset>(&k);
+        cx.remove_asset::<A>(&k);
         cx.drop_image(img, Some(window));
     }
 }
@@ -201,6 +291,35 @@ mod tests {
     use super::*;
 
     // gpui_kit's glob import brings its own `test` macro; use the standard one.
+    #[::core::prelude::v1::test]
+    fn large_views_are_bounded_on_their_longest_side() {
+        assert_eq!(fit_within(3840, 2160, DISPLAY_MAX), (1920, 1080));
+        assert_eq!(fit_within(1000, 4000, DISPLAY_MAX), (480, 1920));
+        assert_eq!(fit_within(800, 600, DISPLAY_MAX), (800, 600), "small pictures are never enlarged");
+        assert_eq!(fit_within(0, 0, DISPLAY_MAX), (0, 0));
+        assert_eq!(fit_within(100_000, 1, DISPLAY_MAX), (1920, 1));
+        let tmp = std::env::temp_dir().join(format!("mv-display-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("tall.png");
+        RgbaImage::from_pixel(1200, 2400, image::Rgba([1, 2, 3, 255])).save(&src).unwrap();
+        assert_eq!(load_display(&src).unwrap().dimensions(), (960, 1920));
+        std::fs::write(tmp.join("bad.png"), b"not a picture").unwrap();
+        assert!(load_display(&tmp.join("bad.png")).is_err());
+        // Uploads: the real format counts, not the name; too big or broken files are refused.
+        assert_eq!(check_upload(&src, 8192, 50_000_000).unwrap(), "png");
+        let renamed = tmp.join("really-a-png.jpg");
+        std::fs::copy(&src, &renamed).unwrap();
+        assert_eq!(check_upload(&renamed, 8192, 50_000_000).unwrap(), "png");
+        assert!(check_upload(&tmp.join("bad.png"), 8192, 50_000_000).is_err());
+        assert!(check_upload(&src, 2000, 50_000_000).is_err(), "2400 px tall is over a 2000 px cap");
+        assert!(check_upload(&src, 8192, 10).is_err(), "over the byte cap");
+        let bytes = std::fs::read(&src).unwrap();
+        std::fs::write(tmp.join("cut.png"), &bytes[..bytes.len() / 2]).unwrap();
+        assert!(check_upload(&tmp.join("cut.png"), 8192, 50_000_000).is_err(), "a truncated file is refused");
+        assert!(check_upload(&tmp.join("missing.png"), 8192, 50_000_000).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[::core::prelude::v1::test]
     fn scales_wide_covers_and_saves_a_thumb() {
         let tmp = std::env::temp_dir().join(format!("mv-thumbs-{}", std::process::id()));

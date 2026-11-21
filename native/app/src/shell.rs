@@ -18,14 +18,14 @@ use mv_ui::panel::PanelTab;
 use mv_ui::theme::{icon as icon_px, radius};
 use mv_ui::toast::{self, Toast};
 use mv_ui::update::{version, Status, Updater};
-use mv_ui::{appear, btn, empty_view, glyphs, icon_button, icon_ph, kbd, nav_item, ph, section_label, segmented, size, skeleton_line, tip, ButtonKind, Interactive as _, Ph, Route, Tokens};
+use mv_ui::{appear, badge, btn, empty_view, glyphs, icon_button, icon_ph, kbd, nav_item, ph, ph_icon, section_label, segmented, size, skeleton_line, tip, ButtonKind, ControlSize, Interactive as _, Ph, Route, Tokens, Tone, Weight};
 
 use crate::activity::StudioRuns;
 use crate::keys::{self, Shortcut};
 use crate::palette::{self, Cmd, Palette, Title};
 use crate::panel::Views;
 use crate::prefs::{self, ShellPrefs, DOCK_MAX, DOCK_MIN};
-use crate::routes::{is_detail, is_focus, is_workspace, keep_alive, nav_for, nav_label, Section, SECTIONS};
+use crate::routes::{is_detail, is_focus, is_workspace, keep_alive, nav_for, nav_label, Section, MEDIA_SECTIONS, SECTIONS};
 use crate::updates;
 
 /// Fluent NavigationView: the expanded pane needs 1008px; below it the sidebar is a rail.
@@ -327,6 +327,7 @@ impl Shell {
             .or_else(|| ui_studio::open(route, window, cx))
             .or_else(|| ui_phone::open(route, window, cx))
             .or_else(|| ui_youtube::open(route, window, cx))
+            .or_else(|| ui_anime::open(route, window, cx))
             .or_else(|| ui_welcome::open(route, window, cx))
             .unwrap_or_else(|| {
                 let title = route_title(route).into();
@@ -339,6 +340,10 @@ impl Shell {
     fn go(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
         if route == Route::Back {
             self.back(window, cx);
+            return;
+        }
+        // The Anime Engine exists only in Studio mode (a stale link or the assistant cannot open it).
+        if !Section::Engine.visible(mv_ui::mode::studio_enabled(cx)) && nav_label(Section::Engine, &route).is_some() {
             return;
         }
         self.nav_overlay = false;
@@ -620,6 +625,29 @@ impl Shell {
         self.after_nav(window, cx);
     }
 
+    /// Makes `section` the one under the Settings page on screen, without leaving Settings: its
+    /// parked page (or its home) becomes what Back leads to. The section that was under Settings
+    /// is dropped, not parked (only the Anime Engine leaves this way, when its tab goes).
+    fn section_under_settings(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = section;
+        let (history, forward) = match self.parked.remove(&section) {
+            Some(p) => {
+                let mut h = p.history;
+                h.push(Entry::new(p.route, p.page));
+                (h, p.forward)
+            }
+            None => {
+                let home = section.home();
+                let page = self.open(&home, window, cx);
+                (vec![Entry::new(home, page)], Vec::new())
+            }
+        };
+        self.history = history;
+        self.forward = forward;
+        self.nav_overlay = false;
+        self.sync_back(cx);
+    }
+
     /// Ctrl+1/2/3 and the section switcher. Asking for the section you are in from Settings
     /// goes back to it.
     fn show_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
@@ -627,6 +655,12 @@ impl Shell {
             self.set_section(section, window, cx);
         } else if matches!(self.route, Route::Settings { .. }) {
             self.back(window, cx);
+        } else if is_workspace(&self.route) || matches!(self.route, Route::Mobile) {
+            // Studio (or the phone page) opened from this section: its key and its tab bring the
+            // section's own page back, the last one the user was on.
+            let own = |r: &Route| !is_workspace(r) && !matches!(r, Route::Settings { .. } | Route::Mobile | Route::Player { .. } | Route::Welcome) && nav_label(section, r).is_some();
+            let target = self.history.iter().rev().map(|e| &e.route).find(|r| own(r)).cloned().unwrap_or_else(|| section.home());
+            self.go(target, window, cx);
         }
     }
 
@@ -647,6 +681,10 @@ impl Shell {
 
     /// A route's name as people say it ("Library", "Anime home", "One Piece").
     fn label(&self, r: &Route) -> SharedString {
+        // The tab's one page is named after the tab ("Anime Engine – MangaVox", "Back to Anime Engine").
+        if *r == Route::AnimeEngine {
+            return "Anime Engine".into();
+        }
         if let Some(l) = nav_label(self.section, r) {
             return if l == "Home" { format!("{} home", self.section.label()).into() } else { l.into() };
         }
@@ -805,11 +843,26 @@ impl Shell {
             if mv_ui::panel::state(cx).tab == PanelTab::Chat {
                 mv_ui::panel::set_tab(PanelTab::Activity, cx);
             }
+            // The Anime Engine tab goes too: its queue is paused (nothing runs where the user
+            // cannot see or stop it; with Studio mode back, the tab shows it paused with its
+            // Resume). The shell moves to Manga and forgets the tab's pages (its page keeps its
+            // own state in ui-anime for when Studio mode is back).
+            ui_anime::studio_mode_off();
+            if self.section == Section::Engine {
+                if matches!(self.route, Route::Settings { .. }) {
+                    // The switch was flipped in Settings: Settings stays on screen, and Manga
+                    // becomes the section under it (Back leads there).
+                    self.section_under_settings(Section::Manga, window, cx);
+                } else {
+                    self.set_section(Section::Manga, window, cx);
+                }
+            }
+            self.parked.remove(&Section::Engine);
             if is_workspace(&self.route) {
                 let home = self.section.home();
                 self.go(home, window, cx);
             }
-            let not_studio = |e: &Entry| !is_workspace(&e.route);
+            let not_studio = |e: &Entry| !is_workspace(&e.route) && e.route != Route::AnimeEngine;
             self.history.retain(not_studio);
             self.forward.retain(not_studio);
             for p in self.parked.values_mut() {
@@ -1042,6 +1095,12 @@ impl Shell {
             Shortcut::Manga => self.show_section(Section::Manga, window, cx),
             Shortcut::Anime => self.show_section(Section::Anime, window, cx),
             Shortcut::Movies => self.show_section(Section::Movies, window, cx),
+            // Only in Studio mode, like the tab itself.
+            Shortcut::Engine => {
+                if Section::Engine.visible(mv_ui::mode::studio_enabled(cx)) {
+                    self.show_section(Section::Engine, window, cx);
+                }
+            }
             Shortcut::Back => self.back(window, cx),
             Shortcut::Forward => self.forward(window, cx),
             // Full screen is for the reader and the player (they take F11 / F themselves). On any
@@ -1366,6 +1425,7 @@ impl Shell {
             .child(mv_ui::app_logo(28.).rounded(px(radius::SM)))
             .when(!rail, |d| d.child(div().text_size(px(size::LG)).font_weight(FontWeight::SEMIBOLD).text_color(Tokens::text_1()).child("MangaVox")));
 
+        let studio_on = mv_ui::mode::studio_enabled(cx);
         let switcher = if rail {
             div()
                 .flex()
@@ -1378,19 +1438,46 @@ impl Shell {
                 .bg(Tokens::well())
                 .border_1()
                 .border_color(Tokens::border())
-                .children(SECTIONS.map(|s| {
-                    icon_button(("section", s.index()), s.icon(), s.label())
+                .children(SECTIONS.into_iter().filter(|s| s.visible(studio_on)).map(|s| {
+                    let label = if s == Section::Engine { "Anime Engine (Beta)" } else { s.label() };
+                    icon_button(("section", s.index()), s.icon(), label)
                         .selected(s == self.section)
                         .kbd(s.shortcut().keys())
                         .on_click(cx.listener(move |this, _, w, cx| this.show_section(s, w, cx)))
                 }))
                 .into_any_element()
         } else {
-            segmented("section", SECTIONS.map(|s| (Some(s.icon()), s.label())), self.section.index())
-                .small()
-                .full_width()
-                .on_change(cx.listener(|this, ix: &usize, w, cx| this.show_section(SECTIONS[*ix], w, cx)))
-                .into_any_element()
+            // Manga, Anime and Movies; on the Anime Engine none of them is selected.
+            let first_row = |seg: mv_ui::Segmented| seg.small().full_width().on_change(cx.listener(|this, ix: &usize, w, cx| {
+                if let Some(s) = MEDIA_SECTIONS.get(*ix) {
+                    this.show_section(*s, w, cx);
+                }
+            }));
+            let selected = if self.section == Section::Engine { MEDIA_SECTIONS.len() } else { self.section.index() };
+            let media = segmented("section", MEDIA_SECTIONS.map(|s| (Some(s.icon()), s.label())), selected);
+            if studio_on {
+                // Four sections do not fit side by side in the sidebar: one well, the media
+                // sections in the first row and the Anime Engine across the second.
+                // Highlighted while its own page is on screen; from Studio it reads as a way back.
+                let on_engine = self.section == Section::Engine && !is_workspace(&self.route) && self.route != Route::Mobile;
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .p(px(2.))
+                    .gap(px(2.))
+                    .rounded(px(radius::MD))
+                    .bg(Tokens::well())
+                    .border_1()
+                    .border_color(Tokens::border())
+                    // The row sits in the shared well: its own track is see-through (a second
+                    // translucent well would darken it), unbordered and unpadded.
+                    .child(first_row(media).bg(Tokens::well().alpha(0.)).border_0().p(px(0.)))
+                    .child(engine_tab(on_engine).when(!on_engine, |d| d.on_click(cx.listener(|this, _, w, cx| this.show_section(Section::Engine, w, cx)))))
+                    .into_any_element()
+            } else {
+                first_row(media).into_any_element()
+            }
         };
 
         let items = nav_for(self.section).into_iter().enumerate().map(|(i, e)| {
@@ -1666,6 +1753,38 @@ fn route_title(route: &Route) -> &'static str {
     }
 }
 
+/// The switcher's second row: the Anime Engine (Beta) across the full width. Built exactly like
+/// one segment of `mv_ui::segmented` (`controls.rs`, `Segmented::build`) at the small size, so the
+/// two rows read as one control; the caller adds the click while it is not selected.
+fn engine_tab(selected: bool) -> Stateful<Div> {
+    let (weight, color) = if selected { (Weight::Fill, Tokens::text_1()) } else { (Weight::Bold, Tokens::text_3()) };
+    div()
+        .id("section-engine")
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .w_full()
+        .h(px(ControlSize::Sm.height() - 6.))
+        .px(px(8.))
+        .rounded(px(radius::SM))
+        .text_size(px(size::SM))
+        .whitespace_nowrap()
+        .role(Role::RadioButton)
+        .aria_selected(selected)
+        .aria_label("Anime Engine (Beta)")
+        .map(|d| {
+            if selected {
+                d.bg(Tokens::surface_3()).border_1().border_color(Tokens::border_strong()).shadow_xs().text_color(Tokens::text_1()).font_weight(FontWeight::MEDIUM)
+            } else {
+                d.text_color(Tokens::text_2()).cursor_pointer().group("section-engine").hover(|s| s.bg(Tokens::hover()).text_color(Tokens::text_1())).active(|s| s.bg(Tokens::pressed()))
+            }
+        })
+        .focus_ring()
+        .child(ph_icon(Section::Engine.icon(), weight, color, icon_px::SM).when(!selected, |s| s.group_hover("section-engine", |s| s.text_color(Tokens::text_1()))))
+        .child(div().flex_1().min_w_0().child(Section::Engine.label()))
+        .child(badge("BETA", Tone::Warning))
+}
+
 /// Segoe UI Variable (the Windows 11 UI font, optical sizes for small text) when installed,
 /// Segoe UI otherwise. Fluent 2 typography: <https://fluent2.microsoft.design/typography>
 fn ui_font(cx: &App) -> SharedString {
@@ -1693,6 +1812,8 @@ impl Render for Placeholder {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::first_frame();
+        // The Anime Engine reads nothing while its page is not the one on screen.
+        ui_anime::set_tab_shown(self.route == Route::AnimeEngine && mv_ui::mode::studio_enabled(cx));
         let vw = viewport_w(window);
         if vw >= RAIL_BELOW {
             self.nav_overlay = false;
@@ -1730,6 +1851,10 @@ impl Render for Shell {
             }
             if self.route != Route::Studio && !layout.shown {
                 cards.extend(self.studio_runs.read(cx).cards(&self.studio_runs));
+            }
+            // The Anime Engine's jobs, off its own page (which lists them) and only in Studio mode.
+            if self.route != Route::AnimeEngine && !layout.shown && mv_ui::mode::studio_enabled(cx) {
+                cards.extend(ui_anime::activity_cards(cx));
             }
             mv_ui::activity::corner(cards, Some(toast::view(cx)), cx)
         };

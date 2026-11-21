@@ -23,10 +23,15 @@ pub(crate) type Reply = oneshot::Sender<Result<Value, String>>;
 pub(crate) enum Kind {
     Html { url: String, wait_for: Option<String> },
     /// `timeout`: how long the script may take (default: the configured action timeout).
-    Eval { url: String, script: String, timeout: Option<Duration> },
+    /// `window_only`: runs only in the site's own window ([`Kind::Show`]), waiting while that
+    /// window is busy; never in another page, and fails when the window is not open.
+    Eval { url: String, script: String, timeout: Option<Duration>, window_only: bool },
     /// Opens `url` in a window the user sees and uses (to sign in to a site), kept open until
-    /// they close it. Later requests for that site run in it.
-    Show { url: String, title: String },
+    /// they close it. Later requests for that site run in it. `front`: in front with focus and a
+    /// taskbar button; else shown behind every other window, unfocused, keeping its taskbar
+    /// button (titled `title`) so the user can find it. A site that already has its window uses
+    /// that one, waiting while it is busy.
+    Show { url: String, title: String, front: bool },
     Fetch { url: String, headers: Vec<(String, String)> },
     Cookies { url: String },
 }
@@ -45,11 +50,145 @@ impl Kind {
             _ => None,
         }
     }
+    /// Runs in the site's own window when it has one (and waits for it while it is busy).
+    fn own_window(&self) -> bool {
+        matches!(self, Kind::Eval { window_only: true, .. } | Kind::Show { .. })
+    }
+    /// Runs nowhere else than the site's own window.
+    fn window_only(&self) -> bool {
+        matches!(self, Kind::Eval { window_only: true, .. })
+    }
+    /// Work in the site's own window that the user is not watching: a check for a person stops
+    /// it at once (the caller hands the window to the user), and a slow page is reported as
+    /// still loading, never as a check.
+    fn hands_walls_over(&self) -> bool {
+        matches!(self, Kind::Eval { window_only: true, .. } | Kind::Show { front: false, .. })
+    }
+}
+
+/// What a window-only request answers when the site has no window open.
+pub(crate) const NO_WINDOW: &str = "no window is open for this site";
+
+/// What a window-only script answers when its page went away under it (the page navigated or
+/// reloaded, or its renderer stopped), so no answer can come any more.
+pub(crate) const PAGE_GONE: &str = "the page reloaded or closed before the script finished";
+
+/// What a window-only script answers when it never began running in the page.
+pub(crate) const NOT_STARTED: &str = "the script did not start in the page";
+
+/// What a window-only script whose caller stopped waiting ends with (nobody reads it).
+pub(crate) const CALLER_GONE: &str = "the request was cancelled while it ran";
+
+/// How long a window-only script may keep its window once its caller has gone (the caller's
+/// stop signal reaches the page first; the routine's own checks make a late one harmless).
+const CALLER_GRACE: Duration = Duration::from_secs(3);
+/// The first check that a window-only script is alive in its page, then every [`PROBE_EVERY`].
+const FIRST_PROBE: Duration = Duration::from_secs(2);
+const PROBE_EVERY: Duration = Duration::from_secs(5);
+/// A check the page does not answer for this long: its renderer has stopped.
+const PROBE_SILENT: Duration = Duration::from_secs(20);
+/// Checks in a row that got no clear answer: the page is not there any more.
+const PROBE_MISSES: u32 = 3;
+
+/// Keeps watch over a window-only script while the runner waits for its answer: whether its
+/// caller is still there and whether the script is still alive in the page. Pure (no web view),
+/// so it can be tested.
+#[derive(Debug, Default)]
+struct Watch {
+    /// When the caller was first seen gone.
+    gone_since: Option<Instant>,
+    /// When the check now under way was sent.
+    sent: Option<Instant>,
+    /// When the next check is due (`None` while one is under way, or when not watching).
+    due: Option<Instant>,
+    /// The script was seen running in the page.
+    seen: bool,
+    misses: u32,
+}
+
+#[derive(Debug, PartialEq)]
+enum Look {
+    Wait,
+    /// Ask the page whether the script is still alive.
+    Probe,
+    /// End the job with this reason.
+    End(&'static str),
+}
+
+impl Watch {
+    fn start(now: Instant) -> Self {
+        Watch { due: Some(now + FIRST_PROBE), ..Default::default() }
+    }
+
+    fn lost(&self) -> &'static str {
+        if self.seen {
+            PAGE_GONE
+        } else {
+            NOT_STARTED
+        }
+    }
+
+    /// Every tick: `caller_gone`, the caller stopped waiting for the answer.
+    fn tick(&mut self, now: Instant, caller_gone: bool) -> Look {
+        if caller_gone {
+            let since = *self.gone_since.get_or_insert(now);
+            if now.duration_since(since) >= CALLER_GRACE {
+                return Look::End(CALLER_GONE);
+            }
+        }
+        if let Some(sent) = self.sent {
+            return if now.duration_since(sent) >= PROBE_SILENT { Look::End(self.lost()) } else { Look::Wait };
+        }
+        match self.due {
+            Some(t) if now >= t => {
+                self.sent = Some(now);
+                self.due = None;
+                Look::Probe
+            }
+            _ => Look::Wait,
+        }
+    }
+
+    /// The page's answer to a check (`None`: it could not be asked). `Some(reason)`: end the job.
+    fn answer(&mut self, now: Instant, raw: Option<&str>) -> Option<&'static str> {
+        self.sent = None;
+        self.due = Some(now + PROBE_EVERY);
+        match raw.map(str::trim) {
+            Some("true") => {
+                self.seen = true;
+                self.misses = 0;
+                None
+            }
+            // The page answers, but its document no longer holds the script: a new document.
+            Some("false") => Some(self.lost()),
+            _ => {
+                self.misses += 1;
+                (self.misses >= PROBE_MISSES).then(|| self.lost())
+            }
+        }
+    }
+}
+
+/// The check that the window-only script of job `jid` is still alive in the page.
+fn probe_script(jid: u64) -> String {
+    format!("window.__mvwallJob === {jid}")
+}
+
+/// Something done to a site's own window at once, without waiting for its job.
+pub(crate) enum WinOp {
+    /// Whether the window is open.
+    Exists,
+    /// Bring it to the front for the user (with this title).
+    Raise(String),
+    /// Run a short script in it beside whatever runs there (a stop signal for a running job).
+    Signal(String),
 }
 
 pub(crate) struct Request {
     pub kind: Kind,
     pub reply: Reply,
+    /// Told once the request gets its page (it no longer waits in the queue).
+    pub started: Option<oneshot::Sender<()>>,
 }
 
 pub(crate) enum Ev {
@@ -59,6 +198,10 @@ pub(crate) enum Ev {
     State(u64, u64, String),
     Html(u64, u64, String),
     Ipc(u64, String),
+    /// (page, job, raw JSON): whether a window-only script is still alive in its page.
+    Alive(u64, u64, String),
+    /// An operation on the site's own window (by URL); `reply` gets whether it was there.
+    Window { url: String, op: WinOp, reply: Option<oneshot::Sender<bool>> },
     Shutdown,
 }
 
@@ -81,6 +224,8 @@ struct Job {
     streak: u32,
     cleared_at: Option<Instant>,
     poll_since: Option<Instant>,
+    /// Watch over a window-only script while its answer is awaited.
+    watch: Watch,
 }
 
 struct Page {
@@ -200,6 +345,13 @@ pub(crate) fn run(
                     r.finish_if(pid, jid, Ok(Value::String(html)), elwt);
                 }
                 Ev::Ipc(pid, body) => r.on_ipc(pid, &body, elwt),
+                Ev::Alive(pid, jid, raw) => r.on_alive(pid, jid, Some(&raw), elwt),
+                Ev::Window { url, op, reply } => {
+                    let there = r.window_op(&url, op);
+                    if let Some(t) = reply {
+                        let _ = t.send(there);
+                    }
+                }
             },
             _ => {}
         }
@@ -269,7 +421,30 @@ impl Runner {
     fn show(&mut self, pid: u64) {
         if let Some(p) = self.pages.get_mut(&pid) {
             p.visible = true;
-            show_behind(&p.window);
+            show_behind(&p.window, false);
+        }
+    }
+
+    /// The site's own window ([`Kind::Show`]) for `origin`, if it is open.
+    fn window_for(&self, origin: &Option<String>) -> Option<u64> {
+        origin.as_ref()?;
+        self.pages.iter().filter(|(_, p)| p.pinned && p.origin == *origin).map(|(i, _)| *i).min()
+    }
+
+    /// Does `op` to the site's own window for `url`; false when it has none.
+    fn window_op(&mut self, url: &str, op: WinOp) -> bool {
+        let Some(pid) = self.window_for(&origin_of(url)) else { return false };
+        let Some(p) = self.pages.get_mut(&pid) else { return false };
+        match op {
+            WinOp::Exists => true,
+            WinOp::Raise(title) => {
+                p.visible = true;
+                p.popups.store(true, Ordering::Relaxed);
+                p.window.set_title(&title);
+                show_front(&p.window);
+                true
+            }
+            WinOp::Signal(script) => p.webview.evaluate_script(&script).is_ok(),
         }
     }
 
@@ -288,10 +463,48 @@ impl Runner {
         }
     }
 
-    /// Hand queued requests to idle pages (creating pages up to the cap).
+    /// Hand queued requests to idle pages (creating pages up to the cap). A request for a site's
+    /// own window goes to that window only, and waits (without holding up the others) while
+    /// the window is busy.
     fn pump(&mut self, elwt: &EventLoopWindowTarget<Ev>) {
-        while let Some(req) = self.queue.front() {
+        let mut i = 0;
+        // A request that cannot get a page holds up every later one that needs a page (they keep
+        // their order), but not the work for a site's own window, which needs no new page.
+        let mut blocked = false;
+        while let Some(req) = self.queue.get(i) {
             let origin = origin_of(&req.kind.nav_url());
+            if req.kind.own_window() {
+                // A caller that stopped waiting (its job was cancelled) is never served late.
+                if req.reply.is_closed() {
+                    self.queue.remove(i);
+                    continue;
+                }
+                let only = req.kind.window_only();
+                match self.window_for(&origin) {
+                    Some(pid) => {
+                        if self.pages.get(&pid).is_some_and(|p| p.job.is_none()) {
+                            if let Some(req) = self.queue.remove(i) {
+                                self.begin(pid, req);
+                            }
+                        } else {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    None if only => {
+                        if let Some(req) = self.queue.remove(i) {
+                            let _ = req.reply.send(Err(NO_WINDOW.into()));
+                        }
+                        continue;
+                    }
+                    // The site's first window: opened below like any page.
+                    None => {}
+                }
+            }
+            if blocked {
+                i += 1;
+                continue;
+            }
             let idle: Vec<u64> = self.pages.iter().filter(|(_, p)| p.job.is_none()).map(|(i, _)| *i).collect();
             let pick = idle
                 .iter()
@@ -304,8 +517,9 @@ impl Runner {
                 match self.create_page(elwt) {
                     Ok(p) => p,
                     Err(e) => {
-                        let req = self.queue.pop_front().unwrap();
-                        let _ = req.reply.send(Err(e));
+                        if let Some(req) = self.queue.remove(i) {
+                            let _ = req.reply.send(Err(e));
+                        }
                         continue;
                     }
                 }
@@ -313,10 +527,13 @@ impl Runner {
                 self.remove_page(other);
                 continue;
             } else {
-                break;
+                blocked = true;
+                i += 1;
+                continue;
             };
-            let req = self.queue.pop_front().unwrap();
-            self.begin(pid, req);
+            if let Some(req) = self.queue.remove(i) {
+                self.begin(pid, req);
+            }
         }
     }
 
@@ -327,6 +544,9 @@ impl Runner {
         let nav = req.kind.nav_url();
         let origin = origin_of(&nav);
         let hidden = self.cfg.hidden_timeout;
+        if let Some(t) = req.started {
+            let _ = t.send(());
+        }
         let page = self.pages.get_mut(&pid).expect("page");
         let skip_nav = page.cleared
             && match &req.kind {
@@ -347,17 +567,27 @@ impl Runner {
             streak: 0,
             cleared_at: None,
             poll_since: None,
+            watch: Watch::default(),
         };
-        if let Kind::Show { title, .. } = &job.kind {
+        if let Kind::Show { title, front, .. } = &job.kind {
             // The user's own window: in front, with a taskbar button, from the first moment (a
-            // wall or a sign-in page is theirs to get through).
+            // wall or a sign-in page is theirs to get through). Asked for behind, it is kept
+            // shown (pages that nobody shows run slowly) but never takes the user's focus.
             page.pinned = true;
             page.popups.store(true, Ordering::Relaxed);
             page.visible = true;
             page.window.set_title(title);
-            show_front(&page.window);
+            if *front {
+                show_front(&page.window);
+            } else {
+                show_behind(&page.window, true);
+            }
             job.shown_for_user = true;
             job.deadline = now + self.cfg.interactive_timeout.max(Duration::from_secs(90));
+        }
+        if job.kind.window_only() {
+            // The site's own window loads its page in view: the time a slow page may take.
+            job.deadline = now + hidden + self.cfg.interactive_timeout;
         }
         if skip_nav {
             page.job = Some(job);
@@ -388,6 +618,8 @@ impl Runner {
                     None => (None, now.duration_since(page.idle_since) > self.cfg.idle_ttl && !self.cfg.show_windows && !page.pinned),
                     Some(job) if now > job.deadline => (
                         Some(match job.phase {
+                            // A check there would have stopped it at once: this page was slow.
+                            Phase::Navigating if job.kind.hands_walls_over() => format!("timed out waiting for {} to load", job.kind.nav_url()),
                             Phase::Navigating => {
                                 format!("timed out waiting for {} (anti-bot challenge not cleared)", job.kind.nav_url())
                             }
@@ -407,7 +639,28 @@ impl Runner {
                                 let _ = p.send_event(Ev::State(pid, jid, raw));
                             });
                         }
-                        (None, false)
+                        if job.phase == Phase::Awaiting && job.kind.window_only() {
+                            // A routine whose page went away never answers, and one whose caller
+                            // has gone must not keep the window: the next job waits for it.
+                            let gone = job.reply.as_ref().is_none_or(|r| r.is_closed());
+                            match job.watch.tick(now, gone) {
+                                Look::Wait => (None, false),
+                                Look::End(why) => (Some(why.to_string()), false),
+                                Look::Probe => {
+                                    let jid = job.id;
+                                    let p = self.proxy.clone();
+                                    let asked = page.webview.evaluate_script_with_callback(&probe_script(jid), move |raw| {
+                                        let _ = p.send_event(Ev::Alive(pid, jid, raw));
+                                    });
+                                    match asked {
+                                        Ok(()) => (None, false),
+                                        Err(_) => (job.watch.answer(now, None).map(str::to_string), false),
+                                    }
+                                }
+                            }
+                        } else {
+                            (None, false)
+                        }
                     }
                 }
             };
@@ -440,6 +693,13 @@ impl Runner {
             return;
         }
         let v = classify(&st);
+        if v.wall && job.kind.hands_walls_over() {
+            // Work in the site's own window never waits out a check meant for a person: it stops
+            // now, and the caller brings the window to the front for the user.
+            let msg = format!("blocked by an anti-bot challenge at {}", job.kind.nav_url());
+            self.finish(pid, Err(msg));
+            return;
+        }
         if v.wall {
             job.streak = 0;
             if now > job.hidden_deadline && !job.shown_for_user {
@@ -485,6 +745,12 @@ impl Runner {
         let default_timeout = self.cfg.action_timeout;
         let Some(page) = self.pages.get_mut(&pid) else { return };
         let Some(job) = page.job.as_mut() else { return };
+        // Work in the site's own window whose caller stopped waiting (its job was cancelled
+        // while the page loaded) never starts.
+        if job.kind.window_only() && job.reply.as_ref().is_none_or(|r| r.is_closed()) {
+            self.finish(pid, Err("the request was cancelled before it ran".into()));
+            return;
+        }
         let jid = job.id;
         job.deadline = now + match &job.kind {
             Kind::Eval { timeout: Some(t), .. } => *t,
@@ -509,6 +775,12 @@ impl Runner {
             Kind::Show { .. } => {
                 self.finish(pid, Ok(Value::Null));
                 return;
+            }
+            Kind::Eval { script, window_only: true, .. } => {
+                // Watched while it runs: it marks its page, and the page is asked now and then
+                // whether the mark is still there.
+                job.watch = Watch::start(now);
+                page.webview.evaluate_script(&wrap_marked(jid, script)).map_err(|e| format!("evaluate: {e}"))
             }
             Kind::Eval { script, .. } => page.webview.evaluate_script(&wrap_async(jid, script)).map_err(|e| format!("evaluate: {e}")),
             Kind::Fetch { url, headers } => {
@@ -535,6 +807,19 @@ impl Runner {
             Err(format!("script error: {}", v.get("e").and_then(Value::as_str).unwrap_or("unknown")))
         };
         self.finish_if(pid, jid, res, elwt);
+    }
+
+    /// The page's answer to the check that window-only job `jid` is still alive.
+    fn on_alive(&mut self, pid: u64, jid: u64, raw: Option<&str>, elwt: &EventLoopWindowTarget<Ev>) {
+        let now = Instant::now();
+        let Some(job) = self.pages.get_mut(&pid).and_then(|p| p.job.as_mut()) else { return };
+        if job.id != jid || job.phase != Phase::Awaiting || !job.kind.window_only() {
+            return;
+        }
+        if let Some(why) = job.watch.answer(now, raw) {
+            self.finish(pid, Err(why.to_string()));
+            self.pump(elwt);
+        }
     }
 
     fn finish_if(&mut self, pid: u64, jid: u64, res: Result<Value, String>, elwt: &EventLoopWindowTarget<Ev>) {
@@ -584,12 +869,19 @@ fn wrap_async(jid: u64, expr: &str) -> String {
     )
 }
 
-/// Shows `window` at the bottom of the z-order without activating it, with no taskbar button.
+/// [`wrap_async`] for a window-only script: it first marks its page with its job (the mark goes
+/// with the document, so a page that reloaded or navigated no longer has it).
+fn wrap_marked(jid: u64, expr: &str) -> String {
+    format!("window.__mvwallJob = {jid};\n{}", wrap_async(jid, expr))
+}
+
+/// Shows `window` at the bottom of the z-order without activating it; `taskbar`: it keeps its
+/// taskbar button (a site's own window the user may want to find), else it has none.
 #[cfg(windows)]
-fn show_behind(window: &Window) {
+fn show_behind(window: &Window, taskbar: bool) {
     use tao::platform::windows::WindowExtWindows;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, ShowWindow, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE};
-    let _ = window.set_skip_taskbar(true);
+    let _ = window.set_skip_taskbar(!taskbar);
     let hwnd = window.hwnd() as windows_sys::Win32::Foundation::HWND;
     // SAFETY: `hwnd` is this live window's handle, used on the thread that owns it.
     unsafe {
@@ -599,6 +891,119 @@ fn show_behind(window: &Window) {
 }
 
 #[cfg(not(windows))]
-fn show_behind(window: &Window) {
+fn show_behind(window: &Window, _taskbar: bool) {
     window.set_visible(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{probe_script, wrap_async, wrap_marked, Kind, Look, Watch, CALLER_GONE, NOT_STARTED, PAGE_GONE};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_window_script_whose_page_went_away_frees_the_window_within_seconds() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut w = Watch::start(t0);
+        assert_eq!(w.tick(at(0), false), Look::Wait);
+        assert_eq!(w.tick(at(2000), false), Look::Probe, "the first check comes soon");
+        assert_eq!(w.tick(at(2400), false), Look::Wait, "one check at a time");
+        assert_eq!(w.answer(at(2500), Some("true")), None);
+        assert_eq!(w.tick(at(7000), false), Look::Wait);
+        assert_eq!(w.tick(at(7500), false), Look::Probe, "then about every 5 s");
+        // The page answers, but its new document no longer holds the script: ended at once.
+        assert_eq!(w.answer(at(7600), Some("false")), Some(PAGE_GONE));
+
+        // A script that never began in the page is told apart.
+        let mut w = Watch::start(t0);
+        assert_eq!(w.tick(at(2000), false), Look::Probe);
+        assert_eq!(w.answer(at(2100), Some("false")), Some(NOT_STARTED));
+
+        // A renderer that stopped never answers the check.
+        let mut w = Watch::start(t0);
+        assert_eq!(w.tick(at(2000), false), Look::Probe);
+        assert_eq!(w.answer(at(2100), Some("true")), None);
+        assert_eq!(w.tick(at(7100), false), Look::Probe);
+        assert_eq!(w.tick(at(26_000), false), Look::Wait);
+        assert_eq!(w.tick(at(27_100), false), Look::End(PAGE_GONE));
+
+        // Checks that get no clear answer: three in a row end it, a clear one in between resets.
+        let mut w = Watch::start(t0);
+        assert_eq!(w.tick(at(2000), false), Look::Probe);
+        assert_eq!(w.answer(at(2000), Some("true")), None);
+        let mut t = 7000;
+        for round in 0..6 {
+            assert_eq!(w.tick(at(t), false), Look::Probe);
+            let raw = if round == 1 { Some("true") } else { None };
+            let end = w.answer(at(t), raw);
+            // Misses at rounds 0, 2, 3, 4: the third in a row (round 4) ends it.
+            assert_eq!(end, if round == 4 { Some(PAGE_GONE) } else { None }, "round {round}");
+            if end.is_some() {
+                break;
+            }
+            t += 5000;
+        }
+    }
+
+    #[test]
+    fn a_window_script_whose_caller_left_gives_the_window_back() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut w = Watch::start(t0);
+        assert_eq!(w.tick(at(100), true), Look::Wait, "a moment for the caller's stop signal to land");
+        assert_eq!(w.tick(at(2000), true), Look::Probe);
+        assert_eq!(w.tick(at(3100), true), Look::End(CALLER_GONE));
+        // A caller still waiting is never ended for that.
+        let mut w = Watch::start(t0);
+        assert_eq!(w.tick(at(2000), false), Look::Probe);
+        assert_eq!(w.answer(at(2100), Some("true")), None);
+        assert_eq!(w.tick(at(60_000), false), Look::Probe);
+    }
+
+    #[test]
+    fn only_window_scripts_mark_their_page() {
+        let marked = wrap_marked(9, "1");
+        assert!(marked.starts_with("window.__mvwallJob = 9;\n") && marked.ends_with(&wrap_async(9, "1")));
+        assert!(!wrap_async(9, "1").contains("__mvwallJob"), "the other features' scripts are unchanged");
+        assert_eq!(probe_script(9), "window.__mvwallJob === 9");
+        let src = include_str!("runner.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        assert!(code.contains("Kind::Eval { script, window_only: true, .. } => {") && code.matches("wrap_marked(jid, script)").count() == 1);
+    }
+
+    #[test]
+    fn a_request_without_a_page_never_holds_up_the_sites_own_window() {
+        let src = include_str!("runner.rs").replace("\r\n", "\n");
+        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let pump = &code[code.find("fn pump(").unwrap_or(0)..];
+        let pump = &pump[..pump.find("\n    fn begin(").unwrap_or(pump.len())];
+        assert!(!pump.contains("break"), "the scan goes on past a request that has to wait");
+        assert!(pump.contains("blocked = true;\n                i += 1;\n                continue;"));
+        // Once one request waits for a page, later ones needing a page wait too (their order is
+        // kept); only work for an open own window, which needs no page, still starts.
+        let own = pump.find("if req.kind.own_window()").unwrap_or(usize::MAX);
+        let skip = pump.find("if blocked {").unwrap_or(0);
+        let pick = pump.find("let idle: Vec<u64>").unwrap_or(0);
+        assert!(own < skip && skip < pick);
+    }
+
+    fn eval(window_only: bool) -> Kind {
+        Kind::Eval { url: "https://a.example/app".into(), script: "1".into(), timeout: Some(Duration::from_secs(5)), window_only }
+    }
+
+    #[test]
+    fn only_the_sites_own_window_runs_its_work() {
+        assert!(eval(true).own_window() && eval(true).window_only() && eval(true).hands_walls_over());
+        // Every request the other features make behaves as before.
+        assert!(!eval(false).own_window() && !eval(false).window_only() && !eval(false).hands_walls_over());
+        for k in [Kind::Html { url: "https://a.example/".into(), wait_for: None }, Kind::Fetch { url: "https://a.example/x".into(), headers: vec![] }, Kind::Cookies { url: "https://a.example/".into() }] {
+            assert!(!k.own_window() && !k.window_only() && !k.hands_walls_over());
+        }
+        // Showing a site's window uses the one it has; only the window kept behind for work
+        // stops on a check (the user's own front window is theirs to get through it).
+        let behind = Kind::Show { url: "https://a.example/app".into(), title: "t".into(), front: false };
+        let front = Kind::Show { url: "https://a.example/app".into(), title: "t".into(), front: true };
+        assert!(behind.own_window() && !behind.window_only() && behind.hands_walls_over());
+        assert!(front.own_window() && !front.window_only() && !front.hands_walls_over());
+    }
 }

@@ -43,6 +43,8 @@ pub enum Route {
     /// publish on YouTube → collect results, with a full-auto switch (the YouTube page's
     /// Automation section).
     Automation,
+    /// Anime Engine (Beta): manga → animatic projects.
+    AnimeEngine,
     // App
     Settings { tab: Option<String> },
     /// First-run setup (full window; also "Run welcome setup again" in Settings › About).

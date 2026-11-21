@@ -219,11 +219,13 @@ impl SettingsView {
             settings_group("Workspace", Some("Changing modes never removes your library, downloads or settings.".into()))
                 .child(settings_row(
                     "Studio mode",
-                    "Off keeps MangaVox to manga, anime and movies. On adds the two tools below to the sidebar, plus Studio settings.",
+                    "Off keeps MangaVox to manga, anime and movies. On adds the tools below to the sidebar, plus Studio settings.",
                     switch("mode-studio", studio).on_click(cx.listener(|this, on: &bool, _, cx| this.set_mode(if *on { "studio" } else { "entertainment" }, cx))),
                 ))
                 .child(icon_row(glyphs::STUDIO, "Studio", "Reads manga chapters and turns them into narrated recap videos.", state(studio)))
-                .child(icon_row(glyphs::ASSISTANT, "Assistant", "Chat with local or cloud AI, with tools that act on your library.", state(studio))),
+                .child(icon_row(glyphs::ASSISTANT, "Assistant", "Chat with local or cloud AI, with tools that act on your library.", state(studio)))
+                // The same glyph as the Anime Engine tab in the sidebar switcher.
+                .child(icon_row(ph::FILM_STRIP, "Anime Engine (Beta)", "Turns a manga from your library into an animatic, step by step.", state(studio))),
         )
     }
 

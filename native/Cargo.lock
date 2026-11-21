@@ -5545,6 +5545,7 @@ dependencies = [
  "mv-webwall",
  "serde_json",
  "tray-icon",
+ "ui-anime",
  "ui-assistant",
  "ui-manga",
  "ui-media",
@@ -5830,6 +5831,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mv-anime"
+version = "9.0.32"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "hound",
+ "image",
+ "mv-ai",
+ "mv-core",
+ "mv-recap",
+ "mv-studio",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "mv-core"
 version = "9.0.32"
 dependencies = [
@@ -5844,6 +5866,19 @@ dependencies = [
  "tempfile",
  "uuid",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "mv-magnific"
+version = "9.0.32"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "image",
+ "mv-webwall",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -10095,6 +10130,26 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ui-anime"
+version = "9.0.32"
+dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "mv-ai",
+ "mv-anime",
+ "mv-core",
+ "mv-magnific",
+ "mv-recap",
+ "mv-studio",
+ "mv-ui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ui-assistant",
+ "ui-studio",
 ]
 
 [[package]]

@@ -18,6 +18,7 @@ ui-studio = { path = "../crates/ui-studio" }
 ui-phone = { path = "../crates/ui-phone" }
 ui-youtube = { path = "../crates/ui-youtube" }
 ui-welcome = { path = "../crates/ui-welcome" }
+ui-anime = { path = "../crates/ui-anime" }
 mv-net = { path = "../crates/mv-net" }
 mv-update = { path = "../crates/mv-update" }
 mv-sources = { path = "../crates/mv-sources" }

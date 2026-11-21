@@ -19,7 +19,8 @@ use crate::routes::is_workspace;
 /// show it, nor does the player on a local video (a Studio recap).
 pub fn in_scope(route: &Route) -> bool {
     match route {
-        Route::Settings { .. } | Route::Mobile | Route::Welcome | Route::Back => false,
+        // The Anime Engine is a creator tool, like Studio: private mode is for reading and watching.
+        Route::Settings { .. } | Route::Mobile | Route::Welcome | Route::Back | Route::AnimeEngine => false,
         Route::Player { request } => ui_player::backend::ident(request).tracked,
         r => !is_workspace(r),
     }
@@ -392,7 +393,7 @@ mod tests {
             assert!(in_scope(&r), "{r:?}");
         }
         assert!(in_scope(&Route::Reader { manga_id: "m".into(), chapter_id: "c".into() }));
-        for r in [Route::Studio, Route::Hook, Route::Thumbnails, Route::YouTubeVideos, Route::YouTube, Route::Suggestions, Route::Settings { tab: None }, Route::Mobile, Route::Welcome] {
+        for r in [Route::Studio, Route::Hook, Route::Thumbnails, Route::YouTubeVideos, Route::YouTube, Route::Suggestions, Route::AnimeEngine, Route::Settings { tab: None }, Route::Mobile, Route::Welcome] {
             assert!(!in_scope(&r), "{r:?}");
         }
         let play = |mal: Option<&str>| Route::Player { request: mv_ui::nav::PlayRequest { title: "x".into(), source: "x".into(), file_idx: None, imdb_id: None, mal_id: mal.map(Into::into), season: None, episode: None } };
@@ -409,5 +410,6 @@ mod tests {
         assert!(title_controls(&Route::Reader { manga_id: "m".into(), chapter_id: "c".into() }).is_none());
         let play = Route::Player { request: mv_ui::nav::PlayRequest { title: "x".into(), source: "x".into(), file_idx: None, imdb_id: None, mal_id: Some("21".into()), season: None, episode: None } };
         assert!(title_controls(&play).is_none());
+        assert!(title_controls(&Route::AnimeEngine).is_none(), "the Anime Engine has no private mode");
     }
 }

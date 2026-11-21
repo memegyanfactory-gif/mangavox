@@ -1070,18 +1070,43 @@ def assemble_cached(out: str, chunks: list, cache_dir: str | None, lead_ms: int 
             "chunks": info, "tempo": applied, "device": "cache"}
 
 
+def acted_params(params) -> dict | None:
+    """A caller's exact acting ({exaggeration, cfg_weight, temperature}), clamped to what
+    Chatterbox stays clean at; None when there is none (the planner picks)."""
+    if not isinstance(params, dict):
+        return None
+
+    def num(key, default, lo, hi):
+        try:
+            v = float(params.get(key, default))
+        except (TypeError, ValueError):
+            v = default
+        if v != v:  # NaN
+            v = default
+        return round(min(hi, max(lo, v)), 3)
+
+    return {"exaggeration": num("exaggeration", 0.5, 0.25, 1.0), "cfg_weight": num("cfg_weight", 0.5, 0.2, 0.7),
+            "temperature": num("temperature", 0.8, 0.5, 1.0), "repetition_penalty": 1.2, "top_p": 1.0, "min_p": 0.05}
+
+
 def synthesize_one(text: str, output_path: str, voice: str, speed: float = 1.0, kind: str = "other",
-                   intensity: float = 3.0, mood: str = "", reference: str | None = None) -> dict:
-    """One clip (previews): chunked, styled and loudness-normalised like a chapter page."""
+                   intensity: float = 3.0, mood: str = "", reference: str | None = None, params: dict | None = None,
+                   line_kind: str = "narration", lead_ms: int | None = None, tail_ms: int | None = None) -> dict:
+    """One clip (previews, anime lines): chunked, styled and loudness-normalised like a chapter
+    page. `params` (the Anime Engine's acting per line) wins over the planner's choice for every
+    chunk; `line_kind` (narrator / speech / inner) styles it otherwise."""
     nt = _load_narration()
-    units = [{"text": text, "kind": kind, "mood": mood, "intensity": intensity, "line_kind": "narration"}]
+    units = [{"text": text, "kind": kind, "mood": mood, "intensity": intensity, "line_kind": line_kind or "narration"}]
+    fixed = acted_params(params)
     chunks = []
     for i, c in enumerate(nt.plan_chunks(units)):
-        params = nt.chatterbox_params(c["kind"], c["intensity"], c["line_kind"])
-        chunks.append({"text": c["synth_text"], "params": params, "seed": nt.segment_seed(0, i, c["text"]),
+        p = dict(fixed) if fixed else nt.chatterbox_params(c["kind"], c["intensity"], c["line_kind"])
+        chunks.append({"text": c["synth_text"], "params": p, "seed": nt.segment_seed(0, i, c["text"]),
                        "pause_before_ms": c["pause_before_ms"]})
+    lead = nt.PAGE_LEAD_MS if lead_ms is None else max(0, min(1000, int(lead_ms)))
+    tail = nt.PAGE_TAIL_MS if tail_ms is None else max(0, min(1000, int(tail_ms)))
     with Worker() as w:
-        res = w.page(output_path, voice, chunks, reference=reference, lead_ms=nt.PAGE_LEAD_MS, tail_ms=nt.PAGE_TAIL_MS,
+        res = w.page(output_path, voice, chunks, reference=reference, lead_ms=lead, tail_ms=tail,
                      tempo=float(speed or 1.0) * nt.chatterbox_tempo(kind))
     res["loudness"] = nt.normalize_chapter([output_path])
     return res
@@ -1106,7 +1131,8 @@ def main() -> int:
             a = json.load(f)
         try:
             res = synthesize_one(a["text"], a["output_path"], a.get("voice", "cb_narrator_f"), float(a.get("speed", 1.0)),
-                                 a.get("kind", "other"), float(a.get("intensity", 3)), a.get("mood", ""), a.get("reference"))
+                                 a.get("kind", "other"), float(a.get("intensity", 3)), a.get("mood", ""), a.get("reference"),
+                                 a.get("params"), a.get("line_kind") or "narration", a.get("lead_ms"), a.get("tail_ms"))
             emit({"type": "done", **res})
             return 0
         except Exception as e:

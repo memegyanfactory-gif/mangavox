@@ -1,7 +1,7 @@
 //! The shell's map of the app: sections, their sidebar destinations and which routes are pages,
 //! details or full-screen. Icons come from `mv_ui::glyphs`, so one meaning has one glyph on every
 //! page (Apple HIG SF Symbols: <https://developer.apple.com/design/human-interface-guidelines/sf-symbols>).
-use mv_ui::{glyphs, Ph, Route};
+use mv_ui::{glyphs, ph, Ph, Route};
 
 use crate::keys::Shortcut;
 
@@ -10,9 +10,15 @@ pub enum Section {
     Manga,
     Anime,
     Movies,
+    /// Anime Engine (Beta): manga → animatic projects. A creator tool, shown only in Studio mode
+    /// (see [`Section::visible`]).
+    Engine,
 }
 
-pub const SECTIONS: [Section; 3] = [Section::Manga, Section::Anime, Section::Movies];
+pub const SECTIONS: [Section; 4] = [Section::Manga, Section::Anime, Section::Movies, Section::Engine];
+
+/// The sections in the switcher's first row (the Anime Engine has a row of its own under them).
+pub const MEDIA_SECTIONS: [Section; 3] = [Section::Manga, Section::Anime, Section::Movies];
 
 impl Section {
     pub fn label(self) -> &'static str {
@@ -20,6 +26,7 @@ impl Section {
             Section::Manga => "Manga",
             Section::Anime => "Anime",
             Section::Movies => "Movies",
+            Section::Engine => "Anime Engine",
         }
     }
 
@@ -28,6 +35,7 @@ impl Section {
             Section::Manga => Route::Library,
             Section::Anime => Route::AnimeHome,
             Section::Movies => Route::MoviesHome,
+            Section::Engine => Route::AnimeEngine,
         }
     }
 
@@ -36,6 +44,7 @@ impl Section {
             Section::Manga => glyphs::MANGA,
             Section::Anime => glyphs::ANIME,
             Section::Movies => glyphs::MOVIES,
+            Section::Engine => ph::FILM_STRIP,
         }
     }
 
@@ -44,11 +53,18 @@ impl Section {
             Section::Manga => Shortcut::Manga,
             Section::Anime => Shortcut::Anime,
             Section::Movies => Shortcut::Movies,
+            Section::Engine => Shortcut::Engine,
         }
     }
 
     pub fn index(self) -> usize {
         SECTIONS.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    /// Whether the section is offered: the Anime Engine only in Studio mode (it needs the same
+    /// AI provider, voices and Magnific sign-in as Studio), the others always.
+    pub fn visible(self, studio: bool) -> bool {
+        self != Section::Engine || studio
     }
 }
 
@@ -85,6 +101,7 @@ pub fn nav_for(section: Section) -> Vec<NavEntry> {
             entry(Route::MediaHistory, "History", glyphs::HISTORY, &["recent", "watched", "continue"]),
             entry(Route::Favorites, "Favorites", glyphs::FAVORITES, &["starred", "watchlist"]),
         ],
+        Section::Engine => vec![entry(Route::AnimeEngine, "Projects", ph::FILM_STRIP, &["anime engine", "animate", "animatic", "episode", "beta"])],
     }
 }
 
@@ -156,6 +173,36 @@ mod tests {
         for id in SETTINGS_TABS {
             // Canonical ids, so the palette can mark the page the Settings view reports.
             assert_eq!(ui_settings::Tab::from_id(id).map(|t| t.id()), Some(*id), "{id}");
+        }
+    }
+
+    #[test]
+    fn the_engine_follows_studio_mode() {
+        for s in SECTIONS {
+            assert!(s.visible(true), "{s:?}");
+            assert_eq!(s.visible(false), s != Section::Engine, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn the_engine_is_the_fourth_section_with_its_own_page() {
+        assert_eq!(SECTIONS[3], Section::Engine);
+        assert_eq!(Section::Engine.label(), "Anime Engine");
+        assert_eq!(Section::Engine.home(), Route::AnimeEngine);
+        assert_eq!(Section::Engine.shortcut(), Shortcut::Engine);
+        assert_eq!(nav_label(Section::Engine, &Route::AnimeEngine), Some("Projects"));
+        // Its page belongs to no other section, and is no workspace, detail or focus page.
+        for s in [Section::Manga, Section::Anime, Section::Movies] {
+            assert_eq!(nav_label(s, &Route::AnimeEngine), None, "{s:?}");
+        }
+        assert!(!is_workspace(&Route::AnimeEngine) && !is_detail(&Route::AnimeEngine) && !is_focus(&Route::AnimeEngine) && !keep_alive(&Route::AnimeEngine));
+    }
+
+    #[test]
+    fn the_first_row_of_the_switcher_is_the_media_sections_in_order() {
+        assert_eq!(MEDIA_SECTIONS, [SECTIONS[0], SECTIONS[1], SECTIONS[2]]);
+        for s in MEDIA_SECTIONS {
+            assert_eq!(s.index(), MEDIA_SECTIONS.iter().position(|m| *m == s).unwrap_or(usize::MAX), "{s:?}");
         }
     }
 }

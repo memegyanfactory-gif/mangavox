@@ -29,6 +29,9 @@ pub fn install(main: AnyWindowHandle, cx: &mut App) {
             }
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if ev.id == quit_id {
+                    // The Anime Engine's job queue gets its last state onto disk first (off the
+                    // UI thread), before quit's few-second hard stop starts counting.
+                    let _ = mv_ui::bg::blocking(ui_anime::flush_on_exit).await;
                     cx.update(mv_ui::update::quit);
                     return;
                 }

@@ -1,0 +1,7 @@
+THIS IS A REVISION.
+The episode director checked your shot list against the measured rules and sent it back with notes. Revise it:
+- Fix every note marked MUST FIX, and as many "should fix" notes as you can. Each note names its cut (counted from 1 in screen order) and says how to fix it.
+- Fix a note the way a director would: add the missing wide or overhead, break a run of close shots with a medium or an insert, move the camera back to its side of the line or put a bridge shot before the crossing, put the threat and the hero in one frame before the hit, carry a beat with a back, hands or a wide instead of a face, split a cut that carries too many lines.
+- Keep everything the notes do not mention: the same floor plan, the same marks, the same stations, the same tells. Do not trade one fault for another: the revised plan is checked again and is kept only if it has fewer faults than this one.
+- Every line id still goes in exactly one shot, and every shot still lasts at least as long as its lines take.
+Reply with the WHOLE revised shot list as one JSON object in the same shape ({"shots":[...]}), and nothing else.

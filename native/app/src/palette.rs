@@ -121,10 +121,10 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
         out.push(Group { heading: "Recent".into(), rows: c.recent.iter().map(|(label, icon, route)| row(label.clone(), *icon, Cmd::Go(route.clone()))).collect() });
     }
 
-    // Destinations, the current section first.
+    // Destinations, the current section first; the Anime Engine only in Studio mode.
     let mut order = vec![c.section];
     order.extend(SECTIONS.into_iter().filter(|s| *s != c.section));
-    for s in order {
+    for s in order.into_iter().filter(|s| s.visible(c.studio)) {
         let rows = nav_for(s)
             .into_iter()
             .map(|e| {
@@ -191,7 +191,7 @@ fn groups(c: &Ctx, query: &str, titles: &[Title]) -> Vec<Group> {
     if c.can_forward {
         actions.push(row("Go forward", ph::ARROW_RIGHT, Cmd::Run(Shortcut::Forward)).keys(["next"]).shortcut(Shortcut::Forward));
     }
-    for s in SECTIONS.into_iter().filter(|s| *s != c.section) {
+    for s in SECTIONS.into_iter().filter(|s| *s != c.section && s.visible(c.studio)) {
         actions.push(row(format!("Switch to {}", s.label()), s.icon(), Cmd::Run(s.shortcut())).keys(["section"]).shortcut(s.shortcut()));
     }
     // Off the reader and the player F11 maximizes or restores the window (full screen, which
@@ -317,7 +317,7 @@ mod tests {
         let route = Route::Library;
         let gs = groups(&ctx(&route), "", &[]);
         let all = cmds(&gs);
-        for s in SECTIONS {
+        for s in SECTIONS.into_iter().filter(|s| s.visible(false)) {
             for e in nav_for(s) {
                 assert!(all.contains(&Cmd::Open(s, e.route.clone())), "{} / {}", s.label(), e.label);
             }
@@ -339,6 +339,35 @@ mod tests {
         let on = cmds(&groups(&on, "", &[]));
         assert!(on.contains(&Cmd::Go(Route::Studio)));
         assert!(on.contains(&Cmd::Panel(PanelTab::Chat)));
+    }
+
+    #[test]
+    fn engine_follows_studio_mode() {
+        let route = Route::Library;
+        let off = groups(&ctx(&route), "", &[]);
+        assert!(off.iter().all(|g| g.heading.as_ref() != "Anime Engine"));
+        let off = cmds(&off);
+        assert!(!off.contains(&Cmd::Open(Section::Engine, Route::AnimeEngine)));
+        assert!(!off.contains(&Cmd::Run(Shortcut::Engine)));
+        let on = groups(&Ctx { studio: true, ..ctx(&route) }, "", &[]);
+        assert!(on.iter().any(|g| g.heading.as_ref() == "Anime Engine"));
+        let on_cmds = cmds(&on);
+        // Every destination of every section, the Anime Engine's included.
+        for s in SECTIONS {
+            for e in nav_for(s) {
+                assert!(on_cmds.contains(&Cmd::Open(s, e.route.clone())), "{} / {}", s.label(), e.label);
+            }
+        }
+        let switch = on.iter().flat_map(|g| g.rows.iter()).find(|r| r.cmd == Cmd::Run(Shortcut::Engine)).expect("switch row");
+        assert_eq!(switch.label.as_ref(), "Switch to Anime Engine");
+        assert_eq!(switch.shortcut, Some(Shortcut::Engine));
+        // On the tab itself: its group comes first, its page is marked, and no row switches to it.
+        let here = Route::AnimeEngine;
+        let gs = groups(&Ctx { studio: true, section: Section::Engine, ..ctx(&here) }, "", &[]);
+        assert_eq!(gs[0].heading.as_ref(), "Anime Engine");
+        assert!(gs[0].rows.iter().any(|r| r.current && r.cmd == Cmd::Open(Section::Engine, Route::AnimeEngine)));
+        assert!(!cmds(&gs).contains(&Cmd::Run(Shortcut::Engine)));
+        assert!(cmds(&gs).contains(&Cmd::Run(Shortcut::Manga)));
     }
 
     #[test]

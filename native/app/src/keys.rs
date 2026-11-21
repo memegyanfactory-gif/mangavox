@@ -10,7 +10,7 @@ use gpui_kit::*;
 
 actions!(
     mangavox,
-    [CommandPalette, ToggleSidebar, TogglePanel, OpenSettings, ShowManga, ShowAnime, ShowMovies, GoBack, GoForward, ToggleFullscreen, TogglePrivate]
+    [CommandPalette, ToggleSidebar, TogglePanel, OpenSettings, ShowManga, ShowAnime, ShowMovies, ShowEngine, GoBack, GoForward, ToggleFullscreen, TogglePrivate]
 );
 
 /// What a shortcut does.
@@ -24,6 +24,8 @@ pub enum Shortcut {
     Manga,
     Anime,
     Movies,
+    /// The Anime Engine (Beta) tab; does nothing while Studio mode is off.
+    Engine,
     Back,
     Forward,
     Fullscreen,
@@ -40,6 +42,7 @@ pub const SHORTCUTS: &[(&str, Shortcut)] = &[
     ("ctrl-1", Shortcut::Manga),
     ("ctrl-2", Shortcut::Anime),
     ("ctrl-3", Shortcut::Movies),
+    ("ctrl-4", Shortcut::Engine),
     ("alt-left", Shortcut::Back),
     ("alt-right", Shortcut::Forward),
     ("f11", Shortcut::Fullscreen),
@@ -56,6 +59,7 @@ impl Shortcut {
             Shortcut::Manga => Box::new(ShowManga),
             Shortcut::Anime => Box::new(ShowAnime),
             Shortcut::Movies => Box::new(ShowMovies),
+            Shortcut::Engine => Box::new(ShowEngine),
             Shortcut::Back => Box::new(GoBack),
             Shortcut::Forward => Box::new(GoForward),
             Shortcut::Fullscreen => Box::new(ToggleFullscreen),
@@ -83,6 +87,7 @@ fn binding(keys: &str, s: Shortcut) -> KeyBinding {
         Shortcut::Manga => KeyBinding::new(keys, ShowManga, None),
         Shortcut::Anime => KeyBinding::new(keys, ShowAnime, None),
         Shortcut::Movies => KeyBinding::new(keys, ShowMovies, None),
+        Shortcut::Engine => KeyBinding::new(keys, ShowEngine, None),
         Shortcut::Back => KeyBinding::new(keys, GoBack, None),
         Shortcut::Forward => KeyBinding::new(keys, GoForward, None),
         Shortcut::Fullscreen => KeyBinding::new(keys, ToggleFullscreen, None),
@@ -129,6 +134,13 @@ mod tests {
         assert_eq!(shortcut_for(&k), None);
         let plain = Keystroke::parse("k").unwrap();
         assert_eq!(shortcut_for(&plain), None);
+    }
+
+    #[test]
+    fn ctrl_4_opens_the_anime_engine() {
+        let k = Keystroke::parse("ctrl-4").unwrap();
+        assert_eq!(shortcut_for(&k), Some(Shortcut::Engine));
+        assert_eq!(Shortcut::Engine.keys(), "ctrl-4");
     }
 
     #[test]

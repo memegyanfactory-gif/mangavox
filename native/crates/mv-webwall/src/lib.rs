@@ -9,8 +9,11 @@
 mod detect;
 mod runner;
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,7 +22,14 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 pub use detect::{classify, origin_of, PageState, Verdict};
-use runner::{Ev, Kind, Request, Shared};
+use runner::{Ev, Kind, Request, Shared, WinOp};
+
+/// What [`WebWall::eval_in_window`] answers when the site has no window open.
+pub const NO_WINDOW: &str = runner::NO_WINDOW;
+
+/// What [`WebWall::eval_in_window`] answers when the page went away while the script ran (it
+/// navigated or reloaded, or its renderer stopped): the script can no longer answer.
+pub const PAGE_GONE: &str = runner::PAGE_GONE;
 
 /// Configuration for [`WebWall::start`].
 #[derive(Debug, Clone)]
@@ -133,14 +143,72 @@ impl WebWall {
     /// with this app's own browser profile. It stays open until they close it, and later
     /// requests for that site run in it, as that signed-in user.
     pub async fn show(&self, url: &str, title: &str) -> Result<(), SourceError> {
-        self.call(Kind::Show { url: url.into(), title: title.into() }).await.map(|_| ())
+        self.call(Kind::Show { url: url.into(), title: title.into(), front: true }).await.map(|_| ())
+    }
+
+    /// [`show`](Self::show), but the window is kept behind every other window: shown (a page
+    /// nobody shows may be slowed down), never focused, keeping its taskbar button under
+    /// `title` so the user can find it. Work that runs in a signed-in site's window uses it so
+    /// the user is not interrupted; [`show`](Self::show) or [`raise`](Self::raise) brings the
+    /// same window to the front when the user has something to do in it. A check for a person
+    /// on the way stops it at once ("blocked by an anti-bot challenge").
+    pub async fn show_behind(&self, url: &str, title: &str) -> Result<(), SourceError> {
+        self.call(Kind::Show { url: url.into(), title: title.into(), front: false }).await.map(|_| ())
     }
 
     /// [`WallSolver::eval_json`] for a script that takes long (waiting for a site to make
     /// something): it may run for `timeout`. Runs in the window opened by [`show`](Self::show)
     /// when there is one for that site, as it stands (no reload), else in a hidden one.
     pub async fn eval_json_for(&self, page_url: &str, script: &str, timeout: Duration) -> Result<Value, SourceError> {
-        self.call_within(Kind::Eval { url: page_url.into(), script: script.into(), timeout: Some(timeout) }, timeout).await
+        self.call_within(Kind::Eval { url: page_url.into(), script: script.into(), timeout: Some(timeout), window_only: false }, timeout).await
+    }
+
+    /// [`eval_json_for`](Self::eval_json_for) in the site's own window only: it waits while
+    /// that window runs something else, never uses or opens another page, and fails at once
+    /// ("no window is open for this site") when the window is not open. A check for a person
+    /// stops it at once ("blocked by an anti-bot challenge"). A caller that stops waiting
+    /// before the script began (its future dropped) is never served late.
+    ///
+    /// While it runs, the script is watched: when its page reloads, navigates away or stops
+    /// ([`PAGE_GONE`]), or when this call is dropped, the window is freed within seconds for
+    /// the next request instead of at the end of `timeout`.
+    pub async fn eval_in_window(&self, page_url: &str, script: &str, timeout: Duration) -> Result<Value, SourceError> {
+        self.eval_in_window_notify(page_url, script, timeout, || ()).await
+    }
+
+    /// [`eval_in_window`](Self::eval_in_window) that calls `on_start` once the window is this
+    /// request's (it no longer waits for the window's earlier work).
+    pub async fn eval_in_window_notify(&self, page_url: &str, script: &str, timeout: Duration, on_start: impl FnOnce() + Send) -> Result<Value, SourceError> {
+        let kind = Kind::Eval { url: page_url.into(), script: script.into(), timeout: Some(timeout), window_only: true };
+        let (tx, rx) = oneshot::channel();
+        let (stx, srx) = oneshot::channel();
+        self.submit(Request { kind, reply: tx, started: Some(stx) })?;
+        Self::wait(rx, self.total(timeout), Some((srx, on_start))).await
+    }
+
+    /// Whether the site's own window (from [`show`](Self::show)) is open.
+    pub async fn has_window(&self, url: &str) -> bool {
+        self.window_op(url, WinOp::Exists).await
+    }
+
+    /// Brings the site's own window to the front for the user, titled `title`, at once (also
+    /// while a job runs in it). `false`: it is not open.
+    pub async fn raise(&self, url: &str, title: &str) -> bool {
+        self.window_op(url, WinOp::Raise(title.into())).await
+    }
+
+    /// Runs a short `script` in the site's own window at once, beside whatever runs there (a
+    /// stop signal for a running job). Nothing happens when the window is not open.
+    pub fn signal(&self, url: &str, script: &str) {
+        if let Ok(p) = self.proxy.lock() {
+            let _ = p.send_event(Ev::Window { url: url.into(), op: WinOp::Signal(script.into()), reply: None });
+        }
+    }
+
+    async fn window_op(&self, url: &str, op: WinOp) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let sent = self.proxy.lock().map(|p| p.send_event(Ev::Window { url: url.into(), op, reply: Some(tx) }).is_ok()).unwrap_or(false);
+        sent && matches!(tokio::time::timeout(Duration::from_secs(5), rx).await, Ok(Ok(true)))
     }
 
     async fn call(&self, kind: Kind) -> Result<Value, SourceError> {
@@ -150,16 +218,27 @@ impl WebWall {
     /// `call` with `extra` time for the action itself.
     async fn call_within(&self, kind: Kind, extra: Duration) -> Result<Value, SourceError> {
         let (tx, rx) = oneshot::channel();
-        self.proxy
-            .lock()
-            .unwrap()
-            .send_event(Ev::Submit(Request { kind, reply: tx }))
-            .map_err(|_| SourceError::Solver("webview thread is not running".into()))?;
+        self.submit(Request { kind, reply: tx, started: None })?;
+        Self::wait(rx, self.total(extra), None::<(oneshot::Receiver<()>, fn())>).await
+    }
+
+    fn submit(&self, req: Request) -> Result<(), SourceError> {
+        let not_running = || SourceError::Solver("webview thread is not running".into());
+        self.proxy.lock().map_err(|_| not_running())?.send_event(Ev::Submit(req)).map_err(|_| not_running())
+    }
+
+    /// How long a caller waits for a request with `extra` time for the action itself.
+    fn total(&self, extra: Duration) -> Duration {
         let mut total = self.cfg.hidden_timeout + self.cfg.action_timeout + Duration::from_secs(20) + extra;
         if self.cfg.interactive {
             total += self.cfg.interactive_timeout;
         }
-        match tokio::time::timeout(total, rx).await {
+        total
+    }
+
+    /// Waits up to `total` for the answer; `started`: told when the request got its page.
+    async fn wait(rx: oneshot::Receiver<Result<Value, String>>, total: Duration, started: Option<(oneshot::Receiver<()>, impl FnOnce())>) -> Result<Value, SourceError> {
+        match tokio::time::timeout(total, answer_noting_start(rx, started)).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => Err(SourceError::Solver(e)),
             Ok(Err(_)) => Err(SourceError::Solver("webview request dropped".into())),
@@ -168,11 +247,76 @@ impl WebWall {
     }
 }
 
+/// Waits for `rx`, calling `on_start` once `started` fires (never when it is dropped unfired).
+async fn answer_noting_start<T, F: FnOnce()>(mut rx: oneshot::Receiver<T>, started: Option<(oneshot::Receiver<()>, F)>) -> Result<T, oneshot::error::RecvError> {
+    let mut started = started;
+    std::future::poll_fn(move |cx| {
+        if let Some((s, _)) = started.as_mut() {
+            if let Poll::Ready(r) = Pin::new(s).poll(cx) {
+                if let Some((_, on_start)) = started.take() {
+                    if r.is_ok() {
+                        on_start();
+                    }
+                }
+            }
+        }
+        Pin::new(&mut rx).poll(cx)
+    })
+    .await
+}
+
 impl Drop for WebWall {
     fn drop(&mut self) {
         if let Ok(p) = self.proxy.lock() {
             let _ = p.send_event(Ev::Shutdown);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::answer_noting_start;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn the_caller_hears_when_its_request_gets_the_window() {
+        let n = AtomicU32::new(0);
+        let note = || {
+            n.fetch_add(1, Ordering::SeqCst);
+        };
+        // Got the window, then answered.
+        let (tx, rx) = oneshot::channel::<u8>();
+        let (stx, srx) = oneshot::channel();
+        let _ = stx.send(());
+        let _ = tx.send(7);
+        assert_eq!(answer_noting_start(rx, Some((srx, note))).await.ok(), Some(7));
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        // Answered without ever getting it (no window open): no notice.
+        let (tx, rx) = oneshot::channel::<u8>();
+        let (stx, srx) = oneshot::channel::<()>();
+        drop(stx);
+        let _ = tx.send(1);
+        assert_eq!(answer_noting_start(rx, Some((srx, note))).await.ok(), Some(1));
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        // The notice comes while the answer is still to come.
+        let (tx, rx) = oneshot::channel::<u8>();
+        let (stx, srx) = oneshot::channel();
+        let wait = answer_noting_start(rx, Some((srx, note)));
+        tokio::pin!(wait);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut wait).await.is_err());
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        let _ = stx.send(());
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut wait).await.is_err());
+        assert_eq!(n.load(Ordering::SeqCst), 2, "noticed before the answer");
+        let _ = tx.send(5);
+        assert_eq!(wait.await.ok(), Some(5));
+        assert_eq!(n.load(Ordering::SeqCst), 2, "noticed once");
+        // Without a notice to give, it is a plain wait.
+        let (tx, rx) = oneshot::channel::<u8>();
+        let _ = tx.send(3);
+        assert_eq!(answer_noting_start(rx, None::<(oneshot::Receiver<()>, fn())>).await.ok(), Some(3));
     }
 }
 
@@ -206,6 +350,6 @@ impl WallSolver for WebWall {
     }
 
     async fn eval_json(&self, page_url: &str, script: &str) -> mv_sources::Result<Value> {
-        self.call(Kind::Eval { url: page_url.into(), script: script.into(), timeout: None }).await
+        self.call(Kind::Eval { url: page_url.into(), script: script.into(), timeout: None, window_only: false }).await
     }
 }

@@ -1,0 +1,37 @@
+[package]
+name = "mv-anime"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mv-core = { path = "../mv-core" }
+mv-ai = { path = "../mv-ai" }
+mv-recap = { path = "../mv-recap" }
+mv-studio = { path = "../mv-studio" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "process", "fs"] }
+# All already in the lockfile (design 2.1): hashing, picture crops, WAV lengths, data URLs.
+futures = "0.3"
+sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+hound = "3.5"
+base64 = "0.22"
+# Local time for export names and "Earlier versions" (already in the lockfile through mv-core).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# One feature per step so each work package checks and tests only what it owns (design 2.2,
+# 10.2). Core modules (model, store, queue, ...) are always compiled.
+[features]
+default = ["story", "bible", "shots", "frames", "sound", "cut"]
+story = []
+bible = []
+shots = []
+frames = []
+sound = []
+cut = ["sound"]

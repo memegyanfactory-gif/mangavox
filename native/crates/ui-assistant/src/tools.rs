@@ -221,6 +221,7 @@ pub fn page_name(route: &Route) -> &'static str {
         Route::Thumbnails => "thumbnails",
         Route::YouTubeVideos => "youtube-videos",
         Route::Automation => "automation",
+        Route::AnimeEngine => "anime-engine",
         Route::Settings { .. } => "settings",
         Route::Welcome => "welcome",
         Route::Back => "back",
@@ -237,7 +238,7 @@ pub fn section_name(route: &Route) -> &'static str {
 
 // ── Tool table ───────────────────────────────────────────────────────────────────
 
-pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "youtube", "suggestions", "thumbnails", "youtube-videos", "automation", "mobile", "settings"];
+pub const PAGES: &[&str] = &["library", "browse", "history", "downloads", "anime", "movies", "discover", "favorites", "media-history", "studio", "youtube", "suggestions", "thumbnails", "youtube-videos", "automation", "anime-engine", "mobile", "settings"];
 pub const SETTINGS_TABS: &[&str] = &["providers", "models", "profile", "playback", "sources", "extensions", "addons", "streaming", "storage", "themes", "mode", "about"];
 
 fn obj(properties: Value, required: &[&str]) -> Value {
@@ -561,6 +562,7 @@ pub fn page_groups(route: Option<&Route>) -> &'static [Group] {
         Some(Route::YouTube | Route::Automation) => &[Group::Youtube, Group::Studio],
         Some(Route::Suggestions) => &[Group::Studio, Group::Manga],
         Some(Route::Hook | Route::Thumbnails | Route::YouTubeVideos) => &[Group::Studio],
+        Some(Route::AnimeEngine) => &[Group::Manga],
         Some(Route::Settings { .. } | Route::Welcome | Route::Mobile) => &[],
         Some(r) if section_name(r) != "manga" => &[Group::Media],
         _ => &[Group::Manga],
@@ -790,6 +792,7 @@ pub fn page_title(id: &str) -> String {
         "studio" => "Studio",
         "mobile" => "Mobile",
         "youtube" => "YouTube",
+        "anime-engine" => "Anime Engine",
         "settings" => "Settings",
         "" => "the page",
         other => return capitalize(other),
@@ -955,6 +958,7 @@ pub fn route_for_page(page: &str) -> Option<Route> {
         "thumbnails" => Route::Thumbnails,
         "youtube-videos" => Route::YouTubeVideos,
         "automation" => Route::Automation,
+        "anime-engine" => Route::AnimeEngine,
         "settings" => Route::Settings { tab: None },
         _ => return None,
     })
@@ -1315,6 +1319,17 @@ mod tests {
         assert_eq!(page_groups(Some(&Route::Library)), &[Group::Manga]);
         assert_eq!(page_groups(None), &[Group::Manga]);
         assert!(page_groups(Some(&Route::Settings { tab: None })).is_empty());
+        assert_eq!(page_groups(Some(&Route::AnimeEngine)), &[Group::Manga]);
+    }
+
+    #[test]
+    fn every_page_id_opens_the_page_of_that_name() {
+        for page in PAGES {
+            let route = route_for_page(page).unwrap_or_else(|| panic!("{page} has no route"));
+            assert_eq!(page_name(&route), *page);
+        }
+        assert_eq!(route_for_page("anime-engine"), Some(Route::AnimeEngine));
+        assert_eq!(page_title("anime-engine"), "Anime Engine");
     }
 
     #[test]

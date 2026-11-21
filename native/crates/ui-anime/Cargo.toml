@@ -1,0 +1,30 @@
+[package]
+name = "ui-anime"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true }
+mv-ui = { path = "../mv-ui" }
+mv-core = { path = "../mv-core" }
+mv-ai = { path = "../mv-ai" }
+mv-recap = { path = "../mv-recap" }
+mv-studio = { path = "../mv-studio" }
+mv-anime = { path = "../mv-anime", default-features = false }
+mv-magnific = { path = "../mv-magnific" }
+ui-studio = { path = "../ui-studio" }
+ui-assistant = { path = "../ui-assistant" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+# One feature per step, forwarded to mv-anime (design 2.2, 10.2). The app takes the defaults.
+[features]
+default = ["story", "bible", "shots", "frames", "sound", "cut"]
+story = ["mv-anime/story"]
+bible = ["mv-anime/bible"]
+shots = ["mv-anime/shots"]
+frames = ["mv-anime/frames"]
+sound = ["mv-anime/sound"]
+cut = ["mv-anime/cut", "sound"]

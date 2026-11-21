@@ -173,7 +173,7 @@ impl Tab {
             Tab::Audio => "Narration voices that run on this PC: set up an engine, hear every voice and pick the default narrator.",
             Tab::System => "Keep the PC responsive while MangaVox narrates, renders or runs local models.",
             Tab::Appearance => "Colour theme and motion. Changes apply immediately.",
-            Tab::Mode => "Turn the Studio workspace and Assistant on or off.",
+            Tab::Mode => "Turn the Studio workspace, the Anime Engine and Assistant on or off.",
             Tab::Sources => "Where manga comes from: installed sources, plugins and repositories.",
             Tab::Addons => "Stremio-compatible addons that find streams for movies, series and anime.",
             Tab::Storage => "Where MangaVox keeps your data, what takes up space, and how to free it.",

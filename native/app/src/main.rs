@@ -213,4 +213,7 @@ fn main() {
         tray::install(main.0, cx);
         perf::step("post-window setup");
     });
+    // The app is closing (its event loop ended): the Anime Engine's queue journal, written in
+    // the background, gets its last state onto disk first.
+    ui_anime::flush_on_exit();
 }

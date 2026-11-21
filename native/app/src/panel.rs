@@ -121,12 +121,18 @@ fn activity(studio: bool, views: &Views, cx: &mut Context<Shell>) -> Div {
     cards.extend(ui_media::download_cards(cx));
     let has_cards = !cards.is_empty();
     let downloads = mv_ui::activity::inline(cards);
+    // The Anime Engine's jobs (Studio mode only, like its tab), under their own header.
+    let engine = if studio { ui_anime::activity_cards(cx) } else { vec![] };
+    let has_engine = !engine.is_empty();
+    let engine = mv_ui::activity::inline(engine);
     let studio_any = studio && ui_studio::panel::summary(cx).any;
-    let idle = !has_cards && !studio_any;
+    let idle = !has_cards && !studio_any && !has_engine;
     let studio_view = views.studio_activity.filter(|_| studio).cloned();
     scroller("app-panel-activity", "app-panel-activity-bar", views.activity_scroll, move |d| {
         d.when(has_cards, |d| d.child(section_header(glyphs::DOWNLOADS, "Downloads")))
             .children(downloads)
+            .when(has_engine, |d| d.child(section_header(ph::FILM_STRIP, "Anime Engine")))
+            .children(engine)
             .children(studio_view)
             .when(idle, |d| {
                 d.child(empty_view(ph::PULSE, "Nothing running", "Downloads, Studio's Generate runs and exports show up here while they work.").compact())
